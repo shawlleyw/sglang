@@ -100,6 +100,7 @@ class ModelRunner:
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.should_log = tp_rank == 0
+        self.decode_only = server_args.decode_only
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -689,7 +690,7 @@ class ModelRunner:
     def init_attention_backend(self):
         """Init attention kernel backend."""
         if self.server_args.attention_backend == "flashinfer":
-            self.attn_backend = FlashInferAttnBackend(self)
+            self.attn_backend = FlashInferAttnBackend(self, decode_only=self.decode_only)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
                 "Window attention is not supported in the triton attention backend. "

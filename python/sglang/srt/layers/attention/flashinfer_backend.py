@@ -73,6 +73,7 @@ class FlashInferAttnBackend(AttentionBackend):
         model_runner: ModelRunner,
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
+        decode_only: bool = False, # NOTE(hogura|20250402): different from `skip_prefill`, this is used for PD disaggregation benchmark
     ):
         super().__init__()
 
@@ -152,7 +153,8 @@ class FlashInferAttnBackend(AttentionBackend):
         ]
 
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
+            self.workspace_buffer, "NHD",
+            is_skipped=decode_only,
         )
 
         # Two wrappers: one for sliding window attention and one for full attention.
@@ -185,11 +187,13 @@ class FlashInferAttnBackend(AttentionBackend):
                             self.workspace_buffer,
                             "NHD",
                             backend="fa2",
+                            is_skipped=decode_only,
                         )
                     )
                     self.prefill_wrappers_verify.append(
                         BatchPrefillWithPagedKVCacheWrapper(
-                            self.workspace_buffer, "NHD"
+                            self.workspace_buffer, "NHD",
+                            is_skipped=decode_only,
                         )
                     )
             if self.enable_flashinfer_mla:
@@ -216,6 +220,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}
+
+        self.decode_only = decode_only
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -372,6 +378,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
                         custom_mask_buf=self.cuda_graph_custom_mask,
                         mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                        is_skipped=self.decode_only,
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
@@ -455,7 +462,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     logits_soft_cap=logits_soft_cap,
                 )
 
-                if save_kv_cache:
+                if save_kv_cache and not self.decode_only:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer,
                         cache_loc,
@@ -469,7 +476,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 ]
                 if k is not None:
                     assert v is not None
-                    if save_kv_cache:
+                    if save_kv_cache and not self.decode_only:
                         forward_batch.token_to_kv_pool.set_kv_buffer(
                             layer, cache_loc, k, v
                         )
@@ -499,7 +506,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.forward_metadata.use_ragged:
                 if k is not None:
                     assert v is not None
-                    if save_kv_cache:
+                    if save_kv_cache and not self.decode_only:
                         forward_batch.token_to_kv_pool.set_kv_buffer(
                             layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                         )
@@ -537,7 +544,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
                     o, _ = merge_state(o1, s1, o2, s2)
 
-                if save_kv_cache:
+                if save_kv_cache and not self.decode_only:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )

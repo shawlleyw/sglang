@@ -43,6 +43,7 @@ class ModelConfig:
         is_embedding: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        decode_only: bool = False,
     ) -> None:
         self.model_path = model_path
         self.revision = revision
@@ -65,6 +66,7 @@ class ModelConfig:
         self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
+        self.decode_only = decode_only
 
         # Derive context length
         derived_context_len = get_context_length(self.hf_text_config)

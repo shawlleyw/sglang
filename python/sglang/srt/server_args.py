@@ -171,6 +171,9 @@ class ServerArgs:
 
     enable_flashinfer_mla: bool = False
 
+    # Decode only for DisagMoE's benchmark
+    decode_only: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -936,6 +939,11 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--decode-only",
+            action="store_true",
+            help="Enable decode only serving",
         )
 
     @classmethod

@@ -200,6 +200,7 @@ class Scheduler:
             is_embedding=server_args.is_embedding,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            decode_only=server_args.decode_only,
         )
         self.is_generation = self.model_config.is_generation
 
@@ -1005,6 +1006,11 @@ class Scheduler:
         )
         new_batch.prepare_for_extend()
 
+        if self.model_config.decode_only:
+            self.process_batch_fake_prefill(new_batch)
+            new_batch.output_ids = new_batch.input_ids
+            new_batch.prepare_for_decode()
+
         # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
@@ -1016,7 +1022,10 @@ class Scheduler:
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
-                new_batch.decoding_reqs = self.running_batch.reqs
+                if self.model_config.decode_only:
+                    new_batch.forward_mode = ForwardMode.DECODE
+                else:
+                    new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = None
         else:
             new_batch.decoding_reqs = None
@@ -1110,6 +1119,47 @@ class Scheduler:
                 embeddings=embeddings, bid=model_worker_batch.bid
             )
         return ret
+
+    def process_batch_fake_prefill(
+        self,
+        batch: ScheduleBatch,
+    ):
+        skip_stream_req = None
+
+        # adapter from self.process_batch_result_prefill
+        next_token_ids = [10 for _ in range(batch.batch_size())]  # fill a dummy value, should not be <eos> or something similar
+        # Check finish conditions
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            if req.is_retracted:
+                continue
+
+            if self.is_mixed_chunk and self.enable_overlap and req.finished():
+                # Free the one delayed token for the mixed decode batch
+                j = len(batch.out_cache_loc) - len(batch.reqs) + i
+                self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
+                continue
+
+            if req.is_being_chunked <= 0:
+                req.output_ids.append(next_token_id)
+                req.check_finished()
+
+                if req.finished():
+                    self.tree_cache.cache_finished_req(req)
+                elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    self.tree_cache.cache_unfinished_req(req)
+
+                assert not req.return_logprob, "not supporing return_logprob"
+                assert not self.server_args.return_hidden_states, "not supporting return_hidden_stats"
+
+                if req.grammar is not None:
+                    req.grammar.accept_token(next_token_id)
+                    req.grammar.finished = req.finished()
+            
+            else:
+                req.is_being_chunked -= 1
+                skip_stream_req = req
+                    
+        self.stream_output(batch.reqs, False, skip_stream_req)
 
     def process_batch_result(
         self,

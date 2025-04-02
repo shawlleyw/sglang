@@ -796,8 +796,14 @@ class ScheduleBatch:
             req.is_retracted = False
             pre_lens.append(pre_len)
 
+        # cut the input ids to the last token if decode_only
+        if self.model_config.decode_only:
+            _input_ids = [r.fill_ids[-1: ] for r in reqs]
+        else:
+            _input_ids = input_ids
+
         # Set fields
-        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
+        self.input_ids = torch.tensor(sum(_input_ids, []), dtype=torch.int32).to(
             self.device, non_blocking=True
         )
         self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int64).to(
