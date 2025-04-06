@@ -864,20 +864,20 @@ class Scheduler:
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.being_chunked_req:
-                # Move the chunked request out of the batch
-                self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
-                self.tree_cache.cache_unfinished_req(self.being_chunked_req)
-                # being chunked request keeps its rid but will get a new req_pool_idx
-                self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
-                self.batch_is_full = False
+        # if self.last_batch and self.last_batch.forward_mode.is_extend():
+        #     if self.being_chunked_req:
+        #         # Move the chunked request out of the batch
+        #         self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
+        #         self.tree_cache.cache_unfinished_req(self.being_chunked_req)
+        #         # being chunked request keeps its rid but will get a new req_pool_idx
+        #         self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
+        #         self.batch_is_full = False
 
-            if not self.last_batch.is_empty():
-                if self.running_batch is None:
-                    self.running_batch = self.last_batch
-                else:
-                    self.running_batch.merge_batch(self.last_batch)
+        #     if not self.last_batch.is_empty():
+        #         if self.running_batch is None:
+        #             self.running_batch = self.last_batch
+        #         else:
+        #             self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
         if new_batch is not None:
@@ -890,6 +890,11 @@ class Scheduler:
             else:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch
+        
+        self.running_batch = ret
+        
+        if ret is not None:
+            print(f"get_next_batch_to_run: {ret}")
 
         # Handle DP attention
         if self.server_args.enable_dp_attention:
@@ -1007,9 +1012,17 @@ class Scheduler:
         new_batch.prepare_for_extend()
 
         if self.model_config.decode_only:
-            self.process_batch_fake_prefill(new_batch)
+            # self.process_batch_fake_prefill(new_batch)
             new_batch.output_ids = new_batch.input_ids
             new_batch.prepare_for_decode()
+            if self.running_batch is not None:
+                self.running_batch.filter_batch()
+                if not self.running_batch.is_empty():
+                    self.running_batch.prepare_for_decode()
+                    new_batch.merge_batch(self.running_batch)
+                self.running_batch = None
+                
+            return new_batch
 
         # Mixed-style chunked prefill
         if (
@@ -1022,10 +1035,7 @@ class Scheduler:
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
-                if self.model_config.decode_only:
-                    new_batch.forward_mode = ForwardMode.DECODE
-                else:
-                    new_batch.decoding_reqs = self.running_batch.reqs
+                new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = None
         else:
             new_batch.decoding_reqs = None
@@ -1314,9 +1324,11 @@ class Scheduler:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
+                
+        print(f"batch input ids {batch.input_ids}")
 
         self.token_to_kv_pool.free_group_begin()
-
+        
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
@@ -1335,6 +1347,8 @@ class Scheduler:
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
+                
+            print(f"req {req},  is finished: {req.finished()}")
 
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])

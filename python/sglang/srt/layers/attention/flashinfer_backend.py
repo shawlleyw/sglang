@@ -154,7 +154,6 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD",
-            is_skipped=decode_only,
         )
 
         # Two wrappers: one for sliding window attention and one for full attention.
@@ -187,13 +186,11 @@ class FlashInferAttnBackend(AttentionBackend):
                             self.workspace_buffer,
                             "NHD",
                             backend="fa2",
-                            is_skipped=decode_only,
                         )
                     )
                     self.prefill_wrappers_verify.append(
                         BatchPrefillWithPagedKVCacheWrapper(
                             self.workspace_buffer, "NHD",
-                            is_skipped=decode_only,
                         )
                     )
             if self.enable_flashinfer_mla:
