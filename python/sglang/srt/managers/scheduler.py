@@ -1011,7 +1011,11 @@ class Scheduler:
         if self.model_config.decode_only:
             new_batch.output_ids = new_batch.input_ids
             self.process_batch_fake_prefill(new_batch)
-            new_batch.prepare_for_decode()
+            new_batch.filter_batch()
+            if not new_batch.is_empty():
+                new_batch.prepare_for_decode()
+            else:
+                return None
             if self.running_batch is not None:
                 self.running_batch.filter_batch()
                 if not self.running_batch.is_empty():
@@ -1026,7 +1030,7 @@ class Scheduler:
             return new_batch
 
         # Mixed-style chunked prefill
-        if (
+        if (  
             self.is_mixed_chunk
             and self.running_batch is not None
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
