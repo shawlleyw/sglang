@@ -893,9 +893,6 @@ class Scheduler:
         
         self.running_batch = ret
         
-        if ret is not None:
-            print(f"get_next_batch_to_run: {ret}")
-
         # Handle DP attention
         if self.server_args.enable_dp_attention:
             ret = self.prepare_dp_attn_batch(ret)
@@ -1012,16 +1009,20 @@ class Scheduler:
         new_batch.prepare_for_extend()
 
         if self.model_config.decode_only:
-            # self.process_batch_fake_prefill(new_batch)
             new_batch.output_ids = new_batch.input_ids
+            self.process_batch_fake_prefill(new_batch)
             new_batch.prepare_for_decode()
             if self.running_batch is not None:
                 self.running_batch.filter_batch()
                 if not self.running_batch.is_empty():
                     self.running_batch.prepare_for_decode()
+                    input_ids = torch.cat([new_batch.input_ids, self.running_batch.input_ids])
+                    out_cache_loc = torch.cat([new_batch.out_cache_loc, self.running_batch.out_cache_loc])
                     new_batch.merge_batch(self.running_batch)
-                self.running_batch = None
-                
+                    new_batch.input_ids = input_ids
+                    new_batch.out_cache_loc = out_cache_loc
+            # import sys
+            # print(f"TP rank {self.tp_rank} num reqs {len(new_batch.reqs)}, len out_cache_loc: {new_batch.out_cache_loc.shape}", file=sys.stderr)
             return new_batch
 
         # Mixed-style chunked prefill
@@ -1137,9 +1138,8 @@ class Scheduler:
         skip_stream_req = None
 
         # adapter from self.process_batch_result_prefill
-        next_token_ids = [10 for _ in range(batch.batch_size())]  # fill a dummy value, should not be <eos> or something similar
         # Check finish conditions
-        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, batch.output_ids)):
             if req.is_retracted:
                 continue
 
@@ -1325,8 +1325,6 @@ class Scheduler:
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
                 
-        print(f"batch input ids {batch.input_ids}")
-
         self.token_to_kv_pool.free_group_begin()
         
         # Check finish condition
@@ -1348,8 +1346,6 @@ class Scheduler:
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
                 
-            print(f"req {req},  is finished: {req.finished()}")
-
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
