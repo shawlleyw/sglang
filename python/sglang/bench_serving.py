@@ -645,6 +645,8 @@ def sample_random_requests(
         output_len + 1,
         size=num_prompts,
     )
+    # input_lens = np.array([input_len] * num_prompts)
+    # output_lens = np.array([output_len] * num_prompts)
 
     if True:
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens

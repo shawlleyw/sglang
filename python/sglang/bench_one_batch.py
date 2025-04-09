@@ -56,6 +56,10 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.managers.utils import (
+    start_metrics,
+    stop_metrics,
+)
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hf_transformers_utils import get_tokenizer
@@ -336,6 +340,8 @@ def latency_test_run_once(
     device,
     profile,
     profile_filename_prefix,
+    metrics=False,
+    rank=0,
 ):
     print(f"latency test: batch_size, input_len, output_len ({batch_size}, {input_len}, {output_len})")
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
@@ -368,6 +374,9 @@ def latency_test_run_once(
             with_stack=True,
         )
         profiler.start()
+    
+    if metrics:
+        start_metrics()
 
     # Prefill
     synchronize(device)
@@ -398,6 +407,9 @@ def latency_test_run_once(
             rank_print(
                 f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
+            
+    if metrics:
+        stop_metrics(rank)
 
     if profile:
         profiler.stop()
@@ -482,6 +494,8 @@ def latency_test(
             server_args.device,
             bench_args.profile if tp_rank == 0 else None,
             bench_args.profile_filename_prefix,
+            bench_args.metrics,
+            tp_rank,
         )
         if ret is not None:
             result_list.append(ret)
@@ -536,9 +550,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
+    parser.add_argument("--metrics", action="store_true", default=False, help="Enable metrics collection.")
     args = parser.parse_args()
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
+    bench_args.metrics = args.metrics
 
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),

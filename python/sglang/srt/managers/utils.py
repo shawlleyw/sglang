@@ -5,6 +5,8 @@ from typing import Optional, List
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 import torch
 import numpy as np
+import os
+import pickle
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -113,3 +115,14 @@ class StepRecorder:
 cur_step_runtime_recorder: StepRecorder = None
 
 metrics_list: List[StepMetrics] = None
+
+def start_metrics():
+    global metrics_list
+    metrics_list = []
+
+def stop_metrics(rank):
+    global metrics_list
+    sglang_metrics_dir = os.getenv("SGLANG_METRICS_DIR", ".")
+    with open(f"{sglang_metrics_dir}/sglang_metrics_rank{rank}.pickle", "wb") as f:
+        pickle.dump(metrics_list, f)
+    metrics_list = None

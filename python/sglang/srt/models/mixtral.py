@@ -25,6 +25,8 @@ from transformers import MixtralConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+    get_tensor_model_parallel_rank,
+    get_tp_group,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -45,6 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_v2 import all_gather
 import sglang.srt.managers.utils as utils
 
 class MixtralMoE(nn.Module):
@@ -70,7 +73,7 @@ class MixtralMoE(nn.Module):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.hidden_size = hidden_size
-
+        
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
             hidden_size,
@@ -110,6 +113,7 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        router_logits = torch.rand_like(router_logits)
         final_hidden_states = self.experts(hidden_states, router_logits)
         if self.tp_size > 1 and not global_server_args_dict["enable_dp_attention"]:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -259,6 +263,13 @@ class MixtralDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        
+        self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
+        
+        if self.enable_dp_attention:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_group = get_tp_group().device_group
 
     def forward(
         self,
@@ -269,7 +280,6 @@ class MixtralDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         utils.cur_step_runtime_recorder.mark_attention_start()
         if not forward_batch.forward_mode.is_idle():
-        
             # Self Attention
             if residual is None:
                 residual = hidden_states
@@ -283,10 +293,17 @@ class MixtralDecoderLayer(nn.Module):
             )
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         
-        # utils.cur_step_runtime_recorder.mark_attention_end()
+        utils.cur_step_runtime_recorder.mark_attention_end()
         
         # Fully Connected
-        hidden_states = self.block_sparse_moe(hidden_states)
+        if global_server_args_dict["enable_dp_attention"] and not global_server_args_dict["enable_all2all_ep"]:
+                hidden_states, start_idx, end_idx = all_gather(
+                    hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
+                )
+                hidden_states = self.block_sparse_moe(hidden_states)
+                hidden_states = hidden_states[start_idx:end_idx]
+        else:
+            hidden_states = self.block_sparse_moe(hidden_states)
         
         return hidden_states, residual
 

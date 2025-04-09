@@ -1795,18 +1795,9 @@ class Scheduler:
     
     def metrics(self, recv_req: MetricsReq):
         if recv_req == MetricsReq.START_METRICS:
-            self.start_metrics()
+            utils.start_metrics()
         else:
-            self.stop_metrics()
-            
-    def start_metrics(self):
-        utils.metrics_list = []
-    
-    def stop_metrics(self):
-        sglang_metrics_dir = os.getenv("SGLANG_METRICS_DIR", ".")
-        with open(f"{sglang_metrics_dir}/sglang_metrics_dp{self.dp_rank}_tp{self.tp_rank}.pickle", "wb") as f:
-            pickle.dump(utils.metrics_list, f)
-        utils.metrics_list = None
+            utils.stop_metrics(self.dp_rank)
 
     def profile(self, recv_req: ProfileReq):
         if recv_req == ProfileReq.START_PROFILE:

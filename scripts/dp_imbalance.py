@@ -5,16 +5,7 @@ import sys
 from typing import List
 import matplotlib.pyplot as plt
 import numpy as np
-def make_plot(array, title, ylabel, filename):
-    
-    total_steps = 100 
-    
-    nparray = np.array(array)
-    
-    if total_steps < nparray.shape[0]:
-        start_idx = (nparray.shape[0] - total_steps) // 2
-        nparray = nparray[start_idx:start_idx + total_steps]
-    
+def make_plot(nparray, title, ylabel, filename):
     maxn = np.max(nparray, axis=1)
     minn = np.min(nparray, axis=1)
     steps = np.arange(nparray.shape[0])
@@ -25,7 +16,7 @@ def make_plot(array, title, ylabel, filename):
     plt.vlines(steps, minn, maxn, color='cyan', linewidth=2)
     
     for i in range(nparray.shape[0]):
-        plt.hlines(nparray[i], steps[i] - 0.5, steps[i] + 0.5, color='#8B0000', linewidth=2)
+        plt.hlines(nparray[i], steps[i] - 0.25, steps[i] + 0.25, color='#8B0000', linewidth=2)
 
     # Add markers for max and min points
     # plt.scatter(steps, maxn, color='red', label='Max', zorder=5, s=1)
@@ -41,8 +32,36 @@ def make_plot(array, title, ylabel, filename):
     plt.xlabel('Steps')
     plt.ylabel(ylabel)
     plt.title(title)
-    plt.savefig(f"{filename}.png")
+    plt.savefig(f"{filename}.pdf")
     plt.close()
+    
+def sample(x, n):
+    
+    nparray = np.array(x)
+    
+    if n < nparray.shape[0]:
+        start_idx = (nparray.shape[0] - n) // 2
+        nparray = nparray[start_idx:start_idx + n]
+    
+    return nparray
+
+def sample_start(x, n):
+    return sample(x[50 * 32 : 150 * 32 : 32], n)
+
+def sample_start_batch_size(x, n):
+    return sample(x[50 : 150], n)
+
+def sample_in_the_end_batch_size(x, n):
+    return np.array(x[-n : ])
+
+def sample_in_the_end(x, n):
+    return np.array(x[-n * 32 :  : 32])
+
+def sample_moe_in_the_end(x, n):
+    return np.array(x[-n * 32 :  -n * 32 + 100])
+
+def analyze(nparray, title):
+    print(f"{title}: {np.min(nparray, axis=1)}, {np.median(nparray, axis=1)}, {np.max(nparray, axis=1)}, {np.std(nparray, axis=1)}")
     
 def main():
     directory = sys.argv[1]
@@ -103,12 +122,51 @@ def main():
             all_gather_elapse.append(all_gather)
             attn_all_gather_elapse.append(attn_all_gather)
             
-    make_plot(batch_sizes, 'Batch Size', 'Batch Size', 'batch_size')
-    make_plot(ntokens_per_expert, 'Number of Tokens per Expert', 'Number of Tokens', 'ntokens_per_expert')
-    make_plot(attn_elapse, 'Attention Elapse Time', 'Time (ms)', 'attn_elapse')
-    make_plot(moe_elapse, 'MoE Elapse Time', 'Time (ms)', 'moe_elapse')
-    make_plot(all_gather_elapse, 'AllGather', 'Time (ms)', filename='all_gather')
-    make_plot(attn_all_gather_elapse, 'Attn + AllGather', 'Time (ms)', 'attn_all_gather')
+    sample_steps = 100
+    
+    # for i in range(100, nsteps):
+    #     bs = sum(batch_sizes[i])
+    #     if bs < 128 * nranks:
+    #         print(f"Step {i}, Batch size is less than 128")
+    #         batch_sizes = batch_sizes[:i]
+    #         ntokens_per_expert = ntokens_per_expert[:i * nlayers_per_step]
+    #         attn_elapse = attn_elapse[:i * nlayers_per_step]
+    #         moe_elapse = moe_elapse[:i * nlayers_per_step]
+    #         break
+        
+    decode_batch_sizes = []
+    decode_ntokens_per_expert = []
+    decode_attn_elapse = []
+    decode_moe_elapse = []
+    
+    for i in range(nsteps):
+        total_bs = sum(batch_sizes[i])
+        max_bs = max(batch_sizes[i])
+        if total_bs < 128 * nranks or max_bs > 400:
+            continue
+        decode_batch_sizes.append(batch_sizes[i])
+        for j in range(nlayers_per_step):
+            decode_ntokens_per_expert.append(ntokens_per_expert[i * nlayers_per_step + j])
+            decode_attn_elapse.append(attn_elapse[i * nlayers_per_step + j])
+            decode_moe_elapse.append(moe_elapse[i * nlayers_per_step + j])
+        
+    make_plot(sample_in_the_end_batch_size(decode_batch_sizes, sample_steps), 'Batch Size', 'Batch Size', 'batch_size')
+    make_plot(sample_in_the_end(decode_ntokens_per_expert, sample_steps), 'Number of Tokens per Expert', 'Number of Tokens', 'ntokens_per_expert')
+    make_plot(sample_in_the_end(decode_attn_elapse, sample_steps), 'Attention Elapse Time', 'Time (ms)', 'attn_elapse')
+    make_plot(sample_in_the_end(decode_moe_elapse, sample_steps), 'MoE Elapse Time', 'Time (ms)', 'moe_elapse')
+    
+    
+    make_plot(sample_moe_in_the_end(decode_ntokens_per_expert, sample_steps), 'Number of Tokens per Expert', 'Number of Tokens', 'layers_ntokens_per_expert')
+    
+    make_plot(sample_moe_in_the_end(decode_moe_elapse, sample_steps), 'MoE Elapse Time', 'Time (ms)', 'layers_moe_elapse')
+    
+    # make_plot(sample_start(all_gather_elapse, sample_steps), 'AllGather', 'Time (ms)', filename='all_gather')
+    # make_plot(sample_start(attn_all_gather_elapse, sample_steps), 'Attn + AllGather', 'Time (ms)', 'attn_all_gather')
+    
+    # analyze(sample_start_batch_size(batch_sizes, sample_steps), 'Batch Size')
+    # analyze(sample_start(ntokens_per_expert, sample_steps), 'Number of Tokens per Expert')
+    # analyze(sample_start(attn_elapse, sample_steps), 'Attention Elapse Time')
+    # analyze(sample_start(moe_elapse, sample_steps), 'MoE Elapse Time')
                 
 if __name__ == '__main__':
     main()
