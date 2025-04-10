@@ -25,6 +25,8 @@ def main():
     metrics_all_ranks: List[List[StepMetrics]] = []
     for filename in os.listdir(directory):
         file_path = os.path.join(directory, filename)
+        if not filename.endswith(".pickle"):
+            continue
         if os.path.isfile(file_path):
             with open(file_path, 'rb') as file:
                 metrics_all_ranks.append(pickle.load(file))
