@@ -6,15 +6,15 @@ from typing import List
 import matplotlib.pyplot as plt
 import numpy as np
 
-def heatmap(data, save_path):
+def heatmap(data, title, label, save_path):
     data = np.transpose(data)
     # use pyplot to draw a heatmap of global_expert_num_tokens
     plt.figure(figsize=(10, 6))
     plt.imshow(data, cmap='hot', interpolation='nearest')
-    plt.title("Expert Number of Tokens")
+    plt.title(title)
     plt.xlabel("Layer ID")
     plt.ylabel("Expert ID")
-    plt.colorbar(label='Number of Tokens')
+    plt.colorbar(label=label)
     plt.xticks(np.arange(data.shape[1]), np.arange(data.shape[1]))
     plt.yticks(np.arange(data.shape[0]), np.arange(data.shape[0]))
     plt.grid(False)
@@ -91,11 +91,11 @@ def main():
     def get_path(filename):
         return os.path.join(directory, filename)
     
-    heatmap(global_expert_num_tokens, get_path("global_expert_num_tokens.png"))
+    heatmap(global_expert_num_tokens, "global #tokens per expert", "#thousand tokens", get_path("global_expert_num_tokens.png"))
     
-    heatmap(expert_num_tokens[100], get_path("one_batch_expert_num_tokens.png"))
+    heatmap(expert_num_tokens[100], "one batch #tokens per expert", "#tokens", get_path("one_batch_expert_num_tokens.png"))
     
-    heatmap(moe_elapse[100], get_path("moe_elapse.png"))
+    heatmap(moe_elapse[100], "one batch execution time per expert", "time cost(ms)", get_path("moe_elapse.png"))
     
 
     
