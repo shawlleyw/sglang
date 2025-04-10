@@ -1794,6 +1794,9 @@ class Scheduler:
         return ResumeMemoryOccupationReqOutput()
     
     def metrics(self, recv_req: MetricsReq):
+        if self.dp_rank == 0:
+            # only send once
+            self.send_to_detokenizer.send_pyobj(recv_req)
         if recv_req == MetricsReq.START_METRICS:
             utils.start_metrics()
         else:

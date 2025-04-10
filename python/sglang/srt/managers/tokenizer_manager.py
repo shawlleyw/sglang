@@ -27,6 +27,8 @@ import uuid
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
+from sglang.srt.managers.utils import TokenStepMetrics, append_one_metric
+import sglang.srt.managers.utils as utils
 
 import fastapi
 import uvloop
@@ -289,10 +291,19 @@ class TokenizerManager:
         async with self.model_update_lock.reader_lock:
             is_single = obj.is_single
             if is_single:
+                t_tokenize_start = time.perf_counter()
                 tokenized_obj = await self._tokenize_one_request(obj)
                 self._send_one_request(obj, tokenized_obj, created_time)
+                t_tokenizer_elapsed = time.perf_counter() - t_tokenize_start
                 async for response in self._wait_one_response(obj, request):
+                    t_wait_start = time.perf_counter()
                     yield response
+                    t_wait_elapsed = time.perf_counter() - t_wait_start
+                    append_one_metric(
+                        TokenStepMetrics(
+                            1, t_tokenizer_elapsed, t_wait_elapsed
+                        )
+                    )
             else:
                 async for response in self._handle_batch_request(
                     obj, request, created_time
@@ -462,6 +473,8 @@ class TokenizerManager:
     ):
         batch_size = obj.batch_size
 
+        t_tokenize_start = time.perf_counter()
+
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
@@ -508,10 +521,27 @@ class TokenizerManager:
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
 
+        t_tokenizer_elapsed = time.perf_counter() - t_tokenize_start
+        t_wait_start = time.perf_counter()
+
+        def finish_waiting():
+            t_wait_elapsed = time.perf_counter() - t_wait_start
+            
+            append_one_metric(
+                TokenStepMetrics(
+                    batch_size,
+                    t_tokenizer_elapsed,
+                    t_wait_elapsed,
+                )
+            )
+            
+            t_wait_start = time.perf_counter()
+
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
         if not is_stream:
             outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
+            finish_waiting()
             yield outputs
         else:
             rid_to_index = {rid: i for i, rid in enumerate(rids)}
@@ -520,7 +550,8 @@ class TokenizerManager:
                 done, _ = await asyncio.wait(
                     task_map.keys(), return_when=asyncio.FIRST_COMPLETED
                 )
-
+                finish_waiting()
+                
                 for task in done:
                     gen = task_map.pop(task)
                     try:
@@ -546,10 +577,12 @@ class TokenizerManager:
     def start_metrics(self):
         req = MetricsReq.START_METRICS
         self.send_to_scheduler.send_pyobj(req)
+        utils.start_metrics()
 
     def stop_metrics(self):
         req = MetricsReq.STOP_METRICS
         self.send_to_scheduler.send_pyobj(req)
+        utils.stop_metrics(None, "tokenizer")
 
     def start_profile(self):
         req = ProfileReq.START_PROFILE

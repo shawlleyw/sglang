@@ -1,8 +1,9 @@
 import logging
 from http import HTTPStatus
-from typing import Optional, List
+from typing import Optional, List, Union, Dict
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+import time
 import torch
 import numpy as np
 import os
@@ -56,6 +57,13 @@ class StepMetrics:
     moe_elapse: List[float]
     moe_num_tokens_per_local_expert: List[List[int]]
     
+@dataclass
+class TokenStepMetrics:
+    """For tokenizer and detokenizer"""
+    batch_size: int
+    t_elapse: float  # For tokenizer, this includes sampling & sending request; for detokenizer, this includes `batch_decode` & `send_pyobj`
+    t_wait: Optional[float] # tokenizer only, the time for `Wait for all requests`
+        
 class StepRecorder:
     
     def __init__(self, batch_size):
@@ -114,15 +122,52 @@ class StepRecorder:
         
 cur_step_runtime_recorder: StepRecorder = None
 
-metrics_list: List[StepMetrics] = None
+metrics_list: List[Union[StepMetrics, TokenStepMetrics]] = None
+
+_last_detoken_time: Dict[int, int] = {}
+
+detoken_itl: Dict[int, List[float]] = {}
 
 def start_metrics():
-    global metrics_list
+    global metrics_list, detoken_itl
     metrics_list = []
+    detoken_itl = {}
 
-def stop_metrics(rank):
-    global metrics_list
+def stop_metrics(rank, name="scheduler"):
+    global metrics_list, detoken_itl
     sglang_metrics_dir = os.getenv("SGLANG_METRICS_DIR", ".")
-    with open(f"{sglang_metrics_dir}/sglang_metrics_rank{rank}.pickle", "wb") as f:
+    if name == "scheduler":
+        # align previous behavior, won't change file name
+        fn = f"{sglang_metrics_dir}/sglang_metrics_rank{rank}"
+    else:
+        # tokenizer & detokenizer, no rank
+        fn = f"{sglang_metrics_dir}/sglang_metrics_{name}"
+    with open(f"{fn}.pickle", "wb") as f:
         pickle.dump(metrics_list, f)
+    if name == "detokenizer":
+        # save detoken_itl
+        with open(f"{fn}_detoken_itl.pickle", "wb") as f:
+            pickle.dump(detoken_itl, f)
     metrics_list = None
+    detoken_itl = None
+    
+def append_one_metric(metric):
+    # print("append one metric:", metric)
+    global metrics_list
+    if metrics_list is not None:
+        metrics_list.append(metric)
+
+def append_detok_rids(rids: List[int]):
+    global _last_detoken_time, metrics_list, detoken_itl
+    if metrics_list is None:
+        return
+    st = time.perf_counter()
+    for rid in rids:
+        if rid not in _last_detoken_time:
+            _last_detoken_time[rid] = st
+        else:
+            dt = st - _last_detoken_time[rid]
+            if rid not in detoken_itl:
+                detoken_itl[rid] = []
+            detoken_itl[rid].append(dt)
+            _last_detoken_time[rid] = st

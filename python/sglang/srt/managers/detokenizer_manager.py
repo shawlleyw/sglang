@@ -23,16 +23,21 @@ from typing import Dict, List, Union
 import psutil
 import setproctitle
 import zmq
+import time
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
+    MetricsReq,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, get_zmq_socket
 from sglang.utils import find_printable_text, get_exception_traceback
+
+import sglang.srt.managers.utils as utils
+from sglang.srt.managers.utils import TokenStepMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +87,7 @@ class DetokenizerManager:
             )
 
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
+        self.enable_metrics = False
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -106,20 +112,38 @@ class DetokenizerManager:
             return output[:-1]
         return output
 
+    def metrics(self, recv_obj: MetricsReq):
+        if recv_obj == MetricsReq.START_METRICS:
+            utils.start_metrics()
+            self.enable_metrics = True
+        elif recv_obj == MetricsReq.STOP_METRICS:
+            utils.stop_metrics(
+                None,
+                "detokenizer",
+            )
+            self.enable_metrics = False
+
     def event_loop(self):
         """The event loop that handles requests"""
 
         while True:
+            t_wait_start = time.perf_counter()
             recv_obj = self.recv_from_scheduler.recv_pyobj()
+            t_wait_elapsed = time.perf_counter() - t_wait_start
 
             if isinstance(recv_obj, BatchEmbeddingOut):
                 # If it is embedding model, no detokenization is needed.
                 self.send_to_tokenizer.send_pyobj(recv_obj)
                 continue
+            elif isinstance(recv_obj, MetricsReq):
+                self.metrics(recv_obj)
+                continue
             else:
                 assert isinstance(recv_obj, BatchTokenIDOut)
 
             bs = len(recv_obj.rids)
+
+            t_start = time.perf_counter()
 
             # Initialize decode status
             read_ids, surr_ids = [], []
@@ -213,7 +237,18 @@ class DetokenizerManager:
                     output_hidden_states=recv_obj.output_hidden_states,
                 )
             )
-
+            
+            t_elapsed = time.perf_counter() - t_start
+            if utils.metrics_list is not None:
+                metric = TokenStepMetrics(
+                    batch_size=bs,
+                    t_elapse=t_elapsed,
+                    t_wait=t_wait_elapsed,
+                )
+                utils.metrics_list.append(
+                    metric
+                )
+                utils.append_detok_rids(recv_obj.rids)
 
 class LimitedCapacityDict(OrderedDict):
     def __init__(self, capacity: int, *args, **kwargs):

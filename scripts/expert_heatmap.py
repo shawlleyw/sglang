@@ -26,8 +26,10 @@ def main():
     for filename in os.listdir(directory):
         file_path = os.path.join(directory, filename)
         if os.path.isfile(file_path):
-            with open(file_path, 'rb') as file:
-                metrics_all_ranks.append(pickle.load(file))
+            fn = filename.split(".")
+            if "rank" in fn[0]:
+                with open(file_path, 'rb') as file:
+                    metrics_all_ranks.append(pickle.load(file))
                 
     nranks = len(metrics_all_ranks)
     
