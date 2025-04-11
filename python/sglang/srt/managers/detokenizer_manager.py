@@ -31,6 +31,7 @@ from sglang.srt.managers.io_struct import (
     BatchStrOut,
     BatchTokenIDOut,
     MetricsReq,
+    BatchTokenRID,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, get_zmq_socket
@@ -123,6 +124,9 @@ class DetokenizerManager:
             )
             self.enable_metrics = False
 
+    def record_rids(self, recv_obj: BatchTokenRID):
+        utils.append_detok_rids(recv_obj.rids)
+
     def event_loop(self):
         """The event loop that handles requests"""
 
@@ -137,6 +141,9 @@ class DetokenizerManager:
                 continue
             elif isinstance(recv_obj, MetricsReq):
                 self.metrics(recv_obj)
+                continue
+            elif isinstance(recv_obj, BatchTokenRID):
+                self.record_rids(recv_obj)
                 continue
             else:
                 assert isinstance(recv_obj, BatchTokenIDOut)
@@ -248,7 +255,7 @@ class DetokenizerManager:
                 utils.metrics_list.append(
                     metric
                 )
-                utils.append_detok_rids(recv_obj.rids)
+                # utils.append_detok_rids(recv_obj.rids)
 
 class LimitedCapacityDict(OrderedDict):
     def __init__(self, capacity: int, *args, **kwargs):

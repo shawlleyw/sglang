@@ -228,6 +228,7 @@ compile_commands.json
 
 1
 
-profile_disable_stream
-profile_enable_stream
-torch_profile
+profile_disable_stream/
+profile_enable_stream/
+torch_profile/
+profiles/

@@ -337,6 +337,12 @@ class TokenizedEmbeddingReqInput:
 
 
 @dataclass
+class BatchTokenRID:
+    """For Detokenizer to record ITL"""
+    rids: List[str]
+
+
+@dataclass
 class BatchTokenIDOut:
     # The request id
     rids: List[str]

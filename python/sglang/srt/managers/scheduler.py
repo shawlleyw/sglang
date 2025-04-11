@@ -43,6 +43,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
     BatchTokenIDOut,
+    BatchTokenRID,
     CloseSessionReqInput,
     FlushCacheReq,
     GetWeightsByNameReqInput,
@@ -1508,10 +1509,13 @@ class Scheduler:
                     input_top_logprobs_idx
                 ) = output_top_logprobs_val = output_top_logprobs_idx = None
 
+            itl_rids = []
+            
             for req in reqs:
                 if req is skip_req:
                     continue
-
+                
+                itl_rids.append(req.rid)
                 # TODO(lianmin): revisit this for overlap + retract + stream
                 if (
                     req.finished()
@@ -1558,6 +1562,10 @@ class Scheduler:
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
 
                     hidden_states.append(req.hidden_states)
+
+            # Send ITL rids to detokenizer
+            if itl_rids and utils.metrics_list is not None:
+                self.send_to_detokenizer.send_pyobj(BatchTokenRID(itl_rids))
 
             # Send to detokenizer
             if rids:
