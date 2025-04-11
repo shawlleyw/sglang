@@ -124,6 +124,8 @@ def start_metrics():
 def stop_metrics(rank):
     global metrics_list
     sglang_metrics_dir = os.getenv("SGLANG_METRICS_DIR", ".")
+    if not os.path.exists(sglang_metrics_dir):
+        os.makedirs(sglang_metrics_dir, exist_ok=True)
     with open(f"{sglang_metrics_dir}/sglang_metrics_rank{rank}.pickle", "wb") as f:
         pickle.dump(metrics_list, f)
     metrics_list = None
