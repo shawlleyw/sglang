@@ -1,6 +1,6 @@
 import logging
 from http import HTTPStatus
-from typing import Optional, List, Union, Dict
+from typing import Optional, List, Union, Dict, Tuple
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 import time
@@ -129,13 +129,16 @@ _last_detoken_time: Dict[int, int] = {}
 
 detoken_itl: Dict[int, List[float]] = {}
 
+_throughput_record: List[Tuple[float, int]] = None
+
 def start_metrics():
-    global metrics_list, detoken_itl
+    global metrics_list, detoken_itl, _throughput_record
     metrics_list = []
     detoken_itl = {}
+    _throughput_record = []
 
 def stop_metrics(rank, name="scheduler"):
-    global metrics_list, detoken_itl
+    global metrics_list, detoken_itl, _throughput_record
     sglang_metrics_dir = os.getenv("SGLANG_METRICS_DIR", ".")
     if name == "scheduler":
         # align previous behavior, won't change file name
@@ -149,8 +152,11 @@ def stop_metrics(rank, name="scheduler"):
         # save detoken_itl
         with open(f"{fn}_detoken_itl.pickle", "wb") as f:
             pickle.dump(detoken_itl, f)
+        with open(f"{fn}_throughput.pickle", "wb") as f:
+            pickle.dump(_throughput_record, f)
     metrics_list = None
     detoken_itl = None
+    _throughput_record = None
     
 def append_one_metric(metric):
     # print("append one metric:", metric)
@@ -163,6 +169,7 @@ def append_detok_rids(rids: List[int]):
     if metrics_list is None:
         return
     st = time.perf_counter()
+    _throughput_record.append((st, len(rids)))
     for rid in rids:
         if rid not in _last_detoken_time:
             _last_detoken_time[rid] = st
