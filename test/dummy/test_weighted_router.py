@@ -10,7 +10,11 @@ def _random_router_with_weights(weighted_router: torch.Tensor, router_logits: to
     # mask the top0 elements
     mask = torch.ones_like(router_logits)
     mask[torch.arange(num_tokens), top0_ids] = 0
-    top1_weights = weighted_router[1] * mask
+    
+    # transform the conditional probabilities
+    filtered_weight0 = weighted_router[0] * mask
+    filtered_weight0 = filtered_weight0 / torch.sum(filtered_weight0, dim=1, keepdim=True)
+    top1_weights = weighted_router[1] * mask * (1 + filtered_weight0)
     top1_weights = top1_weights / torch.sum(top1_weights, dim=1, keepdim=True)
     
     # then select the top1
@@ -28,8 +32,8 @@ def _random_router_with_weights(weighted_router: torch.Tensor, router_logits: to
 
 weighted_router = torch.tensor(
     [
-        [1, 2, 3, 4, 5, 6, 7, 8],
-        [1, 2, 3, 4, 5, 6, 7, 8]
+        [9, 10, 3, 4, 5, 6, 1, 8],
+        [3, 4, 2, 2, 1, 1, 1, 1]
     ],
     device="cuda",
 )
@@ -59,5 +63,5 @@ for _ in range(T):
 
 max_sum = torch.Tensor(max_sum)
 sec_sum = torch.Tensor(sec_sum)
-print(max_sum / max_sum[0])
-print(sec_sum / sec_sum[0])
+print(max_sum / max_sum.min().item())
+print(sec_sum / sec_sum.min().item())
