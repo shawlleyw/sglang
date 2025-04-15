@@ -130,16 +130,30 @@ class MixtralMoE(nn.Module):
     def _random_router_with_weights(self, router_logits: torch.Tensor) -> torch.Tensor:
         num_tokens = router_logits.shape[0]
         device = router_logits.device
-        top0_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-        torch.multinomial(self.weighted_router[0], num_tokens, top0_ids)
+        # first select the top0
+        top0_ids = torch.zeros(num_tokens, dtype=torch.long, device=device)
+        torch.multinomial(self.weighted_router[0], num_tokens, replacement=True, out=top0_ids)
+        
+        # mask the top0 elements
         mask = torch.ones_like(router_logits)
         mask[torch.arange(num_tokens), top0_ids] = 0
-        top1_weights = self.weighted_router[1] * mask
+        
+        # transform the conditional probabilities
+        filtered_weight0 = self.weighted_router[0] * mask
+        filtered_weight0 = filtered_weight0 / torch.sum(filtered_weight0, dim=1, keepdim=True)
+        top1_weights = self.weighted_router[1] * mask * (1 + filtered_weight0)
         top1_weights = top1_weights / torch.sum(top1_weights, dim=1, keepdim=True)
-        top1_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-        torch.multinomial(top1_weights, num_tokens, top1_ids)
-        router_logits[torch.arange(num_tokens), top0_ids] = 3.0
-        router_logits[torch.arange(num_tokens), top1_ids] = 2.0
+        
+        # then select the top1
+        top1_ids = torch.zeros(num_tokens, dtype=torch.long, device=device)
+        torch.multinomial(top1_weights, 1, replacement=True, out=top1_ids)
+        top1_ids = top1_ids.squeeze(1)
+        
+        # change the router logits
+        router_logits[torch.arange(num_tokens), top0_ids] = 5.0
+        router_logits[torch.arange(num_tokens), top1_ids] = 3.0
+        
+        # the original values were in [0, 1]
         router_logits = router_logits / torch.sum(router_logits, dim=1, keepdim=True)
         return router_logits
 
