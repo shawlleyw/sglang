@@ -6,16 +6,16 @@ import pickle
 from typing import Dict, List, Tuple
 
 input_dir = sys.argv[1]
-output_dir = "profiles/plots/"
+output_dir = sys.argv[2]
 
-if not os.path.exists(output_dir):
-    os.makedirs(output_dir)
+# if not os.path.exists(output_dir):
+#     os.makedirs(output_dir)
 
 with open(input_dir, "rb") as f:
     reqs: List[Tuple[float, int]] = pickle.load(f)
 
 # Calculate throughput
-gap = 2
+gap = 1
 timestamps, tokens = zip(*reqs)
 start_time = int(timestamps[0])
 end_time = int(timestamps[-1])
@@ -28,10 +28,10 @@ for t in time_bins[:-1]:
 
 # Plot throughput
 plt.figure(figsize=(10, 6))
-plt.plot([t - time_bins[0] for t in time_bins[:-1]], throughput, marker='o', label="Throughput (tokens/sec)")
+plt.plot([t - time_bins[0] for t in time_bins[:-1]], throughput, marker='', label="Throughput (tokens/sec)")
 plt.xlabel("Time (seconds)")
 plt.ylabel("Tokens per second")
 plt.title("Throughput vs Time")
 plt.legend()
 plt.grid(True)
-plt.savefig(os.path.join(output_dir, "throughput_plot.png"))
+plt.savefig(sys.argv[2])

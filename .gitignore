@@ -232,3 +232,4 @@ profile_disable_stream/
 profile_enable_stream/
 torch_profile/
 profiles/
+*.pickle
