@@ -18,6 +18,7 @@
 
 from typing import Iterable, Optional, Tuple
 
+import os
 import torch
 from torch import nn
 from transformers import MixtralConfig
@@ -69,6 +70,7 @@ class MixtralMoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
         prefix: str = "",
+        layer_id: int = 0,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -106,6 +108,40 @@ class MixtralMoE(nn.Module):
             tp_size=tp_size,
             prefix=f"{prefix}.experts",
         )
+        
+        if os.environ.get("SGLANG_WEIGHTED_ROUTER_FILE", None) != None:
+            file_name = os.environ.get("SGLANG_WEIGHTED_ROUTER_FILE")
+            category = os.environ.get("SGLANG_WEIGHTED_ROUTER_CATEGORY", "closed_qa")
+            assert os.path.exists(file_name), f"Weighted router file {file_name} does not exist."
+            import pandas as pd
+            df = pd.read_csv(file_name)
+            df = df[df['category'] == category and df['layer_id'] == layer_id]
+            
+            # select the expert_0 to expert_7 columns
+            df = df.iloc[:, [1] + list(range(-8, 0))]
+            
+            # df.iloc[0] is top1, and df.iloc[1] is top2
+            data = torch.tensor(df.values, dtype=torch.int32, device=next(self.parameters()).device)
+            assert data.shape == (2, 8), f"Weighted router tensor shape {data.shape} is not valid."
+            self.weighted_router = data
+        else:
+            self.weighted_router = None
+
+    def _random_router_with_weights(self, router_logits: torch.Tensor) -> torch.Tensor:
+        num_tokens = router_logits.shape[0]
+        device = router_logits.device
+        top0_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        torch.multinomial(self.weighted_router[0], num_tokens, top0_ids)
+        mask = torch.ones_like(router_logits)
+        mask[torch.arange(num_tokens), top0_ids] = 0
+        top1_weights = self.weighted_router[1] * mask
+        top1_weights = top1_weights / torch.sum(top1_weights, dim=1, keepdim=True)
+        top1_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        torch.multinomial(top1_weights, num_tokens, top1_ids)
+        router_logits[torch.arange(num_tokens), top0_ids] = 3.0
+        router_logits[torch.arange(num_tokens), top1_ids] = 2.0
+        router_logits = router_logits / torch.sum(router_logits, dim=1, keepdim=True)
+        return router_logits
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -113,7 +149,10 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        router_logits = torch.rand_like(router_logits)
+        if not self.weighted_router:
+            router_logits = torch.rand_like(router_logits)
+        else:
+            router_logits = self._random_router_with_weights(router_logits)
         final_hidden_states = self.experts(hidden_states, router_logits)
         if self.tp_size > 1 and not global_server_args_dict["enable_dp_attention"]:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
