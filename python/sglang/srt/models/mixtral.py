@@ -109,23 +109,24 @@ class MixtralMoE(nn.Module):
             prefix=f"{prefix}.experts",
         )
         
-        if os.environ.get("SGLANG_WEIGHTED_ROUTER_FILE", None) != None:
+        if os.environ.get("SGLANG_WEIGHTED_ROUTER_FILE", "") != "":
             file_name = os.environ.get("SGLANG_WEIGHTED_ROUTER_FILE")
             category = os.environ.get("SGLANG_WEIGHTED_ROUTER_CATEGORY", "closed_qa")
             assert os.path.exists(file_name), f"Weighted router file {file_name} does not exist."
             import pandas as pd
             df = pd.read_csv(file_name)
-            df = df[df['category'] == category and df['layer_id'] == layer_id]
+            df = df[df['category'] == category]
+            df = df[df['layer_id'] == layer_id]
             
             # select the expert_0 to expert_7 columns
-            df = df.iloc[:, [1] + list(range(-8, 0))]
+            df = df.iloc[:, list(range(-8, 0))]
             
             # df.iloc[0] is top1, and df.iloc[1] is top2
             data = torch.tensor(df.values, dtype=torch.int32, device=next(self.parameters()).device)
             assert data.shape == (2, 8), f"Weighted router tensor shape {data.shape} is not valid."
-            self.weighted_router = data
+            self.weighted_router = data / data.sum(dim=-1, keepdim=True)
         else:
-            self.weighted_router = None
+            self.weighted_router = torch.ones((2, 8), device=next(self.parameters()).device)
 
     def _random_router_with_weights(self, router_logits: torch.Tensor) -> torch.Tensor:
         num_tokens = router_logits.shape[0]
@@ -163,7 +164,7 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        if not self.weighted_router:
+        if self.weighted_router is None or router_logits.shape[0] == 0:
             router_logits = torch.rand_like(router_logits)
         else:
             router_logits = self._random_router_with_weights(router_logits)
@@ -311,6 +312,7 @@ class MixtralDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
             prefix=f"{prefix}.block_sparse_moe",
+            layer_id=layer_id,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
