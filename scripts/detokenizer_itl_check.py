@@ -7,10 +7,8 @@ import pickle
 from typing import Dict, List
 
 input_dir = sys.argv[1]
-# output_dir = sys.argv[2]
 
-# if not os.path.exists(output_dir):
-#     os.makedirs(output_dir)
+input_file = f"{input_dir}/sglang_metrics_detokenizer_itl.pickle"
 
 req_itls: Dict[int, List[float]] = None
 
