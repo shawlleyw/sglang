@@ -152,7 +152,7 @@ def stop_metrics(rank, name="scheduler"):
         pickle.dump(metrics_list, f)
     if name == "detokenizer":
         # save detoken_itl
-        with open(f"{fn}_detoken_itl.pickle", "wb") as f:
+        with open(f"{fn}_itl.pickle", "wb") as f:
             pickle.dump(detoken_itl, f)
         with open(f"{fn}_throughput.pickle", "wb") as f:
             pickle.dump(_throughput_record, f)
