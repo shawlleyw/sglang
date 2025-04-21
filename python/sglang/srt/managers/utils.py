@@ -140,6 +140,8 @@ def start_metrics():
 def stop_metrics(rank, name="scheduler"):
     global metrics_list, detoken_itl, _throughput_record
     sglang_metrics_dir = os.getenv("SGLANG_METRICS_DIR", ".")
+    if not os.path.exists(sglang_metrics_dir):
+        os.makedirs(sglang_metrics_dir, exist_ok=True)
     if name == "scheduler":
         # align previous behavior, won't change file name
         fn = f"{sglang_metrics_dir}/sglang_metrics_rank{rank}"

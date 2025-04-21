@@ -88,3 +88,6 @@ class ChunkCache(BasePrefixCache):
 
     def protected_size(self):
         return 0
+
+    def pretty_print(self):
+        pass
