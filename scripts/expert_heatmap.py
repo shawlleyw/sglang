@@ -57,7 +57,7 @@ def main():
     metrics_all_ranks: List[List[StepMetrics]] = []
     for filename in os.listdir(directory):
         file_path = os.path.join(directory, filename)
-        if not filename.endswith(".pickle"):
+        if not filename.endswith(".pickle") or not "rank" in filename:
             continue
         if os.path.isfile(file_path):
             with open(file_path, 'rb') as file:
@@ -150,12 +150,12 @@ def main():
     heatmap(moe_elapse[100], "one batch execution time per expert", "time cost(ms)", get_path("moe_elapse.png"))
     
     heatmap(decode_global_expert_num_tokens, "decode #thousand tokens per expert", "#thousand tokens", get_decode_path("decode_global_expert_num_tokens.pdf"))
-    heatmap(decode_expert_num_tokens[200], "decode one batch #tokens per expert", "#tokens", get_decode_path("decode_one_batch_expert_num_tokens_1.pdf"))
-    heatmap(decode_moe_elapse[200], "decode one batch execution time per expert", "time cost(ms)", get_decode_path("decode_moe_elapse_1.pdf"))
-    heatmap(get_stall_percentage(decode_moe_elapse[200]), "decode one batch stall percentage", "stall percentage", get_decode_path("decode_stall_percentage_1.pdf"))
+    heatmap(decode_expert_num_tokens[50], "decode one batch #tokens per expert", "#tokens", get_decode_path("decode_one_batch_expert_num_tokens_1.pdf"))
+    heatmap(decode_moe_elapse[50], "decode one batch execution time per expert", "time cost(ms)", get_decode_path("decode_moe_elapse_1.pdf"))
+    heatmap(get_stall_percentage(decode_moe_elapse[50]), "decode one batch stall percentage", "stall percentage", get_decode_path("decode_stall_percentage_1.pdf"))
     
     heatmapN(
-        [decode_global_expert_num_tokens, decode_expert_num_tokens[0], get_stall_percentage(decode_moe_elapse[0])], 
+        [decode_global_expert_num_tokens, decode_expert_num_tokens[400], get_stall_percentage(decode_moe_elapse[400])], 
         ["global #thousand tokens per expert", "one batch #tokens per expert", "one batch stall percentage"], 
         ["#thousand tokens", "#tokens", "stall percentage"], 
         get_decode_path("deocde_combined.pdf")
