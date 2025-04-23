@@ -12,7 +12,7 @@ input_file = f"{input_dir}/sglang_metrics_detokenizer_itl.pickle"
 
 req_itls: Dict[int, List[float]] = None
 
-with open(input_dir, "rb") as f:
+with open(input_file, "rb") as f:
     req_itls = pickle.load(f)
 
 itls = []

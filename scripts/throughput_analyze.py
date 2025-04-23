@@ -23,11 +23,15 @@ start_time = int(timestamps[0])
 end_time = int(timestamps[-1])
 time_bins = range(start_time, end_time + gap, gap)  # +gap to include the last second
 
+
 throughput = []
 for t in time_bins[:-1]:
     tokens_in_bin = [tokens[i] for i in range(len(timestamps)) if t <= timestamps[i] < t + gap]
     throughput.append(sum(tokens_in_bin) / gap)
-print(f"peak throughput {max(throughput)} tokens/sec")
+    
+n = len(time_bins)
+num_tokens = sum(throughput[n//2 - 3 : n//2 + 3])
+print(f"peak throughput {num_tokens / 6:.1f} tokens/sec")
 # Plot throughput
 plt.figure(figsize=(10, 6))
 plt.plot([t - time_bins[0] for t in time_bins[:-1]], throughput, marker='', label="Throughput (tokens/sec)")
