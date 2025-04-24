@@ -76,8 +76,6 @@ class MixtralMoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.hidden_size = hidden_size
         
-        top_k = 1
-        
         self.top_k = top_k
         
         # Gate always runs at half / full precision for now.
