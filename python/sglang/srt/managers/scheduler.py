@@ -1566,6 +1566,7 @@ class Scheduler:
             # Send ITL rids to detokenizer
             if itl_rids and utils.metrics_list is not None:
                 self.send_to_detokenizer.send_pyobj(BatchTokenRID(itl_rids))
+                utils.append_detok_rids(itl_rids)
 
             # Send to detokenizer
             if rids:
