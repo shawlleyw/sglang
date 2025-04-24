@@ -157,7 +157,7 @@ def main():
     heatmap(get_stall_percentage(decode_moe_elapse[50]), "decode one batch stall percentage", "stall percentage", get_decode_path("decode_stall_percentage_1.pdf"))
     
     heatmapN(
-        [decode_global_expert_num_tokens, decode_expert_num_tokens[200], get_stall_percentage(decode_moe_elapse[200])], 
+        [decode_global_expert_num_tokens, decode_expert_num_tokens[100], get_stall_percentage(decode_moe_elapse[100])], 
         ["global #thousand tokens per expert", "one batch #tokens per expert", "one batch stall percentage"], 
         ["#thousand tokens", "#tokens", "stall percentage"], 
         get_decode_path("deocde_combined.pdf")

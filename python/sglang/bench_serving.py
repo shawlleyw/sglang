@@ -670,27 +670,28 @@ def sample_random_requests(
 
         # Filter out sequences that are too long or too short
         input_requests: List[Tuple[str, int, int]] = []
-        for data in dataset:
-            i = len(input_requests)
-            if i == num_prompts:
-                break
+        while len(input_requests) < num_prompts:
+            for data in dataset:
+                i = len(input_requests)
+                if i == num_prompts:
+                    break
 
-            # Tokenize the prompts and completions.
-            prompt = data[0]
-            prompt_token_ids = tokenizer.encode(prompt)
-            prompt_len = len(prompt_token_ids)
+                # Tokenize the prompts and completions.
+                prompt = data[0]
+                prompt_token_ids = tokenizer.encode(prompt)
+                prompt_len = len(prompt_token_ids)
 
-            # Skip empty prompt
-            if prompt_len == 0:
-                continue
+                # Skip empty prompt
+                if prompt_len == 0:
+                    continue
 
-            if prompt_len > input_lens[i]:
-                input_ids = prompt_token_ids[: input_lens[i]]
-            else:
-                ratio = (input_lens[i] + prompt_len - 1) // prompt_len
-                input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            prompt = tokenizer.decode(input_ids)
-            input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
+                if prompt_len > input_lens[i]:
+                    input_ids = prompt_token_ids[: input_lens[i]]
+                else:
+                    ratio = (input_lens[i] + prompt_len - 1) // prompt_len
+                    input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
+                prompt = tokenizer.decode(input_ids)
+                input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
     else:
         # Sample token ids from random integers. This can cause some NaN issues.
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
@@ -1284,6 +1285,8 @@ def run_benchmark(args_: argparse.Namespace):
     tokenizer = get_tokenizer(tokenizer_id)
 
     input_requests = get_dataset(args, tokenizer)
+    
+    print(f"Total requests: {len(input_requests)}")
 
     if not args.multi:
         return asyncio.run(
