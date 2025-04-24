@@ -140,6 +140,8 @@ def start_metrics():
 def stop_metrics(rank, name="scheduler"):
     global metrics_list, detoken_itl, _throughput_record
     sglang_metrics_dir = os.getenv("SGLANG_METRICS_DIR", ".")
+    if not os.path.exists(sglang_metrics_dir):
+        os.makedirs(sglang_metrics_dir, exist_ok=True)
     
     # 1. save metrics
     if name == "scheduler":
@@ -154,7 +156,7 @@ def stop_metrics(rank, name="scheduler"):
     # 2. save detokenized itl
     if name == "detokenizer":
         # save detoken_itl
-        with open(f"{fn}_detoken_itl.pickle", "wb") as f:
+        with open(f"{fn}_itl.pickle", "wb") as f:
             pickle.dump(detoken_itl, f)
         with open(f"{fn}_throughput.pickle", "wb") as f:
             pickle.dump(_throughput_record, f)
