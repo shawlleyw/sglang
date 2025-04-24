@@ -2,7 +2,7 @@
 
 # make sure the server is running
 
-INPUT_LEN=200
+INPUT_LEN=300
 OUTPUT_LEN=500
 NUM_PROMPTS=8000
 
