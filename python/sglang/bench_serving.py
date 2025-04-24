@@ -627,26 +627,32 @@ def sample_sharegpt_requests(
 
 
 def sample_random_requests(
-    input_len: int,
-    output_len: int,
+    input_len: str,
+    output_len: str,
     num_prompts: int,
     range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
 ) -> List[Tuple[str, int, int]]:
+    
+    input_len = input_len.strip("()").split(",")
+    input_len = (int(input_len[0]), int(input_len[1]))
+    
+    output_len = output_len.strip("()").split(",")
+    output_len = (int(output_len[0]), int(output_len[1]))
 
-    # input_lens = np.random.randint(
-    #     max(int(input_len * range_ratio), 1),
-    #     input_len + 1,
-    #     size=num_prompts,
-    # )
-    # output_lens = np.random.randint(
-    #     int(output_len * range_ratio),
-    #     output_len + 1,
-    #     size=num_prompts,
-    # )
-    input_lens = np.array([input_len] * num_prompts)
-    output_lens = np.array([output_len] * num_prompts)
+    input_lens = np.random.randint(
+        input_len[0],
+        input_len[1] + 1,
+        size=num_prompts,
+    )
+    output_lens = np.random.randint(
+        output_len[0],
+        output_len[1] + 1,
+        size=num_prompts,
+    )
+    # input_lens = np.array([input_len] * num_prompts)
+    # output_lens = np.array([output_len] * num_prompts)
 
     if True:
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
@@ -1404,14 +1410,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--random-input-len",
-        type=int,
-        default=1024,
+        type=str,
+        default="(30, 70)",
         help="Number of input tokens per request, used only for random dataset.",
     )
     parser.add_argument(
         "--random-output-len",
-        default=1024,
-        type=int,
+        default="(80, 120)",
+        type=str,
         help="Number of output tokens per request, used only for random dataset.",
     )
     parser.add_argument(
