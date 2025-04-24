@@ -1,7 +1,6 @@
 import sys
 import os
 import pandas as pd
-import matplotlib.pyplot as plt
 import pickle
 
 from typing import Dict, List
