@@ -18,6 +18,8 @@
 
 from typing import Iterable, Optional, Tuple
 
+import triton
+import triton.language as tl
 import os
 import torch
 from torch import nn
@@ -50,6 +52,57 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import all_gather
 import sglang.srt.managers.utils as utils
+
+
+@triton.jit
+def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
+    expert = tl.program_id(0)
+    low = 0
+    high = num_toks - 1
+    target_location = -1
+    while low <= high:
+        mid = (low + high) // 2
+
+        if tl.load(reorder_topk_ids + mid) > expert:
+            high = mid - 1
+        else:
+            low = mid + 1
+            target_location = mid
+    tl.store(seg_indptr + expert + 1, target_location + 1)
+
+@triton.jit
+def compute_src2dst_triton_kernel(
+    reorder_ids, src2dst, num_toks, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = dst_id < num_toks
+    src_id = tl.load(reorder_ids + dst_id, mask=mask)
+    tl.store(src2dst + src_id, dst_id, mask=mask)
+    
+@torch.compile
+def multinomial_no_replacement(probs, num_samples):
+    """
+    probs: [batch_size, num_classes] or [num_classes] (will be normalized)
+    num_samples: number of samples to draw (must be <= num_classes)
+    Returns: [batch_size, num_samples] or [num_samples]
+    """
+    # Normalize and reshape to [batch_size, num_classes]
+    if probs.dim() == 1:
+        probs = probs.unsqueeze(0)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    
+    batch_size, num_classes = probs.shape
+    assert num_samples <= num_classes, "Can't sample more than population"
+    
+    # Gumbel trick: logp + Uniform noise
+    gumbel_noise = -torch.empty_like(probs).exponential_().log()  # ~Gumbel(0,1)
+    noisy_logits = torch.log(probs) + gumbel_noise
+    
+    # Top-k selection (equivalent to sampling without replacement)
+    _, samples = torch.topk(noisy_logits, num_samples, dim=-1)
+    
+    return samples
 
 class MixtralMoE(nn.Module):
     """A tensor-parallel MoE implementation for Mixtral that shards each expert
@@ -132,33 +185,11 @@ class MixtralMoE(nn.Module):
 
     def _random_router_with_weights(self, router_logits: torch.Tensor) -> torch.Tensor:
         num_tokens = router_logits.shape[0]
-        device = router_logits.device
-        # first select the top0
-        top0_ids = torch.zeros(num_tokens, dtype=torch.long, device=device)
-        torch.multinomial(self.weighted_router[0], num_tokens, replacement=True, out=top0_ids)
-        router_logits[torch.arange(num_tokens), top0_ids] = 5.0
-        if self.top_k > 1:
-            # mask the top0 elements
-            mask = torch.ones_like(router_logits)
-            mask[torch.arange(num_tokens), top0_ids] = 0
-            
-            # transform the conditional probabilities
-            filtered_weight0 = self.weighted_router[0] * mask
-            filtered_weight0 = filtered_weight0 / torch.sum(filtered_weight0, dim=1, keepdim=True)
-            top1_weights = self.weighted_router[1] * mask * (1 + filtered_weight0)
-            top1_weights = top1_weights / torch.sum(top1_weights, dim=1, keepdim=True)
-            
-            # then select the top1
-            top1_ids = torch.zeros(num_tokens, dtype=torch.long, device=device)
-            torch.multinomial(top1_weights, 1, replacement=True, out=top1_ids)
-            top1_ids = top1_ids.squeeze(1)
-            
-            # change the router logits
-            router_logits[torch.arange(num_tokens), top1_ids] = 3.0
-        
-        # the original values were in [0, 1]
-        router_logits = router_logits / torch.sum(router_logits, dim=1, keepdim=True)
-        return router_logits
+        weights = self.weighted_router.expand(num_tokens, -1)
+        topk_ids = multinomial_no_replacement(weights, self.top_k)
+        sampled_weights = torch.gather(weights, 1, topk_ids)
+        topk_weights = sampled_weights / sampled_weights.sum(dim=1, keepdim=True)
+        return topk_weights
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
