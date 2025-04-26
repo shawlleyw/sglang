@@ -27,20 +27,20 @@ METRICS_TARGET=/mnt/efs/baseline/scale_metrics
 
 QA=mqa
 
-for rate in 120 200 240 280; do
-    echo "Running with request rate: $rate"
-    target_dir=$METRICS_TARGET/resonable_top"$TOPK"_$QA/rate"$rate"
-    mkdir -p $target_dir
-    num_reqs=$(($rate * 100))
-    python -m sglang.bench_serving --dataset-name random --random-input-len "(100, 300)" --random-output-len "(100, 500)" --num-prompts $num_reqs --metrics --disable-stream --request-rate=$rate
-    mv metrics_dir/* $target_dir
-done
+# for rate in 120 200 240 280; do
+#     echo "Running with request rate: $rate"
+#     target_dir=$METRICS_TARGET/resonable_top"$TOPK"_$QA/rate"$rate"
+#     mkdir -p $target_dir
+#     num_reqs=$(($rate * 100))
+#     python -m sglang.bench_serving --dataset-name random --random-input-len "(100, 300)" --random-output-len "(100, 500)" --num-prompts $num_reqs --metrics --disable-stream --request-rate=$rate
+#     mv metrics_dir/* $target_dir
+# done
 
-for rate in 120 200 240 280; do
+for rate in 80 160 240 320 480 640; do
     echo "Running with request rate: $rate"
-    target_dir=$METRICS_TARGET/resonable_v2_top"$TOPK"_$QA/rate"$rate"
+    target_dir=$METRICS_TARGET/TP/reasonable_v2_top"$TOPK"_$QA/rate"$rate"
     mkdir -p $target_dir
-    num_reqs=$(($rate * 100))
+    num_reqs=$(($rate * 80))
     python -m sglang.bench_serving --dataset-name random --random-input-len "(50, 150)" --random-output-len "(50, 250)" --num-prompts $num_reqs --metrics --disable-stream --request-rate=$rate
     mv metrics_dir/* $target_dir
 done
