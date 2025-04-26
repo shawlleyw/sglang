@@ -177,7 +177,7 @@ class MixtralMoE(nn.Module):
             df = df.iloc[:, list(range(-num_experts, 0))]
             
             # df.iloc[0] is top1, and df.iloc[1] is top2
-            data = torch.tensor(df.values, dtype=torch.int32, device=next(self.parameters()).device)
+            data = torch.tensor(df.values, dtype=torch.int32, device=next(self.parameters()).device).sum(dim=0)
             assert data.shape == (2, num_experts), f"Weighted router tensor shape {data.shape} is not valid."
             self.weighted_router = data / data.sum(dim=-1, keepdim=True)
         else:
