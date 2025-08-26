@@ -20,6 +20,7 @@ import signal
 import sys
 import threading
 import time
+import pickle
 from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
@@ -548,6 +549,8 @@ class Scheduler(
             assert dp_balance_meta is not None
 
         self.recv_dp_balance_id_this_term = []
+        
+        self.recording_in_progress = False
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -775,6 +778,40 @@ class Scheduler(
     def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
+            
+    def start_stats_recording(self):
+        if self.recording_in_progress:
+            return
+        self.recording_in_progress = True
+        self.iteration_counter = 0
+        self.iteration_bsz = []
+        self.req_start_iteration: Dict[str, int] = {}
+        self.req_end_iteration: Dict[str, int] = {}
+        logger.info("Start recording scheduler stats")
+        
+    def record_stats(self, batch: ScheduleBatch):
+        self.iteration_counter += 1
+        bsz = len(batch.reqs) if batch.forward_mode.is_decode() else 0
+        self.iteration_bsz.append(bsz)
+        
+        if batch.forward_mode.is_extend():
+            for req in batch.reqs:
+                assert req.rid not in self.req_start_iteration, f"req {req.rid} already started"
+                self.req_start_iteration[req.rid] = self.iteration_counter
+        elif batch.forward_mode.is_decode():
+            for req in batch.reqs:
+                assert req.rid in self.req_start_iteration, f"req {req.rid} not started"
+                if req.finished():
+                    assert req.rid not in self.req_end_iteration, f"req {req.rid} not ended"
+                    self.req_end_iteration[req.rid] = self.iteration_counter
+    
+    def stop_stats_recording(self):
+        if not self.recording_in_progress:
+            return
+        with open("scheduler_stats.pkl", "wb") as f:
+            pickle.dump((self.iteration_bsz, self.req_start_iteration, self.req_end_iteration), f)
+        self.recording_in_progress = False
+        logger.info("Stop recording scheduler stats")
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -787,11 +824,14 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                self.start_stats_recording()
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                self.record_stats(batch)
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+                self.stop_stats_recording()
 
             self.last_batch = batch
 
