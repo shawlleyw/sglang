@@ -551,6 +551,7 @@ class Scheduler(
         self.recv_dp_balance_id_this_term = []
         
         self.recording_in_progress = False
+        self.disable_continuous_batching = True
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -1565,8 +1566,11 @@ class Scheduler(
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
-
-        new_batch = self.get_new_batch_prefill()
+                    
+        if self.disable_continuous_batching and not self.running_batch.is_empty():
+            new_batch = None
+        else:
+            new_batch = self.get_new_batch_prefill()
 
         need_dp_attn_preparation = require_mlp_sync(self.server_args)
 
@@ -1583,7 +1587,10 @@ class Scheduler(
             # Run decode
             if not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch if not self.running_batch.is_empty() else None
+                if self.disable_continuous_batching and self.running_batch.is_empty():
+                    ret = self.get_new_batch_prefill()
+                else:
+                    ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
 
