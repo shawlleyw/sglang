@@ -1,13 +1,14 @@
 import pickle
 import matplotlib.pyplot as plt
+import numpy as np
 
 # self.iteration_bsz = []
 # self.req_start_iteration: Dict[str, int] = {}
 # self.req_end_iteration: Dict[str, int] = {}
 
 with open('scheduler_stats.pkl', 'rb') as f:
-    iteration_bsz, req_start_iteration, req_end_iteration = pickle.load(f)
-    
+    iteration_bsz, req_start_iteration, req_end_iteration, req_timing_tracker = pickle.load(f)
+
 niters = len(iteration_bsz)
 
 req_to_id = {}
@@ -25,9 +26,14 @@ req_id_end = {}
 for req, end_iter in req_end_iteration.items():
     req_id_end[req_to_id[req]] = end_iter
     
+req_id_tracker = {}
+for req, timing in req_timing_tracker.items():
+    req_id_tracker[req_to_id[req]] = timing
+
 print("Total iterations:", niters)
 print("len(req_id_start):", len(req_id_start))
 print("len(req_id_end):", len(req_id_end))
+print("len(req_id_tracker):", len(req_id_tracker))
 
 # Plot
 plt.figure(figsize=(12, 5))
@@ -58,3 +64,31 @@ plt.ylabel("Request ID")
 
 plt.tight_layout()
 plt.savefig("scheduler_stats.png", dpi=300)
+
+# plt.figure(figsize=(8, 5))
+queue_delay = []
+ttft = []
+req_elapse = []
+
+for req_id, (admitted, batching, finish) in req_id_tracker.items():
+    queue_delay.append(batching - admitted)
+    ttft.append(finish - admitted)
+    req_elapse.append(finish - batching)
+
+def plot_cdf(data, ax, title):
+    sorted_data = np.sort(data)
+    yvals = np.arange(1, len(sorted_data) + 1) / len(sorted_data)
+    ax.plot(sorted_data, yvals, marker=".", linestyle="-")
+    ax.set_title(title)
+    ax.set_xlabel("Value")
+    ax.set_ylabel("CDF")
+    ax.grid(True)
+
+fig, axs = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
+
+plot_cdf(queue_delay, axs[0], "Queue Delay CDF")
+plot_cdf(ttft, axs[1], "TTFT CDF")
+plot_cdf(req_elapse, axs[2], "Request Elapse CDF")
+
+plt.tight_layout()
+plt.savefig("req_stats_cdf.png", dpi=300)

@@ -551,7 +551,8 @@ class Scheduler(
         self.recv_dp_balance_id_this_term = []
         
         self.recording_in_progress = False
-        self.disable_continuous_batching = True
+        self.disable_continuous_batching = False
+        self.req_timing_tracker: Dict[str, list[float]] = {} # [admitted time, batching time, finish time]
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -796,22 +797,28 @@ class Scheduler(
         self.iteration_bsz.append(bsz)
         
         if batch.forward_mode.is_extend():
+            batching_tick = time.time()
             for req in batch.reqs:
                 assert req.rid not in self.req_start_iteration, f"req {req.rid} already started"
                 self.req_start_iteration[req.rid] = self.iteration_counter
+                self.req_timing_tracker[req.rid][1] = batching_tick
         elif batch.forward_mode.is_decode():
+            finish_tick = time.time()
             for req in batch.reqs:
                 assert req.rid in self.req_start_iteration, f"req {req.rid} not started"
                 if req.finished():
                     assert req.rid not in self.req_end_iteration, f"req {req.rid} not ended"
                     self.req_end_iteration[req.rid] = self.iteration_counter
-    
+                    self.req_timing_tracker[req.rid][2] = finish_tick
+
     def stop_stats_recording(self):
         if not self.recording_in_progress:
             return
+        
         with open("scheduler_stats.pkl", "wb") as f:
-            pickle.dump((self.iteration_bsz, self.req_start_iteration, self.req_end_iteration), f)
+            pickle.dump((self.iteration_bsz, self.req_start_iteration, self.req_end_iteration, self.req_timing_tracker), f)
         self.recording_in_progress = False
+        self.req_timing_tracker = {}
         logger.info("Stop recording scheduler stats")
 
     @DynamicGradMode()
@@ -1114,6 +1121,7 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
+        admit_tick = time.time()
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
@@ -1137,7 +1145,10 @@ class Scheduler(
                     )
                     self.send_to_tokenizer.send_pyobj(abort_req)
                     continue
-            output = self._request_dispatcher(recv_req)
+            if isinstance(recv_req, TokenizedGenerateReqInput):
+                output = self._request_dispatcher(recv_req, admit_tick=admit_tick)
+            else:
+                output = self._request_dispatcher(recv_req)
             if output is not None:
                 if isinstance(output, RpcReqOutput):
                     if self.recv_from_rpc is not None:
@@ -1148,6 +1159,7 @@ class Scheduler(
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
+        admit_tick: float = None,
     ):
         if (
             self.server_args.enable_dp_attention
@@ -1192,6 +1204,10 @@ class Scheduler(
                 vocab_size=self.model_config.vocab_size,
             )
             req.tokenizer = self.tokenizer
+            
+            if admit_tick is None:
+                admit_tick = time.time()
+            self.req_timing_tracker[req.rid] = [admit_tick, 0.0, 0.0] # admitted time
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
