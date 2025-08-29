@@ -1,12 +1,14 @@
+import os
 import pickle
 import matplotlib.pyplot as plt
 import numpy as np
+from argparse import ArgumentParser
 
-# self.iteration_bsz = []
-# self.req_start_iteration: Dict[str, int] = {}
-# self.req_end_iteration: Dict[str, int] = {}
+parser = ArgumentParser()
+parser.add_argument("-d", "--dir", type=str, default=".")
+args = parser.parse_args()
 
-with open('scheduler_stats.pkl', 'rb') as f:
+with open(os.path.join(args.dir, "scheduler_stats.pkl"), 'rb') as f:
     iteration_bsz, req_start_iteration, req_end_iteration, req_timing_tracker = pickle.load(f)
 
 niters = len(iteration_bsz)
@@ -60,12 +62,10 @@ for req_id in req_id_start:
 plt.title("Request Lifespan over Iterations")
 plt.xlabel("Iteration")
 plt.ylabel("Request ID")
-# plt.grid(True)
 
 plt.tight_layout()
-plt.savefig("scheduler_stats.png", dpi=300)
+plt.savefig(os.path.join(args.dir, "scheduler_stats.png"), dpi=300)
 
-# plt.figure(figsize=(8, 5))
 queue_delay = []
 ttft = []
 req_elapse = []
@@ -91,4 +91,4 @@ plot_cdf(ttft, axs[1], "TTFT CDF")
 plot_cdf(req_elapse, axs[2], "Request Elapse CDF")
 
 plt.tight_layout()
-plt.savefig("req_stats_cdf.png", dpi=300)
+plt.savefig(os.path.join(args.dir, "req_stats_cdf.png"), dpi=300)
