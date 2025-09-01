@@ -551,7 +551,7 @@ class Scheduler(
         self.recv_dp_balance_id_this_term = []
         
         self.recording_in_progress = False
-        self.disable_continuous_batching = True
+        self.disable_continuous_batching = False
         self.req_timing_tracker: Dict[str, list[float]] = {} # [admitted time, batching time, finish time]
 
     def init_tokenizer(self):

@@ -8,6 +8,8 @@ parser = ArgumentParser()
 parser.add_argument("-d", "--dir", type=str, default=".")
 args = parser.parse_args()
 
+font_size = 22
+
 with open(os.path.join(args.dir, "scheduler_stats.pkl"), 'rb') as f:
     iteration_bsz, req_start_iteration, req_end_iteration, req_timing_tracker = pickle.load(f)
 
@@ -40,13 +42,23 @@ print("len(req_id_tracker):", len(req_id_tracker))
 # Plot
 plt.figure(figsize=(12, 5))
 
+# set all font size to 11pt
+plt.rcParams.update({
+    'font.size': font_size,
+    'axes.titlesize': font_size,
+    'axes.labelsize': font_size,
+    'xtick.labelsize': font_size,
+    'ytick.labelsize': font_size,
+    'legend.fontsize': font_size
+})
+
 # 1. Batch size over iterations
 plt.subplot(1, 2, 1)
 plt.plot(range(niters), iteration_bsz, linestyle='-')
-plt.title("Batch Size over Iterations")
-plt.xlabel("Iteration")
-plt.ylabel("Batch Size")
-plt.yticks(range(0, max(iteration_bsz)+1, max(1, max(iteration_bsz)//10)))
+plt.title("Batch Size", fontsize=font_size)
+plt.xlabel("Iteration", fontsize=font_size)
+plt.ylabel("Batch Size", fontsize=font_size)
+plt.yticks(range(0, max(iteration_bsz)+1, max(1, max(iteration_bsz)//5)))
 plt.grid(True)
 
 # 2. Request lifespan over iterations
@@ -59,9 +71,9 @@ for req_id in req_id_start:
     end = req_id_end[req_id]
     plt.hlines(y=req_id, xmin=start, xmax=end, linewidth=1)
 
-plt.title("Request Lifespan over Iterations")
-plt.xlabel("Iteration")
-plt.ylabel("Request ID")
+plt.title("Request Lifespan", fontsize=font_size)
+plt.xlabel("Iteration", fontsize=font_size)
+plt.ylabel("Req ID", fontsize=font_size)
 
 plt.tight_layout()
 plt.savefig(os.path.join(args.dir, "scheduler_stats.png"), dpi=300)
@@ -79,16 +91,16 @@ def plot_cdf(data, ax, title):
     sorted_data = np.sort(data)
     yvals = np.arange(1, len(sorted_data) + 1) / len(sorted_data)
     ax.plot(sorted_data, yvals, marker=".", linestyle="-")
-    ax.set_title(title)
-    ax.set_xlabel("Value")
-    ax.set_ylabel("CDF")
+    ax.set_title(title, fontsize=font_size)
+    ax.set_xlabel("time (s)", fontsize=font_size)
+    ax.set_ylabel("CDF", fontsize=font_size)
     ax.grid(True)
 
 fig, axs = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
 
-plot_cdf(queue_delay, axs[0], "Queue Delay CDF")
-plot_cdf(ttft, axs[1], "TTFT CDF")
-plot_cdf(req_elapse, axs[2], "Request Elapse CDF")
+plot_cdf(queue_delay, axs[0], "Queueing Delay")
+plot_cdf(ttft, axs[1], "Time to First Token")
+plot_cdf(req_elapse, axs[2], "Request Generation Time")
 
 plt.tight_layout()
 plt.savefig(os.path.join(args.dir, "req_stats_cdf.png"), dpi=300)
