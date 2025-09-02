@@ -13,7 +13,7 @@ run_once() {
 
     mv scheduler_stats.pkl $1/
 
-    python ../draw.py -d $1
+    python draw.py -d $1
 }
 
 run_once cont_batch
