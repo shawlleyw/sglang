@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.paras.utils import print_class_tensor_member, profile_object_members
+from sglang.srt.paras.ops import gather_kv_and_permute, permute_and_scatter_kv
 
 def prune_request(req: Req):
     req.last_node = None
@@ -206,11 +207,10 @@ class ParaSReqGatherManager:
             if self.num_local_tokens > 0:
                 k_buffer = kv_cache.get_key_buffer(layer_id)
                 v_buffer = kv_cache.get_value_buffer(layer_id)
-                local_kcache = k_buffer[self.local_token_indices]
-                local_vcache = v_buffer[self.local_token_indices]
                 
-                local_kvcache = torch.stack([local_kcache, local_vcache], dim=0).view(2, -1, kv_cache.head_num, kv_cache.head_dim)
-                permuted_local_kvcache = local_kvcache.permute(2, 0, 1, 3).contiguous().flatten() # [num_heads, 2, num_tokens, head_dim]
+                # Fused gather and permute using Triton kernel
+                # Output: [num_heads * 2 * num_tokens * head_dim] with layout [num_heads, 2, num_tokens, head_dim]
+                permuted_local_kvcache = gather_kv_and_permute(k_buffer, v_buffer, self.local_token_indices)
             else:
                 permuted_local_kvcache = torch.empty((0, ), dtype=kv_cache.store_dtype, device=kv_cache.device)
                 
@@ -219,13 +219,15 @@ class ParaSReqGatherManager:
             if self.num_global_tokens > 0:
                 gathered_kvcache = torch.empty(2 * self.num_global_tokens * splited_size_per_token, dtype=permuted_local_kvcache.dtype, device=permuted_local_kvcache.device)
                 torch.distributed.all_to_all_single(gathered_kvcache, permuted_local_kvcache, output_split_sizes, input_split_sizes, group=self.gather_group.device_group)
-                gathered_kvcache = gathered_kvcache.view(self.num_global_tokens, 2, sharded_num_heads, head_dim)
-                permuted_gathered_kvcache = gathered_kvcache.permute(1, 0, 2, 3).contiguous() # [2, num_global_tokens, sharded_num_heads, head_dim]
                 
+                # Fused scatter using Triton kernel
+                # Input layout: [num_tokens, 2, num_heads, head_dim] (flat)
                 k_buffer = kv_cache.get_key_buffer(layer_id)
                 v_buffer = kv_cache.get_value_buffer(layer_id)
-                k_buffer[self.global_token_indices].copy_(permuted_gathered_kvcache[0])
-                v_buffer[self.global_token_indices].copy_(permuted_gathered_kvcache[1])
+                permute_and_scatter_kv(
+                    gathered_kvcache, k_buffer, v_buffer, self.global_token_indices,
+                    self.num_global_tokens, sharded_num_heads, head_dim
+                )
                 
         for layer_id in range(num_layers):
             gather_one_layer(layer_id)
