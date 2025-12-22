@@ -124,7 +124,7 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
-from sglang.srt.managers.scheduler_paras_mixin import SchedulerParasMixin
+from sglang.srt.paras.scheduler_paras_mixin import SchedulerParasMixin
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
