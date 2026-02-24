@@ -582,6 +582,8 @@ def ep_scatter(
     )
 
     grid = min(recv_topk.shape[0], 1024 * 8)
+    if grid == 0:
+        return
 
     _fwd_kernel_ep_scatter_2[(grid,)](
         recv_topk.shape[0],
@@ -692,8 +694,11 @@ def ep_gather(
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
     BLOCK_D = 128 if hidden_size % 1024 != 0 else 1024  # block size of quantization
-    assert hidden_size % BLOCK_D == 0
+    assert hidden_size % BLOCK_D == 0, f"input shape: {input_tensor.shape}, hidden_size: {hidden_size}, BLOCK_D: {BLOCK_D}"
     grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
+    if num_tokens == 0:
+        return
+
     _fwd_kernel_ep_gather[grid](
         num_tokens,
         input_tensor,
