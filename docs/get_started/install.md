@@ -2,17 +2,26 @@
 
 You can install SGLang using one of the methods below.
 
+> This repository is a fork with branch-specific changes (for example `fake_prefill`).
+> Install from source in this repo. Do not use `pip install sglang` or `uv pip install sglang`,
+> because those install upstream packages and will not include this fork's changes.
+
 This page primarily applies to common NVIDIA GPU platforms.
 For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [TPU](../platforms/tpu.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-10-13-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend_npu.md).
 
-## Method 1: With pip or uv
-
-It is recommended to use uv for faster installation:
+## Method 1: From source (recommended for this fork)
 
 ```bash
+# Clone this fork and switch to the target branch
+git clone -b fake_prefill https://github.com/shawlleyw/sglang.git sglang-fake-prefill
+cd sglang-fake-prefill
+
+# Install from source (editable)
 pip install --upgrade pip
-pip install uv
-uv pip install "sglang" --prerelease=allow
+pip install -e .
+
+# Alternative editable install path
+pip install -e "python"
 ```
 
 **Quick fixes to common problems**
@@ -21,23 +30,7 @@ uv pip install "sglang" --prerelease=allow
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
   2. Install FlashInfer first following [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
 
-## Method 2: From source
-
-```bash
-# Use the last release branch
-git clone -b v0.5.5 https://github.com/sgl-project/sglang.git
-cd sglang
-
-# Install the python packages
-pip install --upgrade pip
-pip install -e "python"
-```
-
-**Quick fixes to common problems**
-
-- If you want to develop SGLang, it is recommended to use docker. Please refer to [setup docker container](../developer_guide/development_guide_using_docker.md#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
-
-## Method 3: Using docker
+## Method 2: Using docker
 
 The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
@@ -55,7 +48,7 @@ docker run --gpus all \
 
 You can also find the nightly docker images [here](https://hub.docker.com/r/lmsysorg/sglang/tags?name=nightly).
 
-## Method 4: Using Kubernetes
+## Method 3: Using Kubernetes
 
 Please check out [OME](https://github.com/sgl-project/ome), a Kubernetes operator for enterprise-grade management and serving of large language models (LLMs).
 
@@ -72,7 +65,7 @@ Please check out [OME](https://github.com/sgl-project/ome), a Kubernetes operato
 
 </details>
 
-## Method 5: Using docker compose
+## Method 4: Using docker compose
 
 <details>
 <summary>More</summary>
@@ -84,7 +77,7 @@ Please check out [OME](https://github.com/sgl-project/ome), a Kubernetes operato
 2. Execute the command `docker compose up -d` in your terminal.
 </details>
 
-## Method 6: Run on Kubernetes or Clouds with SkyPilot
+## Method 5: Run on Kubernetes or Clouds with SkyPilot
 
 <details>
 <summary>More</summary>
