@@ -82,21 +82,26 @@ class SchedulerProfilerMixin:
 
         if num_steps:
             self.profile_steps = num_steps
-            if self.profile_by_stage:
+
+        if self.profile_by_stage:
+            if num_steps:
                 self.profiler_target_prefill_ct = num_steps
                 self.profiler_target_decode_ct = num_steps
                 self.profiler_prefill_ct = 0
                 self.profiler_decode_ct = 0
-            elif start_min_batch_size:
-                self.profile_start_min_batch_size = start_min_batch_size
-                logger.warning(f"Init profile: profile start min batch size: {self.profile_start_min_batch_size}")
-            elif start_step:
+        elif start_min_batch_size:
+            self.profile_start_min_batch_size = start_min_batch_size
+            logger.warning(
+                f"Init profile: profile start min batch size: "
+                f"{self.profile_start_min_batch_size}, profile steps: {self.profile_steps}"
+            )
+        elif num_steps:
+            if start_step:
                 self.profiler_target_forward_ct = (
                     self.profiler_start_forward_ct + num_steps
                 )
             else:
                 self.profiler_target_forward_ct = self.forward_ct + num_steps
-            # The caller will be notified when reaching profiler_target_forward_ct
         else:
             self.profiler_target_forward_ct = None
 
@@ -243,6 +248,8 @@ class SchedulerProfilerMixin:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
+                logger.warning(f"Profiled batch size: {self.profile_batch_size}, results saved to file: {self.torch_profiler_output_dir / filename}")
+                
             torch.distributed.barrier(self.tp_cpu_group)
 
         if self.rpd_profiler is not None:
@@ -279,7 +286,6 @@ class SchedulerProfilerMixin:
             self.torch_profiler_output_dir,
             merge_message,
         )
-        logger.warning(f"Profiled batch size: {self.profile_batch_size}")
         self.profile_batch_size = []
         self.torch_profiler = None
         self.profile_in_progress = False
@@ -311,11 +317,16 @@ class SchedulerProfilerMixin:
             else:
                 raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
         elif self.profile_start_min_batch_size:
-            if not self.profile_in_progress and batch.batch_size() >= self.profile_start_min_batch_size:
+            if not self.profile_in_progress and batch.forward_mode.is_decode() and batch.batch_size() >= self.profile_start_min_batch_size:
                 logger.warning(f"Start profile: batch size: {batch.batch_size()}, profile start min batch size: {self.profile_start_min_batch_size}")
                 self.start_profile()
-                self.profiler_target_forward_ct = self.forward_ct + self.profile_steps
-            if self.profile_in_progress and self.forward_ct >= self.profiler_target_forward_ct:
+                if self.profile_steps is not None:
+                    self.profiler_target_forward_ct = self.forward_ct + self.profile_steps
+            elif (
+                self.profile_in_progress
+                and self.profiler_target_forward_ct is not None
+                and self.forward_ct >= self.profiler_target_forward_ct
+            ):
                 self.stop_profile()
                 self.profile_start_min_batch_size = None
                 self.profiler_target_forward_ct = None
