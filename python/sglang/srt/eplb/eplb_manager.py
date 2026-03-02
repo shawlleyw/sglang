@@ -6,6 +6,7 @@ import torch.cuda
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+from sglang.srt.eplb.moe_kernel_balance import get_global_moe_kernel_balance_recorder
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -31,6 +32,9 @@ class EPLBManager:
 
         if not get_global_expert_distribution_recorder().recording:
             get_global_expert_distribution_recorder().start_record()
+
+        if not get_global_moe_kernel_balance_recorder().recording:
+            get_global_moe_kernel_balance_recorder().start_record()
 
         logger.info(
             f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
@@ -61,6 +65,7 @@ class EPLBManager:
         dump_record_output = get_global_expert_distribution_recorder().dump_record(
             output_mode="object"
         )
+        get_global_moe_kernel_balance_recorder().dump()
         logical_count = dump_record_output["logical_count"]
         average_utilization_rate_over_window = dump_record_output[
             "average_utilization_rate_over_window"

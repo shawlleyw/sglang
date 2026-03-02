@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 import time
 from abc import ABC
-from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Literal, Optional
 
@@ -25,7 +24,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +33,19 @@ _OutputMode = Literal["file", "object"]
 
 class MoEKernelBalanceRecorder(ABC):
     """Records MoE kernel execution time per layer per forward step.
+
+    Usage from each MoE layer's forward method::
+
+        recorder = get_global_moe_kernel_balance_recorder()
+        recorder.record_start(self.layer_id)
+        output = self.run_moe_core(...)
+        recorder.record_end(self.layer_id)
+
+    Step boundaries are detected automatically: ``layer_idx == 0`` signals the
+    start of a new forward step (finalising the previous one).
+
+    ``set_forward_mode`` should be called once per forward pass (e.g. from
+    the model runner) so that dump-time filtering to decode-only steps works.
 
     At dump time, gathers data from all ranks, filters to steps where all ranks
     are in decode mode, and produces a 3D tensor of shape
@@ -51,13 +63,14 @@ class MoEKernelBalanceRecorder(ABC):
             return _MoEKernelBalanceRecorderReal(num_layers, rank, world_size)
         return _MoEKernelBalanceRecorderNoop()
 
-    @contextmanager
-    def with_forward_pass(self, forward_batch: ForwardBatch):
-        yield
+    def set_forward_mode(self, forward_mode: ForwardMode):
+        pass
 
-    @contextmanager
-    def with_moe_layer(self, layer_idx: int):
-        yield
+    def record_start(self, layer_idx: int):
+        pass
+
+    def record_end(self, layer_idx: int):
+        pass
 
     def start_record(self):
         pass
@@ -89,53 +102,63 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         # either None (layer not recorded) or a (start_event, end_event) tuple.
         self._step_events: List[List] = []
 
-        self._current_forward_mode: Optional[ForwardMode] = None
+        self._current_forward_mode_value: int = -1
         self._current_events: Optional[List] = None
+        self._pending_start_event: Optional[torch.cuda.Event] = None
 
-    @contextmanager
-    def with_forward_pass(self, forward_batch: ForwardBatch):
+    def set_forward_mode(self, forward_mode: ForwardMode):
         if self._recording:
-            self._current_forward_mode = forward_batch.forward_mode
-            self._current_events = [None] * self._num_layers
-        try:
-            yield
-        finally:
-            if self._recording and self._current_forward_mode is not None:
-                self._forward_modes.append(self._current_forward_mode.value)
-                self._step_events.append(self._current_events)
-                self._current_forward_mode = None
-                self._current_events = None
+            self._current_forward_mode_value = forward_mode.value
 
-    @contextmanager
-    def with_moe_layer(self, layer_idx: int):
-        recording = self._recording and self._current_events is not None
-        if recording:
-            start_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-        yield
-        if recording:
-            end_event = torch.cuda.Event(enable_timing=True)
-            end_event.record()
-            self._current_events[layer_idx] = (start_event, end_event)
+    def record_start(self, layer_idx: int):
+        if not self._recording:
+            return
+        if layer_idx == 0:
+            self._finalize_step()
+            self._current_events = [None] * self._num_layers
+        if self._current_events is None:
+            return
+        start_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        self._pending_start_event = start_event
+
+    def record_end(self, layer_idx: int):
+        if not self._recording or self._current_events is None:
+            return
+        if self._pending_start_event is None:
+            return
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        self._current_events[layer_idx] = (self._pending_start_event, end_event)
+        self._pending_start_event = None
+
+    def _finalize_step(self):
+        if self._current_events is not None:
+            self._forward_modes.append(self._current_forward_mode_value)
+            self._step_events.append(self._current_events)
+            self._current_events = None
 
     def start_record(self):
         self._recording = True
         self._reset()
 
     def stop_record(self):
+        self._finalize_step()
         self._recording = False
 
     def _reset(self):
         self._forward_modes.clear()
         self._step_events.clear()
-        self._current_forward_mode = None
+        self._current_forward_mode_value = -1
         self._current_events = None
+        self._pending_start_event = None
 
     @property
     def recording(self):
         return self._recording
 
     def dump(self, output_mode: _OutputMode = "file"):
+        self._finalize_step()
         num_steps = len(self._forward_modes)
         device = "cuda"
 
