@@ -846,7 +846,7 @@ class FusedMoE(torch.nn.Module):
         )
 
         recorder = get_global_moe_kernel_balance_recorder()
-        recorder.record_start(self.layer_id)
+        recorder.record_start(self.layer_id, batch_size=hidden_states.shape[0])
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
             **kwargs,

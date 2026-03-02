@@ -66,7 +66,7 @@ class MoEKernelBalanceRecorder(ABC):
     def set_forward_mode(self, forward_mode: ForwardMode):
         pass
 
-    def record_start(self, layer_idx: int):
+    def record_start(self, layer_idx: int, batch_size: int = 0):
         pass
 
     def record_end(self, layer_idx: int):
@@ -98,11 +98,13 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         self._recording = False
 
         self._forward_modes: List[int] = []
+        self._batch_sizes: List[int] = []
         # Each entry is a list of num_layers elements, where each element is
         # either None (layer not recorded) or a (start_event, end_event) tuple.
         self._step_events: List[List] = []
 
         self._current_forward_mode_value: int = -1
+        self._current_batch_size: int = 0
         self._current_events: Optional[List] = None
         self._pending_start_event: Optional[torch.cuda.Event] = None
 
@@ -110,12 +112,13 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         if self._recording:
             self._current_forward_mode_value = forward_mode.value
 
-    def record_start(self, layer_idx: int):
+    def record_start(self, layer_idx: int, batch_size: int = 0):
         if not self._recording:
             return
         if layer_idx == 0:
             self._finalize_step()
             self._current_events = [None] * self._num_layers
+            self._current_batch_size = batch_size
         if self._current_events is None:
             return
         start_event = torch.cuda.Event(enable_timing=True)
@@ -135,6 +138,7 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
     def _finalize_step(self):
         if self._current_events is not None:
             self._forward_modes.append(self._current_forward_mode_value)
+            self._batch_sizes.append(self._current_batch_size)
             self._step_events.append(self._current_events)
             self._current_events = None
 
@@ -148,8 +152,10 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
 
     def _reset(self):
         self._forward_modes.clear()
+        self._batch_sizes.clear()
         self._step_events.clear()
         self._current_forward_mode_value = -1
+        self._current_batch_size = 0
         self._current_events = None
         self._pending_start_event = None
 
@@ -200,11 +206,16 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
             (max_steps, self._num_layers), dtype=torch.float32, device=device
         )
 
+        local_bsz = torch.zeros((max_steps,), dtype=torch.int32, device=device)
+
         if num_steps > 0:
             local_modes[:num_steps] = torch.tensor(
                 self._forward_modes, dtype=torch.int32, device=device
             )
             local_times[:num_steps] = local_times_cpu.to(device)
+            local_bsz[:num_steps] = torch.tensor(
+                self._batch_sizes, dtype=torch.int32, device=device
+            )
 
         # Gather forward modes from all ranks -> [world_size, max_steps]
         all_modes_list = [
@@ -224,13 +235,24 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         torch.distributed.all_gather(all_times_list, local_times)
         all_times = torch.stack(all_times_list)
 
+        # Gather batch sizes from all ranks -> [world_size, max_steps]
+        all_bsz_list = [
+            torch.zeros_like(local_bsz) for _ in range(self._world_size)
+        ]
+        torch.distributed.all_gather(all_bsz_list, local_bsz)
+        all_bsz = torch.stack(all_bsz_list)  # [world_size, max_steps]
+
         # Filter to all-decode steps and reshape to [#decode_steps, num_layers, world_size]
         decode_times = all_times[:, all_decode_mask, :]
         result = decode_times.permute(1, 2, 0).contiguous()
 
+        # Batch sizes: [#decode_steps, world_size]
+        decode_bsz = all_bsz[:, all_decode_mask].permute(1, 0).contiguous()
+
         output = dict(
             rank=self._rank,
             moe_times=result,
+            batch_sizes=decode_bsz,
             num_total_steps=max_steps,
             num_decode_steps=result.shape[0],
         )
