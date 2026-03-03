@@ -110,6 +110,13 @@ class GptOssSparseMoeBlock(nn.Module):
         self.gemm1_alpha = getattr(config, "hidden_act_alpha", 1.702)
         self.gemm1_clamp_limit = config.swiglu_limit
 
+        self._num_experts_config = config.num_local_experts
+        self._top_k_config = config.num_experts_per_tok
+
+        # Lazily initialize profile-driven router (shared global singleton)
+        from sglang.srt.layers.moe.profile_driven_router import maybe_init_global_profile_router
+        maybe_init_global_profile_router(config.num_local_experts, config.num_experts_per_tok)
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=True,
@@ -159,7 +166,7 @@ class GptOssSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(hidden_states, should_allreduce_fusion)
+            return self.forward_normal(hidden_states, forward_batch, should_allreduce_fusion)
         else:
             raise Exception("forward_deepep branch not implemented yet")
 
@@ -173,12 +180,26 @@ class GptOssSparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
 
+        # ALWAYS run gate + topk to preserve computation volume
         router_logits, _ = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+
+        # Overwrite routing decisions with profiled outcomes (GPU-only, CUDA graph safe)
+        from sglang.srt.layers.moe.profile_driven_router import get_global_profile_router
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        profile_router = get_global_profile_router()
+        if profile_router is not None and forward_batch is not None:
+            profiled_weights, profiled_ids = profile_router.route_gpu(
+                request_ids=forward_batch.req_pool_indices,
+                token_indices=forward_batch.positions,
+                layer_id=self.layer_id,
+            )
+            topk_output = StandardTopKOutput(profiled_weights, profiled_ids, topk_output.router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.tp_size > 1 and not should_allreduce_fusion:

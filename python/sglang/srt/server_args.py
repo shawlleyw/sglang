@@ -257,6 +257,7 @@ class ServerArgs:
 
     # Memory and scheduling
     enable_fake_prefill: bool = False
+    profile_driven_gate_path: Optional[str] = None
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
@@ -2096,6 +2097,15 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_fake_prefill,
             help="If set, the server will use fake prefill.",
+        )
+        parser.add_argument(
+            "--profile-driven-gate-path",
+            type=str,
+            default=ServerArgs.profile_driven_gate_path,
+            help="Path to a Parquet file with pre-profiled MoE routing outcomes. "
+            "When set with --enable-fake-prefill, expert routing uses these "
+            "deterministic outcomes instead of the learned gate. "
+            "Compatible with DisagMoE profile format.",
         )
         parser.add_argument(
             "--mem-fraction-static",

@@ -96,6 +96,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
+        self._num_experts_config = config.num_experts
+        self._top_k_config = config.num_experts_per_tok
+
+        # Lazily initialize profile-driven router (shared global singleton)
+        from sglang.srt.layers.moe.profile_driven_router import maybe_init_global_profile_router
+        maybe_init_global_profile_router(config.num_experts, config.num_experts_per_tok)
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
@@ -139,7 +146,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+                hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
             )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -154,15 +161,28 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
+        # ALWAYS run gate + topk to preserve computation volume
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+
+        # Overwrite routing decisions with profiled outcomes (GPU-only, CUDA graph safe)
+        from sglang.srt.layers.moe.profile_driven_router import get_global_profile_router
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        profile_router = get_global_profile_router()
+        if profile_router is not None and forward_batch is not None:
+            profiled_weights, profiled_ids = profile_router.route_gpu(
+                request_ids=forward_batch.req_pool_indices,
+                token_indices=forward_batch.positions,
+                layer_id=self.layer_id,
+            )
+            topk_output = StandardTopKOutput(profiled_weights, profiled_ids, topk_output.router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
         if (
             self.tp_size > 1
