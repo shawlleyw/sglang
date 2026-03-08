@@ -124,6 +124,53 @@ python -m sglang.launch_server \
 
 ---
 
+## Pipeline Parallelism (PP) — Multi-Node Alternative to EP
+
+DeepEP only supports single-node (intranode NVLink) on A100. For multi-node setups,
+pipeline parallelism is an alternative that splits layers across nodes instead of
+splitting experts.
+
+### PP=2, TP=2 (tested, works)
+
+Each PP stage runs 12 of the 24 layers. Each stage uses 2-way tensor parallelism.
+Simulates a 2-node × 2-GPU configuration.
+
+```bash
+python -m sglang.launch_server \
+  --model openai/gpt-oss-20b \
+  --tp 2 --pp-size 2 \
+  --host 0.0.0.0 --port 30005 \
+  --mem-fraction-static 0.8 \
+  --enable-fake-prefill \
+  --disable-radix-cache \
+  --chunked-prefill-size -1 \
+  --load-format dummy
+```
+
+Notes:
+- No `--moe-a2a-backend deepep` — PP does not use EP; each rank holds all 32 experts
+  for its layers.
+- PP auto-disables overlap scheduling.
+- Custom layer partitioning: set `SGLANG_PP_LAYER_PARTITION=10,14` (or any split
+  summing to 24) for uneven memory balancing.
+
+### PP=4, TP=1 (tested, fails)
+
+Crashes with `IndexError: list index out of range` in KV cache memory pool
+(`memory_pool.py: v_buffer[layer_id - self.start_layer]`). The attention backend
+initializes with `layer_id=0` but non-first PP stages have `start_layer > 0`.
+This appears to be an upstream sglang bug, not GPT-OSS specific.
+
+### PP constraints
+
+- PP is incompatible with: overlap scheduling (auto-disabled), speculative decoding,
+  mixed chunked prefill.
+- `tp_size * pp_size` must equal total GPU count.
+- PP does **not** combine with EP in any useful way on A100 (DeepEP forces
+  `ep_size = tp_size`, so PP+EP would just reduce EP size).
+
+---
+
 ## Weight Dequantization Behavior
 
 GPT-OSS uses mxfp4 quantized expert weights (uint8 packed). On A100 with EP, the
