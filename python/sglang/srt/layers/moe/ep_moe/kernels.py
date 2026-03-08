@@ -552,11 +552,17 @@ def ep_scatter(
     scale_ue8m0: bool = False,
 ):
     BLOCK_E = 128  # token num of per expert is aligned to 128
-    BLOCK_D = 128  # block size of quantization
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
-    # grid = (triton.cdiv(hidden_size, BLOCK_D), num_experts)
+    if hidden_size % 1024 == 0:
+        BLOCK_D = 1024
+    elif hidden_size % 128 == 0:
+        BLOCK_D = 128
+    elif hidden_size % 64 == 0:
+        BLOCK_D = 64
+    else:
+        BLOCK_D = 32
     grid = num_experts
 
     scale_hidden_size = hidden_size // BLOCK_D
@@ -582,6 +588,8 @@ def ep_scatter(
     )
 
     grid = min(recv_topk.shape[0], 1024 * 8)
+    if grid == 0:
+        return
 
     _fwd_kernel_ep_scatter_2[(grid,)](
         recv_topk.shape[0],
@@ -691,8 +699,19 @@ def ep_gather(
     num_warps = 2
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
-    BLOCK_D = 128 if hidden_size % 1024 != 0 else 1024  # block size of quantization
-    assert hidden_size % BLOCK_D == 0
+    # Pick largest power-of-2 tile size that divides hidden_size
+    if hidden_size % 1024 == 0:
+        BLOCK_D = 1024
+    elif hidden_size % 128 == 0:
+        BLOCK_D = 128
+    elif hidden_size % 64 == 0:
+        BLOCK_D = 64
+    else:
+        BLOCK_D = 32
+    assert hidden_size % BLOCK_D == 0, f"input shape: {input_tensor.shape}, hidden_size: {hidden_size}, BLOCK_D: {BLOCK_D}"
+    if num_tokens == 0:
+        return
+
     grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
     _fwd_kernel_ep_gather[grid](
         num_tokens,

@@ -168,7 +168,7 @@ class GptOssSparseMoeBlock(nn.Module):
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(hidden_states, forward_batch, should_allreduce_fusion)
         else:
-            raise Exception("forward_deepep branch not implemented yet")
+            return self.forward_deepep(hidden_states, forward_batch)
 
     def get_moe_weights(self):
         return [
@@ -176,6 +176,49 @@ class GptOssSparseMoeBlock(nn.Module):
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
         ]
+
+    def forward_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+
+        router_logits, _ = self.router(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
+
+        from sglang.srt.layers.moe.profile_driven_router import get_global_profile_router
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        profile_router = get_global_profile_router()
+        if profile_router is not None and forward_batch is not None:
+            # Align batch metadata with actual hidden_states token count.
+            # During warmup or padded batches, forward_batch.positions may be
+            # padded beyond num_tokens, or req_pool_indices may have fewer
+            # entries (e.g. 1 request producing multiple tokens in prefill).
+            req_ids = forward_batch.req_pool_indices
+            pos = forward_batch.positions
+            if pos.shape[0] != num_tokens:
+                pos = pos[:num_tokens]
+            if req_ids.shape[0] != num_tokens:
+                if req_ids.shape[0] == 1:
+                    req_ids = req_ids[0:1].expand(num_tokens)
+                elif req_ids.shape[0] > num_tokens:
+                    req_ids = req_ids[:num_tokens]
+                else:
+                    # Fewer req_ids than tokens: repeat last entry
+                    req_ids = req_ids[
+                        torch.arange(num_tokens, device=req_ids.device) % req_ids.shape[0]
+                    ]
+
+            profiled_weights, profiled_ids = profile_router.route_gpu(
+                request_ids=req_ids,
+                token_indices=pos,
+                layer_id=self.layer_id,
+            )
+            topk_output = StandardTopKOutput(profiled_weights, profiled_ids, topk_output.router_logits)
+
+        final_hidden_states = self.experts(hidden_states, topk_output)
+        return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_normal(
         self,
@@ -189,14 +232,26 @@ class GptOssSparseMoeBlock(nn.Module):
         router_logits, _ = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
 
-        # Overwrite routing decisions with profiled outcomes (GPU-only, CUDA graph safe)
         from sglang.srt.layers.moe.profile_driven_router import get_global_profile_router
         from sglang.srt.layers.moe.topk import StandardTopKOutput
         profile_router = get_global_profile_router()
         if profile_router is not None and forward_batch is not None:
+            req_ids = forward_batch.req_pool_indices
+            pos = forward_batch.positions
+            if pos.shape[0] != num_tokens:
+                pos = pos[:num_tokens]
+            if req_ids.shape[0] != num_tokens:
+                if req_ids.shape[0] == 1:
+                    req_ids = req_ids[0:1].expand(num_tokens)
+                elif req_ids.shape[0] > num_tokens:
+                    req_ids = req_ids[:num_tokens]
+                else:
+                    req_ids = req_ids[
+                        torch.arange(num_tokens, device=req_ids.device) % req_ids.shape[0]
+                    ]
             profiled_weights, profiled_ids = profile_router.route_gpu(
-                request_ids=forward_batch.req_pool_indices,
-                token_indices=forward_batch.positions,
+                request_ids=req_ids,
+                token_indices=pos,
                 layer_id=self.layer_id,
             )
             topk_output = StandardTopKOutput(profiled_weights, profiled_ids, topk_output.router_logits)
