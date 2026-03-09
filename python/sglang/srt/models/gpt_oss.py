@@ -215,7 +215,8 @@ class GptOssSparseMoeBlock(nn.Module):
                 token_indices=pos,
                 layer_id=self.layer_id,
             )
-            topk_output = StandardTopKOutput(profiled_weights, profiled_ids, topk_output.router_logits)
+            original_logits = getattr(topk_output, 'router_logits', router_logits)
+            topk_output = StandardTopKOutput(profiled_weights, profiled_ids, original_logits)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -254,7 +255,8 @@ class GptOssSparseMoeBlock(nn.Module):
                 token_indices=pos,
                 layer_id=self.layer_id,
             )
-            topk_output = StandardTopKOutput(profiled_weights, profiled_ids, topk_output.router_logits)
+            original_logits = getattr(topk_output, 'router_logits', router_logits)
+            topk_output = StandardTopKOutput(profiled_weights, profiled_ids, original_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.tp_size > 1 and not should_allreduce_fusion:
