@@ -429,3 +429,121 @@ python scripts/plot_advanced_logs.py ./advanced_logs/ --rank 0 --output-dir ./pl
 - **Enabled**: Counter-based sampling + async CUDA events. At typical decode rates (~16k MoE calls/s), overhead is <0.1 ms/s.
 
 See `docs/advanced_logging.md` for full documentation.
+
+---
+
+## MoE Kernel Balance Recorder
+
+The kernel balance recorder captures per-step, per-rank MoE metrics during serving.
+Unlike Advanced MoE Logging (which samples), this recorder captures **every decode
+step** with zero gaps, producing dense tensors suitable for cross-system comparison.
+
+### What it records
+
+| Metric | Shape | Description |
+|--------|-------|-------------|
+| `moe_times` | `[decode_steps, world_size]` | Forward pass time per step per rank (ms), measured via CUDA events placed **outside** the torch.compile / CUDA-graph boundary |
+| `local_token_counts` | `[decode_steps, num_layers, world_size]` | Number of local token-expert pairs processed per MoE layer per rank per step |
+| `batch_sizes` | `[decode_steps, world_size]` | Batch size (number of tokens) per rank per step |
+| `timestamps` | `[decode_steps, world_size]` | Wall-clock `time.time()` at the start of each forward step, per rank (float64 epoch seconds) |
+
+All metrics are allgathered across ranks at dump time, so every `.pt` file contains
+the full picture from all ranks.
+
+### Enabling the recorder
+
+Add these flags to the server launch command:
+
+```bash
+--expert-distribution-recorder-mode stat
+```
+
+And set the output directory via environment variable:
+
+```bash
+export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR=/path/to/output/dir
+```
+
+The launch scripts `launch_head_ep_nccl_record.sh` and `launch_worker_ep_nccl_record.sh`
+already include both. They accept `RECORD_DIR` as the 3rd argument:
+
+```bash
+# Head (sgpu4):
+bash launch_head_ep_nccl_record.sh <gating_profile> <log_file> <record_dir> [mem_frac]
+
+# Workers (sgpu6/7/8):
+bash launch_worker_ep_nccl_record.sh <node_rank> <gating_profile> <log_file> <record_dir> [mem_frac]
+```
+
+### HTTP workflow
+
+Recording is controlled at runtime via HTTP endpoints on the head node (port 30000):
+
+```bash
+# 1. Start recording (resets all buffers)
+curl -X POST http://127.0.0.1:30000/start_expert_distribution_record
+
+# 2. Run your benchmark
+python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 30000 \
+  --model lmsys/gpt-oss-120b-bf16 --dataset-name random \
+  --random-input-len 128 --random-output-len 512 --random-range-ratio 0.5 \
+  --num-prompts 2000 --request-rate 500 --seed 1 --warmup-requests 1
+
+# 3. Stop recording
+curl -X POST http://127.0.0.1:30000/stop_expert_distribution_record
+
+# 4. Dump to .pt files (triggers allgather + save)
+curl -X POST http://127.0.0.1:30000/dump_expert_distribution_record
+```
+
+This produces two files in `RECORD_DIR`:
+- `expert_distribution_recorder_<timestamp>.pt` — raw expert distribution stats
+- `moe_kernel_balance_<timestamp>.pt` — the kernel balance data (timing, tokens, timestamps)
+
+### Plotting
+
+**Per-experiment plots** (7 plots per experiment):
+
+```bash
+python experiments/plot_moe_kernel_balance.py \
+  "experiments/sgl-001/exp1_dp_gptoss/recorder_raw/moe_kernel_balance_*.pt" \
+  -o experiments/plots/sgl-001/exp1_dp_gptoss/
+```
+
+Generates:
+- `step_time_timeline.png` — Forward time per rank over time
+- `avg_time_per_rank.png` — Average forward time bar chart per rank
+- `time_imbalance_timeline.png` — Max/min time ratio over time
+- `local_tokens_avg_heatmap.png` — Avg local tokens (layer × rank)
+- `local_tokens_rank_imbalance.png` — Token count CV per layer
+- `local_tokens_step_rank_heatmap.png` — Token count heatmap (time × rank)
+- `cumulative_tokens_timeline.png` — Cumulative local tokens per rank + divergence %
+
+**Cross-experiment comparison** (6 plots):
+
+```bash
+python experiments/plot_moe_recorder_compare.py \
+  --experiments \
+    "DP+gptoss:experiments/sgl-001/exp1_dp_gptoss/recorder_raw" \
+    "DP+gsm8k:experiments/sgl-001/exp2_dp_gsm8k/recorder_raw" \
+  --output-dir experiments/plots/sgl-001/
+```
+
+Generates CDF comparisons (batch size, execution time, local tokens), timeline grids,
+and cumulative token comparison across experiments.
+
+When timestamps are present in the data, all timeline plots use **Time (s)** on the
+x-axis. Old data without timestamps falls back to step index.
+
+### Implementation details
+
+- **Timing**: CUDA events are recorded in `model_runner.forward()`, outside the
+  torch.compile / CUDA-graph boundary. This ensures every step gets a valid timing
+  measurement regardless of execution mode (eager, compiled, or graph replay).
+- **Token counts**: Written inside `FusedMoE.forward()` using pure tensor ops to a
+  pre-allocated GPU buffer (`_local_tokens_gpu_buffer`). These tensor ops are
+  CUDA-graph safe. After each forward step, `capture_step()` does a D2H copy.
+- **Timestamps**: `time.time()` called at `record_start()` in Python (model runner),
+  giving wall-clock time per rank. Cross-rank drift is typically <5ms with NTP sync.
+- **Warmup**: The plot scripts skip the first 10 decode steps by default (`-w 10`).
+  Override with `-w 0` to include all steps.
