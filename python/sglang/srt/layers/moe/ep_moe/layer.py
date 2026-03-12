@@ -495,6 +495,7 @@ class DeepEPMoE(FusedMoE):
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
         return DeepEPMoE
+    # mooncake-nccl: standard EP with NCCL all-reduce, uses FusedMoE (not DeepEPMoE)
 
     # NEW: Direct FP4 detection (bypasses EP requirements)
     # Check for FP4 quantization with TRTLLM flag, regardless of EP

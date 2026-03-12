@@ -305,7 +305,7 @@ class _SinglePassGatherer(ABC):
             else:
                 raise NotImplementedError
 
-        if server_args.moe_a2a_backend != "none":
+        if server_args.moe_a2a_backend not in ("none", "mooncake-nccl"):
             if server_args.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":

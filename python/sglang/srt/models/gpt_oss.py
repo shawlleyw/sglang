@@ -33,6 +33,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -165,10 +166,11 @@ class GptOssSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
-        if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(hidden_states, forward_batch, should_allreduce_fusion)
-        else:
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             return self.forward_deepep(hidden_states, forward_batch)
+        else:
+            # mooncake-nccl and none both use forward_normal (standard EP with NCCL all-reduce)
+            return self.forward_normal(hidden_states, forward_batch, should_allreduce_fusion)
 
     def get_moe_weights(self):
         return [
@@ -239,17 +241,36 @@ class GptOssSparseMoeBlock(nn.Module):
         if profile_router is not None and forward_batch is not None:
             req_ids = forward_batch.req_pool_indices
             pos = forward_batch.positions
-            if pos.shape[0] != num_tokens:
-                pos = pos[:num_tokens]
-            if req_ids.shape[0] != num_tokens:
-                if req_ids.shape[0] == 1:
-                    req_ids = req_ids[0:1].expand(num_tokens)
-                elif req_ids.shape[0] > num_tokens:
-                    req_ids = req_ids[:num_tokens]
-                else:
-                    req_ids = req_ids[
-                        torch.arange(num_tokens, device=req_ids.device) % req_ids.shape[0]
-                    ]
+
+            if is_dp_attention_enabled() and pos.shape[0] != num_tokens:
+                from sglang.srt.layers.dp_attention import (
+                    get_dp_local_info,
+                    memcpy_triton,
+                )
+                local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+
+                global_pos = torch.zeros(num_tokens, dtype=torch.float32, device=pos.device)
+                memcpy_triton(global_pos, pos.float(), 0, local_start_pos, local_num_tokens, False)
+                global_pos = tensor_model_parallel_all_reduce(global_pos)
+                pos = global_pos.to(torch.int64)
+
+                global_req = torch.zeros(num_tokens, dtype=torch.float32, device=req_ids.device)
+                memcpy_triton(global_req, req_ids.float(), 0, local_start_pos, local_num_tokens, False)
+                global_req = tensor_model_parallel_all_reduce(global_req)
+                req_ids = global_req.to(torch.int64)
+            else:
+                if pos.shape[0] != num_tokens:
+                    pos = pos[:num_tokens]
+                if req_ids.shape[0] != num_tokens:
+                    if req_ids.shape[0] == 1:
+                        req_ids = req_ids[0:1].expand(num_tokens)
+                    elif req_ids.shape[0] > num_tokens:
+                        req_ids = req_ids[:num_tokens]
+                    else:
+                        req_ids = req_ids[
+                            torch.arange(num_tokens, device=req_ids.device) % req_ids.shape[0]
+                        ]
+
             profiled_weights, profiled_ids = profile_router.route_gpu(
                 request_ids=req_ids,
                 token_indices=pos,

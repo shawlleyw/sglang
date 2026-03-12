@@ -18,6 +18,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.moe_kernel_balance import (
+    get_local_tokens_gpu_buffer,
+)
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
@@ -75,7 +78,7 @@ logger = logging.getLogger(__name__)
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none():
+    if a2a_backend.is_none() or a2a_backend.is_mooncake_nccl():
         return StandardDispatcher(moe_runner_config)
     elif a2a_backend.is_deepep() or a2a_backend.is_mooncake():
         return MaybeTboDeepEPDispatcher(
@@ -844,6 +847,16 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+
+        # Write local token count to GPU buffer (pure tensor ops — CUDA-graph safe).
+        # This is always executed (even inside compiled/graph-replayed code).
+        _lt_buf = get_local_tokens_gpu_buffer()
+        if _lt_buf is not None and self.moe_ep_size > 1 and hasattr(topk_output, "topk_ids"):
+            _local_start = self.moe_ep_rank * self.num_local_experts
+            _local_end = _local_start + self.num_local_experts
+            _lt_buf[self.layer_id] = (
+                (topk_output.topk_ids >= _local_start) & (topk_output.topk_ids < _local_end)
+            ).sum()
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,

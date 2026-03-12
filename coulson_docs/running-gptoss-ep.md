@@ -234,6 +234,127 @@ Expected output quality:
 
 ---
 
+## NCCL-EP: Multi-Node Expert Parallelism without Mooncake/DeepEP (L40S / A100)
+
+The `mooncake-nccl` backend enables expert parallelism across nodes using standard
+NCCL all-reduce — no Mooncake C++ runtime or DeepEP RDMA required. Each GPU holds a
+shard of experts, processes only its local experts for all tokens, and NCCL all-reduce
+combines the partial results.
+
+### How it works
+
+- `--moe-a2a-backend mooncake-nccl` sets `ep_size = tp_size` (like `mooncake` / `deepep`)
+- Uses `FusedMoE` with `StandardDispatcher` (not `DeepEPMoE`)
+- `StandardDispatcher` remaps `topk_ids` to local expert indices (-1 for non-local)
+- The triton fused_moe kernel processes only local experts, outputs zero for non-local
+- `tensor_model_parallel_all_reduce` sums partial results across all GPUs
+- No all-to-all communication — just one all-reduce per MoE layer
+
+### GPT-OSS 120B on sgpu4/6/7/8 (4 nodes × 2 L40S = EP8 + DP-Attention)
+
+Launch scripts: `launch_head_ep_nccl.sh` and `launch_worker_ep_nccl.sh`
+
+**DP-Attention is now enabled by default** in the launch scripts. With
+`--enable-dp-attention --dp-size 8`, each GPU handles attention for only 1/8 of the
+requests, while all GPUs still participate in the full MoE computation via NCCL
+all-reduce. This dramatically reduces per-GPU activation memory pressure.
+
+```bash
+# From sgpu4:
+tmux new-session -d -s sglang-head \
+  "bash /home/yizhuoliang/sglang-fake-prefill/launch_head_ep_nccl.sh \
+   ./gating_profiles/gating_gptoss120b_200.parquet server_ep_nccl_head.log"
+
+tmux new-session -d -s sglang-w1 \
+  "ssh sgpu6 'bash /home/yizhuoliang/sglang-fake-prefill/launch_worker_ep_nccl.sh 1 \
+   ./gating_profiles/gating_gptoss120b_200.parquet server_ep_nccl_w1.log'"
+
+tmux new-session -d -s sglang-w2 \
+  "ssh sgpu7 'bash /home/yizhuoliang/sglang-fake-prefill/launch_worker_ep_nccl.sh 2 \
+   ./gating_profiles/gating_gptoss120b_200.parquet server_ep_nccl_w2.log'"
+
+tmux new-session -d -s sglang-w3 \
+  "ssh sgpu8 'bash /home/yizhuoliang/sglang-fake-prefill/launch_worker_ep_nccl.sh 3 \
+   ./gating_profiles/gating_gptoss120b_200.parquet server_ep_nccl_w3.log'"
+```
+
+Key launch parameters:
+```
+--tp-size 8
+--moe-a2a-backend mooncake-nccl
+--enable-dp-attention --dp-size 8
+--moe-runner-backend triton
+--mem-fraction-static 0.80  # optional 3rd arg to head script, 4th to worker script
+--nnodes 4 --node-rank <0|1|2|3> --dist-init-addr 10.0.0.1:25000
+```
+
+No `--deepep-mode` needed (not applicable for this backend).
+
+**Important:** Use `--mem-fraction-static 0.80` (not 0.85). See "Activation memory
+OOM" in Troubleshooting below.
+
+### DP-Attention + Profile-Driven Router Fix
+
+When DP-attention is enabled, `prepare_mlp()` calls `dp_gather_partial()` which
+grows `hidden_states` from DP-local size (e.g. 160 tokens) to global size (e.g. 1280
+tokens). However, `forward_batch.positions` and `forward_batch.req_pool_indices`
+remain DP-local. The profile-driven router in `gpt_oss.py:forward_normal()` needs
+global-sized metadata to index the gating profile correctly.
+
+**Fix** (in `gpt_oss.py`): When `is_dp_attention_enabled()` and the position tensor
+size doesn't match `num_tokens` (global), we all-reduce-gather `positions` and
+`req_pool_indices` from all DP ranks using `memcpy_triton` + `tensor_model_parallel_all_reduce`
+(via float32 cast for compatibility).
+
+### Benchmark results (random in=128/out=512, `--mem-fraction-static 0.80`, DP-attention)
+
+With `--enable-fake-prefill`, only output (decode) throughput is meaningful — input
+tokens are not actually processed.
+
+**EP8 + DP-Attention (gptoss profile):**
+
+| Metric | 1000 prompts, r=250 | 2000 prompts, r=500 |
+|--------|---------------------|---------------------|
+| Output throughput | 5143.72 tok/s | 5809.36 tok/s |
+| Median ITL | 158.11 ms | 208.32 ms |
+| Mean TTFT | 137.45 ms | 11623.11 ms |
+| Successful requests | 1000/1000 | 2000/2000 |
+
+**EP8 + DP-Attention (gsm8k profile):**
+
+| Metric | 1000 prompts, r=250 | 2000 prompts, r=500 |
+|--------|---------------------|---------------------|
+| Output throughput | 5254.99 tok/s | 5898.99 tok/s |
+| Median ITL | 155.33 ms | 208.43 ms |
+| Mean TTFT | 137.62 ms | 11481.04 ms |
+| Successful requests | 1000/1000 | 2000/2000 |
+
+Key improvement vs non-DP-attention: All experiments run at `--mem-fraction-static 0.80`
+with no OOM. Previously, 2k/r500 experiments required 0.75 (gptoss) or 0.70 (gsm8k)
+without DP-attention.
+
+See `gptoss120b-ep8-vs-pp4tp2-halved-seqlen.md` for full comparison with PP4×TP2.
+
+### When to use mooncake-nccl vs mooncake vs deepep
+
+| Backend | Transport | GPU requirement | Best for |
+|---------|-----------|-----------------|----------|
+| `deepep` | NVSHMEM RDMA | NVLink (single-node) | A100/H100 intra-node EP |
+| `mooncake` | IBGDA RDMA | GPUDirect RDMA (H100) | H100 multi-node EP with deep_gemm |
+| `mooncake-nccl` | NCCL all-reduce | Any GPU (RoCE/IB) | L40S/A100 multi-node EP without RDMA |
+
+### Limitations
+
+- Every GPU receives all tokens and processes only its local experts. For very high
+  token counts, the NCCL all-reduce payload (`hidden_size × num_tokens × 2 bytes`)
+  may become a bottleneck.
+- No overlap between communication and computation (the all-reduce is synchronous
+  after expert GEMMs).
+- For decode workloads (small batches, 1 token/request), these limitations are
+  negligible.
+
+---
+
 ## Troubleshooting
 
 ### DeepEP assertion: `is_token_in_rank.size(0) == x.size(0)`
@@ -252,7 +373,59 @@ specifying `num_sms`. Safe to ignore for functional testing.
 Missing Triton autotuning config for the specific expert/hidden-size combo.
 Can generate with the benchmarking script referenced in the warning. Safe to ignore.
 
+### Activation memory OOM at high request rates
+
+At high request rates (e.g. 500 r/s), the scheduler admits many concurrent decode
+requests. The KV cache pool is pre-allocated in `--mem-fraction-static`, but
+**activation memory** (logits tensor, hidden states) is allocated dynamically from
+the remaining VRAM. The logits tensor is `batch_size × vocab_size × 4 bytes` (float32)
+— for GPT-OSS 120B (vocab_size=201,088), each concurrent request costs ~1.15 MiB of
+logits memory alone.
+
+With `--mem-fraction-static 0.85` on L40S (44.4 GiB), only ~6.7 GiB is left for
+activations. At ~1,100+ concurrent requests, the logits allocation exceeds this
+headroom and the scheduler OOMs fatally.
+
+**Fix:** Use `--mem-fraction-static 0.80`. This frees an extra ~2.2 GiB for
+activations, allowing the scheduler's existing `check_decode_mem` + `retract_decode`
+mechanism to naturally bound concurrency via KV cache pressure. The scheduler queues
+excess requests in its `waiting_queue` and processes them as slots free up — no hard
+`--max-running-requests` cap needed.
+
 ### NCCL timeout during startup
 
 Increase timeout with `--dist-timeout 600` (default 300s). Common when loading
 large models over slow storage.
+
+---
+
+## Advanced MoE Logging
+
+Add `--enable-advanced-logging` to the server launch to collect fine-grained MoE metrics:
+
+1. **GroupedGEMM batch sizes** — CDF of num_tokens per MoE step (sampled every 100th call)
+2. **GroupedGEMM execution times** — CDF via async CUDA events (no GPU sync overhead)
+3. **Per-iteration global batch size** — Timeline of tokens per forward pass
+
+### Usage
+
+```bash
+# Add to launch scripts (launch_head_ep_nccl.sh, etc.):
+--enable-advanced-logging
+```
+
+Data is dumped to `./advanced_logs/advanced_log_rank{N}.json` on server shutdown.
+
+### Plotting
+
+```bash
+python scripts/plot_advanced_logs.py ./advanced_logs/
+python scripts/plot_advanced_logs.py ./advanced_logs/ --rank 0 --output-dir ./plots/
+```
+
+### Overhead
+
+- **Disabled**: Single `None` check per MoE call (~20ns) — effectively zero.
+- **Enabled**: Counter-based sampling + async CUDA events. At typical decode rates (~16k MoE calls/s), overhead is <0.1 ms/s.
+
+See `docs/advanced_logging.md` for full documentation.

@@ -21,6 +21,9 @@ OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 - Always derive output path from `__file__` so the script works from any working directory.
 - Close figure with `plt.close(fig)` after saving.
 
+## Font
+Use CMU Sans Serif
+
 ## Layout
 
 - **1×3 subplots** for the standard triple (throughput, median ITL, p99 ITL).

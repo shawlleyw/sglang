@@ -73,6 +73,12 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.moe_kernel_balance import (
+    MoEKernelBalanceRecorder,
+    get_global_moe_kernel_balance_recorder,
+    init_local_tokens_gpu_buffer,
+    set_global_moe_kernel_balance_recorder,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -379,6 +385,21 @@ class ModelRunner:
                     rank=self.tp_rank,
                 )
             )
+
+            set_global_moe_kernel_balance_recorder(
+                MoEKernelBalanceRecorder.init_new(
+                    num_layers=self.model_config.num_hidden_layers,
+                    rank=self.tp_rank,
+                    world_size=torch.distributed.get_world_size(),
+                    enabled=server_args.expert_distribution_recorder_mode is not None,
+                )
+            )
+
+            # Pre-allocate GPU buffer for local-token counting (CUDA-graph safe).
+            init_local_tokens_gpu_buffer(self.model_config.num_hidden_layers)
+
+            if server_args.enable_expert_distribution_metrics:
+                get_global_moe_kernel_balance_recorder().start_record()
 
         # Expert parallelism
         self.eplb_manager = (
@@ -2140,10 +2161,16 @@ class ModelRunner:
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
 
+        get_global_moe_kernel_balance_recorder().set_forward_mode(
+            forward_batch.forward_mode
+        )
+
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,
         ):
+            kernel_recorder = get_global_moe_kernel_balance_recorder()
+            kernel_recorder.record_start()
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -2151,6 +2178,13 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
+            kernel_recorder.record_end()
+
+        # Snapshot the GPU local-tokens buffer (written by FusedMoE tensor ops
+        # inside the CUDA graph).  This D2H copy runs outside the graph.
+        get_global_moe_kernel_balance_recorder().capture_step(
+            batch_size=forward_batch.batch_size,
+        )
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()

@@ -81,10 +81,11 @@ class TestExpertDistribution(CustomTestCase):
                 )
                 self.assertEqual(response.status_code, 200)
 
-                # Check data rows
-                data = torch.load(
-                    list(Path(tmp_dir).glob("*.pt"))[0], weights_only=True
+                expert_files = list(
+                    Path(tmp_dir).glob("expert_distribution_recorder_*.pt")
                 )
+                self.assertTrue(expert_files, "Expected expert distribution dump file")
+                data = torch.load(expert_files[0], weights_only=True)
                 print(f"{data=}")
 
                 if mode in ["per_pass", "per_token"]:
@@ -93,6 +94,12 @@ class TestExpertDistribution(CustomTestCase):
                     logical_count = data["logical_count"]
                     print(f"{logical_count.sum()=} {logical_count=}")
                     self.assertTrue(logical_count.sum() > 0)
+
+                kernel_files = list(Path(tmp_dir).glob("moe_kernel_balance_*.pt"))
+                if kernel_files:
+                    kernel_data = torch.load(kernel_files[0], weights_only=True)
+                    self.assertIn("moe_times", kernel_data)
+                    self.assertIn("batch_sizes", kernel_data)
 
             finally:
                 kill_process_tree(process.pid)
