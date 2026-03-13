@@ -47,6 +47,45 @@ def load_data(path: str):
     return moe_times, batch_sizes, local_token_counts, timestamps
 
 
+def filter_peak_batch(
+    moe_times, batch_sizes, local_token_counts, timestamps, peak_pct: float
+):
+    """Keep only the contiguous time range where global batch size >= peak_pct * peak.
+
+    Global batch size = sum of batch_sizes across all ranks for each step.
+    We find the first and last step meeting the threshold, then slice all arrays
+    to that contiguous range.
+    """
+    if batch_sizes is None or peak_pct <= 0:
+        return moe_times, batch_sizes, local_token_counts, timestamps
+
+    global_batch = batch_sizes.sum(axis=1)  # [steps]
+    peak = global_batch.max()
+    threshold = peak_pct * peak
+    mask = global_batch >= threshold
+    indices = np.where(mask)[0]
+
+    if len(indices) == 0:
+        print(f"  WARNING: No steps meet {peak_pct:.0%} of peak batch ({peak}). Keeping all.")
+        return moe_times, batch_sizes, local_token_counts, timestamps
+
+    start, end = indices[0], indices[-1] + 1  # contiguous range
+    kept = end - start
+    total = len(global_batch)
+    print(
+        f"  Peak filter: global_batch peak={peak}, threshold={threshold:.0f} "
+        f"({peak_pct:.0%}), keeping steps [{start}:{end}] ({kept}/{total} steps)"
+    )
+
+    moe_times = moe_times[start:end]
+    batch_sizes = batch_sizes[start:end]
+    if local_token_counts is not None:
+        local_token_counts = local_token_counts[start:end]
+    if timestamps is not None:
+        timestamps = timestamps[start:end]
+    return moe_times, batch_sizes, local_token_counts, timestamps
+
+
 # ── Timing plots (moe_times: [steps, ranks]) ────────────────────────────
 
 
@@ -324,6 +363,13 @@ def main():
         default=10,
         help="Number of initial steps to skip as warmup (default: 10)",
     )
+    parser.add_argument(
+        "--peak-pct",
+        type=float,
+        default=0,
+        help="Keep only the contiguous time range where global batch size "
+        ">= this fraction of peak (e.g. 0.9 for 90%%). 0 = disabled.",
+    )
     args = parser.parse_args()
 
     paths = []
@@ -338,7 +384,7 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n{'=' * 60}")
-        moe_times, _batch_sizes, local_token_counts, timestamps = load_data(
+        moe_times, batch_sizes, local_token_counts, timestamps = load_data(
             str(pt_path)
         )
 
@@ -346,10 +392,17 @@ def main():
         if warmup > 0 and moe_times.shape[0] > warmup:
             print(f"  Skipping first {warmup} steps (warmup)")
             moe_times = moe_times[warmup:]
+            if batch_sizes is not None:
+                batch_sizes = batch_sizes[warmup:]
             if local_token_counts is not None:
                 local_token_counts = local_token_counts[warmup:]
             if timestamps is not None:
                 timestamps = timestamps[warmup:]
+
+        if args.peak_pct > 0:
+            moe_times, batch_sizes, local_token_counts, timestamps = filter_peak_batch(
+                moe_times, batch_sizes, local_token_counts, timestamps, args.peak_pct
+            )
 
         if moe_times.sum() == 0:
             print("  All times are zero, skipping.")

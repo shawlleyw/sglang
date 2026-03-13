@@ -15,6 +15,61 @@ import torch
 COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
 
 
+def filter_peak_batch(data: dict, peak_pct: float) -> dict:
+    """Keep only the contiguous time range where global batch size >= peak_pct * peak."""
+    if peak_pct <= 0:
+        return data
+
+    batch_sizes = data["batch_sizes"]
+    global_batch = batch_sizes.sum(axis=1)  # [steps]
+    peak = global_batch.max()
+    threshold = peak_pct * peak
+    mask = global_batch >= threshold
+    indices = np.where(mask)[0]
+
+    if len(indices) == 0:
+        print(f"  WARNING: No steps meet {peak_pct:.0%} of peak batch ({peak}). Keeping all.")
+        return data
+
+    start, end = indices[0], indices[-1] + 1
+    kept = end - start
+    total = len(global_batch)
+    print(
+        f"  Peak filter: global_batch peak={peak}, threshold={threshold:.0f} "
+        f"({peak_pct:.0%}), keeping steps [{start}:{end}] ({kept}/{total} steps)"
+    )
+
+    filtered = {
+        "pt_path": data["pt_path"],
+        "batch_sizes": batch_sizes[start:end],
+        "moe_times": data["moe_times"][start:end],
+    }
+    # Rebuild per-rank data
+    num_steps = end - start
+    ranks = []
+    for rank_data in data["ranks"]:
+        new_rank = {
+            "rank": rank_data["rank"],
+            "batch_sizes": rank_data["batch_sizes"][start:end],
+            "step_times": rank_data["step_times"][start:end],
+        }
+        if "local_tokens" in rank_data:
+            # local_tokens was reshaped to [steps * layers]; need to slice by step
+            num_layers = data["local_token_counts"].shape[1]
+            orig_steps = data["local_token_counts"].shape[0]
+            # Reshape back to [steps, layers], slice, reshape again
+            lt = rank_data["local_tokens"].reshape(orig_steps, num_layers)
+            new_rank["local_tokens"] = lt[start:end].reshape(num_steps * num_layers)
+        ranks.append(new_rank)
+    filtered["ranks"] = ranks
+
+    if "local_token_counts" in data:
+        filtered["local_token_counts"] = data["local_token_counts"][start:end]
+    if "timestamps" in data:
+        filtered["timestamps"] = data["timestamps"][start:end]
+    return filtered
+
+
 def _resolve_kernel_balance_path(path_or_dir: str) -> str | None:
     if path_or_dir.endswith(".pt") and os.path.exists(path_or_dir):
         return path_or_dir
@@ -252,6 +307,13 @@ def main():
         help='Each entry is "Label:path_to_experiment_dir_or_pt"',
     )
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--peak-pct",
+        type=float,
+        default=0,
+        help="Keep only the contiguous time range where global batch size "
+        ">= this fraction of peak (e.g. 0.9 for 90%%). 0 = disabled.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -265,6 +327,8 @@ def main():
         print(f"Loading {label} from {path_or_dir}...")
         data = load_experiment(path_or_dir)
         if data is not None:
+            if args.peak_pct > 0:
+                data = filter_peak_batch(data, args.peak_pct)
             experiments.append((label, data))
             print(
                 f"  source={data['pt_path']}, steps={data['batch_sizes'].shape[0]}, "
