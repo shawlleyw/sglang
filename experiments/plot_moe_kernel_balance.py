@@ -19,32 +19,20 @@ import torch
 
 def load_data(path: str):
     data = torch.load(path, map_location="cpu", weights_only=False)
+    # moe_times: [steps, layers, ranks], local_token_counts: [steps, layers, ranks]
     moe_times = data["moe_times"].cpu().float().numpy()
-    batch_sizes = data.get("batch_sizes")
-    if batch_sizes is not None:
-        batch_sizes = batch_sizes.cpu().int().numpy()
-    local_token_counts = data.get("local_token_counts")
-    if local_token_counts is not None:
-        local_token_counts = local_token_counts.cpu().int().numpy()
+    local_token_counts = data["local_token_counts"].cpu().int().numpy()
     timestamps = data.get("timestamps")
     if timestamps is not None:
         timestamps = timestamps.cpu().double().numpy()
     print(f"Loaded: {path}")
-    print(f"  moe_times shape    = {moe_times.shape} (decode_steps, world_size)")
-    if batch_sizes is not None:
-        print(f"  batch_sizes shape  = {batch_sizes.shape} (decode_steps, world_size)")
-    if local_token_counts is not None:
-        print(
-            f"  local_token_counts = {local_token_counts.shape} "
-            f"(decode_steps, num_layers, world_size)"
-        )
+    print(f"  moe_times shape    = {moe_times.shape} (steps, layers, ranks)")
+    print(f"  local_token_counts = {local_token_counts.shape} (steps, layers, ranks)")
     if timestamps is not None:
-        print(f"  timestamps shape   = {timestamps.shape} (decode_steps, world_size)")
-    else:
-        print("  timestamps         = NOT AVAILABLE (will fall back to step index)")
+        print(f"  timestamps shape   = {timestamps.shape} (steps, ranks)")
     print(f"  num_total_steps    = {data['num_total_steps']}")
     print(f"  num_decode_steps   = {data['num_decode_steps']}")
-    return moe_times, batch_sizes, local_token_counts, timestamps
+    return moe_times, local_token_counts, timestamps
 
 
 def filter_peak_batch(
@@ -384,40 +372,48 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n{'=' * 60}")
-        moe_times, batch_sizes, local_token_counts, timestamps = load_data(
-            str(pt_path)
-        )
+        moe_times, local_token_counts, timestamps = load_data(str(pt_path))
 
         warmup = args.warmup
         if warmup > 0 and moe_times.shape[0] > warmup:
             print(f"  Skipping first {warmup} steps (warmup)")
             moe_times = moe_times[warmup:]
-            if batch_sizes is not None:
-                batch_sizes = batch_sizes[warmup:]
             if local_token_counts is not None:
                 local_token_counts = local_token_counts[warmup:]
             if timestamps is not None:
                 timestamps = timestamps[warmup:]
 
-        if args.peak_pct > 0:
-            moe_times, batch_sizes, local_token_counts, timestamps = filter_peak_batch(
-                moe_times, batch_sizes, local_token_counts, timestamps, args.peak_pct
-            )
+        if args.peak_pct > 0 and local_token_counts is not None:
+            global_batch = local_token_counts.sum(axis=(1, 2))
+            peak = global_batch.max()
+            threshold = args.peak_pct * peak
+            indices = np.where(global_batch >= threshold)[0]
+            if len(indices) > 0:
+                start, end = indices[0], indices[-1] + 1
+                print(
+                    f"  Peak filter: keeping steps [{start}:{end}] "
+                    f"({end - start}/{len(global_batch)} steps)"
+                )
+                moe_times = moe_times[start:end]
+                local_token_counts = local_token_counts[start:end]
+                if timestamps is not None:
+                    timestamps = timestamps[start:end]
 
         if moe_times.sum() == 0:
             print("  All times are zero, skipping.")
             continue
 
-        # Convert absolute timestamps to elapsed seconds (relative to first step)
-        # Use rank 0 as reference timeline; per-rank timestamps used where needed
         elapsed = None
         if timestamps is not None:
-            elapsed = timestamps - timestamps[0, 0]  # [steps, ranks], seconds
+            elapsed = timestamps - timestamps[0, 0]
+
+        # moe_times: [steps, layers, ranks] → sum across layers for per-step per-rank total
+        moe_times_per_step = moe_times.sum(axis=1)  # [steps, ranks]
 
         print(f"  Generating plots in {output_dir}/")
-        plot_step_time_timeline(moe_times, output_dir, elapsed)
-        plot_avg_time_per_rank(moe_times, output_dir)
-        plot_time_imbalance_timeline(moe_times, output_dir, elapsed)
+        plot_step_time_timeline(moe_times_per_step, output_dir, elapsed)
+        plot_avg_time_per_rank(moe_times_per_step, output_dir)
+        plot_time_imbalance_timeline(moe_times_per_step, output_dir, elapsed)
 
         if local_token_counts is not None:
             plot_avg_heatmap_local_tokens(local_token_counts, output_dir)

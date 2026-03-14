@@ -95,6 +95,12 @@ class MoEKernelBalanceRecorder(ABC):
     def record_end(self):
         pass
 
+    def record_moe_start(self, layer_id: int):
+        pass
+
+    def record_moe_end(self, layer_id: int):
+        pass
+
     def capture_step(self, batch_size: int = 0):
         """Called from model_runner after each forward to snapshot the GPU buffer."""
         pass
@@ -126,12 +132,23 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
 
         self._forward_modes: List[int] = []
         self._batch_sizes: List[int] = []
-        self._timestamps: List[float] = []  # wall-clock time.time() per step
-        self._local_tokens_per_step: List[torch.Tensor] = []  # CPU int32 [num_layers]
-        self._step_events: List[tuple] = []  # (start_event, end_event) per step
+        self._timestamps: List[float] = []
+        self._local_tokens_per_step: List[torch.Tensor] = []
+        self._step_times: List[torch.Tensor] = []  # [step] -> tensor[num_layers] ms
 
         self._current_forward_mode_value: int = -1
-        self._pending_start_event: Optional[torch.cuda.Event] = None
+
+        # Pre-allocated CUDA events for per-layer timing.
+        # These are recorded unconditionally in FusedMoE.forward() so that
+        # the event.record() calls are captured inside CUDA graphs during
+        # warmup.  During graph replay the same events are re-recorded
+        # automatically by the replayed graph.
+        self._start_events = [
+            torch.cuda.Event(enable_timing=True) for _ in range(num_layers)
+        ]
+        self._end_events = [
+            torch.cuda.Event(enable_timing=True) for _ in range(num_layers)
+        ]
 
     def set_forward_mode(self, forward_mode: ForwardMode):
         if self._recording:
@@ -141,37 +158,44 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         if not self._recording:
             return
         self._timestamps.append(time.time())
-        start_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        self._pending_start_event = start_event
 
     def record_end(self):
-        if not self._recording:
-            return
-        if self._pending_start_event is None:
-            return
-        end_event = torch.cuda.Event(enable_timing=True)
-        end_event.record()
-        self._step_events.append((self._pending_start_event, end_event))
-        self._pending_start_event = None
+        pass
+
+    def record_moe_start(self, layer_id: int):
+        # No _recording guard — must always run so event.record() is
+        # captured inside CUDA graphs during warmup.
+        self._start_events[layer_id].record()
+
+    def record_moe_end(self, layer_id: int):
+        # No _recording guard — same reason as above.
+        self._end_events[layer_id].record()
 
     def capture_step(self, batch_size: int = 0):
-        """Snapshot the GPU local-tokens buffer after each forward pass.
-
-        Called from model_runner.forward() AFTER the model forward completes.
-        The GPU buffer was written by FusedMoE.forward() tensor ops (CUDA-graph
-        safe).  We do a D2H copy here (outside the graph).
-        """
         if not self._recording:
             return
         gpu_buf = get_local_tokens_gpu_buffer()
         if gpu_buf is None:
             return
-        # D2H copy — non_blocking since we only need the value at dump time
         cpu_snapshot = gpu_buf.to("cpu", non_blocking=True)
+        moe_batch_size = int(cpu_snapshot.sum().item())
         self._forward_modes.append(self._current_forward_mode_value)
-        self._batch_sizes.append(batch_size)
+        self._batch_sizes.append(moe_batch_size)
         self._local_tokens_per_step.append(cpu_snapshot)
+
+        # Read per-layer MoE timing from pre-allocated events.
+        # Must sync because the same events are overwritten on the next
+        # forward step (or graph replay).
+        torch.cuda.synchronize()
+        times = torch.zeros(self._num_layers, dtype=torch.float32)
+        for i in range(self._num_layers):
+            try:
+                times[i] = self._start_events[i].elapsed_time(
+                    self._end_events[i]
+                )
+            except RuntimeError:
+                times[i] = 0.0
+        self._step_times.append(times)
 
     def start_record(self):
         self._recording = True
@@ -185,9 +209,8 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         self._batch_sizes.clear()
         self._timestamps.clear()
         self._local_tokens_per_step.clear()
-        self._step_events.clear()
+        self._step_times.clear()
         self._current_forward_mode_value = -1
-        self._pending_start_event = None
 
     @property
     def recording(self):
@@ -199,17 +222,14 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
 
         torch.cuda.synchronize()
 
-        # --- Per-step timing from events ---
-        # record_start / record_end are called from model_runner.forward()
-        # (outside the compiled / CUDA-graph region) so every step has an
-        # event pair.  They are 1:1 aligned with capture_step entries.
-        local_times_cpu = torch.zeros(num_steps, dtype=torch.float32)
-        num_event_steps = min(len(self._step_events), num_steps)
-        for step_idx in range(num_event_steps):
-            start_evt, end_evt = self._step_events[step_idx]
-            local_times_cpu[step_idx] = start_evt.elapsed_time(end_evt)
+        # Build per-layer MoE times from values stored in capture_step()
+        local_times_cpu = torch.zeros(
+            (num_steps, self._num_layers), dtype=torch.float32
+        )
+        for step_idx in range(min(len(self._step_times), num_steps)):
+            local_times_cpu[step_idx] = self._step_times[step_idx]
 
-        # --- Gather across ranks ---
+        # --- Gather across ranks (symmetric on all ranks) ---
         local_num_steps = torch.tensor([num_steps], dtype=torch.int64, device=device)
         all_num_steps_list = [
             torch.zeros(1, dtype=torch.int64, device=device)
@@ -227,8 +247,9 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         local_modes = torch.full(
             (max_steps,), fill_value=-1, dtype=torch.int32, device=device
         )
-        local_times = torch.zeros(max_steps, dtype=torch.float32, device=device)
-        local_bsz = torch.zeros((max_steps,), dtype=torch.int32, device=device)
+        local_times = torch.zeros(
+            (max_steps, self._num_layers), dtype=torch.float32, device=device
+        )
         local_ltok = torch.zeros(
             (max_steps, self._num_layers), dtype=torch.int32, device=device
         )
@@ -239,19 +260,16 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
                 self._forward_modes, dtype=torch.int32, device=device
             )
             local_times[:num_steps] = local_times_cpu.to(device)
-            local_bsz[:num_steps] = torch.tensor(
-                self._batch_sizes, dtype=torch.int32, device=device
-            )
-            # Wall-clock timestamps (time.time() recorded at record_start)
             num_ts = min(len(self._timestamps), num_steps)
             if num_ts > 0:
                 local_ts[:num_ts] = torch.tensor(
                     self._timestamps[:num_ts], dtype=torch.float64, device=device
                 )
-            # Stack CPU snapshots from capture_step (already CPU tensors)
             if self._local_tokens_per_step:
-                ltok_stacked = torch.stack(self._local_tokens_per_step)  # [steps, layers]
-                local_ltok[:num_steps] = ltok_stacked.to(device=device, dtype=torch.int32)
+                ltok_stacked = torch.stack(self._local_tokens_per_step)
+                local_ltok[:num_steps] = ltok_stacked.to(
+                    device=device, dtype=torch.int32
+                )
 
         all_modes_list = [
             torch.zeros_like(local_modes) for _ in range(self._world_size)
@@ -266,13 +284,8 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
             torch.zeros_like(local_times) for _ in range(self._world_size)
         ]
         torch.distributed.all_gather(all_times_list, local_times)
-        all_times = torch.stack(all_times_list)  # [world_size, max_steps]
-
-        all_bsz_list = [
-            torch.zeros_like(local_bsz) for _ in range(self._world_size)
-        ]
-        torch.distributed.all_gather(all_bsz_list, local_bsz)
-        all_bsz = torch.stack(all_bsz_list)
+        all_times = torch.stack(all_times_list)
+        # all_times: [world_size, max_steps, num_layers]
 
         all_ltok_list = [
             torch.zeros_like(local_ltok) for _ in range(self._world_size)
@@ -284,21 +297,18 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
             torch.zeros_like(local_ts) for _ in range(self._world_size)
         ]
         torch.distributed.all_gather(all_ts_list, local_ts)
-        all_ts = torch.stack(all_ts_list)  # [world_size, max_steps]
+        all_ts = torch.stack(all_ts_list)
 
-        # moe_times: [decode_steps, world_size]  (per-step total forward time)
-        decode_times = all_times[:, all_decode_mask]  # [world_size, decode_steps]
-        result = decode_times.permute(1, 0).contiguous()  # [decode_steps, world_size]
-        decode_bsz = all_bsz[:, all_decode_mask].permute(1, 0).contiguous()
+        # moe_times: [decode_steps, num_layers, world_size]
+        decode_times = all_times[:, all_decode_mask, :]
+        result = decode_times.permute(1, 2, 0).contiguous()
         decode_ltok = all_ltok[:, all_decode_mask, :]
         decode_ltok = decode_ltok.permute(1, 2, 0).contiguous()
         decode_ts = all_ts[:, all_decode_mask].permute(1, 0).contiguous()
-        # decode_ts: [decode_steps, world_size] — wall-clock time per rank per step
 
         output = dict(
             rank=self._rank,
             moe_times=result,
-            batch_sizes=decode_bsz,
             local_token_counts=decode_ltok,
             timestamps=decode_ts,
             num_total_steps=max_steps,

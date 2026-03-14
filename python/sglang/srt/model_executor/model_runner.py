@@ -2178,13 +2178,8 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
-            kernel_recorder.record_end()
 
-        # Snapshot the GPU local-tokens buffer (written by FusedMoE tensor ops
-        # inside the CUDA graph).  This D2H copy runs outside the graph.
-        get_global_moe_kernel_balance_recorder().capture_step(
-            batch_size=forward_batch.batch_size,
-        )
+        get_global_moe_kernel_balance_recorder().capture_step()
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()

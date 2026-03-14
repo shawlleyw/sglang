@@ -858,10 +858,14 @@ class FusedMoE(torch.nn.Module):
                 (topk_output.topk_ids >= _local_start) & (topk_output.topk_ids < _local_end)
             ).sum()
 
+        from sglang.srt.eplb.moe_kernel_balance import get_global_moe_kernel_balance_recorder
+        _kr = get_global_moe_kernel_balance_recorder()
+        _kr.record_moe_start(self.layer_id)
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
             **kwargs,
         )
+        _kr.record_moe_end(self.layer_id)
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()

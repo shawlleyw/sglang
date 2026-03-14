@@ -18,14 +18,14 @@ PROFILES=(
 )
 PROFILE_NAMES=(gptoss gsm8k legal chinese)
 
-EXP_ID="sgl-006"
+EXP_ID="sgl-008"
 MEM_FRAC="0.70"
 NUM_PROMPTS=8000
 REQUEST_RATE=2000
 INPUT_LEN=128
 OUTPUT_LEN=512
-MAX_RUNNING_REQS=1024
-CUDA_GRAPH_MAX_BS=1024
+MAX_RUNNING_REQS=
+CUDA_GRAPH_MAX_BS=
 
 mkdir -p "experiments/${EXP_ID}" logs
 
@@ -62,8 +62,8 @@ launch_ep16() {
     mkdir -p "$exp_dir/recorder_raw"
 
     tmux new-session -d -s sglang-head \
-        "bash experiments/scripts/launch_head_ep_record.sh \
-         ./gating_profiles/$profile $exp_dir/server_head.log $exp_dir/recorder_raw $MEM_FRAC $MAX_RUNNING_REQS $CUDA_GRAPH_MAX_BS"
+        "bash experiments/scripts/sphere-16/launch_head_ep_record.sh \
+         ./gating_profiles/$profile $exp_dir/server_head.log $exp_dir/recorder_raw '$MEM_FRAC' '$MAX_RUNNING_REQS' '$CUDA_GRAPH_MAX_BS'"
 
     sleep 3
 
@@ -72,7 +72,7 @@ launch_ep16() {
         local rank="${WORKER_RANKS[$i]}"
         local sess="sglang-w$((i+1))"
         tmux new-session -d -s "$sess" \
-            "ssh $w 'bash /home/yizhuoliang/sglang-fake-prefill/experiments/scripts/launch_worker_ep_record.sh \
+            "ssh $w 'bash /home/yizhuoliang/sglang-fake-prefill/experiments/scripts/sphere-16/launch_worker_ep_record.sh \
              $rank ./gating_profiles/$profile $exp_dir/server_w${rank}.log $exp_dir/recorder_raw $MEM_FRAC $MAX_RUNNING_REQS $CUDA_GRAPH_MAX_BS'"
     done
 }
@@ -142,8 +142,8 @@ for pi in "${!PROFILES[@]}"; do
         MEM_FRAC="$ORIG_MEM_FRAC"
     fi
 
-    curl -X POST http://localhost:30000/stop_expert_distribution_record 2>/dev/null || true
-    curl -X POST http://localhost:30000/dump_expert_distribution_record 2>/dev/null || true
+    timeout 30 curl -X POST http://localhost:30000/stop_expert_distribution_record 2>/dev/null || true
+    timeout 30 curl -X POST http://localhost:30000/dump_expert_distribution_record 2>/dev/null || true
     sleep 3
 
     kill_all
