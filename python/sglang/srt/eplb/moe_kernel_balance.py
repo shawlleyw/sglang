@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import time
 from abc import ABC
@@ -27,6 +28,59 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# cudaEventRecordWithFlags via ctypes
+#
+# torch.cuda.Event.record() uses cudaEventRecord() which does NOT set the
+# CU_EVENT_RECORD_EXTERNAL flag.  Without this flag, events recorded inside
+# a CUDA graph capture produce no valid timing data on graph replay — the
+# events become "internal" to the graph and elapsed_time() returns 0.
+#
+# Fix: call cudaEventRecordWithFlags(event, stream, cudaEventRecordExternal)
+# so the events are treated as external synchronization points whose timing
+# is observable after replay.
+#
+# See: https://github.com/pytorch/pytorch/issues/115339
+# ---------------------------------------------------------------------------
+_cudart_lib = None
+try:
+    _cudart_lib = ctypes.CDLL("libcudart.so")
+except OSError:
+    for _suffix in ("libcudart.so.12", "libcudart.so.11"):
+        try:
+            _cudart_lib = ctypes.CDLL(_suffix)
+            break
+        except OSError:
+            continue
+
+_CUDA_EVENT_RECORD_EXTERNAL = 0x1
+
+
+def _event_record_for_graph(event: torch.cuda.Event):
+    """Record a CUDA event with cudaEventRecordExternal flag.
+
+    Must be used instead of event.record() for events that are recorded
+    inside CUDA graph capture regions and need valid elapsed_time() after
+    graph replay.
+    """
+    stream = torch.cuda.current_stream()
+    handle = event.cuda_event
+    if _cudart_lib is not None and handle != 0:
+        ret = _cudart_lib.cudaEventRecordWithFlags(
+            ctypes.c_void_p(handle),
+            ctypes.c_void_p(stream.cuda_stream),
+            ctypes.c_uint(_CUDA_EVENT_RECORD_EXTERNAL),
+        )
+        if ret != 0:
+            logger.warning(
+                "cudaEventRecordWithFlags returned %d, falling back to event.record()",
+                ret,
+            )
+            event.record(stream)
+    else:
+        event.record(stream)
+
 
 _OutputMode = Literal["file", "object"]
 
@@ -163,13 +217,24 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         pass
 
     def record_moe_start(self, layer_id: int):
-        # No _recording guard — must always run so event.record() is
-        # captured inside CUDA graphs during warmup.
-        self._start_events[layer_id].record()
+        # No _recording guard — must always run so event.record() calls
+        # are captured inside CUDA graphs during warmup/capture.
+        #
+        # During graph capture we must use cudaEventRecordWithFlags with
+        # CU_EVENT_RECORD_EXTERNAL so that the events produce valid timing
+        # data on graph replay.  During normal (non-graph) execution,
+        # regular event.record() suffices and is cheaper.
+        if torch.cuda.is_current_stream_capturing():
+            _event_record_for_graph(self._start_events[layer_id])
+        else:
+            self._start_events[layer_id].record()
 
     def record_moe_end(self, layer_id: int):
-        # No _recording guard — same reason as above.
-        self._end_events[layer_id].record()
+        # Same logic as record_moe_start — see comment above.
+        if torch.cuda.is_current_stream_capturing():
+            _event_record_for_graph(self._end_events[layer_id])
+        else:
+            self._end_events[layer_id].record()
 
     def capture_step(self, batch_size: int = 0):
         if not self._recording:
@@ -190,9 +255,7 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         times = torch.zeros(self._num_layers, dtype=torch.float32)
         for i in range(self._num_layers):
             try:
-                times[i] = self._start_events[i].elapsed_time(
-                    self._end_events[i]
-                )
+                times[i] = self._start_events[i].elapsed_time(self._end_events[i])
             except RuntimeError:
                 times[i] = 0.0
         self._step_times.append(times)
@@ -287,15 +350,11 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         all_times = torch.stack(all_times_list)
         # all_times: [world_size, max_steps, num_layers]
 
-        all_ltok_list = [
-            torch.zeros_like(local_ltok) for _ in range(self._world_size)
-        ]
+        all_ltok_list = [torch.zeros_like(local_ltok) for _ in range(self._world_size)]
         torch.distributed.all_gather(all_ltok_list, local_ltok)
         all_ltok = torch.stack(all_ltok_list)
 
-        all_ts_list = [
-            torch.zeros_like(local_ts) for _ in range(self._world_size)
-        ]
+        all_ts_list = [torch.zeros_like(local_ts) for _ in range(self._world_size)]
         torch.distributed.all_gather(all_ts_list, local_ts)
         all_ts = torch.stack(all_ts_list)
 
