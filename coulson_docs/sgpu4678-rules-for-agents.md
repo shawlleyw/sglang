@@ -297,6 +297,7 @@ logs/bench_run1.log          # TP8, run 1
 ```
 gating_profiles/gating_gptoss120b_200.parquet   # General-purpose (ShareGPT-like)
 gating_profiles/gating_math_gsm8k_200.parquet   # Math topic (GSM8K)
+now there are more! chinese, legal, math
 ```
 
 Used with `--profile-driven-gate-path`. **Always** pair with `--disable-radix-cache --chunked-prefill-size -1`.
