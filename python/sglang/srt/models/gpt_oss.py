@@ -38,6 +38,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.moe_kernel_balance import get_global_moe_kernel_balance_recorder
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -115,8 +116,13 @@ class GptOssSparseMoeBlock(nn.Module):
         self._top_k_config = config.num_experts_per_tok
 
         # Lazily initialize profile-driven router (shared global singleton)
-        from sglang.srt.layers.moe.profile_driven_router import maybe_init_global_profile_router
-        maybe_init_global_profile_router(config.num_local_experts, config.num_experts_per_tok)
+        from sglang.srt.layers.moe.profile_driven_router import (
+            maybe_init_global_profile_router,
+        )
+
+        maybe_init_global_profile_router(
+            config.num_local_experts, config.num_experts_per_tok
+        )
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -132,8 +138,7 @@ class GptOssSparseMoeBlock(nn.Module):
             )
             extra_kwargs = {
                 # for moe gate_up_proj and down_proj and their bias loading
-                "use_weight_loader_fused": quant_config_name
-                != "mxfp4"
+                "use_weight_loader_fused": quant_config_name != "mxfp4"
             }
         self.experts = experts_type(
             num_experts=config.num_local_experts
@@ -170,7 +175,9 @@ class GptOssSparseMoeBlock(nn.Module):
             return self.forward_deepep(hidden_states, forward_batch)
         else:
             # mooncake-nccl and none both use forward_normal (standard EP with NCCL all-reduce)
-            return self.forward_normal(hidden_states, forward_batch, should_allreduce_fusion)
+            return self.forward_normal(
+                hidden_states, forward_batch, should_allreduce_fusion
+            )
 
     def get_moe_weights(self):
         return [
@@ -189,8 +196,11 @@ class GptOssSparseMoeBlock(nn.Module):
         router_logits, _ = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
 
-        from sglang.srt.layers.moe.profile_driven_router import get_global_profile_router
+        from sglang.srt.layers.moe.profile_driven_router import (
+            get_global_profile_router,
+        )
         from sglang.srt.layers.moe.topk import StandardTopKOutput
+
         profile_router = get_global_profile_router()
         if profile_router is not None and forward_batch is not None:
             # Align batch metadata with actual hidden_states token count.
@@ -209,7 +219,8 @@ class GptOssSparseMoeBlock(nn.Module):
                 else:
                     # Fewer req_ids than tokens: repeat last entry
                     req_ids = req_ids[
-                        torch.arange(num_tokens, device=req_ids.device) % req_ids.shape[0]
+                        torch.arange(num_tokens, device=req_ids.device)
+                        % req_ids.shape[0]
                     ]
 
             profiled_weights, profiled_ids = profile_router.route_gpu(
@@ -217,8 +228,10 @@ class GptOssSparseMoeBlock(nn.Module):
                 token_indices=pos,
                 layer_id=self.layer_id,
             )
-            original_logits = getattr(topk_output, 'router_logits', router_logits)
-            topk_output = StandardTopKOutput(profiled_weights, profiled_ids, original_logits)
+            original_logits = getattr(topk_output, "router_logits", router_logits)
+            topk_output = StandardTopKOutput(
+                profiled_weights, profiled_ids, original_logits
+            )
 
         final_hidden_states = self.experts(hidden_states, topk_output)
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -235,8 +248,11 @@ class GptOssSparseMoeBlock(nn.Module):
         router_logits, _ = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
 
-        from sglang.srt.layers.moe.profile_driven_router import get_global_profile_router
+        from sglang.srt.layers.moe.profile_driven_router import (
+            get_global_profile_router,
+        )
         from sglang.srt.layers.moe.topk import StandardTopKOutput
+
         profile_router = get_global_profile_router()
         if profile_router is not None and forward_batch is not None:
             req_ids = forward_batch.req_pool_indices
@@ -247,15 +263,29 @@ class GptOssSparseMoeBlock(nn.Module):
                     get_dp_local_info,
                     memcpy_triton,
                 )
+
                 local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-                global_pos = torch.zeros(num_tokens, dtype=torch.float32, device=pos.device)
-                memcpy_triton(global_pos, pos.float(), 0, local_start_pos, local_num_tokens, False)
+                global_pos = torch.zeros(
+                    num_tokens, dtype=torch.float32, device=pos.device
+                )
+                memcpy_triton(
+                    global_pos, pos.float(), 0, local_start_pos, local_num_tokens, False
+                )
                 global_pos = tensor_model_parallel_all_reduce(global_pos)
                 pos = global_pos.to(torch.int64)
 
-                global_req = torch.zeros(num_tokens, dtype=torch.float32, device=req_ids.device)
-                memcpy_triton(global_req, req_ids.float(), 0, local_start_pos, local_num_tokens, False)
+                global_req = torch.zeros(
+                    num_tokens, dtype=torch.float32, device=req_ids.device
+                )
+                memcpy_triton(
+                    global_req,
+                    req_ids.float(),
+                    0,
+                    local_start_pos,
+                    local_num_tokens,
+                    False,
+                )
                 global_req = tensor_model_parallel_all_reduce(global_req)
                 req_ids = global_req.to(torch.int64)
             else:
@@ -268,7 +298,8 @@ class GptOssSparseMoeBlock(nn.Module):
                         req_ids = req_ids[:num_tokens]
                     else:
                         req_ids = req_ids[
-                            torch.arange(num_tokens, device=req_ids.device) % req_ids.shape[0]
+                            torch.arange(num_tokens, device=req_ids.device)
+                            % req_ids.shape[0]
                         ]
 
             profiled_weights, profiled_ids = profile_router.route_gpu(
@@ -276,8 +307,10 @@ class GptOssSparseMoeBlock(nn.Module):
                 token_indices=pos,
                 layer_id=self.layer_id,
             )
-            original_logits = getattr(topk_output, 'router_logits', router_logits)
-            topk_output = StandardTopKOutput(profiled_weights, profiled_ids, original_logits)
+            original_logits = getattr(topk_output, "router_logits", router_logits)
+            topk_output = StandardTopKOutput(
+                profiled_weights, profiled_ids, original_logits
+            )
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.tp_size > 1 and not should_allreduce_fusion:
@@ -526,6 +559,7 @@ class GptOssDecoderLayer(nn.Module):
             is_last_layer=(
                 self.is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
+            layer_id=self.layer_id,
         )
 
     def forward(
@@ -535,16 +569,20 @@ class GptOssDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _kr = get_global_moe_kernel_balance_recorder()
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
 
+        _kr.record_attn_start(self.layer_id)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        _kr.record_attn_end(self.layer_id)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -847,7 +885,6 @@ class GptOssForCausalLM(nn.Module):
         )
 
     def _load_mxfp4_experts_weights(self, weights):
-
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         mxfp4_block = 32
@@ -858,9 +895,9 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_size = get_moe_expert_parallel_world_size()
 
         intermediate_size = self.config.intermediate_size
-        assert (
-            intermediate_size % mxfp4_block == 0
-        ), f"{intermediate_size=} must be divisible by {mxfp4_block=}"
+        assert intermediate_size % mxfp4_block == 0, (
+            f"{intermediate_size=} must be divisible by {mxfp4_block=}"
+        )
         intermediate_size_block = intermediate_size // mxfp4_block
 
         per_rank_intermediate_size_block = math.ceil(

@@ -42,6 +42,9 @@ def filter_peak_batch(data: dict, peak_pct: float) -> dict:
     filtered["local_token_counts"] = data["local_token_counts"][start:end]
     if "timestamps" in data:
         filtered["timestamps"] = data["timestamps"][start:end]
+    for key in ("attn_times", "ag_times", "ar_times"):
+        if key in data:
+            filtered[key] = data[key][start:end]
     return filtered
 
 
@@ -78,6 +81,10 @@ def load_experiment(path_or_dir: str):
     }
     if timestamps is not None:
         result["timestamps"] = timestamps
+    for key in ("attn_times", "ag_times", "ar_times"):
+        t = data.get(key)
+        if t is not None:
+            result[key] = t.cpu().float().numpy()
     return result
 
 
@@ -158,12 +165,19 @@ def plot_timeline_grid(experiments, output_path, metric="local_token_counts"):
             window = max(len(mean_series) // 50, 10)
             rolling = np.convolve(mean_series, np.ones(window) / window, mode="valid")
             ax.plot(
-                x[window - 1:], rolling,
-                linewidth=2.5, color="black", alpha=0.8,
+                x[window - 1 :],
+                rolling,
+                linewidth=2.5,
+                color="black",
+                alpha=0.8,
                 label=f"rolling avg (w={window})",
             )
 
-        ylabel = "Local Tokens (avg over layers)" if metric == "local_token_counts" else "MoE Time (ms, avg over layers)"
+        ylabel = (
+            "Local Tokens (avg over layers)"
+            if metric == "local_token_counts"
+            else "MoE Time (ms, avg over layers)"
+        )
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.set_title(label)
@@ -174,7 +188,11 @@ def plot_timeline_grid(experiments, output_path, metric="local_token_counts"):
         r, c = divmod(i, cols)
         axes[r][c].set_visible(False)
 
-    title = "Local Token Count Timeline" if metric == "local_token_counts" else "MoE Compute Time Timeline"
+    title = (
+        "Local Token Count Timeline"
+        if metric == "local_token_counts"
+        else "MoE Compute Time Timeline"
+    )
     fig.suptitle(title, fontsize=14, y=1.01)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -210,8 +228,10 @@ def plot_cumulative_tokens_comparison(experiments, output_path):
         for rank in range(world_size):
             x_rank = (ts[:, rank] - t0) if has_ts else np.arange(num_steps)
             ax.plot(
-                x_rank, cumulative[:, rank],
-                linewidth=1.2, alpha=0.8,
+                x_rank,
+                cumulative[:, rank],
+                linewidth=1.2,
+                alpha=0.8,
                 color=cmap(rank / max(world_size - 1, 1)),
                 label=f"Rank {rank}",
             )
@@ -231,15 +251,118 @@ def plot_cumulative_tokens_comparison(experiments, output_path):
     print(f"  Saved: {output_path}")
 
 
+def plot_heatmap_summary(experiments, output_path, metric="local_token_counts"):
+    """Side-by-side layer×rank heatmaps for all experiments in a single PNG."""
+    n = len(experiments)
+    fig, axes = plt.subplots(1, n, figsize=(6 * n, 6), squeeze=False)
+
+    if metric == "local_token_counts":
+        cmap = "viridis"
+        cb_label = "Token-Expert Pairs"
+        suptitle = "Local Token Count — Avg per Layer per Rank"
+    else:
+        cmap = "inferno"
+        cb_label = "Time (ms)"
+        suptitle = "MoE Compute Time (ms) — Avg per Layer per Rank"
+
+    for i, (label, data) in enumerate(experiments):
+        ax = axes[0][i]
+        arr = data[metric].astype(np.float64)
+        avg = arr.mean(axis=0)  # [layers, ranks]
+        num_layers, world_size = avg.shape
+
+        im = ax.imshow(avg.T, aspect="auto", cmap=cmap, interpolation="nearest")
+        ax.set_xlabel("Layer ID")
+        if i == 0:
+            ax.set_ylabel("Rank")
+        else:
+            ax.set_yticklabels([])
+        ax.set_title(label)
+        ax.set_xticks(np.arange(0, num_layers, max(1, num_layers // 10)))
+        ax.set_yticks(np.arange(world_size))
+        fig.colorbar(im, ax=ax, label=cb_label, shrink=0.8)
+
+    fig.suptitle(suptitle, fontsize=14, y=1.02)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def plot_phase_breakdown_comparison(experiments, output_path):
+    """Grouped bar chart comparing phase breakdown across experiments.
+
+    Each experiment gets a stacked bar showing average per-step time
+    split into ag, attn, ar, moe phases.
+    """
+    has_phases = all(
+        "attn_times" in d and "ag_times" in d and "ar_times" in d
+        for _, d in experiments
+    )
+    if not has_phases:
+        print("  Skipping phase breakdown comparison (missing phase data)")
+        return
+
+    n = len(experiments)
+    labels = []
+    avg_ag_vals = []
+    avg_attn_vals = []
+    avg_ar_vals = []
+    avg_moe_vals = []
+
+    for label, data in experiments:
+        labels.append(label)
+        avg_moe_vals.append(data["moe_times"].sum(axis=1).mean())
+        avg_attn_vals.append(data["attn_times"].sum(axis=1).mean())
+        avg_ag_vals.append(data["ag_times"].sum(axis=1).mean())
+        avg_ar_vals.append(data["ar_times"].sum(axis=1).mean())
+
+    avg_ag = np.array(avg_ag_vals)
+    avg_attn = np.array(avg_attn_vals)
+    avg_ar = np.array(avg_ar_vals)
+    avg_moe = np.array(avg_moe_vals)
+
+    x = np.arange(n)
+    bar_width = 0.5
+    fig, ax = plt.subplots(figsize=(max(6, n * 2), 5))
+
+    bottom = np.zeros(n)
+    ax.bar(x, avg_ag, bar_width, bottom=bottom, label="All-Gather", color="#ff7f0e")
+    bottom += avg_ag
+    ax.bar(x, avg_attn, bar_width, bottom=bottom, label="Attention", color="#1f77b4")
+    bottom += avg_attn
+    ax.bar(x, avg_ar, bar_width, bottom=bottom, label="All-Reduce", color="#d62728")
+    bottom += avg_ar
+    ax.bar(x, avg_moe, bar_width, bottom=bottom, label="MoE FFN", color="#2ca02c")
+
+    ax.set_xlabel("Experiment")
+    ax.set_ylabel("Avg Per-Step Time (ms, summed across layers & ranks)")
+    ax.set_title("Phase Breakdown Comparison")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.legend(loc="upper right")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Compare recorder dumps across experiments")
+    parser = argparse.ArgumentParser(
+        description="Compare recorder dumps across experiments"
+    )
     parser.add_argument(
-        "--experiments", nargs="+", required=True,
+        "--experiments",
+        nargs="+",
+        required=True,
         help='Each entry is "Label:path_to_experiment_dir_or_pt"',
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
-        "--peak-pct", type=float, default=0,
+        "--peak-pct",
+        type=float,
+        default=0,
         help="Keep only the contiguous time range where global batch size "
         ">= this fraction of peak (e.g. 0.9 for 90%%). 0 = disabled.",
     )
@@ -260,7 +383,9 @@ def main():
                 data = filter_peak_batch(data, args.peak_pct)
             experiments.append((label, data))
             s = data["moe_times"].shape
-            print(f"  source={data['pt_path']}, steps={s[0]}, layers={s[1]}, ranks={s[2]}")
+            print(
+                f"  source={data['pt_path']}, steps={s[0]}, layers={s[1]}, ranks={s[2]}"
+            )
 
     if not experiments:
         print("No data loaded.")
@@ -302,6 +427,26 @@ def main():
     plot_cumulative_tokens_comparison(
         experiments,
         output_path=os.path.join(args.output_dir, "cumulative_tokens_comparison.png"),
+    )
+
+    print("Plotting local token count heatmap summary...")
+    plot_heatmap_summary(
+        experiments,
+        output_path=os.path.join(args.output_dir, "heatmap_local_tokens.png"),
+        metric="local_token_counts",
+    )
+
+    print("Plotting MoE compute time heatmap summary...")
+    plot_heatmap_summary(
+        experiments,
+        output_path=os.path.join(args.output_dir, "heatmap_moe_times.png"),
+        metric="moe_times",
+    )
+
+    print("Plotting phase breakdown comparison...")
+    plot_phase_breakdown_comparison(
+        experiments,
+        output_path=os.path.join(args.output_dir, "phase_breakdown_comparison.png"),
     )
 
     print(f"\nAll comparison plots saved to: {args.output_dir}/")

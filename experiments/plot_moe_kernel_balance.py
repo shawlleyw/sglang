@@ -19,20 +19,28 @@ import torch
 
 def load_data(path: str):
     data = torch.load(path, map_location="cpu", weights_only=False)
-    # moe_times: [steps, layers, ranks], local_token_counts: [steps, layers, ranks]
     moe_times = data["moe_times"].cpu().float().numpy()
     local_token_counts = data["local_token_counts"].cpu().int().numpy()
     timestamps = data.get("timestamps")
     if timestamps is not None:
         timestamps = timestamps.cpu().double().numpy()
+
+    phase_times = {}
+    for key in ("attn_times", "ag_times", "ar_times"):
+        t = data.get(key)
+        if t is not None:
+            phase_times[key] = t.cpu().float().numpy()
+
     print(f"Loaded: {path}")
     print(f"  moe_times shape    = {moe_times.shape} (steps, layers, ranks)")
     print(f"  local_token_counts = {local_token_counts.shape} (steps, layers, ranks)")
     if timestamps is not None:
         print(f"  timestamps shape   = {timestamps.shape} (steps, ranks)")
+    for key, arr in phase_times.items():
+        print(f"  {key} shape      = {arr.shape}")
     print(f"  num_total_steps    = {data['num_total_steps']}")
     print(f"  num_decode_steps   = {data['num_decode_steps']}")
-    return moe_times, local_token_counts, timestamps
+    return moe_times, local_token_counts, timestamps, phase_times
 
 
 def filter_peak_batch(
@@ -54,7 +62,9 @@ def filter_peak_batch(
     indices = np.where(mask)[0]
 
     if len(indices) == 0:
-        print(f"  WARNING: No steps meet {peak_pct:.0%} of peak batch ({peak}). Keeping all.")
+        print(
+            f"  WARNING: No steps meet {peak_pct:.0%} of peak batch ({peak}). Keeping all."
+        )
         return moe_times, batch_sizes, local_token_counts, timestamps
 
     start, end = indices[0], indices[-1] + 1  # contiguous range
@@ -93,7 +103,9 @@ def plot_step_time_timeline(
         ax.plot(x, moe_times[:, rank], alpha=0.6, linewidth=0.5, label=f"Rank {rank}")
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Forward Time (ms)")
-    ax.set_title(f"Per-Step Forward Time ({num_steps} decode steps, {world_size} ranks)")
+    ax.set_title(
+        f"Per-Step Forward Time ({num_steps} decode steps, {world_size} ranks)"
+    )
     ax.legend(fontsize=7, ncol=min(world_size, 4), loc="upper right")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -109,15 +121,12 @@ def plot_avg_time_per_rank(moe_times: np.ndarray, output_dir: Path):
     world_size = len(avg)
     fig, ax = plt.subplots(figsize=(8, 4))
     ranks = np.arange(world_size)
-    colors = plt.cm.RdYlGn_r(
-        (avg - avg.min()) / max(avg.max() - avg.min(), 1e-6)
-    )
+    colors = plt.cm.RdYlGn_r((avg - avg.min()) / max(avg.max() - avg.min(), 1e-6))
     ax.bar(ranks, avg, color=colors)
     ax.set_xlabel("Rank")
     ax.set_ylabel("Avg Forward Time (ms)")
     ax.set_title(
-        f"Avg Forward Time per Rank "
-        f"(CV={avg.std() / max(avg.mean(), 1e-6):.4f})"
+        f"Avg Forward Time per Rank (CV={avg.std() / max(avg.mean(), 1e-6):.4f})"
     )
     ax.set_xticks(ranks)
     ax.grid(True, axis="y", alpha=0.3)
@@ -152,6 +161,34 @@ def plot_time_imbalance_timeline(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fname = "time_imbalance_timeline.png"
+    fig.savefig(output_dir / fname, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {fname}")
+
+
+# ── Per-layer per-rank MoE time heatmap ──────────────────────────────────
+
+
+def plot_avg_heatmap_moe_times(moe_times: np.ndarray, output_dir: Path):
+    """Heatmap of average MoE compute time (ms) per layer per rank.
+
+    moe_times: [steps, layers, ranks]
+    """
+    avg = moe_times.astype(np.float64).mean(axis=0)  # [layers, ranks]
+    num_layers, world_size = avg.shape
+
+    fig, ax = plt.subplots(
+        figsize=(max(10, num_layers * 0.15), max(4, world_size * 0.4))
+    )
+    im = ax.imshow(avg.T, aspect="auto", cmap="inferno", interpolation="nearest")
+    ax.set_xlabel("Layer ID")
+    ax.set_ylabel("Rank")
+    ax.set_title(f"MoE Compute Time (ms) — Avg over {moe_times.shape[0]} Decode Steps")
+    ax.set_xticks(np.arange(0, num_layers, max(1, num_layers // 20)))
+    ax.set_yticks(np.arange(world_size))
+    fig.colorbar(im, ax=ax, label="Time (ms)")
+    fig.tight_layout()
+    fname = "moe_times_avg_heatmap.png"
     fig.savefig(output_dir / fname, dpi=150)
     plt.close(fig)
     print(f"  Saved {fname}")
@@ -218,7 +255,9 @@ def plot_step_rank_heatmap_local_tokens(
     X-axis: time (s) or decode step, Y-axis: rank, color: total local token count.
     """
     # local_token_counts: [steps, layers, ranks]
-    total_per_step_rank = local_token_counts.astype(np.float64).sum(axis=1)  # [steps, ranks]
+    total_per_step_rank = local_token_counts.astype(np.float64).sum(
+        axis=1
+    )  # [steps, ranks]
     num_steps, world_size = total_per_step_rank.shape
 
     fig, ax = plt.subplots(figsize=(14, max(3, world_size * 0.5)))
@@ -233,8 +272,11 @@ def plot_step_rank_heatmap_local_tokens(
         t_edges[1:-1] = (t[:-1] + t[1:]) / 2
         rank_edges = np.arange(world_size + 1) - 0.5
         im = ax.pcolormesh(
-            t_edges, rank_edges, total_per_step_rank.T,
-            cmap="inferno", shading="flat",
+            t_edges,
+            rank_edges,
+            total_per_step_rank.T,
+            cmap="inferno",
+            shading="flat",
         )
         xlabel = "Time (s)"
     else:
@@ -294,16 +336,17 @@ def plot_cumulative_tokens_timeline(
         else:
             x = np.arange(num_steps)
         ax.plot(
-            x, cumulative[:, rank],
-            linewidth=1.2, alpha=0.8,
+            x,
+            cumulative[:, rank],
+            linewidth=1.2,
+            alpha=0.8,
             color=cmap(rank / max(world_size - 1, 1)),
             label=f"Rank {rank}",
         )
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Cumulative Local Tokens")
     ax.set_title(
-        f"Cumulative Local MoE Tokens per Rank "
-        f"({num_steps} steps, {world_size} ranks)"
+        f"Cumulative Local MoE Tokens per Rank ({num_steps} steps, {world_size} ranks)"
     )
     ax.legend(fontsize=7, ncol=min(world_size, 4), loc="upper left")
     ax.grid(True, alpha=0.3)
@@ -330,6 +373,63 @@ def plot_cumulative_tokens_timeline(
     print(f"  Saved {fname}")
 
 
+# ── Phase breakdown plots ────────────────────────────────────────────────
+
+
+def plot_phase_breakdown_per_rank(
+    moe_times: np.ndarray, phase_times: dict, output_dir: Path
+):
+    """Stacked bar chart of average per-step time breakdown by rank.
+
+    Each bar shows the four phases: attn (blue), ag (orange), moe (green), ar (red).
+    moe_times: [steps, layers, ranks]
+    phase_times: dict with attn_times/ag_times/ar_times, each [steps, layers, ranks]
+    """
+    attn = phase_times.get("attn_times")
+    ag = phase_times.get("ag_times")
+    ar = phase_times.get("ar_times")
+    if attn is None or ag is None or ar is None:
+        print("  Skipping phase breakdown (missing phase data)")
+        return
+
+    world_size = moe_times.shape[2]
+    ranks = np.arange(world_size)
+
+    avg_moe = moe_times.sum(axis=1).mean(axis=0)
+    avg_attn = attn.sum(axis=1).mean(axis=0)
+    avg_ag = ag.sum(axis=1).mean(axis=0)
+    avg_ar = ar.sum(axis=1).mean(axis=0)
+
+    fig, ax = plt.subplots(figsize=(max(8, world_size * 0.6), 5))
+    bar_width = 0.6
+
+    bottom = np.zeros(world_size)
+    ax.bar(ranks, avg_ag, bar_width, bottom=bottom, label="All-Gather", color="#ff7f0e")
+    bottom += avg_ag
+    ax.bar(
+        ranks, avg_attn, bar_width, bottom=bottom, label="Attention", color="#1f77b4"
+    )
+    bottom += avg_attn
+    ax.bar(ranks, avg_ar, bar_width, bottom=bottom, label="All-Reduce", color="#d62728")
+    bottom += avg_ar
+    ax.bar(ranks, avg_moe, bar_width, bottom=bottom, label="MoE FFN", color="#2ca02c")
+
+    ax.set_xlabel("Rank")
+    ax.set_ylabel("Avg Per-Step Time (ms)")
+    ax.set_title(
+        f"Phase Breakdown per Rank ({moe_times.shape[0]} decode steps, "
+        f"summed across {moe_times.shape[1]} layers)"
+    )
+    ax.set_xticks(ranks)
+    ax.legend(loc="upper right")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    fname = "phase_breakdown_per_rank.png"
+    fig.savefig(output_dir / fname, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {fname}")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────
 
 
@@ -337,7 +437,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Plot MoE kernel balance data from .pt dump files"
     )
-    parser.add_argument("input", nargs="+", help="Path(s) to .pt file(s), supports glob")
+    parser.add_argument(
+        "input", nargs="+", help="Path(s) to .pt file(s), supports glob"
+    )
     parser.add_argument(
         "--output-dir",
         "-o",
@@ -362,7 +464,14 @@ def main():
 
     paths = []
     for pattern in args.input:
-        paths.extend(glob.glob(pattern))
+        expanded = glob.glob(pattern)
+        for entry in expanded:
+            p = Path(entry)
+            if p.is_dir():
+                pts = sorted(p.glob("moe_kernel_balance_*.pt"))
+                paths.extend(str(f) for f in pts)
+            else:
+                paths.append(entry)
     if not paths:
         parser.error("No matching .pt files found")
 
@@ -372,7 +481,7 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n{'=' * 60}")
-        moe_times, local_token_counts, timestamps = load_data(str(pt_path))
+        moe_times, local_token_counts, timestamps, phase_times = load_data(str(pt_path))
 
         warmup = args.warmup
         if warmup > 0 and moe_times.shape[0] > warmup:
@@ -382,6 +491,8 @@ def main():
                 local_token_counts = local_token_counts[warmup:]
             if timestamps is not None:
                 timestamps = timestamps[warmup:]
+            for key in list(phase_times):
+                phase_times[key] = phase_times[key][warmup:]
 
         if args.peak_pct > 0 and local_token_counts is not None:
             global_batch = local_token_counts.sum(axis=(1, 2))
@@ -398,6 +509,8 @@ def main():
                 local_token_counts = local_token_counts[start:end]
                 if timestamps is not None:
                     timestamps = timestamps[start:end]
+                for key in list(phase_times):
+                    phase_times[key] = phase_times[key][start:end]
 
         if moe_times.sum() == 0:
             print("  All times are zero, skipping.")
@@ -407,19 +520,22 @@ def main():
         if timestamps is not None:
             elapsed = timestamps - timestamps[0, 0]
 
-        # moe_times: [steps, layers, ranks] → sum across layers for per-step per-rank total
-        moe_times_per_step = moe_times.sum(axis=1)  # [steps, ranks]
+        moe_times_per_step = moe_times.sum(axis=1)
 
         print(f"  Generating plots in {output_dir}/")
         plot_step_time_timeline(moe_times_per_step, output_dir, elapsed)
         plot_avg_time_per_rank(moe_times_per_step, output_dir)
         plot_time_imbalance_timeline(moe_times_per_step, output_dir, elapsed)
+        plot_avg_heatmap_moe_times(moe_times, output_dir)
 
         if local_token_counts is not None:
             plot_avg_heatmap_local_tokens(local_token_counts, output_dir)
             plot_rank_imbalance_local_tokens(local_token_counts, output_dir)
             plot_step_rank_heatmap_local_tokens(local_token_counts, output_dir, elapsed)
             plot_cumulative_tokens_timeline(local_token_counts, output_dir, elapsed)
+
+        if phase_times:
+            plot_phase_breakdown_per_rank(moe_times, phase_times, output_dir)
 
     print("\nDone.")
 

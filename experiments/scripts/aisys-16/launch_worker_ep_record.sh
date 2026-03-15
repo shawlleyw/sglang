@@ -28,6 +28,8 @@ export TRITON_CACHE_DIR=/tmp/triton_cache
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR="$RECORD_DIR"
 
+find ~/coulson/sglang-fake-prefill/python -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+
 python -m sglang.launch_server \
     --model-path lmsys/gpt-oss-120b-bf16 \
     --load-format dummy \

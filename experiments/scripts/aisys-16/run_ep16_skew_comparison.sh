@@ -207,7 +207,7 @@ for pi in "${!PROFILES[@]}"; do
         mkdir -p "$plot_dir"
         echo "  Plotting $pname..."
         python experiments/plot_moe_kernel_balance.py \
-            "$pt_dir"/moe_kernel_balance_*.pt --output-dir "$plot_dir" --warmup 20 --peak-pct 0.5 2>&1 || true
+            "$pt_dir"/moe_kernel_balance_*.pt --output-dir "$plot_dir" --warmup 20 --peak-pct 0.8 2>&1 || true
     fi
 done
 
@@ -224,6 +224,6 @@ if [ -n "$COMPARE_ARGS" ]; then
     python experiments/plot_moe_recorder_compare.py \
         --experiments $COMPARE_ARGS \
         --output-dir "${PLOT_BASE}/comparison" \
-        --peak-pct 0.5 2>&1 || true
+        --peak-pct 0.8 2>&1 || true
 fi
 echo "All plots saved to: ${PLOT_BASE}/"
