@@ -293,7 +293,9 @@ def plot_phase_breakdown_comparison(experiments, output_path):
     """Grouped bar chart comparing phase breakdown across experiments.
 
     Each experiment gets a stacked bar showing average per-step time
-    split into ag, attn, ar, moe phases.
+    split into ag, attn, ar, moe, and other (from fwd_times) phases.
+    When fwd_times is available, "other" = fwd_total - (attn+ag+moe+ar)
+    captures layernorm, router/gate, dp_scatter, etc.
     """
     has_phases = all(
         "attn_times" in d and "ag_times" in d and "ar_times" in d
@@ -303,12 +305,15 @@ def plot_phase_breakdown_comparison(experiments, output_path):
         print("  Skipping phase breakdown comparison (missing phase data)")
         return
 
+    has_fwd = all("fwd_times" in d for _, d in experiments)
+
     n = len(experiments)
     labels = []
     avg_ag_vals = []
     avg_attn_vals = []
     avg_ar_vals = []
     avg_moe_vals = []
+    avg_other_vals = []
 
     for label, data in experiments:
         labels.append(label)
@@ -316,11 +321,23 @@ def plot_phase_breakdown_comparison(experiments, output_path):
         avg_attn_vals.append(data["attn_times"].sum(axis=1).mean())
         avg_ag_vals.append(data["ag_times"].sum(axis=1).mean())
         avg_ar_vals.append(data["ar_times"].sum(axis=1).mean())
+        if has_fwd:
+            fwd_total = data["fwd_times"].sum(axis=1).mean()
+            four_phases = (
+                data["moe_times"].sum(axis=1).mean()
+                + data["attn_times"].sum(axis=1).mean()
+                + data["ag_times"].sum(axis=1).mean()
+                + data["ar_times"].sum(axis=1).mean()
+            )
+            avg_other_vals.append(max(0, fwd_total - four_phases))
+        else:
+            avg_other_vals.append(0)
 
     avg_ag = np.array(avg_ag_vals)
     avg_attn = np.array(avg_attn_vals)
     avg_ar = np.array(avg_ar_vals)
     avg_moe = np.array(avg_moe_vals)
+    avg_other = np.array(avg_other_vals)
 
     x = np.arange(n)
     bar_width = 0.5
@@ -334,10 +351,19 @@ def plot_phase_breakdown_comparison(experiments, output_path):
     ax.bar(x, avg_ar, bar_width, bottom=bottom, label="All-Reduce", color="#d62728")
     bottom += avg_ar
     ax.bar(x, avg_moe, bar_width, bottom=bottom, label="MoE FFN", color="#2ca02c")
+    bottom += avg_moe
+    if has_fwd and avg_other.sum() > 0:
+        ax.bar(
+            x, avg_other, bar_width, bottom=bottom,
+            label="Other (LN, gate, scatter…)", color="#9467bd",
+        )
 
     ax.set_xlabel("Experiment")
-    ax.set_ylabel("Avg Per-Step Time (ms, summed across layers & ranks)")
-    ax.set_title("Phase Breakdown Comparison")
+    ax.set_ylabel("Avg Per-Step Time (ms, summed across layers)")
+    title = "Phase Breakdown Comparison"
+    if has_fwd:
+        title += " (full layer-forward coverage)"
+    ax.set_title(title)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=15, ha="right")
     ax.legend(loc="upper right")

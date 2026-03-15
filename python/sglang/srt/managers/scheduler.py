@@ -2661,7 +2661,10 @@ class Scheduler(
             get_global_moe_kernel_balance_recorder().stop_record()
         elif action == ExpertDistributionReqType.DUMP_RECORD:
             get_global_expert_distribution_recorder().dump_record()
-            get_global_moe_kernel_balance_recorder().dump()
+            try:
+                get_global_moe_kernel_balance_recorder().dump()
+            except Exception as e:
+                logger.error("MoEKernelBalanceRecorder.dump() failed: %s", e, exc_info=True)
         else:
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
         return ExpertDistributionReqOutput()

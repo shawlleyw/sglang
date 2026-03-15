@@ -26,7 +26,7 @@ def load_data(path: str):
         timestamps = timestamps.cpu().double().numpy()
 
     phase_times = {}
-    for key in ("attn_times", "ag_times", "ar_times"):
+    for key in ("attn_times", "ag_times", "ar_times", "fwd_times"):
         t = data.get(key)
         if t is not None:
             phase_times[key] = t.cpu().float().numpy()
@@ -395,10 +395,17 @@ def plot_phase_breakdown_per_rank(
     world_size = moe_times.shape[2]
     ranks = np.arange(world_size)
 
+    fwd = phase_times.get("fwd_times")
+
     avg_moe = moe_times.sum(axis=1).mean(axis=0)
     avg_attn = attn.sum(axis=1).mean(axis=0)
     avg_ag = ag.sum(axis=1).mean(axis=0)
     avg_ar = ar.sum(axis=1).mean(axis=0)
+    if fwd is not None:
+        avg_fwd = fwd.sum(axis=1).mean(axis=0)
+        avg_other = np.maximum(0, avg_fwd - avg_moe - avg_attn - avg_ag - avg_ar)
+    else:
+        avg_other = np.zeros(world_size)
 
     fig, ax = plt.subplots(figsize=(max(8, world_size * 0.6), 5))
     bar_width = 0.6
@@ -413,6 +420,12 @@ def plot_phase_breakdown_per_rank(
     ax.bar(ranks, avg_ar, bar_width, bottom=bottom, label="All-Reduce", color="#d62728")
     bottom += avg_ar
     ax.bar(ranks, avg_moe, bar_width, bottom=bottom, label="MoE FFN", color="#2ca02c")
+    bottom += avg_moe
+    if fwd is not None and avg_other.sum() > 0:
+        ax.bar(
+            ranks, avg_other, bar_width, bottom=bottom,
+            label="Other (LN, gate, scatter…)", color="#9467bd",
+        )
 
     ax.set_xlabel("Rank")
     ax.set_ylabel("Avg Per-Step Time (ms)")

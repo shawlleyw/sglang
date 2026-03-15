@@ -344,9 +344,16 @@ class TopK(CustomOp):
                 topk_ids = topk_ids_logical_to_physical(
                     topk_ids, expert_location_dispatch_info
                 )
-            get_global_expert_distribution_recorder().on_select_experts(
-                topk_ids=topk_ids
+            # Skip recording here when profile-driven gating is active —
+            # the caller will record the post-override topk_ids instead.
+            from sglang.srt.layers.moe.profile_driven_router import (
+                get_global_profile_router,
             )
+
+            if get_global_profile_router() is None:
+                get_global_expert_distribution_recorder().on_select_experts(
+                    topk_ids=topk_ids
+                )
 
             return StandardTopKOutput(topk_weights, topk_ids, _)
         if use_grouped_topk and not torch_native and router_logits.shape[-1] == 256:
@@ -378,9 +385,14 @@ class TopK(CustomOp):
                 topk_ids = topk_ids_logical_to_physical(
                     topk_ids, expert_location_dispatch_info
                 )
-            get_global_expert_distribution_recorder().on_select_experts(
-                topk_ids=topk_ids
+            from sglang.srt.layers.moe.profile_driven_router import (
+                get_global_profile_router,
             )
+
+            if get_global_profile_router() is None:
+                get_global_expert_distribution_recorder().on_select_experts(
+                    topk_ids=topk_ids
+                )
 
             return StandardTopKOutput(topk_weights, topk_ids, _)
         else:
@@ -919,6 +931,11 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    from sglang.srt.layers.moe.profile_driven_router import get_global_profile_router
+
+    if get_global_profile_router() is None:
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=topk_ids
+        )
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

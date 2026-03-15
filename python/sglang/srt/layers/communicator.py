@@ -696,19 +696,14 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
     ):
-        _kr = get_global_moe_kernel_balance_recorder()
         hidden_states, global_hidden_states = (
             get_local_dp_buffer(),
             hidden_states,
         )
         if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
-            _kr.record_ar_start(context.layer_id)
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
-            _kr.record_ar_end(context.layer_id)
         else:
-            _kr.record_ar_start(context.layer_id)
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
-            _kr.record_ar_end(context.layer_id)
         return hidden_states, residual
 
     @staticmethod

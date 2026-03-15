@@ -311,10 +311,22 @@ class GptOssSparseMoeBlock(nn.Module):
             topk_output = StandardTopKOutput(
                 profiled_weights, profiled_ids, original_logits
             )
+            # Record expert distribution with the actual profiled routing
+            # (topk.py skips recording when profile router is active).
+            from sglang.srt.eplb.expert_distribution import (
+                get_global_expert_distribution_recorder,
+            )
+
+            get_global_expert_distribution_recorder().on_select_experts(
+                topk_ids=profiled_ids
+            )
         final_hidden_states = self.experts(hidden_states, topk_output)
 
+        _kr = get_global_moe_kernel_balance_recorder()
         if self.tp_size > 1 and not should_allreduce_fusion:
+            _kr.record_ar_start(self.layer_id)
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            _kr.record_ar_end(self.layer_id)
 
         ans = final_hidden_states.view(num_tokens, hidden_dim)
         return ans
@@ -571,6 +583,11 @@ class GptOssDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         _kr = get_global_moe_kernel_balance_recorder()
 
+        # fwd_start captures the ENTIRE layer forward (all ops including
+        # layernorm, router, dp_scatter, etc.) so we can compute
+        # "other" = fwd_total - (attn + AG + MoE + AR).
+        _kr.record_fwd_start(self.layer_id)
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -603,6 +620,8 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+
+        _kr.record_fwd_end(self.layer_id)
 
         return hidden_states, residual
 
