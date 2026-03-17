@@ -82,3 +82,9 @@ For each profile, compare recorder-ON vs recorder-OFF:
 - **P99 ITL** (ms)
 
 If the throughput difference between ON and OFF is small, it means there are other sync points or bottlenecks beyond the recorder that we haven't identified.
+
+## Optional PP*TP comparison
+
+For comparing performance differences, we can also enable intra-node TP and cross-node PP, where number of pp stages is equal to number of nodes, and tp-size is equal to number of gpus on each node.
+We run exactly the same benchmark client parameters as EP cases.
+For PP*TP runs, we also test the 4 dataset profiles, but we don't need to enable recorder, we only need their basic performance metrics.
