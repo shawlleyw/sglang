@@ -137,6 +137,12 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
+        self._batch_sizes = []
+        self._batch_timestamps = []
+        self._vram_allocated = []  # torch.cuda.memory_allocated() per step (bytes)
+        self._vram_reserved = []   # torch.cuda.memory_reserved() per step (bytes)
+        self._dp_size = server_args.dp_size if hasattr(server_args, "dp_size") else 1
+        self._rank = rank
         self._accumulator = _Accumulator.init_new(
             server_args, expert_location_metadata, rank
         )
@@ -179,6 +185,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _on_forward_pass_start(self, forward_batch: ForwardBatch):
         if not self._recording:
             return
+        # Record the local batch size, wall-clock timestamp, and VRAM per forward pass
+        self._batch_sizes.append(len(forward_batch.input_ids))
+        self._batch_timestamps.append(time.time())
+        self._vram_allocated.append(torch.cuda.memory_allocated())
+        self._vram_reserved.append(torch.cuda.memory_reserved())
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             gatherer.reset()
             gatherer.on_forward_pass_start(forward_batch)
@@ -236,6 +247,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         assert (
             self._current_layer_idx.value is None
         ), f"{self._current_layer_idx.value=}"
+        self._batch_sizes.clear()
+        self._batch_timestamps.clear()
+        self._vram_allocated.clear()
+        self._vram_reserved.clear()
         for gatherer in self._single_pass_gatherers.values():
             gatherer.reset()
         self._accumulator.reset()
@@ -259,6 +274,20 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def dump_record(self, output_mode: _OutputMode = "file"):
         """Dump the expert distribution record and reset the recorder after dumping."""
+        # Save per-step batch size timeline with real timestamps and VRAM
+        if self._batch_sizes and output_mode == "file":
+            _dump_to_file(
+                f"batch_size_timeline_{time.time()}.pt",
+                {
+                    "local_batch_sizes": self._batch_sizes[:],
+                    "timestamps": self._batch_timestamps[:],
+                    "vram_allocated_bytes": self._vram_allocated[:],
+                    "vram_reserved_bytes": self._vram_reserved[:],
+                    "rank": self._rank,
+                    "dp_size": self._dp_size,
+                    "num_steps": len(self._batch_sizes),
+                },
+            )
         output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
         return output

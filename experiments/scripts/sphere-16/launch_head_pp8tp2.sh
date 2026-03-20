@@ -1,6 +1,4 @@
 #!/bin/bash
-# PP4×TP2 head (rank 0) — no recorder
-# Usage: ./launch_head_pptp.sh <gating_profile> <log_file> [mem_frac]
 set -euo pipefail
 
 GATING_PROFILE=$1
@@ -40,5 +38,6 @@ python -m sglang.launch_server \
     --trust-remote-code \
     --log-level-http warning \
     --moe-runner-backend triton \
+    --disable-custom-all-reduce \
     --dist-timeout 1800 \
     --log-level warning 2>&1 | tee "$LOG_FILE"
