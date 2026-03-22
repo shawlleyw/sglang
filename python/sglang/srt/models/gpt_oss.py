@@ -253,6 +253,7 @@ class GptOssSparseMoeBlock(nn.Module):
         )
         from sglang.srt.layers.moe.topk import StandardTopKOutput
 
+        _kr = get_global_moe_kernel_balance_recorder()
         profile_router = get_global_profile_router()
         if profile_router is not None and forward_batch is not None:
             req_ids = forward_batch.req_pool_indices
@@ -266,6 +267,7 @@ class GptOssSparseMoeBlock(nn.Module):
 
                 local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
+                _kr.record_metadata_ar_start(self.layer_id)
                 global_pos = torch.zeros(
                     num_tokens, dtype=torch.float32, device=pos.device
                 )
@@ -288,6 +290,7 @@ class GptOssSparseMoeBlock(nn.Module):
                 )
                 global_req = tensor_model_parallel_all_reduce(global_req)
                 req_ids = global_req.to(torch.int64)
+                _kr.record_metadata_ar_end(self.layer_id)
             else:
                 if pos.shape[0] != num_tokens:
                     pos = pos[:num_tokens]
@@ -322,7 +325,6 @@ class GptOssSparseMoeBlock(nn.Module):
             )
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        _kr = get_global_moe_kernel_balance_recorder()
         if self.tp_size > 1 and not should_allreduce_fusion:
             _kr.record_ar_start(self.layer_id)
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

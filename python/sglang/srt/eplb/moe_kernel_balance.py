@@ -173,6 +173,12 @@ class MoEKernelBalanceRecorder(ABC):
     def record_ar_end(self, layer_id: int):
         pass
 
+    def record_metadata_ar_start(self, layer_id: int):
+        pass
+
+    def record_metadata_ar_end(self, layer_id: int):
+        pass
+
     def record_fwd_start(self, layer_id: int):
         pass
 
@@ -253,6 +259,15 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         self._ar_end_events = [
             torch.cuda.Event(enable_timing=True) for _ in range(num_layers)
         ]
+        # Per-step timing for metadata all-reduce (positions + req_ids reconstruction
+        # in baseline, or routing-gather all-reduce after local DP gating).
+        self._metadata_ar_step_times: List[torch.Tensor] = []
+        self._metadata_ar_start_events = [
+            torch.cuda.Event(enable_timing=True) for _ in range(num_layers)
+        ]
+        self._metadata_ar_end_events = [
+            torch.cuda.Event(enable_timing=True) for _ in range(num_layers)
+        ]
         self._fwd_start_events = [
             torch.cuda.Event(enable_timing=True) for _ in range(num_layers)
         ]
@@ -327,6 +342,22 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         else:
             self._ar_end_events[layer_id].record()
 
+    def record_metadata_ar_start(self, layer_id: int):
+        # Times the metadata all-reduce (positions + req_ids reconstruction in
+        # baseline; routing-gather all-reduce after local DP gating).
+        # No _recording guard — must always run so event.record() calls are
+        # captured inside CUDA graphs during warmup/capture.
+        if torch.cuda.is_current_stream_capturing():
+            _event_record_for_graph(self._metadata_ar_start_events[layer_id])
+        else:
+            self._metadata_ar_start_events[layer_id].record()
+
+    def record_metadata_ar_end(self, layer_id: int):
+        if torch.cuda.is_current_stream_capturing():
+            _event_record_for_graph(self._metadata_ar_end_events[layer_id])
+        else:
+            self._metadata_ar_end_events[layer_id].record()
+
     def record_fwd_start(self, layer_id: int):
         if torch.cuda.is_current_stream_capturing():
             _event_record_for_graph(self._fwd_start_events[layer_id])
@@ -389,11 +420,20 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
                 )
             except (RuntimeError, ValueError):
                 fwd_times[i] = 0.0
+        metadata_ar_times = torch.zeros(self._num_layers, dtype=torch.float32)
+        for i in range(self._num_layers):
+            try:
+                metadata_ar_times[i] = self._metadata_ar_start_events[i].elapsed_time(
+                    self._metadata_ar_end_events[i]
+                )
+            except (RuntimeError, ValueError):
+                metadata_ar_times[i] = 0.0
         self._step_times.append(times)
         self._attn_step_times.append(attn_times)
         self._ag_step_times.append(ag_times)
         self._ar_step_times.append(ar_times)
         self._fwd_step_times.append(fwd_times)
+        self._metadata_ar_step_times.append(metadata_ar_times)
 
     def start_record(self):
         self._recording = True
@@ -412,6 +452,7 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         self._ag_step_times.clear()
         self._ar_step_times.clear()
         self._fwd_step_times.clear()
+        self._metadata_ar_step_times.clear()
         self._current_forward_mode_value = -1
 
     @property
@@ -459,6 +500,12 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         for step_idx in range(min(len(self._fwd_step_times), num_steps)):
             local_fwd_times_cpu[step_idx] = self._fwd_step_times[step_idx]
 
+        local_metadata_ar_times_cpu = torch.zeros(
+            (num_steps, self._num_layers), dtype=torch.float32
+        )
+        for step_idx in range(min(len(self._metadata_ar_step_times), num_steps)):
+            local_metadata_ar_times_cpu[step_idx] = self._metadata_ar_step_times[step_idx]
+
         local_num_steps = torch.tensor([num_steps], dtype=torch.int64, device=device)
         all_num_steps_list = [
             torch.zeros(1, dtype=torch.int64, device=device)
@@ -491,6 +538,9 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         local_fwd = torch.zeros(
             (max_steps, self._num_layers), dtype=torch.float32, device=device
         )
+        local_metadata_ar = torch.zeros(
+            (max_steps, self._num_layers), dtype=torch.float32, device=device
+        )
         local_ltok = torch.zeros(
             (max_steps, self._num_layers), dtype=torch.int32, device=device
         )
@@ -505,6 +555,7 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
             local_ag[:num_steps] = local_ag_times_cpu.to(device)
             local_ar[:num_steps] = local_ar_times_cpu.to(device)
             local_fwd[:num_steps] = local_fwd_times_cpu.to(device)
+            local_metadata_ar[:num_steps] = local_metadata_ar_times_cpu.to(device)
             num_ts = min(len(self._timestamps), num_steps)
             if num_ts > 0:
                 local_ts[:num_ts] = torch.tensor(
@@ -547,6 +598,10 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         torch.distributed.all_gather(all_fwd_list, local_fwd)
         all_fwd = torch.stack(all_fwd_list)
 
+        all_metadata_ar_list = [torch.zeros_like(local_metadata_ar) for _ in range(self._world_size)]
+        torch.distributed.all_gather(all_metadata_ar_list, local_metadata_ar)
+        all_metadata_ar = torch.stack(all_metadata_ar_list)
+
         all_ltok_list = [torch.zeros_like(local_ltok) for _ in range(self._world_size)]
         torch.distributed.all_gather(all_ltok_list, local_ltok)
         all_ltok = torch.stack(all_ltok_list)
@@ -561,6 +616,7 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
         decode_ag = all_ag[:, all_decode_mask, :].permute(1, 2, 0).contiguous()
         decode_ar = all_ar[:, all_decode_mask, :].permute(1, 2, 0).contiguous()
         decode_fwd = all_fwd[:, all_decode_mask, :].permute(1, 2, 0).contiguous()
+        decode_metadata_ar = all_metadata_ar[:, all_decode_mask, :].permute(1, 2, 0).contiguous()
         decode_ltok = all_ltok[:, all_decode_mask, :]
         decode_ltok = decode_ltok.permute(1, 2, 0).contiguous()
         decode_ts = all_ts[:, all_decode_mask].permute(1, 0).contiguous()
@@ -572,6 +628,7 @@ class _MoEKernelBalanceRecorderReal(MoEKernelBalanceRecorder):
             ag_times=decode_ag,
             ar_times=decode_ar,
             fwd_times=decode_fwd,
+            metadata_ar_times=decode_metadata_ar,
             local_token_counts=decode_ltok,
             timestamps=decode_ts,
             num_total_steps=max_steps,
