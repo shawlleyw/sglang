@@ -71,6 +71,17 @@ python -m sglang.launch_server \
 Startup takes ~3 minutes (TVM/inductor compilation + CUDA graph capture).
 Look for `The server is fired up and ready to roll!` in the log.
 
+## Multi-Node All-Reduce Test
+
+16 GPUs across 4 nodes (gpua069, gpua080, gpua082, gpua095):
+
+```bash
+~/sglang/experiments/delta/run_torch_allreduce.sh
+```
+
+Uses SSH + `torchrun` per node (modeled after `/projects/bgro/spark36/nccl-tests/nccl-test.sh`).
+Peaks at ~8.4 GB/s algo BW / ~15.7 GB/s bus BW on Slingshot.
+
 ## Known Issues
 
 - **Custom all-reduce fails during CUDA graph capture** on this DP/EP topology.
