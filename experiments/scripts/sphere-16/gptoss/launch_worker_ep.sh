@@ -43,5 +43,6 @@ python -m sglang.launch_server \
     --trust-remote-code \
     --log-level-http warning \
     --moe-runner-backend triton \
+    --enable-dp-lm-head \
     --dist-timeout 1800 \
     --log-level warning 2>&1 | tee "$LOG_FILE"

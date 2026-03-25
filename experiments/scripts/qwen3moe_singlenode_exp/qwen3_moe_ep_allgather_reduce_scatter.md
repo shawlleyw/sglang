@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | Model | Qwen3 MoE (e.g. Qwen3-30B-A3B, Qwen3-235B-A22B) |
-| GPUs | N× GPU with NVLink |
+| GPUs | N× GPU |
 | SGLang | 0.5.5+ |
 | Parallelism | TP=N, DP=N, EP=N |
 
@@ -34,7 +34,7 @@ python -m sglang.launch_server \
     --trust-remote-code \
     --disable-radix-cache \
     --chunked-prefill-size -1 \
-    --max-prefill-tokens 16384 \
+    --enable-fake-prefill \ 
     --mem-fraction-static 0.8 \
     --tp-size $NUM_GPUS --dp-size $NUM_GPUS --ep-size $NUM_GPUS \
     --enable-dp-attention \
