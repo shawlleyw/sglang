@@ -11,6 +11,8 @@
 
 log_bench() { echo "$(date '+%Y-%m-%d %H:%M:%S') [bench] $*"; }
 
+bench_python() { echo "${MINICONDA}/envs/${CONDA_ENV}/bin/python"; }
+
 # run_benchmark <result_json_path> <cmd_file_path> [extra_args...]
 #   Runs sglang.bench_serving with fixed params from config.sh.
 #   Saves the exact command to <cmd_file_path> for reproducibility.
@@ -21,7 +23,7 @@ run_benchmark() {
     local extra_args=("$@")
 
     local cmd=(
-        python -m sglang.bench_serving
+        "$(bench_python)" -m sglang.bench_serving
         --backend "$BENCH_BACKEND"
         --host "$HEAD"
         --port "$SERVER_PORT"

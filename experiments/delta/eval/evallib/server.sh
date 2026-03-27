@@ -12,6 +12,9 @@
 
 log_server() { echo "$(date '+%Y-%m-%d %H:%M:%S') [server] $*"; }
 
+# Resolve full-path python from the conda env (robust under nohup/tmux)
+server_python() { echo "${MINICONDA}/envs/${CONDA_ENV}/bin/python"; }
+
 # _build_server_cmd <server_profile> <node_rank> <gate_profile> <log_file>
 _build_server_cmd() {
     local server_profile="$1"
@@ -19,7 +22,7 @@ _build_server_cmd() {
     local gate_profile="$3"
     local log_file="$4"
 
-    local cmd="eval \"\$(${MINICONDA}/bin/conda shell.bash hook)\" && conda activate sglang && cd ${REPO_DIR} && mkdir -p \$(dirname ${log_file})"
+    local cmd="eval \"\$(${MINICONDA}/bin/conda shell.bash hook)\" && conda activate ${CONDA_ENV} && cd ${REPO_DIR} && mkdir -p \$(dirname ${log_file})"
 
     cmd+=" && export NCCL_SOCKET_IFNAME=${HOST_IFNAME}"
     cmd+=" && export GLOO_SOCKET_IFNAME=${HOST_IFNAME}"
@@ -27,7 +30,7 @@ _build_server_cmd() {
     cmd+=" && export SGLANG_LOCAL_IP_NIC=${HOST_IFNAME}"
     cmd+=" && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 
-    cmd+=" && python -m sglang.launch_server"
+    cmd+=" && $(server_python) -m sglang.launch_server"
     cmd+=" --model-path ${MODEL_PATH}"
     cmd+=" --load-format ${LOAD_FORMAT}"
     cmd+=" --nnodes ${N_NODE}"
@@ -166,7 +169,7 @@ is_oom() {
 kill_server() {
     log_server "Killing server..."
     for n in "${ALL_NODES[@]}"; do
-        ssh "$n" 'pkill -9 -f "sglang.launch_server" 2>/dev/null; pkill -9 -f "sglang.srt" 2>/dev/null; pkill -9 -f "torch._inductor.compile_worker" 2>/dev/null' 2>/dev/null || true
+        ssh "$n" 'pkill -9 -f "sglang\.launch_server" 2>/dev/null; pkill -9 -f "sglang\.srt" 2>/dev/null; pkill -9 -f "torch\._inductor\.compile_worker" 2>/dev/null' 2>/dev/null || true
     done
     for s in sglang-head sglang-w1 sglang-w2 sglang-w3; do
         tmux kill-session -t "$s" 2>/dev/null || true

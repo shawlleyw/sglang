@@ -5,7 +5,7 @@
 # Usage: source experiments/delta/eval/config.sh
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SCRIPT_DIR="$REPO_DIR/experiments/delta"
 GATING_DIR="$REPO_DIR/gating_profiles"
 MODEL_PATH="/projects/bgro/spark36/models/gpt-oss-120b-bf16"
@@ -42,15 +42,18 @@ HOST_IFNAME="hsn0"
 
 EP16_LIMITED_MAX_RUNNING_REQS=256
 
+# ── Conda environment ─────────────────────────────────────────────────────────
+CONDA_ENV="${CONDA_ENV:-sglang}"
+
 # ── Benchmark — 10 000 requests, 2000 rps, lengths 256-512 uniform ────────────
-BENCH_BACKEND="sglang"
-BENCH_DATASET="random"
-BENCH_NUM_PROMPTS=10000
-BENCH_REQUEST_RATE=2000
-BENCH_RANDOM_INPUT_LEN=512
-BENCH_RANDOM_OUTPUT_LEN=512
-BENCH_RANDOM_RANGE_RATIO=0.5
-BENCH_TIMEOUT=600
+BENCH_BACKEND="${BENCH_BACKEND:-sglang}"
+BENCH_DATASET="${BENCH_DATASET:-random}"
+BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-10000}"
+BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-2000}"
+BENCH_RANDOM_INPUT_LEN="${BENCH_RANDOM_INPUT_LEN:-512}"
+BENCH_RANDOM_OUTPUT_LEN="${BENCH_RANDOM_OUTPUT_LEN:-512}"
+BENCH_RANDOM_RANGE_RATIO="${BENCH_RANDOM_RANGE_RATIO:-0.5}"
+BENCH_TIMEOUT="${BENCH_TIMEOUT:-600}"
 
 # ── Server startup timeout ────────────────────────────────────────────────────
-SERVER_READY_TIMEOUT=1800
+SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-1800}"

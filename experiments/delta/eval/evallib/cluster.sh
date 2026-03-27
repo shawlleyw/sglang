@@ -51,7 +51,7 @@ discover_nodes() {
 kill_all() {
     log_cluster "Killing all sglang processes..."
     for n in "${ALL_NODES[@]}"; do
-        ssh "$n" 'pkill -9 -f "sglang.launch_server" 2>/dev/null; pkill -9 -f "sglang.srt" 2>/dev/null; pkill -9 -f "torch._inductor.compile_worker" 2>/dev/null' 2>/dev/null || true
+        ssh "$n" 'pkill -9 -f "sglang\.launch_server" 2>/dev/null; pkill -9 -f "sglang\.srt" 2>/dev/null; pkill -9 -f "torch\._inductor\.compile_worker" 2>/dev/null' 2>/dev/null || true
     done
     for s in sglang-head sglang-w1 sglang-w2 sglang-w3; do
         tmux kill-session -t "$s" 2>/dev/null || true

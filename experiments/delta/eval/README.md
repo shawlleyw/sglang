@@ -57,16 +57,19 @@ All profiles share: `--enable-fake-prefill`, `--profile-driven-gate-path`,
 
 ## Fixed config (edit `config.sh`)
 
-| Parameter | Value |
-|---|---|
-| Model | `lmsys/gpt-oss-120b-bf16` (36 layers, 128 experts, dummy weights) |
-| Cluster | 4 nodes × 4 A100-SXM4-40GB = 16 GPUs |
-| Network | HPE Slingshot `hsn0`, NCCL+Gloo |
-| Initial memory fraction | 0.80 |
-| OOM step | −0.02 per retry |
-| Benchmark | 2000 rps × 10k reqs, in/out 256–512 uniform |
-| Server ready timeout | 1800s (30 min) |
-| Benchmark timeout | 600s (10 min) |
+| Parameter | Default | Env override |
+|---|---|---|
+| Model | `lmsys/gpt-oss-120b-bf16` (36 layers, 128 experts, dummy weights) | — |
+| Cluster | 4 nodes × 4 A100-SXM4-40GB = 16 GPUs | — |
+| Network | HPE Slingshot `hsn0`, NCCL+Gloo | — |
+| Conda env | `sglang` | `CONDA_ENV` |
+| Initial memory fraction | 0.80 | — |
+| OOM step | −0.02 per retry | — |
+| Benchmark rate | 2000 rps | `BENCH_REQUEST_RATE` |
+| Benchmark prompts | 10k | `BENCH_NUM_PROMPTS` |
+| Benchmark input/output | 256–512 uniform | `BENCH_RANDOM_INPUT_LEN`, `BENCH_RANDOM_OUTPUT_LEN`, `BENCH_RANDOM_RANGE_RATIO` |
+| Server ready timeout | 1800s (30 min) | `SERVER_READY_TIMEOUT` |
+| Benchmark timeout | 600s (10 min) | `BENCH_TIMEOUT` |
 
 ---
 
@@ -107,6 +110,13 @@ bash experiments/delta/eval/ep16_eval.sh /path/to/my_results \
 # Or override node discovery:
 HEAD=gpua002 WORKERS="gpua007 gpua047 gpua076" \
     bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
+
+# Override benchmark parameters without editing config.sh:
+BENCH_REQUEST_RATE=500 BENCH_NUM_PROMPTS=1000 \
+    bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
+
+# Use a different conda environment:
+CONDA_ENV=my_env bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
 ```
 
 ---
@@ -134,8 +144,8 @@ Run directories are named `<system>_<server_profile>-<dataset_label>` under `RES
   ...  (12 directories total)
 ```
 
-Only the final successful attempt's logs are kept; previous attempts are
-cleaned up before each retry.
+Failed attempt artifacts are archived to `attempt<N>/` subdirectories before
+each retry, preserving logs for post-mortem debugging.
 
 ---
 

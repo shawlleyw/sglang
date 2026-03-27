@@ -54,6 +54,23 @@ MEM_FRAC_STEP=0.02   # how much to reduce MEM_FRAC on each OOM retry
 # ─────────────────────────────────────────────────────────────────────────────
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [main] $*"; }
 
+# archive_attempt_artifacts <run_dir> <attempt_number>
+#   Moves server logs, server_cmd.sh, bench_result.* to attempt<N>/ so
+#   failed-attempt artifacts survive retries for post-mortem debugging.
+archive_attempt_artifacts() {
+    local run_dir="$1"
+    local attempt="$2"
+    local archive_dir="$run_dir/attempt${attempt}"
+
+    mkdir -p "$archive_dir"
+    for artifact in "$run_dir"/logs "$run_dir"/server_cmd.sh \
+                    "$run_dir"/bench_result.json "$run_dir"/bench_result.log \
+                    "$run_dir"/bench_cmd.sh; do
+        [ -e "$artifact" ] && mv "$artifact" "$archive_dir/" 2>/dev/null || true
+    done
+    log "Archived attempt $attempt artifacts to $archive_dir/"
+}
+
 mkdir -p "$RESULTS_DIR"
 
 # ── Discover nodes ────────────────────────────────────────────────────────────
@@ -126,6 +143,7 @@ for exp_entry in "${EXPERIMENTS[@]}"; do
         fi
 
         kill_server
+        archive_attempt_artifacts "$run_dir" "$attempt"
         sleep 10
     done
 
