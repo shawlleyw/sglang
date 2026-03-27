@@ -21,6 +21,7 @@ _build_server_cmd() {
     local log_file="$4"
 
     local cmd="eval \"\$(${MINICONDA}/bin/conda shell.bash hook)\" && conda activate ${CONDA_ENV} && cd ${REPO_DIR} && mkdir -p \$(dirname ${log_file})"
+    local apply_customized_args=0
 
     cmd+=" && export NCCL_SOCKET_IFNAME=${HOST_IFNAME}"
     cmd+=" && export NCCL_IB_HCA=${NCCL_IB_HCA}"
@@ -47,20 +48,20 @@ _build_server_cmd() {
 
     case "$server_profile" in
         ep16)
+            apply_customized_args=1
             cmd+=" --tp-size ${WORLD_SIZE}"
             cmd+=" --dp-size ${WORLD_SIZE}"
             cmd+=" --ep-size ${WORLD_SIZE}"
             cmd+=" --enable-dp-attention"
             cmd+=" --enable-dp-lm-head"
-            cmd+=" --moe-a2a-backend mooncake-nccl"
             ;;
         ep16_limited)
+            apply_customized_args=1
             cmd+=" --tp-size ${WORLD_SIZE}"
             cmd+=" --dp-size ${WORLD_SIZE}"
             cmd+=" --ep-size ${WORLD_SIZE}"
             cmd+=" --enable-dp-attention"
             cmd+=" --enable-dp-lm-head"
-            cmd+=" --moe-a2a-backend mooncake-nccl"
             cmd+=" --max-running-requests ${EP16_LIMITED_MAX_RUNNING_REQS}"
             ;;
         pp8tp2)
@@ -82,11 +83,11 @@ _build_server_cmd() {
         cmd+=" --profile-driven-gate-path ${gate_profile}"
     fi
 
-    if [ -n "${CUSTOMIZED_ARGS:-}" ]; then
+    if [ "$apply_customized_args" -eq 1 ] && [ -n "${CUSTOMIZED_ARGS:-}" ]; then
         cmd+=" ${CUSTOMIZED_ARGS}"
     fi
 
-    cmd+=" 2>&1 | tee ${log_file}"
+    cmd+=" 2>&1"
     echo "$cmd"
 }
 
@@ -122,7 +123,7 @@ launch_server() {
 
     local head_cmd
     head_cmd=$(_build_server_cmd "$server_profile" 0 "$gate_profile" "$log_dir/server_head.log")
-    tmux new-session -d -s sglang-head "ssh $HEAD '${head_cmd}'"
+    tmux new-session -d -s sglang-head "ssh $HEAD '${head_cmd}' 2>&1 | tee $log_dir/server_head.log"
 
     sleep 5
 
@@ -132,7 +133,7 @@ launch_server() {
         local sess="sglang-w$((i + 1))"
         local worker_cmd
         worker_cmd=$(_build_server_cmd "$server_profile" "$rank" "$gate_profile" "$log_dir/server_w${rank}.log")
-        tmux new-session -d -s "$sess" "ssh $w '${worker_cmd}'"
+        tmux new-session -d -s "$sess" "ssh $w '${worker_cmd}' 2>&1 | tee $log_dir/server_w${rank}.log"
     done
 
     log_server "Head + ${#WORKERS[@]} workers launched (command saved to $(basename "$cmd_file"))"

@@ -97,7 +97,10 @@ for exp_entry in "${EXPERIMENTS[@]}"; do
         kill_server
         sleep 5
 
-        rm -rf "$server_log_dir"
+        if [ -d "$server_log_dir" ]; then
+            mv "$server_log_dir" "${server_log_dir}_attempt$((attempt - 1))"
+            log "Previous logs preserved as logs_attempt$((attempt - 1))/"
+        fi
         launch_server "$server_profile" "$gate_profile" "$server_log_dir" "$server_cmd"
 
         if wait_for_server; then
@@ -125,8 +128,7 @@ for exp_entry in "${EXPERIMENTS[@]}"; do
     if [ "$SUCCESS" -eq 0 ]; then
         log "FAILED: $run_name — all $MAX_RETRIES attempts unsuccessful."
     else
-        log "SUCCESS: $run_name"
-        log "Result: $(tr -d '\n' < "$run_dir/result.json")"
+        log "SUCCESS: $run_name → $run_dir/result.json"
     fi
 done
 

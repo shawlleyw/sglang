@@ -48,7 +48,7 @@ run_benchmark() {
         printf '\n'
     } > "$cmd_file"
 
-    if timeout "$BENCH_TIMEOUT" "${cmd[@]}" 2>&1 | tee "${result_file%.json}.log"; then
+    if timeout "$BENCH_TIMEOUT" "${MINICONDA}/envs/${CONDA_ENV}/bin/python" "${cmd[@]:1}" 2>&1 | tee "${result_file%.json}.log"; then
         if [ -f "$result_file" ]; then
             log_bench "Benchmark complete. Result: $result_file"
             return 0

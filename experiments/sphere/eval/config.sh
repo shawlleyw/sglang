@@ -6,7 +6,7 @@
 # Usage: source experiments/sphere/eval/config.sh
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SCRIPT_DIR="$REPO_DIR/experiments/sphere"
 GATING_DIR="$REPO_DIR/gating_profiles"
 MINICONDA="$HOME/miniconda3"
@@ -24,7 +24,7 @@ WORLD_SIZE=16
 DEFAULT_WORKERS="sgpu2 sgpu3 sgpu4 sgpu6 sgpu7 sgpu8 sgpu9"
 
 # ── Common runtime ────────────────────────────────────────────────────────────
-MEM_FRAC=0.80
+MEM_FRAC=0.77
 SERVER_PORT=30000
 DIST_INIT_PORT=25000
 DIST_TIMEOUT=1800
@@ -47,8 +47,8 @@ EP16_LIMITED_MAX_RUNNING_REQS=256
 # ── Benchmark — 10 000 requests, 2000 rps, lengths 256-512 uniform ────────────
 BENCH_BACKEND="sglang"
 BENCH_DATASET="random"
-BENCH_NUM_PROMPTS=10000
-BENCH_REQUEST_RATE=2000
+BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS:-10000}
+BENCH_REQUEST_RATE=${BENCH_REQUEST_RATE:-2000}
 BENCH_RANDOM_INPUT_LEN=512
 BENCH_RANDOM_OUTPUT_LEN=512
 BENCH_RANDOM_RANGE_RATIO=0.5

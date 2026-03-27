@@ -22,4 +22,4 @@ GATE_PROFILES=(
 )
 
 # ── Customized server args (appended to every sglang.launch_server command) ───
-CUSTOMIZED_ARGS=""
+CUSTOMIZED_ARGS="--moe-a2a-backend mooncake-nccl"
