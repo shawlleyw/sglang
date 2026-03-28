@@ -4,7 +4,7 @@
 #
 # Requires (from config.sh):
 #   SERVER_PORT, BENCH_TIMEOUT, MODEL_NAME, BENCH_BACKEND, BENCH_DATASET,
-#   BENCH_NUM_PROMPTS, BENCH_REQUEST_RATE
+#   BENCH_NUM_PROMPTS, BENCH_REQUEST_RATE, MINICONDA, CONDA_ENV
 #   For random:   BENCH_RANDOM_INPUT_LEN, BENCH_RANDOM_OUTPUT_LEN, BENCH_RANDOM_RANGE_RATIO
 #   For sharegpt: BENCH_SHAREGPT_CONTEXT_LEN, (optional) BENCH_SHAREGPT_OUTPUT_LEN
 #   For gsm8k:    BENCH_GSM8K_CONTEXT_LEN,    (optional) BENCH_GSM8K_OUTPUT_LEN
@@ -12,8 +12,6 @@
 #   HEAD
 
 log_bench() { echo "$(date '+%Y-%m-%d %H:%M:%S') [bench] $*"; }
-
-bench_python() { echo "${MINICONDA}/envs/${CONDA_ENV}/bin/python"; }
 
 _build_dataset_args() {
     local dataset_args=()
@@ -68,7 +66,7 @@ run_benchmark() {
     read -ra dataset_args <<< "$(_build_dataset_args)"
 
     local cmd=(
-        "$(bench_python)" -m sglang.bench_serving
+        python -m sglang.bench_serving
         --backend "$BENCH_BACKEND"
         --host "$HEAD"
         --port "$SERVER_PORT"
@@ -81,6 +79,7 @@ run_benchmark() {
         "${extra_args[@]}"
     )
 
+    rm -f "$result_file"
     log_bench "Running benchmark:"
     log_bench "  host=${HEAD}:${SERVER_PORT}"
     log_bench "  dataset=${BENCH_DATASET}, ${BENCH_NUM_PROMPTS} prompts, ${BENCH_REQUEST_RATE} rps"
@@ -94,7 +93,7 @@ run_benchmark() {
         printf '\n'
     } > "$cmd_file"
 
-    if timeout "$BENCH_TIMEOUT" "${cmd[@]}" 2>&1 | tee "${result_file%.json}.log"; then
+    if timeout "$BENCH_TIMEOUT" "${MINICONDA}/envs/${CONDA_ENV}/bin/python" "${cmd[@]:1}" 2>&1 | tee "${result_file%.json}.log"; then
         if [ -f "$result_file" ]; then
             log_bench "Benchmark complete. Result: $result_file"
             return 0

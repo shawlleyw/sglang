@@ -4,31 +4,68 @@
 
 ```
 eval/
-  ep16_eval.sh      # main: experiment matrix + orchestration loop
-  config.sh         # all fixed variables (sourced by main)
+  gptoss_eval.sh      # gpt-oss-120b: experiment matrix + orchestration loop
+  config.sh           # shared cluster / network / benchmark config
+  config_gptoss.sh    # gpt-oss-120b model config (sources config.sh)
   evallib/
-    cluster.sh      # discover_nodes(), kill_all() — SSH+tmux cluster management
-    server.sh       # launch_server(), wait_for_server(), kill_server(), is_oom()
-    benchmark.sh    # run_benchmark() — sglang.bench_serving wrapper
+    cluster.sh        # discover_nodes(), kill_all() — SSH+tmux cluster management
+    server.sh         # launch_server(), wait_for_server(), kill_server(), is_oom()
+    benchmark.sh      # run_benchmark() — sglang.bench_serving wrapper
   README.md
 ```
 
 `evallib/` scripts only define functions; they are sourced, not executed.
 To change any single concern, edit only that one file.
 
+### Config hierarchy
+
+```
+config.sh                  ← shared: cluster, network, benchmark, runtime
+  └── config_gptoss.sh     ← model: MODEL_PATH, GATE_PROFILES, CUSTOMIZED_ARGS
+```
+
+Each eval script sources its model config (which internally sources the
+shared config), then sources the function libraries.
+
 ---
 
-## What the main script does
+## Models
 
-Evaluates **3 server profiles × 4 gate profiles = 12 experiments**.
+| Eval script | Model config | Model | Params | Layers | Experts | HuggingFace path |
+|---|---|---|---|---|---|---|
+| `gptoss_eval.sh` | `config_gptoss.sh` | gpt-oss-120b-bf16 | 120B | 36 | 128 | `lmsys/gpt-oss-120b-bf16` |
+
+The model uses 128 routed experts and is evaluated with `--load-format dummy`.
+
+---
+
+## CUSTOMIZED_ARGS
+
+Each model config defines a `CUSTOMIZED_ARGS` variable (string) that is
+appended verbatim to every `sglang.launch_server` command for EP profiles.
+Use this to pass model-specific flags without modifying the shared server profiles.
+
+Example:
+
+```bash
+# In config_gptoss.sh — mooncake-nccl a2a backend:
+CUSTOMIZED_ARGS="--moe-a2a-backend mooncake-nccl"
+```
+
+---
+
+## What each eval script does
+
+Evaluates **4 server profiles × 4 gate profiles = 16 experiments**.
 For each experiment, up to `MAX_RETRIES=3` times:
 
 1. **`kill_server`** — kills any existing sglang processes + tmux sessions
    across all nodes. Required between runs to release GPUs.
 2. **`launch_server`** — builds the full `sglang.launch_server` command based
-   on the current `SERVER_PROFILE` (ep16, ep16_limited, or pp4tp4) with
-   `--enable-fake-prefill` and `--profile-driven-gate-path`. Launches head
-   (rank 0) + 3 workers via SSH+tmux. Saves commands to `server_cmd.sh`.
+   on the current `SERVER_PROFILE` (ep16, ep16_limited, pp4tp4, or ep8) with
+   `--enable-fake-prefill` and `--profile-driven-gate-path`, plus any
+   `CUSTOMIZED_ARGS`. Launches head (rank 0) + workers via SSH+tmux.
+   Saves commands to `server_cmd.sh`.
 3. **`wait_for_server`** — polls `http://<head>:30000/health` every 10s,
    up to `SERVER_READY_TIMEOUT=1800s` (multi-node init on Delta can be slow).
    - If timeout, calls **`is_oom`** on the server logs. On OOM,
@@ -45,31 +82,33 @@ Final cleanup: `kill_server`.
 
 | Profile | Parallelism | Key flags |
 |---|---|---|
-| `ep16` | tp=16, dp=16, ep=16 | `--enable-dp-attention --enable-dp-lm-head --moe-a2a-backend mooncake-nccl` |
-| `ep16_limited` | tp=16, dp=16, ep=16 | Same as ep16 + `--max-running-requests 256` |
-| `pp4tp4` | tp=4, pp=4 | No EP/DP-attention (pure pipeline + tensor parallel) |
+| `ep16` | tp=16, dp=16, ep=16 (4 nodes) | `--enable-dp-attention --enable-dp-lm-head` + `CUSTOMIZED_ARGS` |
+| `ep16_limited` | tp=16, dp=16, ep=16 (4 nodes) | Same as ep16 + `--max-running-requests 256` |
+| `ep8` | tp=8, dp=8, ep=8 (2 nodes) | Same flags as ep16 (DP-attention, DP-lm-head) but half the cluster |
+| `pp4tp4` | tp=4, pp=4 (4 nodes) | `--disable-custom-all-reduce` (no EP/DP-attention) |
 
 All profiles share: `--enable-fake-prefill`, `--profile-driven-gate-path`,
-`--disable-radix-cache`, `--chunked-prefill-size -1`, `--disable-custom-all-reduce`,
+`--disable-radix-cache`, `--chunked-prefill-size -1`,
 `--moe-runner-backend triton`.
+
+EP profiles additionally append `CUSTOMIZED_ARGS` from the model config
+(e.g. `--moe-a2a-backend mooncake-nccl` for gpt-oss).
 
 ---
 
-## Fixed config (edit `config.sh`)
+## Shared config (edit `config.sh`)
 
-| Parameter | Default | Env override |
-|---|---|---|
-| Model | `lmsys/gpt-oss-120b-bf16` (36 layers, 128 experts, dummy weights) | — |
-| Cluster | 4 nodes × 4 A100-SXM4-40GB = 16 GPUs | — |
-| Network | HPE Slingshot `hsn0`, NCCL+Gloo | — |
-| Conda env | `sglang` | `CONDA_ENV` |
-| Initial memory fraction | 0.80 | — |
-| OOM step | −0.02 per retry | — |
-| Benchmark dataset | `sharegpt` | `BENCH_DATASET` (`sharegpt`, `random`, `gsm8k`) |
-| Benchmark rate | 2000 rps | `BENCH_REQUEST_RATE` |
-| Benchmark prompts | 10k | `BENCH_NUM_PROMPTS` |
-| Server ready timeout | 1800s (30 min) | `SERVER_READY_TIMEOUT` |
-| Benchmark timeout | 600s (10 min) | `BENCH_TIMEOUT` |
+| Parameter | Value |
+|---|---|
+| Cluster | 4 nodes × 4 A100-SXM4-40GB = 16 GPUs |
+| Network | HPE Slingshot `hsn0`, NCCL+Gloo |
+| Initial memory fraction | 0.80 |
+| OOM step | −0.02 per retry |
+| Benchmark dataset | `sharegpt` (default), `random`, `gsm8k` |
+| Benchmark rate / prompts | 2000 rps × 10k reqs |
+| Server ready timeout | 1800s (30 min) |
+| Benchmark timeout | 1200s (20 min) |
+| Conda env | `sglang` |
 
 ### Benchmark datasets
 
@@ -86,24 +125,23 @@ Each dataset uses its own config variables, all overridable via environment:
 
 ## Experiment matrix
 
-The full matrix is `SERVER_PROFILES × GATE_PROFILES` (3 × 4 = 12 experiments):
+Each eval script runs `SERVER_PROFILES × GATE_PROFILES` (4 × 4 = 16 experiments).
 
-**3 server profiles**: `ep16`, `ep16_limited`, `pp4tp4`
+**4 server profiles**: `ep16`, `ep16_limited`, `pp4tp4`, `ep8`
 
-**4 workloads** (`{sharegpt, legal-court} × {regular, balanced}`):
+**4 workloads** (`{sharegpt, gsm8k} × {regular, balanced}`):
 
-| Workload | Gate profile | Description |
-|---|---|---|
-| `sharegpt_regular` | `gating_gptoss120b_sharegpt_200.parquet` | ShareGPT trace, real expert routing |
-| `sharegpt_balanced` | `balanced_gptoss120b_sharegpt_200.parquet` | ShareGPT trace, balanced expert routing |
-| `legal_court_regular` | `gating_legal_court_opinions_200.parquet` | Legal court opinions trace, real expert routing |
-| `legal_court_balanced` | `balanced_legal_court_opinions_200.parquet` | Legal court opinions trace, balanced expert routing |
+### gpt-oss-120b gate profiles (`config_gptoss.sh`)
+
+| Workload | Gate profile |
+|---|---|
+| `sharegpt_regular` | `gating_gptoss120b_sharegpt_200.parquet` |
+| `sharegpt_balanced` | `balanced_gptoss120b_sharegpt_200.parquet` |
+| `gsm8k_regular` | `gating_math_gsm8k_200.parquet` |
+| `gsm8k_balanced` | `balanced_math_gsm8k_200.parquet` |
 
 Regular profiles are captured from real inference traces.
 Balanced profiles are pre-generated and placed in `gating_profiles/balanced_output/`.
-
-Benchmark parameters are configured in `config.sh`: 2000 rps, 10k requests,
-default dataset `sharegpt` (context_len=2048). Override via `BENCH_DATASET`.
 
 ---
 
@@ -115,29 +153,53 @@ squeue -u $USER
 
 # 2. Run from login node (uses SSH+tmux to reach compute nodes)
 cd ~/sglang
-bash experiments/delta/eval/ep16_eval.sh /path/to/my_results \
-    |& tee experiments/eval.log
+bash experiments/delta/eval/gptoss_eval.sh /path/to/gptoss_results \
+    |& tee experiments/gptoss_eval.log
 
 # Or override node discovery:
 HEAD=gpua002 WORKERS="gpua007 gpua047 gpua076" \
-    bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
-
-# Override benchmark parameters without editing config.sh:
-BENCH_REQUEST_RATE=500 BENCH_NUM_PROMPTS=1000 \
-    bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
+    bash experiments/delta/eval/gptoss_eval.sh /path/to/results
 
 # Use a different benchmark dataset:
-BENCH_DATASET=gsm8k bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
-BENCH_DATASET=random bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
+BENCH_DATASET=gsm8k bash experiments/delta/eval/gptoss_eval.sh /path/to/results
+BENCH_DATASET=random bash experiments/delta/eval/gptoss_eval.sh /path/to/results
 
 # Override context length for sharegpt or gsm8k:
-BENCH_SHAREGPT_CONTEXT_LEN=4096 bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
+BENCH_SHAREGPT_CONTEXT_LEN=4096 bash experiments/delta/eval/gptoss_eval.sh /path/to/results
 BENCH_DATASET=gsm8k BENCH_GSM8K_CONTEXT_LEN=4096 \
-    bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
-
-# Use a different conda environment:
-CONDA_ENV=my_env bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
+    bash experiments/delta/eval/gptoss_eval.sh /path/to/results
 ```
+
+### Running a single experiment
+
+Use `--list` to see available experiments and `--only` to select which to run:
+
+```bash
+# List all 16 experiments (prints index + name, then exits)
+bash experiments/delta/eval/gptoss_eval.sh /path/to/results --list
+
+# Run by index (1-based)
+bash experiments/delta/eval/gptoss_eval.sh /path/to/results --only 1
+
+# Run multiple by index
+bash experiments/delta/eval/gptoss_eval.sh /path/to/results --only 1,5,9
+
+# Run all experiments for a server profile
+bash experiments/delta/eval/gptoss_eval.sh /path/to/results --only pp4tp4
+
+# Run all experiments for a workload across all server profiles
+bash experiments/delta/eval/gptoss_eval.sh /path/to/results --only sharegpt_regular
+
+# Run one exact experiment (server profile + workload)
+bash experiments/delta/eval/gptoss_eval.sh /path/to/results --only ep16-sharegpt_regular
+```
+
+The `--only` filter accepts comma-separated values. Each value is matched as
+a 1-based index (if numeric) or as a substring of the run name (e.g.
+`sglang_ep16-sharegpt_regular`). Omitting `--only` runs all 16 experiments.
+
+**Note:** substring `ep16` matches both `ep16` and `ep16_limited` run names.
+Use `_ep16-` to match only the base ep16 profile.
 
 ---
 
@@ -159,9 +221,9 @@ Run directories are named `<system>_<server_profile>-<dataset_label>` under `RES
     bench_result.log                     # benchmark stdout
     result.json                          # copy of the successful result
   sglang_ep16-sharegpt_balanced/         ...
-  sglang_ep16_limited-sharegpt_regular/  ...
-  sglang_pp4tp4-sharegpt_regular/        ...
-  ...  (12 directories total)
+  sglang_ep16-gsm8k_regular/            ...
+  sglang_ep16-gsm8k_balanced/           ...
+  ...  (16 directories total)
 ```
 
 Failed attempt artifacts are archived to `attempt<N>/` subdirectories before
@@ -169,11 +231,10 @@ each retry, preserving logs for post-mortem debugging.
 
 ---
 
-## Server command construction
+## Adding a new model
 
-The eval harness builds the full `sglang.launch_server` command directly in
-`evallib/server.sh`, dispatching on `SERVER_PROFILE` via a `case` statement.
-This keeps the eval self-contained and allows each experiment to use a different
-parallelism strategy and gate profile without modifying shared launch scripts.
-
-Compatible with DisagMoE gate profile format (Parquet).
+1. Create `config_<model>.sh` — source `config.sh`, set `MODEL_PATH`,
+   `MODEL_NAME`, `LOAD_FORMAT`, `GATE_PROFILES`, and `CUSTOMIZED_ARGS`.
+2. Copy any eval script (e.g. `gptoss_eval.sh`), change the source line
+   to `config_<model>.sh`, and update the header comment.
+3. Generate gate profiles for the new model and place them in `gating_profiles/`.

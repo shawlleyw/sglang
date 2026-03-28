@@ -3,8 +3,8 @@
 # Source this file; do not execute directly.
 #
 # Requires (from config.sh):
-#   REPO_DIR, MODEL_PATH, LOAD_FORMAT, MEM_FRAC, MINICONDA
-#   N_NODE, WORLD_SIZE, EP16_LIMITED_MAX_RUNNING_REQS
+#   REPO_DIR, MODEL_PATH, LOAD_FORMAT, MEM_FRAC, MINICONDA, CONDA_ENV
+#   N_NODE, WORLD_SIZE, EP8_N_NODE, EP8_WORLD_SIZE, EP16_LIMITED_MAX_RUNNING_REQS
 #   SERVER_PORT, SERVER_READY_TIMEOUT, DIST_TIMEOUT, HOST_IFNAME
 # Requires (from cluster.sh):
 #   HEAD, WORKERS, ALL_NODES, HEAD_IP, DIST_INIT_ADDR
@@ -12,8 +12,12 @@
 
 log_server() { echo "$(date '+%Y-%m-%d %H:%M:%S') [server] $*"; }
 
-# Resolve full-path python from the conda env (robust under nohup/tmux)
-server_python() { echo "${MINICONDA}/envs/${CONDA_ENV}/bin/python"; }
+_profile_nnodes() {
+    case "$1" in
+        ep8) echo "${EP8_N_NODE}" ;;
+        *)   echo "${N_NODE}" ;;
+    esac
+}
 
 # _build_server_cmd <server_profile> <node_rank> <gate_profile> <log_file>
 _build_server_cmd() {
@@ -23,6 +27,7 @@ _build_server_cmd() {
     local log_file="$4"
 
     local cmd="eval \"\$(${MINICONDA}/bin/conda shell.bash hook)\" && conda activate ${CONDA_ENV} && cd ${REPO_DIR} && mkdir -p \$(dirname ${log_file})"
+    local apply_customized_args=0
 
     cmd+=" && export NCCL_SOCKET_IFNAME=${HOST_IFNAME}"
     cmd+=" && export GLOO_SOCKET_IFNAME=${HOST_IFNAME}"
@@ -30,17 +35,19 @@ _build_server_cmd() {
     cmd+=" && export SGLANG_LOCAL_IP_NIC=${HOST_IFNAME}"
     cmd+=" && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 
-    cmd+=" && $(server_python) -m sglang.launch_server"
+    local nnodes
+    nnodes=$(_profile_nnodes "$server_profile")
+
+    cmd+=" && python -m sglang.launch_server"
     cmd+=" --model-path ${MODEL_PATH}"
     cmd+=" --load-format ${LOAD_FORMAT}"
-    cmd+=" --nnodes ${N_NODE}"
+    cmd+=" --nnodes ${nnodes}"
     cmd+=" --node-rank ${node_rank}"
     cmd+=" --dist-init-addr ${DIST_INIT_ADDR}"
     cmd+=" --enable-fake-prefill"
     cmd+=" --disable-radix-cache"
     cmd+=" --chunked-prefill-size -1"
     cmd+=" --mem-fraction-static ${MEM_FRAC}"
-    cmd+=" --disable-custom-all-reduce"
     cmd+=" --trust-remote-code"
     cmd+=" --moe-runner-backend triton"
     cmd+=" --dist-timeout ${DIST_TIMEOUT}"
@@ -49,25 +56,34 @@ _build_server_cmd() {
 
     case "$server_profile" in
         ep16)
+            apply_customized_args=1
             cmd+=" --tp-size ${WORLD_SIZE}"
             cmd+=" --dp-size ${WORLD_SIZE}"
             cmd+=" --ep-size ${WORLD_SIZE}"
             cmd+=" --enable-dp-attention"
             cmd+=" --enable-dp-lm-head"
-            cmd+=" --moe-a2a-backend mooncake-nccl"
             ;;
         ep16_limited)
+            apply_customized_args=1
             cmd+=" --tp-size ${WORLD_SIZE}"
             cmd+=" --dp-size ${WORLD_SIZE}"
             cmd+=" --ep-size ${WORLD_SIZE}"
             cmd+=" --enable-dp-attention"
             cmd+=" --enable-dp-lm-head"
-            cmd+=" --moe-a2a-backend mooncake-nccl"
             cmd+=" --max-running-requests ${EP16_LIMITED_MAX_RUNNING_REQS}"
+            ;;
+        ep8)
+            apply_customized_args=1
+            cmd+=" --tp-size ${EP8_WORLD_SIZE}"
+            cmd+=" --dp-size ${EP8_WORLD_SIZE}"
+            cmd+=" --ep-size ${EP8_WORLD_SIZE}"
+            cmd+=" --enable-dp-attention"
+            cmd+=" --enable-dp-lm-head"
             ;;
         pp4tp4)
             cmd+=" --tp-size 4"
             cmd+=" --pp-size 4"
+            cmd+=" --disable-custom-all-reduce"
             ;;
         *)
             log_server "FATAL: unknown server_profile='$server_profile'"
@@ -83,7 +99,11 @@ _build_server_cmd() {
         cmd+=" --profile-driven-gate-path ${gate_profile}"
     fi
 
-    cmd+=" 2>&1 | tee ${log_file}"
+    if [ "$apply_customized_args" -eq 1 ] && [ -n "${CUSTOMIZED_ARGS:-}" ]; then
+        cmd+=" ${CUSTOMIZED_ARGS}"
+    fi
+
+    cmd+=" 2>&1"
     echo "$cmd"
 }
 
@@ -94,13 +114,18 @@ launch_server() {
     local log_dir="$3"
     local cmd_file="$4"
 
-    log_server "Launching $server_profile | profile=$(basename "${gate_profile:-none}") | mem_frac=$MEM_FRAC"
+    local nnodes
+    nnodes=$(_profile_nnodes "$server_profile")
+    local n_workers=$((nnodes - 1))
+
+    log_server "Launching $server_profile | profile=$(basename "${gate_profile:-none}") | mem_frac=$MEM_FRAC | nnodes=$nnodes"
     mkdir -p "$log_dir"
 
     {
         printf '# Server launch commands\n'
         printf '# Generated: %s\n' "$(date)"
         printf '# server_profile: %s\n' "$server_profile"
+        printf '# nnodes: %d\n' "$nnodes"
         printf '# mem_frac: %s\n' "$MEM_FRAC"
         printf '# gate_profile: %s\n' "${gate_profile:-none}"
         printf '# dist_init_addr: %s\n\n' "$DIST_INIT_ADDR"
@@ -109,7 +134,7 @@ launch_server() {
         printf 'ssh %s '\''%s'\''\n\n' "$HEAD" \
             "$(_build_server_cmd "$server_profile" 0 "$gate_profile" "$log_dir/server_head.log")"
 
-        for i in "${!WORKERS[@]}"; do
+        for i in $(seq 0 $((n_workers - 1))); do
             local rank=$((i + 1))
             printf '# Worker rank %d on %s:\n' "$rank" "${WORKERS[$i]}"
             printf 'ssh %s '\''%s'\''\n\n' "${WORKERS[$i]}" \
@@ -119,20 +144,20 @@ launch_server() {
 
     local head_cmd
     head_cmd=$(_build_server_cmd "$server_profile" 0 "$gate_profile" "$log_dir/server_head.log")
-    tmux new-session -d -s sglang-head "ssh $HEAD '${head_cmd}'"
+    tmux new-session -d -s sglang-head "ssh $HEAD '${head_cmd}' 2>&1 | tee $log_dir/server_head.log"
 
     sleep 5
 
-    for i in "${!WORKERS[@]}"; do
+    for i in $(seq 0 $((n_workers - 1))); do
         local w="${WORKERS[$i]}"
         local rank=$((i + 1))
         local sess="sglang-w$((i + 1))"
         local worker_cmd
         worker_cmd=$(_build_server_cmd "$server_profile" "$rank" "$gate_profile" "$log_dir/server_w${rank}.log")
-        tmux new-session -d -s "$sess" "ssh $w '${worker_cmd}'"
+        tmux new-session -d -s "$sess" "ssh $w '${worker_cmd}' 2>&1 | tee $log_dir/server_w${rank}.log"
     done
 
-    log_server "Head + ${#WORKERS[@]} workers launched (command saved to $(basename "$cmd_file"))"
+    log_server "Head + ${n_workers} workers launched (command saved to $(basename "$cmd_file"))"
 }
 
 # wait_for_server
