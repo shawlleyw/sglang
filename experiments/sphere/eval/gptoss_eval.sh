@@ -70,7 +70,7 @@ for _sp in "${SERVER_PROFILES[@]}"; do
 done
 
 MAX_RETRIES=3
-MEM_FRAC_STEP=0.02
+MEM_FRAC_STEP=0.05
 
 # ─────────────────────────────────────────────────────────────────────────────
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [main] $*"; }
