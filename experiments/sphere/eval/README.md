@@ -142,7 +142,7 @@ Each eval script runs `SERVER_PROFILES × GATE_PROFILES` (3 × 4 = 12 experiment
 
 **3 server profiles**: `ep16`, `ep16_limited`, `pp8tp2`
 
-**4 workloads** (`{sharegpt, legal-court} × {regular, balanced}`):
+**4 workloads** (`{sharegpt, gsm8k} × {regular, balanced}`):
 
 ### gpt-oss-120b gate profiles (`config_gptoss.sh`)
 
@@ -150,8 +150,8 @@ Each eval script runs `SERVER_PROFILES × GATE_PROFILES` (3 × 4 = 12 experiment
 |---|---|
 | `sharegpt_regular` | `gating_gptoss120b_sharegpt_200.parquet` |
 | `sharegpt_balanced` | `balanced_gptoss120b_sharegpt_200.parquet` |
-| `legal_court_regular` | `gating_legal_court_opinions_200.parquet` |
-| `legal_court_balanced` | `balanced_legal_court_opinions_200.parquet` |
+| `gsm8k_regular` | `gating_math_gsm8k_200.parquet` |
+| `gsm8k_balanced` | `balanced_math_gsm8k_200.parquet` |
 
 ### GLM-4.5-Air gate profiles (`config_glm4air.sh`)
 
@@ -159,8 +159,8 @@ Each eval script runs `SERVER_PROFILES × GATE_PROFILES` (3 × 4 = 12 experiment
 |---|---|
 | `sharegpt_regular` | `gating_glm4air_sharegpt_200.parquet` |
 | `sharegpt_balanced` | `balanced_glm4air_sharegpt_200.parquet` |
-| `legal_court_regular` | `gating_glm4air_legal_court_opinions_200.parquet` |
-| `legal_court_balanced` | `balanced_glm4air_legal_court_opinions_200.parquet` |
+| `gsm8k_regular` | `gating_glm45air_gsm8k_200.parquet` |
+| `gsm8k_balanced` | `balanced_glm45air_gsm8k_200.parquet` |
 
 Regular profiles are captured from real inference traces.
 Balanced profiles are pre-generated and placed in `gating_profiles/balanced_output/`.
@@ -246,8 +246,8 @@ Run directories are named `<system>_<server_profile>-<dataset_label>` under `RES
     bench_result.log                     # benchmark stdout
     result.json                          # copy of the successful result
   sglang_ep16-sharegpt_balanced/         ...
-  sglang_ep16_limited-sharegpt_regular/  ...
-  sglang_pp8tp2-sharegpt_regular/        ...
+  sglang_ep16-gsm8k_regular/            ...
+  sglang_ep16-gsm8k_balanced/           ...
   ...  (12 directories total)
 ```
 

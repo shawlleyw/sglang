@@ -17,8 +17,8 @@ LOAD_FORMAT="dummy"
 GATE_PROFILES=(
     "${GATING_DIR}/glm45air_gating_profiles/gating_glm45air_sharegpt_200.parquet:sharegpt_regular"
     "${GATING_DIR}/glm45air_gating_profiles/balanced_output/balanced_glm45air_sharegpt_200.parquet:sharegpt_balanced"
-    "${GATING_DIR}/glm45air_gating_profiles/gating_glm45air_legal_200.parquet:legal_regular"
-    "${GATING_DIR}/glm45air_gating_profiles/balanced_output/balanced_glm45air_legal_200.parquet:legal_balanced"
+    "${GATING_DIR}/glm45air_gating_profiles/gating_glm45air_gsm8k_200.parquet:gsm8k_regular"
+    "${GATING_DIR}/glm45air_gating_profiles/balanced_output/balanced_glm45air_gsm8k_200.parquet:gsm8k_balanced"
 )
 
 # ── Customized server args (appended to every sglang.launch_server command) ───

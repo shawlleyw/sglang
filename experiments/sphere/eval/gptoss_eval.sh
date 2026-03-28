@@ -18,7 +18,7 @@
 #
 # Run directory naming: <RESULTS_DIR>/<system>_<server_profile>-<dataset_label>/
 #   e.g.  sglang_ep16-sharegpt_regular/
-#         sglang_pp8tp2-legal_court_balanced/
+#         sglang_pp8tp2-gsm8k_balanced/
 #
 # Prerequisites:
 #   - 8 nodes × 2 L40S GPUs available via SSH
@@ -83,8 +83,11 @@ should_run_experiment() {
     for f in "${FILTERS[@]}"; do
         f="${f#"${f%%[![:space:]]*}"}"
         f="${f%"${f##*[![:space:]]}"}"
-        if [[ "$f" =~ ^[0-9]+$ ]] && [[ "$f" -eq "$idx" ]]; then return 0; fi
-        if [[ "$label" == *"$f"* ]]; then return 0; fi
+        if [[ "$f" =~ ^[0-9]+$ ]]; then
+            [[ "$f" -eq "$idx" ]] && return 0
+        else
+            [[ "$label" == *"$f"* ]] && return 0
+        fi
     done
     return 1
 }
