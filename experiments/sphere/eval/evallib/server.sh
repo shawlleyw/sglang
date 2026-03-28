@@ -13,7 +13,13 @@
 
 log_server() { echo "$(date '+%Y-%m-%d %H:%M:%S') [server] $*"; }
 
-# _build_server_cmd <server_profile> <node_rank> <gate_profile> <log_file>
+_profile_nnodes() {
+    case "$1" in
+        ep8) echo "${EP8_N_NODE}" ;;
+        *)   echo "${N_NODE}" ;;
+    esac
+}
+
 _build_server_cmd() {
     local server_profile="$1"
     local node_rank="$2"
@@ -30,10 +36,13 @@ _build_server_cmd() {
     cmd+=" && export NCCL_DEBUG=WARN"
     cmd+=" && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 
+    local nnodes
+    nnodes=$(_profile_nnodes "$server_profile")
+
     cmd+=" && python -m sglang.launch_server"
     cmd+=" --model-path ${MODEL_PATH}"
     cmd+=" --load-format ${LOAD_FORMAT}"
-    cmd+=" --nnodes ${N_NODE}"
+    cmd+=" --nnodes ${nnodes}"
     cmd+=" --node-rank ${node_rank}"
     cmd+=" --dist-init-addr ${DIST_INIT_ADDR}"
     cmd+=" --enable-fake-prefill"
@@ -63,6 +72,14 @@ _build_server_cmd() {
             cmd+=" --enable-dp-attention"
             cmd+=" --enable-dp-lm-head"
             cmd+=" --max-running-requests ${EP16_LIMITED_MAX_RUNNING_REQS}"
+            ;;
+        ep8)
+            apply_customized_args=1
+            cmd+=" --tp-size ${EP8_WORLD_SIZE}"
+            cmd+=" --dp-size ${EP8_WORLD_SIZE}"
+            cmd+=" --ep-size ${EP8_WORLD_SIZE}"
+            cmd+=" --enable-dp-attention"
+            cmd+=" --enable-dp-lm-head"
             ;;
         pp8tp2)
             cmd+=" --tp-size 2"
@@ -98,13 +115,18 @@ launch_server() {
     local log_dir="$3"
     local cmd_file="$4"
 
-    log_server "Launching $server_profile | profile=$(basename "${gate_profile:-none}") | mem_frac=$MEM_FRAC"
+    local nnodes
+    nnodes=$(_profile_nnodes "$server_profile")
+    local n_workers=$((nnodes - 1))
+
+    log_server "Launching $server_profile | profile=$(basename "${gate_profile:-none}") | mem_frac=$MEM_FRAC | nnodes=$nnodes"
     mkdir -p "$log_dir"
 
     {
         printf '# Server launch commands\n'
         printf '# Generated: %s\n' "$(date)"
         printf '# server_profile: %s\n' "$server_profile"
+        printf '# nnodes: %d\n' "$nnodes"
         printf '# mem_frac: %s\n' "$MEM_FRAC"
         printf '# gate_profile: %s\n' "${gate_profile:-none}"
         printf '# dist_init_addr: %s\n\n' "$DIST_INIT_ADDR"
@@ -113,7 +135,7 @@ launch_server() {
         printf 'ssh %s '\''%s'\''\n\n' "$HEAD" \
             "$(_build_server_cmd "$server_profile" 0 "$gate_profile" "$log_dir/server_head.log")"
 
-        for i in "${!WORKERS[@]}"; do
+        for i in $(seq 0 $((n_workers - 1))); do
             local rank=$((i + 1))
             printf '# Worker rank %d on %s:\n' "$rank" "${WORKERS[$i]}"
             printf 'ssh %s '\''%s'\''\n\n' "${WORKERS[$i]}" \
@@ -127,7 +149,7 @@ launch_server() {
 
     sleep 5
 
-    for i in "${!WORKERS[@]}"; do
+    for i in $(seq 0 $((n_workers - 1))); do
         local w="${WORKERS[$i]}"
         local rank=$((i + 1))
         local sess="sglang-w$((i + 1))"
@@ -136,7 +158,7 @@ launch_server() {
         tmux new-session -d -s "$sess" "ssh $w '${worker_cmd}' 2>&1 | tee $log_dir/server_w${rank}.log"
     done
 
-    log_server "Head + ${#WORKERS[@]} workers launched (command saved to $(basename "$cmd_file"))"
+    log_server "Head + ${n_workers} workers launched (command saved to $(basename "$cmd_file"))"
 }
 
 # wait_for_server

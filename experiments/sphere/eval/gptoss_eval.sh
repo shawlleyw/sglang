@@ -59,7 +59,7 @@ if [[ "$LIST_ONLY" -eq 0 ]] && [[ -z "$RESULTS_DIR" ]]; then
 fi
 
 # ── Server profiles to evaluate ──────────────────────────────────────────────
-SERVER_PROFILES=( ep16 ep16_limited pp8tp2 )
+SERVER_PROFILES=( ep16 ep16_limited pp8tp2 ep8 )
 
 # ── Full experiment matrix: SERVER_PROFILES × GATE_PROFILES ──────────────────
 EXPERIMENTS=()

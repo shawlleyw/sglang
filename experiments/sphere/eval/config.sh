@@ -38,11 +38,16 @@ NCCL_IB_GID_INDEX=3
 # Each profile defines parallelism strategy and optional server flags.
 # _build_server_cmd in evallib/server.sh dispatches on SERVER_PROFILE.
 #
-#   ep16          — tp=16, dp=16, ep=16, DP-attention, mooncake-nccl a2a
-#   ep16_limited  — same as ep16 + --max-running-requests cap
-#   pp8tp2        — pp=8, tp=2, no EP/DP-attention (pure pipeline+tensor parallel)
+#   ep16          — tp=16, dp=16, ep=16, DP-attention, mooncake-nccl a2a (8 nodes)
+#   ep16_limited  — same as ep16 + --max-running-requests cap (8 nodes)
+#   ep8           — tp=8, dp=8, ep=8, same flags as ep16 (4 nodes)
+#   pp8tp2        — pp=8, tp=2, no EP/DP-attention (8 nodes)
 
 EP16_LIMITED_MAX_RUNNING_REQS=256
+
+# ── EP8 — 4-node subset (head + first 3 workers) ────────────────────────────
+EP8_N_NODE=4
+EP8_WORLD_SIZE=8
 
 # ── Benchmark — common ────────────────────────────────────────────────────────
 BENCH_BACKEND="sglang"
@@ -65,4 +70,4 @@ BENCH_GSM8K_CONTEXT_LEN=${BENCH_GSM8K_CONTEXT_LEN:-2048}
 # BENCH_GSM8K_OUTPUT_LEN=          # unset → use natural answer length
 
 # ── Server startup timeout ────────────────────────────────────────────────────
-SERVER_READY_TIMEOUT=1800
+SERVER_READY_TIMEOUT=600

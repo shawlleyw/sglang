@@ -99,9 +99,10 @@ Final cleanup: `kill_server`.
 
 | Profile | Parallelism | Key flags |
 |---|---|---|
-| `ep16` | tp=16, dp=16, ep=16 | `--enable-dp-attention --enable-dp-lm-head --moe-a2a-backend mooncake-nccl` |
-| `ep16_limited` | tp=16, dp=16, ep=16 | Same as ep16 + `--max-running-requests 256` |
-| `pp8tp2` | tp=2, pp=8 | `--disable-custom-all-reduce` (no EP/DP-attention) |
+| `ep16` | tp=16, dp=16, ep=16 (8 nodes) | `--enable-dp-attention --enable-dp-lm-head --moe-a2a-backend mooncake-nccl` |
+| `ep16_limited` | tp=16, dp=16, ep=16 (8 nodes) | Same as ep16 + `--max-running-requests 256` |
+| `ep8` | tp=8, dp=8, ep=8 (4 nodes) | Same flags as ep16 (DP-attention, DP-lm-head) but half the cluster |
+| `pp8tp2` | tp=2, pp=8 (8 nodes) | `--disable-custom-all-reduce` (no EP/DP-attention) |
 
 All profiles share: `--enable-fake-prefill`, `--profile-driven-gate-path`,
 `--disable-radix-cache`, `--chunked-prefill-size -1`,
@@ -138,9 +139,9 @@ Each dataset uses its own config variables, all overridable via environment:
 
 ## Experiment matrix
 
-Each eval script runs `SERVER_PROFILES × GATE_PROFILES` (3 × 4 = 12 experiments).
+Each eval script runs `SERVER_PROFILES × GATE_PROFILES` (4 × 4 = 16 experiments).
 
-**3 server profiles**: `ep16`, `ep16_limited`, `pp8tp2`
+**4 server profiles**: `ep16`, `ep16_limited`, `pp8tp2`, `ep8`
 
 **4 workloads** (`{sharegpt, gsm8k} × {regular, balanced}`):
 
@@ -201,7 +202,7 @@ BENCH_DATASET=gsm8k BENCH_GSM8K_CONTEXT_LEN=4096 \
 Use `--list` to see available experiments and `--only` to select which to run:
 
 ```bash
-# List all 12 experiments (prints index + name, then exits)
+# List all 16 experiments (prints index + name, then exits)
 bash experiments/sphere/eval/gptoss_eval.sh /path/to/results --list
 
 # Run by index (1-based)
@@ -222,7 +223,7 @@ bash experiments/sphere/eval/gptoss_eval.sh /path/to/results --only ep16-sharegp
 
 The `--only` filter accepts comma-separated values. Each value is matched as
 a 1-based index (if numeric) or as a substring of the run name (e.g.
-`sglang_ep16-sharegpt_regular`). Omitting `--only` runs all 12 experiments.
+`sglang_ep16-sharegpt_regular`). Omitting `--only` runs all 16 experiments.
 
 **Note:** substring `ep16` matches both `ep16` and `ep16_limited` run names.
 Use `_ep16-` to match only the base ep16 profile.
@@ -248,7 +249,7 @@ Run directories are named `<system>_<server_profile>-<dataset_label>` under `RES
   sglang_ep16-sharegpt_balanced/         ...
   sglang_ep16-gsm8k_regular/            ...
   sglang_ep16-gsm8k_balanced/           ...
-  ...  (12 directories total)
+  ...  (16 directories total)
 ```
 
 Only the final successful attempt's logs are kept; previous attempts are
