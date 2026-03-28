@@ -34,6 +34,7 @@ run_benchmark() {
         "${extra_args[@]}"
     )
 
+    rm -f "$result_file"
     log_bench "Running benchmark:"
     log_bench "  host=${HEAD}:${SERVER_PORT}"
     log_bench "  ${BENCH_NUM_PROMPTS} prompts, ${BENCH_REQUEST_RATE} rps"

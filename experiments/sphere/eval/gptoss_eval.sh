@@ -2,10 +2,19 @@
 # gptoss_eval.sh — SGLang multi-baseline evaluation for gpt-oss-120b, Sphere cluster
 #
 # Usage:
-#   bash experiments/sphere/eval/gptoss_eval.sh [RESULTS_DIR]
+#   bash experiments/sphere/eval/gptoss_eval.sh <RESULTS_DIR> [OPTIONS]
 #
 #   RESULTS_DIR  required; a parent directory that holds one sub-dir per run.
 #                Example: /scratch/myrun/results
+#
+#   Options:
+#     --list          Print numbered experiment list and exit
+#     --only FILTER   Run only experiments matching FILTER (comma-separated
+#                     indices or name substrings). Examples:
+#                       --only 1,5,9            # by index
+#                       --only ep16-sharegpt    # name substring
+#                       --only pp8tp2           # all pp8tp2 experiments
+#                       --only sharegpt_regular # all sharegpt_regular across profiles
 #
 # Run directory naming: <RESULTS_DIR>/<system>_<server_profile>-<dataset_label>/
 #   e.g.  sglang_ep16-sharegpt_regular/
@@ -26,8 +35,28 @@ source "$EVAL_DIR/evallib/cluster.sh"
 source "$EVAL_DIR/evallib/server.sh"
 source "$EVAL_DIR/evallib/benchmark.sh"
 
-# ── Results directory (required as $1) ────────────────────────────────────────
-RESULTS_DIR="${1:?ERROR: RESULTS_DIR is required as the first argument (e.g. /path/to/results)}"
+# ── Argument parsing ──────────────────────────────────────────────────────────
+ONLY_FILTER=""
+LIST_ONLY=0
+RESULTS_DIR=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --only) ONLY_FILTER="${2:?ERROR: --only requires a comma-separated list}"; shift 2 ;;
+        --list) LIST_ONLY=1; shift ;;
+        -*) echo "ERROR: Unknown option: $1" >&2; exit 1 ;;
+        *)
+            if [[ -z "$RESULTS_DIR" ]]; then RESULTS_DIR="$1"; shift
+            else echo "ERROR: Unexpected argument: $1" >&2; exit 1; fi
+            ;;
+    esac
+done
+
+if [[ "$LIST_ONLY" -eq 0 ]] && [[ -z "$RESULTS_DIR" ]]; then
+    echo "ERROR: RESULTS_DIR is required (e.g. /path/to/results)" >&2
+    echo "Usage: $0 <RESULTS_DIR> [--list] [--only FILTER]" >&2
+    exit 1
+fi
 
 # ── Server profiles to evaluate ──────────────────────────────────────────────
 SERVER_PROFILES=( ep16 ep16_limited pp8tp2 )
@@ -46,6 +75,31 @@ MEM_FRAC_STEP=0.02
 # ─────────────────────────────────────────────────────────────────────────────
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [main] $*"; }
 
+# ── Experiment filter ─────────────────────────────────────────────────────────
+should_run_experiment() {
+    local idx="$1" label="$2"
+    [[ -z "$ONLY_FILTER" ]] && return 0
+    IFS=',' read -ra FILTERS <<< "$ONLY_FILTER"
+    for f in "${FILTERS[@]}"; do
+        f="${f#"${f%%[![:space:]]*}"}"
+        f="${f%"${f##*[![:space:]]}"}"
+        if [[ "$f" =~ ^[0-9]+$ ]] && [[ "$f" -eq "$idx" ]]; then return 0; fi
+        if [[ "$label" == *"$f"* ]]; then return 0; fi
+    done
+    return 1
+}
+
+if [[ "$LIST_ONLY" -eq 1 ]]; then
+    echo "Available experiments:"
+    _i=0
+    for exp_entry in "${EXPERIMENTS[@]}"; do
+        IFS=: read -r _sp _gp _ds <<< "$exp_entry"
+        _i=$((_i + 1))
+        printf "  %2d. %s_%s-%s\n" "$_i" "$SYSTEM_NAME" "$_sp" "$_ds"
+    done
+    exit 0
+fi
+
 mkdir -p "$RESULTS_DIR"
 
 # ── Discover nodes ────────────────────────────────────────────────────────────
@@ -61,6 +115,7 @@ log "  Server profiles : ${SERVER_PROFILES[*]}"
 log "  Gate profiles   : ${#GATE_PROFILES[@]}"
 log "  Experiments     : ${#EXPERIMENTS[@]} (${#SERVER_PROFILES[@]} × ${#GATE_PROFILES[@]}), up to $MAX_RETRIES retries each"
 log "  Initial MEM_FRAC: $MEM_FRAC"
+[[ -n "$ONLY_FILTER" ]] && log "  Filter          : --only $ONLY_FILTER"
 
 EXP_NUM=0
 TOTAL=${#EXPERIMENTS[@]}
@@ -70,6 +125,12 @@ for exp_entry in "${EXPERIMENTS[@]}"; do
     EXP_NUM=$((EXP_NUM + 1))
 
     run_name="${SYSTEM_NAME}_${server_profile}-${dataset}"
+
+    if ! should_run_experiment "$EXP_NUM" "$run_name"; then
+        log "[$EXP_NUM/$TOTAL] SKIP (--only filter): $run_name"
+        continue
+    fi
+
     run_dir="$RESULTS_DIR/$run_name"
     mkdir -p "$run_dir"
 

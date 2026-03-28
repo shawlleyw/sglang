@@ -161,12 +161,12 @@ Balanced profiles are pre-generated and placed in `gating_profiles/balanced_outp
 # 1. Ensure all 8 nodes are reachable via SSH
 #    Default: head=local, workers=sgpu2 sgpu3 sgpu4 sgpu6 sgpu7 sgpu8 sgpu9
 
-# 2. Run from repo root — gpt-oss-120b
+# 2. Run from repo root — gpt-oss-120b (all 12 experiments)
 cd ~/sglang
 bash experiments/sphere/eval/gptoss_eval.sh /path/to/gptoss_results \
     |& tee experiments/gptoss_eval.log
 
-# 3. Run GLM-4.5-Air
+# 3. Run GLM-4.5-Air (all 12 experiments)
 bash experiments/sphere/eval/glm4air_eval.sh /path/to/glm4air_results \
     |& tee experiments/glm4air_eval.log
 
@@ -174,6 +174,37 @@ bash experiments/sphere/eval/glm4air_eval.sh /path/to/glm4air_results \
 HEAD=sgpu0 WORKERS="sgpu2 sgpu3 sgpu4 sgpu6 sgpu7 sgpu8 sgpu9" \
     bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
 ```
+
+### Running a single experiment
+
+Use `--list` to see available experiments and `--only` to select which to run:
+
+```bash
+# List all 12 experiments (prints index + name, then exits)
+bash experiments/sphere/eval/gptoss_eval.sh /path/to/results --list
+
+# Run by index (1-based)
+bash experiments/sphere/eval/gptoss_eval.sh /path/to/results --only 1
+
+# Run multiple by index
+bash experiments/sphere/eval/gptoss_eval.sh /path/to/results --only 1,5,9
+
+# Run all experiments for a server profile
+bash experiments/sphere/eval/gptoss_eval.sh /path/to/results --only pp8tp2
+
+# Run all experiments for a workload across all server profiles
+bash experiments/sphere/eval/gptoss_eval.sh /path/to/results --only sharegpt_regular
+
+# Run one exact experiment (server profile + workload)
+bash experiments/sphere/eval/gptoss_eval.sh /path/to/results --only ep16-sharegpt_regular
+```
+
+The `--only` filter accepts comma-separated values. Each value is matched as
+a 1-based index (if numeric) or as a substring of the run name (e.g.
+`sglang_ep16-sharegpt_regular`). Omitting `--only` runs all 12 experiments.
+
+**Note:** substring `ep16` matches both `ep16` and `ep16_limited` run names.
+Use `_ep16-` to match only the base ep16 profile.
 
 ---
 
