@@ -117,10 +117,22 @@ All profiles share: `--enable-fake-prefill`, `--profile-driven-gate-path`,
 | Network | InfiniBand `ens1f1np1`, HCA `mlx5_1`, NCCL+Gloo |
 | Initial memory fraction | 0.80 |
 | OOM step | −0.02 per retry |
-| Benchmark | 2000 rps × 10k reqs, in/out 256–512 uniform |
+| Benchmark dataset | `sharegpt` (default), `random`, `gsm8k` |
+| Benchmark rate / prompts | 2000 rps × 10k reqs |
 | Server ready timeout | 1800s (30 min) |
-| Benchmark timeout | 600s (10 min) |
+| Benchmark timeout | 1200s (20 min) |
 | Conda env | `sglang-fp` |
+
+### Benchmark datasets
+
+The benchmark dataset is selected via `BENCH_DATASET` (default: `sharegpt`).
+Each dataset uses its own config variables, all overridable via environment:
+
+| Dataset | Config variables (env override) | Defaults |
+|---|---|---|
+| `sharegpt` | `BENCH_SHAREGPT_CONTEXT_LEN`, `BENCH_SHAREGPT_OUTPUT_LEN` (optional) | context_len=2048, natural output length |
+| `gsm8k` | `BENCH_GSM8K_CONTEXT_LEN`, `BENCH_GSM8K_OUTPUT_LEN` (optional) | context_len=2048, natural answer length |
+| `random` | `BENCH_RANDOM_INPUT_LEN`, `BENCH_RANDOM_OUTPUT_LEN`, `BENCH_RANDOM_RANGE_RATIO` | 512 in/out, 0.5 range ratio |
 
 ---
 
@@ -172,6 +184,15 @@ bash experiments/sphere/eval/glm4air_eval.sh /path/to/glm4air_results \
 
 # Or override node discovery:
 HEAD=sgpu0 WORKERS="sgpu2 sgpu3 sgpu4 sgpu6 sgpu7 sgpu8 sgpu9" \
+    bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
+
+# Use a different benchmark dataset:
+BENCH_DATASET=gsm8k bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
+BENCH_DATASET=random bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
+
+# Override context length for sharegpt or gsm8k:
+BENCH_SHAREGPT_CONTEXT_LEN=4096 bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
+BENCH_DATASET=gsm8k BENCH_GSM8K_CONTEXT_LEN=4096 \
     bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
 ```
 

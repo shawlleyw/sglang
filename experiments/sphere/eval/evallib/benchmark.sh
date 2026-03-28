@@ -4,19 +4,66 @@
 #
 # Requires (from config.sh):
 #   SERVER_PORT, BENCH_TIMEOUT, MODEL_NAME, BENCH_BACKEND, BENCH_DATASET,
-#   BENCH_NUM_PROMPTS, BENCH_REQUEST_RATE,
-#   BENCH_RANDOM_INPUT_LEN, BENCH_RANDOM_OUTPUT_LEN, BENCH_RANDOM_RANGE_RATIO
+#   BENCH_NUM_PROMPTS, BENCH_REQUEST_RATE
+#   For random:   BENCH_RANDOM_INPUT_LEN, BENCH_RANDOM_OUTPUT_LEN, BENCH_RANDOM_RANGE_RATIO
+#   For sharegpt: BENCH_SHAREGPT_CONTEXT_LEN, (optional) BENCH_SHAREGPT_OUTPUT_LEN
+#   For gsm8k:    BENCH_GSM8K_CONTEXT_LEN,    (optional) BENCH_GSM8K_OUTPUT_LEN
 # Requires (from cluster.sh):
 #   HEAD
 
 log_bench() { echo "$(date '+%Y-%m-%d %H:%M:%S') [bench] $*"; }
 
-# run_benchmark <result_json_path> <cmd_file_path> [extra_args...]
+_build_dataset_args() {
+    local dataset_args=()
+    case "$BENCH_DATASET" in
+        random|random-ids)
+            dataset_args+=(
+                --random-input-len "$BENCH_RANDOM_INPUT_LEN"
+                --random-output-len "$BENCH_RANDOM_OUTPUT_LEN"
+                --random-range-ratio "$BENCH_RANDOM_RANGE_RATIO"
+            )
+            ;;
+        sharegpt)
+            dataset_args+=(--sharegpt-context-len "$BENCH_SHAREGPT_CONTEXT_LEN")
+            [[ -n "${BENCH_SHAREGPT_OUTPUT_LEN:-}" ]] && \
+                dataset_args+=(--sharegpt-output-len "$BENCH_SHAREGPT_OUTPUT_LEN")
+            ;;
+        gsm8k)
+            dataset_args+=(--sharegpt-context-len "$BENCH_GSM8K_CONTEXT_LEN")
+            [[ -n "${BENCH_GSM8K_OUTPUT_LEN:-}" ]] && \
+                dataset_args+=(--gsm8k-output-len "$BENCH_GSM8K_OUTPUT_LEN")
+            ;;
+    esac
+    echo "${dataset_args[@]}"
+}
+
+_log_dataset_info() {
+    case "$BENCH_DATASET" in
+        random|random-ids)
+            log_bench "  input=[${BENCH_RANDOM_INPUT_LEN}*${BENCH_RANDOM_RANGE_RATIO}, ${BENCH_RANDOM_INPUT_LEN}]"
+            log_bench "  output=[${BENCH_RANDOM_OUTPUT_LEN}*${BENCH_RANDOM_RANGE_RATIO}, ${BENCH_RANDOM_OUTPUT_LEN}]"
+            ;;
+        sharegpt)
+            log_bench "  context_len=${BENCH_SHAREGPT_CONTEXT_LEN}"
+            [[ -n "${BENCH_SHAREGPT_OUTPUT_LEN:-}" ]] && \
+                log_bench "  fixed_output_len=${BENCH_SHAREGPT_OUTPUT_LEN}"
+            ;;
+        gsm8k)
+            log_bench "  context_len=${BENCH_GSM8K_CONTEXT_LEN}"
+            [[ -n "${BENCH_GSM8K_OUTPUT_LEN:-}" ]] && \
+                log_bench "  fixed_output_len=${BENCH_GSM8K_OUTPUT_LEN}"
+            ;;
+    esac
+}
+
 run_benchmark() {
     local result_file="$1"
     local cmd_file="$2"
     shift 2
     local extra_args=("$@")
+
+    local dataset_args
+    read -ra dataset_args <<< "$(_build_dataset_args)"
 
     local cmd=(
         python -m sglang.bench_serving
@@ -27,9 +74,7 @@ run_benchmark() {
         --dataset-name "$BENCH_DATASET"
         --num-prompts "$BENCH_NUM_PROMPTS"
         --request-rate "$BENCH_REQUEST_RATE"
-        --random-input-len "$BENCH_RANDOM_INPUT_LEN"
-        --random-output-len "$BENCH_RANDOM_OUTPUT_LEN"
-        --random-range-ratio "$BENCH_RANDOM_RANGE_RATIO"
+        "${dataset_args[@]}"
         --output-file "$result_file"
         "${extra_args[@]}"
     )
@@ -37,9 +82,8 @@ run_benchmark() {
     rm -f "$result_file"
     log_bench "Running benchmark:"
     log_bench "  host=${HEAD}:${SERVER_PORT}"
-    log_bench "  ${BENCH_NUM_PROMPTS} prompts, ${BENCH_REQUEST_RATE} rps"
-    log_bench "  input=[${BENCH_RANDOM_INPUT_LEN}*${BENCH_RANDOM_RANGE_RATIO}, ${BENCH_RANDOM_INPUT_LEN}]"
-    log_bench "  output=[${BENCH_RANDOM_OUTPUT_LEN}*${BENCH_RANDOM_RANGE_RATIO}, ${BENCH_RANDOM_OUTPUT_LEN}]"
+    log_bench "  dataset=${BENCH_DATASET}, ${BENCH_NUM_PROMPTS} prompts, ${BENCH_REQUEST_RATE} rps"
+    _log_dataset_info
 
     {
         printf '# Benchmark command\n'

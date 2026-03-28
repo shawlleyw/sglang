@@ -65,11 +65,22 @@ All profiles share: `--enable-fake-prefill`, `--profile-driven-gate-path`,
 | Conda env | `sglang` | `CONDA_ENV` |
 | Initial memory fraction | 0.80 | — |
 | OOM step | −0.02 per retry | — |
+| Benchmark dataset | `sharegpt` | `BENCH_DATASET` (`sharegpt`, `random`, `gsm8k`) |
 | Benchmark rate | 2000 rps | `BENCH_REQUEST_RATE` |
 | Benchmark prompts | 10k | `BENCH_NUM_PROMPTS` |
-| Benchmark input/output | 256–512 uniform | `BENCH_RANDOM_INPUT_LEN`, `BENCH_RANDOM_OUTPUT_LEN`, `BENCH_RANDOM_RANGE_RATIO` |
 | Server ready timeout | 1800s (30 min) | `SERVER_READY_TIMEOUT` |
 | Benchmark timeout | 600s (10 min) | `BENCH_TIMEOUT` |
+
+### Benchmark datasets
+
+The benchmark dataset is selected via `BENCH_DATASET` (default: `sharegpt`).
+Each dataset uses its own config variables, all overridable via environment:
+
+| Dataset | Config variables (env override) | Defaults |
+|---|---|---|
+| `sharegpt` | `BENCH_SHAREGPT_CONTEXT_LEN`, `BENCH_SHAREGPT_OUTPUT_LEN` (optional) | context_len=2048, natural output length |
+| `gsm8k` | `BENCH_GSM8K_CONTEXT_LEN`, `BENCH_GSM8K_OUTPUT_LEN` (optional) | context_len=2048, natural answer length |
+| `random` | `BENCH_RANDOM_INPUT_LEN`, `BENCH_RANDOM_OUTPUT_LEN`, `BENCH_RANDOM_RANGE_RATIO` | 512 in/out, 0.5 range ratio |
 
 ---
 
@@ -91,8 +102,8 @@ The full matrix is `SERVER_PROFILES × GATE_PROFILES` (3 × 4 = 12 experiments):
 Regular profiles are captured from real inference traces.
 Balanced profiles are pre-generated and placed in `gating_profiles/balanced_output/`.
 
-Benchmark parameters are fixed in `config.sh` to match the AsyncMoE evaluation:
-2000 rps, 10k requests, input/output 256–512 uniform.
+Benchmark parameters are configured in `config.sh`: 2000 rps, 10k requests,
+default dataset `sharegpt` (context_len=2048). Override via `BENCH_DATASET`.
 
 ---
 
@@ -113,6 +124,15 @@ HEAD=gpua002 WORKERS="gpua007 gpua047 gpua076" \
 
 # Override benchmark parameters without editing config.sh:
 BENCH_REQUEST_RATE=500 BENCH_NUM_PROMPTS=1000 \
+    bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
+
+# Use a different benchmark dataset:
+BENCH_DATASET=gsm8k bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
+BENCH_DATASET=random bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
+
+# Override context length for sharegpt or gsm8k:
+BENCH_SHAREGPT_CONTEXT_LEN=4096 bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
+BENCH_DATASET=gsm8k BENCH_GSM8K_CONTEXT_LEN=4096 \
     bash experiments/delta/eval/ep16_eval.sh /path/to/my_results
 
 # Use a different conda environment:
