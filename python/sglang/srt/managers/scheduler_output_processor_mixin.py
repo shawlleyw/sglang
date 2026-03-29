@@ -1027,6 +1027,7 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
+                    num_waiting=len(self.waiting_queue),
                 )
             )
 

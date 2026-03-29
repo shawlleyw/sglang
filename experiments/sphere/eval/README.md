@@ -118,22 +118,41 @@ All profiles share: `--enable-fake-prefill`, `--profile-driven-gate-path`,
 | Network | InfiniBand `ens1f1np1`, HCA `mlx5_1`, NCCL+Gloo |
 | Initial memory fraction | 0.80 |
 | OOM step | −0.02 per retry |
-| Benchmark dataset | `sharegpt` (default), `random`, `gsm8k` |
+| Benchmark dataset | `.npy` files (aligned with AsyncMoE), auto-resolved per workload |
 | Benchmark rate / prompts | 2000 rps × 10k reqs |
 | Server ready timeout | 1800s (30 min) |
 | Benchmark timeout | 1200s (20 min) |
 | Conda env | `sglang-fp` |
 
-### Benchmark datasets
+### Benchmark dataset
 
-The benchmark dataset is selected via `BENCH_DATASET` (default: `sharegpt`).
-Each dataset uses its own config variables, all overridable via environment:
+The benchmark always uses `.npy` files for sequence lengths (aligned with AsyncMoE).
+The `.npy` path is auto-resolved per workload from `BENCH_DATASET_PATHS` in `config.sh`.
 
-| Dataset | Config variables (env override) | Defaults |
+| Config variable | Default | Description |
 |---|---|---|
-| `sharegpt` | `BENCH_SHAREGPT_CONTEXT_LEN`, `BENCH_SHAREGPT_OUTPUT_LEN` (optional) | context_len=2048, natural output length |
-| `gsm8k` | `BENCH_GSM8K_CONTEXT_LEN`, `BENCH_GSM8K_OUTPUT_LEN` (optional) | context_len=2048, natural answer length |
-| `random` | `BENCH_RANDOM_INPUT_LEN`, `BENCH_RANDOM_OUTPUT_LEN`, `BENCH_RANDOM_RANGE_RATIO` | 512 in/out, 0.5 range ratio |
+| `BENCH_DATASET_PATHS` | `sharegpt_lengths.npy:sharegpt`, `gsm8k_lengths.npy:gsm8k` | `path:label_substring` mapping |
+| `BENCH_NPY_CONTEXT_LEN` | 2048 | Filter: skip samples where input+output > this |
+
+---
+
+## Benchmark dataset: npy mode (default, aligned with AsyncMoE)
+
+By default, `BENCH_DATASET=npy` is used. This loads input/output token lengths from `.npy`
+files (shape `[N, 2]`, column 0 = input len, column 1 = output len) — the same format used
+by AsyncMoE's `DatasetGenerator`. Since the server runs with `--enable-fake-prefill`, actual
+token content is irrelevant; only the lengths matter.
+
+The eval scripts **automatically resolve** which `.npy` file to use based on the gate profile
+label: labels containing `sharegpt` use `datasets/sharegpt_lengths.npy`, labels containing
+`gsm8k` use `datasets/gsm8k_lengths.npy`. This mapping is defined in `config.sh` via
+`BENCH_DATASET_PATHS`.
+
+To add a new dataset, place the `.npy` file in `datasets/` and add a corresponding entry to
+`BENCH_DATASET_PATHS` in `config.sh`.
+
+To add a new workload with different sequence lengths, place a `.npy` file in `datasets/`
+and add an entry to `BENCH_DATASET_PATHS` in `config.sh`.
 
 ---
 
@@ -187,14 +206,8 @@ bash experiments/sphere/eval/glm4air_eval.sh /path/to/glm4air_results \
 HEAD=sgpu0 WORKERS="sgpu2 sgpu3 sgpu4 sgpu6 sgpu7 sgpu8 sgpu9" \
     bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
 
-# Use a different benchmark dataset:
-BENCH_DATASET=gsm8k bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
-BENCH_DATASET=random bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
-
-# Override context length for sharegpt or gsm8k:
-BENCH_SHAREGPT_CONTEXT_LEN=4096 bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
-BENCH_DATASET=gsm8k BENCH_GSM8K_CONTEXT_LEN=4096 \
-    bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
+# Override npy context length filter:
+BENCH_NPY_CONTEXT_LEN=4096 bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
 ```
 
 ### Running a single experiment

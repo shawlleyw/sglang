@@ -806,6 +806,16 @@ def get_dataset(args, tokenizer, model_id=None):
             fixed_output_len=args.random_output_len,
             random_sample=True,
         )
+    elif args.dataset_name == "npy":
+        assert args.dataset_path and args.dataset_path.endswith(".npy"), (
+            "--dataset-name npy requires --dataset-path pointing to a .npy file"
+        )
+        input_requests = sample_npy_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            context_len=args.sharegpt_context_len,
+        )
     elif args.dataset_name == "mooncake":
         # For mooncake, we don't generate the prompts here.
         # We just load the raw trace data. The async generator will handle the rest.
@@ -1389,6 +1399,54 @@ def sample_random_requests(
                 )
             )
 
+    print(f"#Input tokens: {np.sum(input_lens)}")
+    print(f"#Output tokens: {np.sum(output_lens)}")
+    return input_requests
+
+
+def sample_npy_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    context_len: Optional[int] = None,
+) -> List[DatasetRow]:
+    """Load input/output lengths from a .npy file (shape [N, 2]) and generate
+    dummy-token prompts.  Designed for use with --enable-fake-prefill where the
+    server ignores actual token content and only honours the lengths.
+
+    The .npy format is the same one used by AsyncMoE's DatasetGenerator:
+      column 0 = input token count
+      column 1 = output token count
+    """
+    lengths = np.load(dataset_path)
+    assert lengths.ndim == 2 and lengths.shape[1] == 2, (
+        f"Expected .npy with shape (N, 2), got {lengths.shape}"
+    )
+
+    if context_len is not None:
+        seq_lens = lengths[:, 0] + lengths[:, 1]
+        lengths = lengths[seq_lens <= context_len]
+        assert len(lengths) > 0, (
+            f"No samples with input+output <= {context_len} in {dataset_path}"
+        )
+
+    indices = np.random.randint(0, len(lengths), size=num_requests)
+    input_lens = lengths[indices, 0]
+    output_lens = lengths[indices, 1]
+
+    dummy_token_id = tokenizer.encode("a")[-1]
+    input_requests: List[DatasetRow] = []
+    for i in range(num_requests):
+        il = int(input_lens[i])
+        ol = int(output_lens[i])
+        prompt_ids = [dummy_token_id] * il
+        prompt_text = tokenizer.decode(prompt_ids)
+        input_requests.append(
+            DatasetRow(prompt=prompt_text, prompt_len=il, output_len=ol)
+        )
+
+    print(f"[npy] Loaded {dataset_path}: {lengths.shape[0]} samples, "
+          f"sampled {num_requests} requests")
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
@@ -2523,6 +2581,7 @@ if __name__ == "__main__":
             "mmmu",
             "image",
             "mooncake",
+            "npy",
         ],
         help="Name of the dataset to benchmark on.",
     )

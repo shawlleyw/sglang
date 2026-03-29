@@ -1029,7 +1029,7 @@ class Glm4MoeModel(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo:
+        if forward_batch.can_run_tbo and self.first_k_dense_replace > 0:
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer

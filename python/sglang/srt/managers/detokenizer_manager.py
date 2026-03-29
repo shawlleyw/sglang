@@ -99,7 +99,7 @@ class PerformanceTracker:
         }
         return itl_stats
     
-    def step(self, rids, num_inflight=None):
+    def step(self, rids, num_inflight=None, num_waiting=None):
         cur_time = time.perf_counter()
         self.process_tokens += len(rids)
         for rid in rids:
@@ -118,7 +118,7 @@ class PerformanceTracker:
             self.start_time = time.perf_counter()
             self.process_tokens = 0
             self.itls = []
-            logger.warning(f"from Detokenizer Manager, Throughput: {throughput:.1f} tokens/s, In-flight requests: {num_inflight}, ITL stats: {itl_stats}")
+            logger.warning(f"from Detokenizer Manager, Throughput: {throughput:.1f} tokens/s, In-flight requests: {num_inflight}, Waiting requests: {num_waiting}, ITL stats: {itl_stats}")
 
 class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
@@ -206,7 +206,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
         
-        self.performance_tracker.step(recv_obj.rids, num_inflight=len(self.decode_status))
+        self.performance_tracker.step(recv_obj.rids, num_inflight=len(self.decode_status), num_waiting=recv_obj.num_waiting)
         # Initialize decode status
         read_ids, surr_ids = [], []
         for i in range(bs):

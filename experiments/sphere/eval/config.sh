@@ -24,7 +24,7 @@ WORLD_SIZE=16
 DEFAULT_WORKERS="sgpu2 sgpu3 sgpu4 sgpu6 sgpu7 sgpu8 sgpu9"
 
 # ── Common runtime ────────────────────────────────────────────────────────────
-MEM_FRAC=0.77
+MEM_FRAC=${MEM_FRAC:-0.77}
 SERVER_PORT=30000
 DIST_INIT_PORT=25000
 DIST_TIMEOUT=1800
@@ -51,23 +51,17 @@ EP8_WORLD_SIZE=8
 
 # ── Benchmark — common ────────────────────────────────────────────────────────
 BENCH_BACKEND="sglang"
-BENCH_DATASET=${BENCH_DATASET:-"sharegpt"}
 BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS:-10000}
 BENCH_REQUEST_RATE=${BENCH_REQUEST_RATE:-2000}
 BENCH_TIMEOUT=1200
+BENCH_NPY_CONTEXT_LEN=${BENCH_NPY_CONTEXT_LEN:-2048}
 
-# ── Benchmark — random dataset ───────────────────────────────────────────────
-BENCH_RANDOM_INPUT_LEN=512
-BENCH_RANDOM_OUTPUT_LEN=512
-BENCH_RANDOM_RANGE_RATIO=0.5
-
-# ── Benchmark — sharegpt dataset ─────────────────────────────────────────────
-BENCH_SHAREGPT_CONTEXT_LEN=${BENCH_SHAREGPT_CONTEXT_LEN:-2048}
-# BENCH_SHAREGPT_OUTPUT_LEN=       # unset → use natural completion length
-
-# ── Benchmark — gsm8k dataset ────────────────────────────────────────────────
-BENCH_GSM8K_CONTEXT_LEN=${BENCH_GSM8K_CONTEXT_LEN:-2048}
-# BENCH_GSM8K_OUTPUT_LEN=          # unset → use natural answer length
+# ── Benchmark — .npy dataset paths (aligned with AsyncMoE) ──────────────────
+DATASETS_DIR="${REPO_DIR}/datasets"
+BENCH_DATASET_PATHS=(
+    "${DATASETS_DIR}/sharegpt_lengths.npy:sharegpt"
+    "${DATASETS_DIR}/gsm8k_lengths.npy:gsm8k"
+)
 
 # ── Server startup timeout ────────────────────────────────────────────────────
 SERVER_READY_TIMEOUT=600

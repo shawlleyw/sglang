@@ -75,6 +75,19 @@ MEM_FRAC_STEP=0.05
 # ─────────────────────────────────────────────────────────────────────────────
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [main] $*"; }
 
+resolve_dataset_path() {
+    local label="$1"
+    for entry in "${BENCH_DATASET_PATHS[@]}"; do
+        IFS=: read -r path tag <<< "$entry"
+        if [[ "$label" == *"$tag"* ]]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    echo ""
+    return 1
+}
+
 # ── Experiment filter ─────────────────────────────────────────────────────────
 should_run_experiment() {
     local idx="$1" label="$2"
@@ -127,6 +140,13 @@ TOTAL=${#EXPERIMENTS[@]}
 for exp_entry in "${EXPERIMENTS[@]}"; do
     IFS=: read -r server_profile gate_profile dataset <<< "$exp_entry"
     EXP_NUM=$((EXP_NUM + 1))
+
+    BENCH_DATASET_PATH=$(resolve_dataset_path "$dataset")
+    if [[ -z "$BENCH_DATASET_PATH" ]]; then
+        log "ERROR: No .npy dataset matches label '$dataset' in BENCH_DATASET_PATHS"
+        continue
+    fi
+    export BENCH_DATASET_PATH
 
     run_name="${SYSTEM_NAME}_${server_profile}-${dataset}"
 
