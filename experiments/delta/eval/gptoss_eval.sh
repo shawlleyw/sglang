@@ -151,6 +151,12 @@ for exp_entry in "${EXPERIMENTS[@]}"; do
         continue
     fi
 
+    if [[ "$dataset" == gsm8k* ]]; then
+        BENCH_DATASET="gsm8k"
+    else
+        BENCH_DATASET="sharegpt"
+    fi
+
     run_dir="$RESULTS_DIR/$run_name"
     mkdir -p "$run_dir"
 

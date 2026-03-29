@@ -82,17 +82,20 @@ Final cleanup: `kill_server`.
 
 | Profile | Parallelism | Key flags |
 |---|---|---|
-| `ep16` | tp=16, dp=16, ep=16 (4 nodes) | `--enable-dp-attention --enable-dp-lm-head` + `CUSTOMIZED_ARGS` |
+| `ep16` | tp=16, dp=16, ep=16 (4 nodes) | `--enable-dp-attention --enable-dp-lm-head --disable-custom-all-reduce` + `CUSTOMIZED_ARGS` |
 | `ep16_limited` | tp=16, dp=16, ep=16 (4 nodes) | Same as ep16 + `--max-running-requests 256` |
-| `ep8` | tp=8, dp=8, ep=8 (2 nodes) | Same flags as ep16 (DP-attention, DP-lm-head) but half the cluster |
+| `ep8` | tp=8, dp=8, ep=8 (2 nodes) | Same flags as ep16 but 2 nodes only |
 | `pp4tp4` | tp=4, pp=4 (4 nodes) | `--disable-custom-all-reduce` (no EP/DP-attention) |
 
 All profiles share: `--enable-fake-prefill`, `--profile-driven-gate-path`,
 `--disable-radix-cache`, `--chunked-prefill-size -1`,
-`--moe-runner-backend triton`.
+`--moe-runner-backend triton`, `--disable-custom-all-reduce`.
 
 EP profiles additionally append `CUSTOMIZED_ARGS` from the model config
 (e.g. `--moe-a2a-backend mooncake-nccl` for gpt-oss).
+
+**`--disable-custom-all-reduce` is required on ALL profiles on Delta.** Without it,
+CUDA graph capture hangs indefinitely on DP/EP topologies (falls back to Gloo and deadlocks).
 
 ---
 
@@ -102,18 +105,20 @@ EP profiles additionally append `CUSTOMIZED_ARGS` from the model config
 |---|---|
 | Cluster | 4 nodes × 4 A100-SXM4-40GB = 16 GPUs |
 | Network | HPE Slingshot `hsn0`, NCCL+Gloo |
-| Initial memory fraction | 0.80 |
+| Initial memory fraction | 0.65 (ep16/pp4tp4), 0.85 (ep8) — see Delta notes |
 | OOM step | −0.02 per retry |
 | Benchmark dataset | `sharegpt` (default), `random`, `gsm8k` |
 | Benchmark rate / prompts | 2000 rps × 10k reqs |
-| Server ready timeout | 1800s (30 min) |
-| Benchmark timeout | 1200s (20 min) |
+| Server ready timeout | 300s (5 min) |
+| Benchmark timeout | ep16: 600s, ep16_limited: 1200s, ep8: 900s, pp4tp4: 1500s |
 | Conda env | `sglang` |
 
 ### Benchmark datasets
 
-The benchmark dataset is selected via `BENCH_DATASET` (default: `sharegpt`).
-Each dataset uses its own config variables, all overridable via environment:
+Each experiment auto-selects its benchmark dataset from the gate profile label
+(`sharegpt*` → `sharegpt`, `gsm8k*` → `gsm8k`). Override for all experiments
+in a run by setting `BENCH_DATASET` explicitly. All dataset parameters are
+overridable via environment:
 
 | Dataset | Config variables (env override) | Defaults |
 |---|---|---|
@@ -141,7 +146,7 @@ Each eval script runs `SERVER_PROFILES × GATE_PROFILES` (4 × 4 = 16 experiment
 | `gsm8k_balanced` | `balanced_math_gsm8k_200.parquet` |
 
 Regular profiles are captured from real inference traces.
-Balanced profiles are pre-generated and placed in `gating_profiles/balanced_output/`.
+Balanced profiles live in `gating_profiles/gptosss_balanced_output/` (note triple-s).
 
 ---
 
@@ -228,6 +233,89 @@ Run directories are named `<system>_<server_profile>-<dataset_label>` under `RES
 
 Failed attempt artifacts are archived to `attempt<N>/` subdirectories before
 each retry, preserving logs for post-mortem debugging.
+
+---
+
+## Monitoring
+
+Always check **both** the main eval log and the server head log — critical server
+errors (OOM, NCCL failures) only appear in `server_head.log` and are not surfaced
+in the main `[main]`/`[server]` output.
+
+```bash
+# Main eval progress
+tail -f ~/unified-eval-mar28-1/sglang-gptoss.log | grep '\[main\]\|\[server\]'
+
+# Server health (most important — check this on every poll)
+tail -20 <RESULTS_DIR>/<experiment>/logs/server_head.log
+
+# Worker logs (check if a worker dropped out)
+tail -5 <RESULTS_DIR>/<experiment>/logs/server_w1.log
+tail -5 <RESULTS_DIR>/<experiment>/logs/server_w2.log
+tail -5 <RESULTS_DIR>/<experiment>/logs/server_w3.log
+
+# GPU utilization — if any node shows 0%, a worker crashed
+for node in gpua003 gpua017 gpua072 gpua080; do
+    printf "$node: "
+    ssh $node 'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | tr "\n" " "'
+    echo
+done
+```
+
+Healthy server log shows:
+- `Capturing batches (bs=N avail_mem=X GB): N%|...` — CUDA graph capture in progress
+- `The server is fired up and ready to roll!` — ready
+- `Throughput: N tokens/s, In-flight requests: N` — benchmark running
+
+Unhealthy signs:
+- `RuntimeError: Not enough memory. Please try to increase --mem-fraction-static` → OOM, increase MEM_FRAC
+- `CUDA graph capture` frozen >5 min with all GPUs at 100% → deadlock (check `--disable-custom-all-reduce`)
+- Any node at 0% GPU after server ready → worker crashed, check that node's log
+
+---
+
+## Delta-specific notes
+
+### `--disable-custom-all-reduce` is required on all profiles
+
+Without it, CUDA graph capture on DP/EP topologies hangs indefinitely on Delta —
+falls back to Gloo and deadlocks. All four server profiles now include this flag.
+
+### MEM_FRAC is profile-dependent
+
+| Profile | Required MEM_FRAC | Reason |
+|---|---|---|
+| `ep16`, `ep16_limited`, `pp4tp4` | 0.65 (confirmed working) | 16-GPU sharding leaves adequate headroom |
+| `ep8` | ≥ 0.85 | 8-GPU sharding → ~30 GB weights/GPU for 120B model; 0.75 is not enough |
+
+Setting MEM_FRAC too high on ep16 (≥ 0.70 with `--moe-a2a-backend mooncake-nccl`)
+causes CUDA graph capture to deadlock. `CUDA_LAUNCH_BLOCKING=1` makes this worse
+(full deadlock) because mooncake-nccl relies on async communication during capture.
+
+### Use the HuggingFace model path
+
+Set `MODEL_PATH="lmsys/gpt-oss-120b-bf16"` (HF model ID) rather than a local
+directory. Local copies may be stale or have modified configs. Works correctly
+with `--load-format dummy` which downloads only config + tokenizer (~MBs).
+
+### Killing a stuck eval
+
+`kill $PID` only kills the nohup wrapper — sglang children survive. Always clean up:
+
+```bash
+# Kill eval script
+kill $(cat <pid_file>)
+
+# Kill all sglang processes on all nodes
+for node in gpua003 gpua017 gpua072 gpua080; do
+    ssh $node 'pkill -9 -f "sglang" 2>/dev/null' || true
+done
+
+# Kill tmux sessions
+for s in sglang-head sglang-w1 sglang-w2 sglang-w3; do
+    tmux kill-session -t "$s" 2>/dev/null || true
+done
+```
 
 ---
 

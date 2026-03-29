@@ -21,7 +21,11 @@ N_GPU_PER_NODE=4
 WORLD_SIZE=16
 
 # ── Common runtime ────────────────────────────────────────────────────────────
-MEM_FRAC=0.80
+# ep16/pp4tp4: 0.65 (≥0.70 deadlocks with mooncake-nccl during CUDA graph capture)
+# ep8: must be ≥0.85 (8-GPU sharding → ~30 GB weights/GPU for 120B model)
+# Override per-profile in evallib/server.sh
+MEM_FRAC=0.65
+EP8_MEM_FRAC=0.85
 SERVER_PORT=30000
 DIST_INIT_PORT=25000
 DIST_TIMEOUT=1800
@@ -49,7 +53,10 @@ BENCH_BACKEND="sglang"
 BENCH_DATASET=${BENCH_DATASET:-"sharegpt"}
 BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS:-10000}
 BENCH_REQUEST_RATE=${BENCH_REQUEST_RATE:-2000}
-BENCH_TIMEOUT=1200
+BENCH_TIMEOUT_EP16=600
+BENCH_TIMEOUT_EP16_LIMITED=1200
+BENCH_TIMEOUT_EP8=900
+BENCH_TIMEOUT_PP4TP4=1500
 
 # ── Benchmark — random dataset ───────────────────────────────────────────────
 BENCH_RANDOM_INPUT_LEN=512
@@ -65,4 +72,4 @@ BENCH_GSM8K_CONTEXT_LEN=${BENCH_GSM8K_CONTEXT_LEN:-2048}
 # BENCH_GSM8K_OUTPUT_LEN=          # unset → use natural answer length
 
 # ── Server startup timeout ────────────────────────────────────────────────────
-SERVER_READY_TIMEOUT=1800
+SERVER_READY_TIMEOUT=300

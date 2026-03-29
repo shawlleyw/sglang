@@ -9,16 +9,16 @@ EVAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$EVAL_DIR/config.sh"
 
 # ── Model — gpt-oss-120b-bf16 (36 layers, 128 experts, dummy weights) ────────
-MODEL_PATH="/projects/bgro/spark36/models/gpt-oss-120b-bf16"
+MODEL_PATH="lmsys/gpt-oss-120b-bf16"
 MODEL_NAME="lmsys/gpt-oss-120b-bf16"
 LOAD_FORMAT="dummy"
 
 # ── Gate profiles ─────────────────────────────────────────────────────────────
 GATE_PROFILES=(
     "${GATING_DIR}/gating_gptoss120b_sharegpt_200.parquet:sharegpt_regular"
-    "${GATING_DIR}/balanced_output/balanced_gptoss120b_sharegpt_200.parquet:sharegpt_balanced"
+    "${GATING_DIR}/gptosss_balanced_output/balanced_gptoss120b_sharegpt_200.parquet:sharegpt_balanced"
     "${GATING_DIR}/gating_math_gsm8k_200.parquet:gsm8k_regular"
-    "${GATING_DIR}/balanced_output/balanced_math_gsm8k_200.parquet:gsm8k_balanced"
+    "${GATING_DIR}/gptosss_balanced_output/balanced_math_gsm8k_200.parquet:gsm8k_balanced"
 )
 
 # ── Customized server args (appended to every sglang.launch_server command) ───

@@ -35,6 +35,7 @@ _build_server_cmd() {
     cmd+=" && export SGLANG_LOCAL_IP_NIC=${HOST_IFNAME}"
     cmd+=" && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 
+
     local nnodes
     nnodes=$(_profile_nnodes "$server_profile")
 
@@ -47,7 +48,6 @@ _build_server_cmd() {
     cmd+=" --enable-fake-prefill"
     cmd+=" --disable-radix-cache"
     cmd+=" --chunked-prefill-size -1"
-    cmd+=" --mem-fraction-static ${MEM_FRAC}"
     cmd+=" --trust-remote-code"
     cmd+=" --moe-runner-backend triton"
     cmd+=" --dist-timeout ${DIST_TIMEOUT}"
@@ -57,30 +57,37 @@ _build_server_cmd() {
     case "$server_profile" in
         ep16)
             apply_customized_args=1
+            cmd+=" --mem-fraction-static ${MEM_FRAC}"
             cmd+=" --tp-size ${WORLD_SIZE}"
             cmd+=" --dp-size ${WORLD_SIZE}"
             cmd+=" --ep-size ${WORLD_SIZE}"
             cmd+=" --enable-dp-attention"
             cmd+=" --enable-dp-lm-head"
+            cmd+=" --disable-custom-all-reduce"
             ;;
         ep16_limited)
             apply_customized_args=1
+            cmd+=" --mem-fraction-static ${MEM_FRAC}"
             cmd+=" --tp-size ${WORLD_SIZE}"
             cmd+=" --dp-size ${WORLD_SIZE}"
             cmd+=" --ep-size ${WORLD_SIZE}"
             cmd+=" --enable-dp-attention"
             cmd+=" --enable-dp-lm-head"
             cmd+=" --max-running-requests ${EP16_LIMITED_MAX_RUNNING_REQS}"
+            cmd+=" --disable-custom-all-reduce"
             ;;
         ep8)
             apply_customized_args=1
+            cmd+=" --mem-fraction-static ${EP8_MEM_FRAC:-0.85}"
             cmd+=" --tp-size ${EP8_WORLD_SIZE}"
             cmd+=" --dp-size ${EP8_WORLD_SIZE}"
             cmd+=" --ep-size ${EP8_WORLD_SIZE}"
             cmd+=" --enable-dp-attention"
             cmd+=" --enable-dp-lm-head"
+            cmd+=" --disable-custom-all-reduce"
             ;;
         pp4tp4)
+            cmd+=" --mem-fraction-static ${MEM_FRAC}"
             cmd+=" --tp-size 4"
             cmd+=" --pp-size 4"
             cmd+=" --disable-custom-all-reduce"

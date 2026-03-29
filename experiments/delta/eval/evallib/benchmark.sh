@@ -3,7 +3,8 @@
 # Source this file; do not execute directly.
 #
 # Requires (from config.sh):
-#   SERVER_PORT, BENCH_TIMEOUT, MODEL_NAME, BENCH_BACKEND, BENCH_DATASET,
+#   SERVER_PORT, BENCH_TIMEOUT_EP16, BENCH_TIMEOUT_EP16_LIMITED,
+#   BENCH_TIMEOUT_EP8, BENCH_TIMEOUT_PP4TP4, MODEL_NAME, BENCH_BACKEND, BENCH_DATASET,
 #   BENCH_NUM_PROMPTS, BENCH_REQUEST_RATE, MINICONDA, CONDA_ENV
 #   For random:   BENCH_RANDOM_INPUT_LEN, BENCH_RANDOM_OUTPUT_LEN, BENCH_RANDOM_RANGE_RATIO
 #   For sharegpt: BENCH_SHAREGPT_CONTEXT_LEN, (optional) BENCH_SHAREGPT_OUTPUT_LEN
@@ -62,6 +63,15 @@ run_benchmark() {
     shift 2
     local extra_args=("$@")
 
+    local bench_timeout
+    case "${SERVER_PROFILE:-}" in
+        ep16)         bench_timeout="${BENCH_TIMEOUT_EP16:-600}" ;;
+        ep16_limited) bench_timeout="${BENCH_TIMEOUT_EP16_LIMITED:-1200}" ;;
+        ep8)          bench_timeout="${BENCH_TIMEOUT_EP8:-900}" ;;
+        pp4tp4)       bench_timeout="${BENCH_TIMEOUT_PP4TP4:-1500}" ;;
+        *)            bench_timeout="${BENCH_TIMEOUT_PP4TP4:-1500}" ;;
+    esac
+
     local dataset_args
     read -ra dataset_args <<< "$(_build_dataset_args)"
 
@@ -82,7 +92,7 @@ run_benchmark() {
     rm -f "$result_file"
     log_bench "Running benchmark:"
     log_bench "  host=${HEAD}:${SERVER_PORT}"
-    log_bench "  dataset=${BENCH_DATASET}, ${BENCH_NUM_PROMPTS} prompts, ${BENCH_REQUEST_RATE} rps"
+    log_bench "  dataset=${BENCH_DATASET}, ${BENCH_NUM_PROMPTS} prompts, ${BENCH_REQUEST_RATE} rps, timeout=${bench_timeout}s"
     _log_dataset_info
 
     {
@@ -93,7 +103,7 @@ run_benchmark() {
         printf '\n'
     } > "$cmd_file"
 
-    if timeout "$BENCH_TIMEOUT" "${MINICONDA}/envs/${CONDA_ENV}/bin/python" "${cmd[@]:1}" 2>&1 | tee "${result_file%.json}.log"; then
+    if timeout "$bench_timeout" "${MINICONDA}/envs/${CONDA_ENV}/bin/python" "${cmd[@]:1}" 2>&1 | tee "${result_file%.json}.log"; then
         if [ -f "$result_file" ]; then
             log_bench "Benchmark complete. Result: $result_file"
             return 0
@@ -105,7 +115,7 @@ run_benchmark() {
     else
         local exit_code=$?
         if [ "$exit_code" -eq 124 ]; then
-            log_bench "ERROR: Benchmark timed out after ${BENCH_TIMEOUT}s."
+            log_bench "ERROR: Benchmark timed out after ${bench_timeout}s."
             printf '{"error":"timeout"}\n' > "$result_file"
         else
             log_bench "ERROR: Benchmark failed with exit code $exit_code."
