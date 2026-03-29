@@ -2113,27 +2113,26 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
+    server_info = None
+    accept_length = None
     if "sglang" in backend:
-        server_info = requests.get(
-            base_url + "/get_server_info", headers=get_auth_headers()
-        )
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
-            if "decode" in server_info_json:
-                server_info_json = server_info_json["decode"][0]
-            if (
-                "internal_states" in server_info_json
-                and server_info_json["internal_states"]
-            ):
-                accept_length = server_info_json["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
-            else:
-                accept_length = None
-        else:
-            accept_length = None
-    else:
-        accept_length = None
+        try:
+            resp = requests.get(
+                base_url + "/get_server_info", headers=get_auth_headers(),
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                server_info = resp.json()
+                si = server_info
+                if "decode" in si:
+                    si = si["decode"][0]
+                if "internal_states" in si and si["internal_states"]:
+                    accept_length = si["internal_states"][0].get(
+                        "avg_spec_accept_length", None
+                    )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, Exception):
+            print("Warning: could not reach server for server_info (server may have exited)")
+            server_info = None
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time

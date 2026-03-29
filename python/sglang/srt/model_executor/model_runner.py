@@ -1341,6 +1341,17 @@ class ModelRunner:
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
+        logger.warning(
+            f"KV cache allocation: "
+            f"avail_after_weights(A)={available_gpu_memory:.4f} GiB, "
+            f"avail_before_weights(B)={total_gpu_memory:.4f} GiB, "
+            f"mem_fraction_static={self.mem_fraction_static}, "
+            f"reservation=B*(1-m)={total_gpu_memory * (1 - self.mem_fraction_static):.4f} GiB, "
+            f"rest_memory(KV budget)={rest_memory:.4f} GiB, "
+            f"cell_size={cell_size} bytes/token, "
+            f"max_num_token={max_num_token}, "
+            f"total_kv_cache={max_num_token * cell_size / (1 << 30):.4f} GiB",
+        )
         return max_num_token
 
     def handle_max_mamba_cache(self, total_rest_memory):
