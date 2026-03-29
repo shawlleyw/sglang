@@ -51,9 +51,9 @@ EP8_WORLD_SIZE=8
 
 # ── Benchmark — common ────────────────────────────────────────────────────────
 BENCH_BACKEND="sglang"
-BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS:-10000}
+BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS:-20000}
 BENCH_REQUEST_RATE=${BENCH_REQUEST_RATE:-2000}
-BENCH_TIMEOUT=1200
+BENCH_TIMEOUT=1500
 BENCH_NPY_CONTEXT_LEN=${BENCH_NPY_CONTEXT_LEN:-2048}
 
 # ── Benchmark — .npy dataset paths (aligned with AsyncMoE) ──────────────────

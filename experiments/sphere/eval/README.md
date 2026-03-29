@@ -268,6 +268,8 @@ Run directories are named `<system>_<server_profile>-<dataset_label>` under `RES
 Only the final successful attempt's logs are kept; previous attempts are
 cleaned up before each retry.
 
+To plot global batch size (in-flight/waiting) timelines: `python experiments/sphere/eval/plot_sglang_inflight_timeline.py <RESULTS_DIR> [profile_filter]`
+
 ---
 
 ## Adding a new model
