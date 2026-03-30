@@ -120,6 +120,7 @@ All profiles share: `--enable-fake-prefill`, `--profile-driven-gate-path`,
 | OOM step | −0.02 per retry |
 | Benchmark dataset | `.npy` files (aligned with AsyncMoE), auto-resolved per workload |
 | Benchmark rate / prompts | 2000 rps × 10k reqs |
+| Benchmark streaming | `BENCH_DISABLE_STREAM=0` (set to `1` to pass `--disable-stream`) |
 | Server ready timeout | 1800s (30 min) |
 | Benchmark timeout | 1200s (20 min) |
 | Conda env | `sglang-fp` |
@@ -204,10 +205,16 @@ bash experiments/sphere/eval/glm4air_eval.sh /path/to/glm4air_results \
 
 # Or override node discovery:
 HEAD=sgpu0 WORKERS="sgpu2 sgpu3 sgpu4 sgpu6 sgpu7 sgpu8 sgpu9" \
-    bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
+bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
 
 # Override npy context length filter:
 BENCH_NPY_CONTEXT_LEN=4096 bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
+
+# Disable streaming in sglang.bench_serving:
+bash experiments/sphere/eval/gptoss_eval.sh /path/to/results --disable-stream
+
+# Or set the shared benchmark toggle directly:
+BENCH_DISABLE_STREAM=1 bash experiments/sphere/eval/gptoss_eval.sh /path/to/results
 ```
 
 ### Running a single experiment
@@ -232,11 +239,18 @@ bash experiments/sphere/eval/gptoss_eval.sh /path/to/results --only sharegpt_reg
 
 # Run one exact experiment (server profile + workload)
 bash experiments/sphere/eval/gptoss_eval.sh /path/to/results --only ep16-sharegpt_regular
+
+# Run a single experiment without streaming
+bash experiments/sphere/eval/gptoss_eval.sh /path/to/results --only ep16-sharegpt_regular --disable-stream
 ```
 
 The `--only` filter accepts comma-separated values. Each value is matched as
 a 1-based index (if numeric) or as a substring of the run name (e.g.
 `sglang_ep16-sharegpt_regular`). Omitting `--only` runs all 16 experiments.
+
+`--disable-stream` propagates to `sglang.bench_serving --disable-stream`, so the
+benchmark records aggregate request latency while the server-side detokenizer log
+remains the source of ITL and in-flight metrics.
 
 **Note:** substring `ep16` matches both `ep16` and `ep16_limited` run names.
 Use `_ep16-` to match only the base ep16 profile.

@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FORCE_STREAM_INTERVAL = 50
+DEFAULT_FORCE_STREAM_INTERVAL = 10
 
 
 class SchedulerOutputProcessorMixin:

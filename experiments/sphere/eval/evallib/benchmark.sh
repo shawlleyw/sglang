@@ -33,11 +33,16 @@ run_benchmark() {
         "${extra_args[@]}"
     )
 
+    if [[ "${BENCH_DISABLE_STREAM:-0}" == "1" ]]; then
+        cmd+=(--disable-stream)
+    fi
+
     rm -f "$result_file"
     log_bench "Running benchmark:"
     log_bench "  host=${HEAD}:${SERVER_PORT}"
     log_bench "  npy_path=${BENCH_DATASET_PATH}, context_len=${BENCH_NPY_CONTEXT_LEN}"
     log_bench "  ${BENCH_NUM_PROMPTS} prompts, ${BENCH_REQUEST_RATE} rps"
+    log_bench "  stream=$([[ "${BENCH_DISABLE_STREAM:-0}" == "1" ]] && echo disabled || echo enabled)"
 
     {
         printf '# Benchmark command\n'

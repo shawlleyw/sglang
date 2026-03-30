@@ -39,11 +39,13 @@ source "$EVAL_DIR/evallib/benchmark.sh"
 ONLY_FILTER=""
 LIST_ONLY=0
 RESULTS_DIR=""
+DISABLE_STREAM=${BENCH_DISABLE_STREAM:-0}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --only) ONLY_FILTER="${2:?ERROR: --only requires a comma-separated list}"; shift 2 ;;
         --list) LIST_ONLY=1; shift ;;
+        --disable-stream) DISABLE_STREAM=1; shift ;;
         -*) echo "ERROR: Unknown option: $1" >&2; exit 1 ;;
         *)
             if [[ -z "$RESULTS_DIR" ]]; then RESULTS_DIR="$1"; shift
@@ -54,9 +56,11 @@ done
 
 if [[ "$LIST_ONLY" -eq 0 ]] && [[ -z "$RESULTS_DIR" ]]; then
     echo "ERROR: RESULTS_DIR is required (e.g. /path/to/results)" >&2
-    echo "Usage: $0 <RESULTS_DIR> [--list] [--only FILTER]" >&2
+    echo "Usage: $0 <RESULTS_DIR> [--list] [--only FILTER] [--disable-stream]" >&2
     exit 1
 fi
+
+export BENCH_DISABLE_STREAM="$DISABLE_STREAM"
 
 # ── Server profiles to evaluate ──────────────────────────────────────────────
 SERVER_PROFILES=( ep16 ep16_limited pp8tp2 ep8 )
@@ -69,7 +73,7 @@ for _sp in "${SERVER_PROFILES[@]}"; do
     done
 done
 
-MAX_RETRIES=3
+MAX_RETRIES=${MAX_RETRIES:-1}
 MEM_FRAC_STEP=0.05
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,6 +135,7 @@ log "  Server profiles : ${SERVER_PROFILES[*]}"
 log "  Gate profiles   : ${#GATE_PROFILES[@]}"
 log "  Experiments     : ${#EXPERIMENTS[@]} (${#SERVER_PROFILES[@]} × ${#GATE_PROFILES[@]}), up to $MAX_RETRIES retries each"
 log "  Initial MEM_FRAC: $MEM_FRAC"
+log "  Benchmark stream: $([[ "$BENCH_DISABLE_STREAM" == "1" ]] && echo disabled || echo enabled)"
 [[ -n "$ONLY_FILTER" ]] && log "  Filter          : --only $ONLY_FILTER"
 
 EXP_NUM=0

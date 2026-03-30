@@ -98,10 +98,22 @@ class PerformanceTracker:
             "count": int(len(all_latencies)),
         }
         return itl_stats
+
+    def format_itl_stats(self):
+        itl_stats = self.report_itl()
+        if itl_stats is None:
+            return "ITL mean=N/A ms, median=N/A ms, p99=N/A ms, samples=0"
+
+        return (
+            f"ITL mean={itl_stats['mean'] * 1000:.2f} ms, "
+            f"median={itl_stats['median'] * 1000:.2f} ms, "
+            f"p99={itl_stats['p99'] * 1000:.2f} ms, "
+            f"samples={itl_stats['count']}"
+        )
     
-    def step(self, rids, num_inflight=None, num_waiting=None):
+    def step(self, rids, token_count, num_inflight=None, num_waiting=None):
         cur_time = time.perf_counter()
-        self.process_tokens += len(rids)
+        self.process_tokens += token_count
         for rid in rids:
             if rid not in self.req_token_tracker:
                 self.req_token_tracker[rid] = [cur_time]
@@ -114,11 +126,11 @@ class PerformanceTracker:
             self.start_time = cur_time
         elif cur_time - self.start_time >= self.time_per_report_step:
             throughput = self.report_throughput(cur_time)
-            itl_stats = self.report_itl()
+            itl_stats = self.format_itl_stats()
             self.start_time = time.perf_counter()
             self.process_tokens = 0
             self.itls = []
-            logger.warning(f"from Detokenizer Manager, Throughput: {throughput:.1f} tokens/s, In-flight requests: {num_inflight}, Waiting requests: {num_waiting}, ITL stats: {itl_stats}")
+            logger.warning(f"from Detokenizer Manager, Throughput: {throughput:.1f} tokens/s, In-flight requests: {num_inflight}, Waiting requests: {num_waiting}, {itl_stats}")
 
 class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
@@ -206,7 +218,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
         
-        self.performance_tracker.step(recv_obj.rids, num_inflight=len(self.decode_status), num_waiting=recv_obj.num_waiting)
+        token_count = sum(len(token_ids) for token_ids in recv_obj.decode_ids)
+        self.performance_tracker.step(
+            recv_obj.rids,
+            token_count,
+            num_inflight=len(self.decode_status),
+            num_waiting=recv_obj.num_waiting,
+        )
         # Initialize decode status
         read_ids, surr_ids = [], []
         for i in range(bs):
