@@ -71,7 +71,7 @@ class DecodeStatus:
     
 class PerformanceTracker:
     
-    def __init__(self, time_per_report_step: float = 5):
+    def __init__(self, time_per_report_step: float = 10):
         self.start_time = None
         self.time_per_report_step = time_per_report_step
         

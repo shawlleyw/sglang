@@ -194,11 +194,11 @@ is_oom() {
 kill_server() {
     log_server "Killing server..."
     for n in "${ALL_NODES[@]}"; do
-        ssh "$n" 'pkill -9 -f "sglang.launch_server" 2>/dev/null; pkill -9 -f "sglang.srt" 2>/dev/null; pkill -9 -f "torch._inductor.compile_worker" 2>/dev/null' 2>/dev/null || true
+        ssh "$n" 'pkill -9 -f "sglang.launch_server" 2>/dev/null; pkill -9 -f "sglang.srt" 2>/dev/null; pkill -9 -f "torch._inductor.compile_worker" 2>/dev/null; fuser -k 25000/tcp 25001/tcp 25002/tcp 25003/tcp 25004/tcp 25005/tcp 30000/tcp 2>/dev/null' 2>/dev/null || true
     done
     for s in sglang-head sglang-w1 sglang-w2 sglang-w3 sglang-w4 sglang-w5 sglang-w6 sglang-w7; do
         tmux kill-session -t "$s" 2>/dev/null || true
     done
-    sleep 5
+    sleep 8
     log_server "Server killed."
 }
