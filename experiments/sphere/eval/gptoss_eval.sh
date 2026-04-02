@@ -73,7 +73,7 @@ for _sp in "${SERVER_PROFILES[@]}"; do
     done
 done
 
-MAX_RETRIES=${MAX_RETRIES:-1}
+MAX_RETRIES=2
 MEM_FRAC_STEP=0.05
 
 # ─────────────────────────────────────────────────────────────────────────────
