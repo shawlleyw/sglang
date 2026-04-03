@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.eplb.moe_kernel_balance import get_global_moe_kernel_balance_recorder
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -138,9 +139,13 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
+                # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
+                # mooncake-nccl uses StandardDispatcher (no all-to-all), so each GPU has all tokens → FULL.
                 if (
-                    # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
-                    not get_moe_a2a_backend().is_none()
+                    (
+                        not get_moe_a2a_backend().is_none()
+                        and not get_moe_a2a_backend().is_mooncake_nccl()
+                    )
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 )
                 else ScatterMode.FULL
@@ -186,6 +191,7 @@ class LayerCommunicator:
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
+        layer_id: int = -1,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -193,7 +199,7 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
 
-        self._context = CommunicateContext.init_new()
+        self._context = CommunicateContext.init_new(layer_id=layer_id)
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
@@ -386,13 +392,14 @@ class CommunicateContext:
     attn_tp_size: int
     attn_dp_size: int
     tp_size: int
+    layer_id: int = -1
     cache = None
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
 
     @classmethod
-    def init_new(cls):
+    def init_new(cls, layer_id: int = -1):
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         attn_dp_size = get_attention_dp_size()
@@ -409,6 +416,7 @@ class CommunicateContext:
             attn_tp_size=attn_tp_size,
             attn_dp_size=attn_dp_size,
             tp_size=tp_size,
+            layer_id=layer_id,
         )
 
 
@@ -447,10 +455,13 @@ class CommunicateSimpleFn:
             get_local_dp_buffer(),
             hidden_states,
         )
+        _kr = get_global_moe_kernel_balance_recorder()
+        _kr.record_ag_start(context.layer_id)
         attn_tp_all_gather_into_tensor(
             hidden_states,
             local_hidden_states,
         )
+        _kr.record_ag_end(context.layer_id)
         return hidden_states
 
 
@@ -468,7 +479,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
         residual_output_mode: ScatterMode,
         context: CommunicateContext,
     ):
-
         if (
             context.is_same_group_size(
                 hidden_states_input_mode, hidden_states_output_mode
@@ -531,17 +541,19 @@ class CommunicateWithAllReduceAndLayerNormFn:
         *,
         residual_input_mode,
     ):
+        _kr = get_global_moe_kernel_balance_recorder()
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
             residual, local_residual = (
                 get_local_dp_buffer(),
                 residual,
             )
+            _kr.record_ag_start(context.layer_id)
             attn_tp_all_gather_into_tensor(residual, local_residual)
+            _kr.record_ag_end(context.layer_id)
         if context.attn_dp_size != 1:
             if context.attn_tp_rank == 0:
                 hidden_states += residual
 
-            # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
             use_layer_norm_before_gather = context.attn_tp_size == 1
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
                 residual = hidden_states
@@ -555,15 +567,15 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 get_global_dp_buffer(),
                 hidden_states,
             )
+            _kr.record_ag_start(context.layer_id)
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            _kr.record_ag_end(context.layer_id)
 
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
         else:
-            # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-            # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
             if (
                 (_is_sm100_supported or _is_sm90_supported)
                 and _is_flashinfer_available
@@ -571,11 +583,15 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 and get_global_server_args().enable_flashinfer_allreduce_fusion
                 and hidden_states.shape[0] <= 4096
             ):
+                _kr.record_ar_start(context.layer_id)
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
                 )
+                _kr.record_ar_end(context.layer_id)
             else:
+                _kr.record_ar_start(context.layer_id)
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                _kr.record_ar_end(context.layer_id)
                 if context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
@@ -591,11 +607,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
         *,
         residual_input_mode,
     ):
+        _kr = get_global_moe_kernel_balance_recorder()
         input_hidden_states = hidden_states
         hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
             context.attn_tp_rank
         ]
+        _kr.record_ar_start(context.layer_id)
         attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+        _kr.record_ar_end(context.layer_id)
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
         if hidden_states.shape[0] != 0:
@@ -682,7 +701,6 @@ class CommunicateSummableTensorPairFn:
             hidden_states,
         )
         if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
-            # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
@@ -696,16 +714,19 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         **kwargs,
     ):
+        _kr = get_global_moe_kernel_balance_recorder()
         hidden_states += residual
         residual = None
         hidden_states, local_hidden_states = (
             get_local_dp_buffer(),
             hidden_states,
         )
+        _kr.record_ag_start(context.layer_id)
         attn_tp_all_gather_into_tensor(
             hidden_states,
             local_hidden_states,
         )
+        _kr.record_ag_end(context.layer_id)
         return hidden_states, residual
 
     @staticmethod

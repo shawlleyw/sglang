@@ -68,6 +68,9 @@ class DeepEPMoE(FusedMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
+        gemm1_alpha: Optional[float] = None,
+        gemm1_clamp_limit: Optional[float] = None,
+        **kwargs,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -81,15 +84,20 @@ class DeepEPMoE(FusedMoE):
             prefix=prefix,
             activation=activation,
             routed_scaling_factor=routed_scaling_factor,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            **kwargs,
         )
         
         if _use_aiter or _is_npu:
             self.deprecate_flag = False
+        elif not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            # A100 (SM80): deep_gemm not available, use generic FusedMoE pipeline
+            # with Triton runner + deepep_normal adapters
+            self.deprecate_flag = True
         elif quant_config is None:
             self.deprecate_flag = True
-        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
-            quant_config, Fp8Config
-        ):
+        elif isinstance(quant_config, Fp8Config):
             self.deprecate_flag = True
         else:
             self.deprecate_flag = False
@@ -196,7 +204,7 @@ class DeepEPMoE(FusedMoE):
             if self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8(dispatch_output)
             else:
-                assert False, "forward_deepgemm_contiguous is deprecated"
+                return super().run_moe_core(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
@@ -487,6 +495,7 @@ class DeepEPMoE(FusedMoE):
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
         return DeepEPMoE
+    # mooncake-nccl: standard EP with NCCL all-reduce, uses FusedMoE (not DeepEPMoE)
 
     # NEW: Direct FP4 detection (bypasses EP requirements)
     # Check for FP4 quantization with TRTLLM flag, regardless of EP

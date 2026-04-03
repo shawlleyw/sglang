@@ -408,6 +408,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    or enable_moe_dense_fully_dp()
                     else {}
                 ),
             )
@@ -432,6 +433,15 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
         )
 
+        # Lazily initialize profile-driven router (shared global singleton)
+        from sglang.srt.layers.moe.profile_driven_router import (
+            maybe_init_global_profile_router,
+        )
+
+        maybe_init_global_profile_router(
+            config.n_routed_experts, config.num_experts_per_tok
+        )
+
     def get_moe_weights(self):
         return [
             x.data
@@ -449,7 +459,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
 
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+                hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
             )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -457,17 +467,84 @@ class Glm4MoeSparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] > 0:
+        num_tokens = hidden_states.shape[0]
+        if num_tokens > 0:
             shared_output = self._forward_shared_experts(hidden_states)
-            # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        from sglang.srt.layers.moe.profile_driven_router import (
+            get_global_profile_router,
+        )
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        profile_router = get_global_profile_router()
+        if profile_router is not None and forward_batch is not None and num_tokens > 0:
+            req_ids = forward_batch.req_pool_indices
+            pos = forward_batch.positions
+
+            if is_dp_attention_enabled() and pos.shape[0] != num_tokens:
+                from sglang.srt.layers.dp_attention import (
+                    get_dp_local_info,
+                    memcpy_triton,
+                )
+
+                local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+
+                global_pos = torch.zeros(
+                    num_tokens, dtype=torch.float32, device=pos.device
+                )
+                memcpy_triton(
+                    global_pos, pos.float(), 0, local_start_pos, local_num_tokens, False
+                )
+                global_pos = tensor_model_parallel_all_reduce(global_pos)
+                pos = global_pos.to(torch.int64)
+
+                global_req = torch.zeros(
+                    num_tokens, dtype=torch.float32, device=req_ids.device
+                )
+                memcpy_triton(
+                    global_req,
+                    req_ids.float(),
+                    0,
+                    local_start_pos,
+                    local_num_tokens,
+                    False,
+                )
+                global_req = tensor_model_parallel_all_reduce(global_req)
+                req_ids = global_req.to(torch.int64)
+            else:
+                if pos.shape[0] != num_tokens:
+                    pos = pos[:num_tokens]
+                if req_ids.shape[0] != num_tokens:
+                    if req_ids.shape[0] == 1:
+                        req_ids = req_ids[0:1].expand(num_tokens)
+                    elif req_ids.shape[0] > num_tokens:
+                        req_ids = req_ids[:num_tokens]
+                    else:
+                        req_ids = req_ids[
+                            torch.arange(num_tokens, device=req_ids.device)
+                            % req_ids.shape[0]
+                        ]
+
+            profiled_weights, profiled_ids = profile_router.route_gpu(
+                request_ids=req_ids,
+                token_indices=pos,
+                layer_id=self.layer_id,
+            )
+            topk_output = StandardTopKOutput(
+                profiled_weights, profiled_ids, topk_output.router_logits
+            )
+            get_global_expert_distribution_recorder().on_select_experts(
+                topk_ids=profiled_ids
+            )
 
         final_hidden_states = self.experts(hidden_states, topk_output)
         if not _is_cuda and not _use_aiter:
@@ -492,9 +569,9 @@ class Glm4MoeSparseMoeBlock(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        num_tokens = hidden_states.shape[0]
         shared_output = None
-        if hidden_states.shape[0] > 0:
-            # router_logits: (num_tokens, n_experts)
+        if num_tokens > 0:
             router_logits = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
@@ -507,6 +584,40 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        from sglang.srt.layers.moe.profile_driven_router import (
+            get_global_profile_router,
+        )
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        profile_router = get_global_profile_router()
+        if profile_router is not None and forward_batch is not None and num_tokens > 0:
+            req_ids = forward_batch.req_pool_indices
+            pos = forward_batch.positions
+            if pos.shape[0] != num_tokens:
+                pos = pos[:num_tokens]
+            if req_ids.shape[0] != num_tokens:
+                if req_ids.shape[0] == 1:
+                    req_ids = req_ids[0:1].expand(num_tokens)
+                elif req_ids.shape[0] > num_tokens:
+                    req_ids = req_ids[:num_tokens]
+                else:
+                    req_ids = req_ids[
+                        torch.arange(num_tokens, device=req_ids.device)
+                        % req_ids.shape[0]
+                    ]
+            profiled_weights, profiled_ids = profile_router.route_gpu(
+                request_ids=req_ids,
+                token_indices=pos,
+                layer_id=self.layer_id,
+            )
+            topk_output = StandardTopKOutput(
+                profiled_weights, profiled_ids, topk_output.router_logits
+            )
+            get_global_expert_distribution_recorder().on_select_experts(
+                topk_ids=profiled_ids
+            )
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
@@ -558,6 +669,40 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        from sglang.srt.layers.moe.profile_driven_router import (
+            get_global_profile_router,
+        )
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        profile_router = get_global_profile_router()
+        num_tokens = hidden_states.shape[0]
+        if profile_router is not None and num_tokens > 0:
+            req_ids = state.forward_batch.req_pool_indices
+            pos = state.forward_batch.positions
+            if pos.shape[0] != num_tokens:
+                pos = pos[:num_tokens]
+            if req_ids.shape[0] != num_tokens:
+                if req_ids.shape[0] == 1:
+                    req_ids = req_ids[0:1].expand(num_tokens)
+                elif req_ids.shape[0] > num_tokens:
+                    req_ids = req_ids[:num_tokens]
+                else:
+                    req_ids = req_ids[
+                        torch.arange(num_tokens, device=req_ids.device)
+                        % req_ids.shape[0]
+                    ]
+            profiled_weights, profiled_ids = profile_router.route_gpu(
+                request_ids=req_ids,
+                token_indices=pos,
+                layer_id=self.layer_id,
+            )
+            state.topk_output = StandardTopKOutput(
+                profiled_weights, profiled_ids, state.topk_output.router_logits
+            )
+            get_global_expert_distribution_recorder().on_select_experts(
+                topk_ids=profiled_ids
+            )
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
@@ -884,7 +1029,7 @@ class Glm4MoeModel(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo:
+        if forward_batch.can_run_tbo and self.first_k_dense_replace > 0:
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer
@@ -946,6 +1091,21 @@ class Glm4MoeForCausalLM(nn.Module):
     ) -> None:
         nn.Module.__init__(self)
         self.pp_group = get_pp_group()
+        dense_offset = getattr(config, "first_k_dense_replace", 0)
+        if dense_offset > 0:
+            config.num_hidden_layers -= dense_offset
+            config.first_k_dense_replace = 0
+        server_args = get_global_server_args()
+        if (
+            server_args is not None
+            and getattr(server_args, "num_hidden_layers_override", None) is not None
+        ):
+            logger.info(
+                "Overriding num_hidden_layers from %d to %d",
+                config.num_hidden_layers,
+                server_args.num_hidden_layers_override,
+            )
+            config.num_hidden_layers = server_args.num_hidden_layers_override
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config

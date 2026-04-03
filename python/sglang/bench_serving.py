@@ -196,9 +196,9 @@ async def async_request_openai_completions(
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "completions"
-    ), "OpenAI Completions API URL must end with 'completions'."
+    assert api_url.endswith("completions"), (
+        "OpenAI Completions API URL must end with 'completions'."
+    )
 
     prompt = request_func_input.prompt
 
@@ -307,9 +307,9 @@ async def async_request_openai_chat_completions(
                            latency, TTFT, ITL, and success status.
     """
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "chat/completions"
-    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    assert api_url.endswith("chat/completions"), (
+        "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    )
 
     if request_func_input.image_data:
         # Build multi-image content: a list of image_url entries followed by the text
@@ -762,6 +762,16 @@ def get_dataset(args, tokenizer, model_id=None):
             random_sample=args.dataset_name == "random",
             return_text=not tokenize_prompt,
         )
+    elif args.dataset_name == "gsm8k":
+        assert not tokenize_prompt
+        input_requests = sample_gsm8k_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.gsm8k_output_len,
+            context_len=args.sharegpt_context_len,
+            apply_chat_template=args.apply_chat_template,
+        )
     elif args.dataset_name == "image":
         processor = get_processor(model_id)
         input_requests = sample_image_requests(
@@ -795,6 +805,16 @@ def get_dataset(args, tokenizer, model_id=None):
             backend=args.backend,
             fixed_output_len=args.random_output_len,
             random_sample=True,
+        )
+    elif args.dataset_name == "npy":
+        assert args.dataset_path and args.dataset_path.endswith(".npy"), (
+            "--dataset-name npy requires --dataset-path pointing to a .npy file"
+        )
+        input_requests = sample_npy_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            context_len=args.sharegpt_context_len,
         )
     elif args.dataset_name == "mooncake":
         # For mooncake, we don't generate the prompts here.
@@ -870,6 +890,7 @@ class BenchmarkMetrics:
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+GSM8K_URL = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
 MOONCAKE_DATASET_URL = {
     "mooncake": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl",
     "conversation": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl",
@@ -898,13 +919,16 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     chunk_size = 1024  # Download in chunks of 1KB
 
     # Use tqdm to display the progress bar
-    with open(filename, "wb") as f, tqdm(
-        desc=filename,
-        total=total_size,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
+    with (
+        open(filename, "wb") as f,
+        tqdm(
+            desc=filename,
+            total=total_size,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar,
+    ):
         for chunk in response.iter_content(chunk_size=chunk_size):
             f.write(chunk)
             bar.update(len(chunk))
@@ -1196,6 +1220,87 @@ def sample_sharegpt_requests(
     return filtered_dataset
 
 
+def sample_gsm8k_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+    context_len: Optional[int] = None,
+    apply_chat_template: bool = False,
+) -> List[DatasetRow]:
+    if fixed_output_len is not None and fixed_output_len < 4:
+        raise ValueError("output_len too small")
+
+    # Download GSM8K if necessary.
+    # Note: GSM8K is JSONL, not JSON. download_and_cache_file uses
+    # is_file_valid_json which calls json.load() and would fail on JSONL,
+    # so we check file existence directly.
+    if dataset_path == "" or not os.path.isfile(dataset_path):
+        local_path = os.path.join("/tmp", GSM8K_URL.split("/")[-1])
+        if not os.path.isfile(local_path):
+            download_and_cache_file(GSM8K_URL, local_path)
+        dataset_path = local_path
+
+    # Load the dataset (JSONL format with 'question' and 'answer' fields).
+    lines = []
+    with open(dataset_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                lines.append(json.loads(line))
+
+    # Shuffle the dataset.
+    random.shuffle(lines)
+
+    # Filter out sequences that are too long or too short
+    filtered_dataset: List[DatasetRow] = []
+    for i in range(len(lines)):
+        if len(filtered_dataset) == num_requests:
+            break
+
+        question = lines[i]["question"]
+        answer = lines[i]["answer"]
+
+        # Build the prompt
+        prompt = f"Question: {question}\nAnswer:"
+
+        if apply_chat_template:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            if tokenizer.bos_token:
+                prompt = prompt.replace(tokenizer.bos_token, "")
+
+        prompt_token_ids = tokenizer.encode(prompt)
+        completion_token_ids = tokenizer.encode(answer)
+        prompt_len = len(prompt_token_ids)
+        output_len = (
+            len(completion_token_ids) if fixed_output_len is None else fixed_output_len
+        )
+
+        if prompt_len < 2 or output_len < 2:
+            # Prune too short sequences.
+            continue
+
+        if context_len and prompt_len + output_len > context_len:
+            # Prune too long sequences.
+            continue
+
+        filtered_dataset.append(
+            DatasetRow(
+                prompt=prompt,
+                prompt_len=prompt_len,
+                output_len=output_len,
+            )
+        )
+
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
+    return filtered_dataset
+
+
 def sample_random_requests(
     input_len: int,
     output_len: int,
@@ -1294,6 +1399,54 @@ def sample_random_requests(
                 )
             )
 
+    print(f"#Input tokens: {np.sum(input_lens)}")
+    print(f"#Output tokens: {np.sum(output_lens)}")
+    return input_requests
+
+
+def sample_npy_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    context_len: Optional[int] = None,
+) -> List[DatasetRow]:
+    """Load input/output lengths from a .npy file (shape [N, 2]) and generate
+    dummy-token prompts.  Designed for use with --enable-fake-prefill where the
+    server ignores actual token content and only honours the lengths.
+
+    The .npy format is the same one used by AsyncMoE's DatasetGenerator:
+      column 0 = input token count
+      column 1 = output token count
+    """
+    lengths = np.load(dataset_path)
+    assert lengths.ndim == 2 and lengths.shape[1] == 2, (
+        f"Expected .npy with shape (N, 2), got {lengths.shape}"
+    )
+
+    if context_len is not None:
+        seq_lens = lengths[:, 0] + lengths[:, 1]
+        lengths = lengths[seq_lens <= context_len]
+        assert len(lengths) > 0, (
+            f"No samples with input+output <= {context_len} in {dataset_path}"
+        )
+
+    indices = np.random.randint(0, len(lengths), size=num_requests)
+    input_lens = lengths[indices, 0]
+    output_lens = lengths[indices, 1]
+
+    dummy_token_id = tokenizer.encode("a")[-1]
+    input_requests: List[DatasetRow] = []
+    for i in range(num_requests):
+        il = int(input_lens[i])
+        ol = int(output_lens[i])
+        prompt_ids = [dummy_token_id] * il
+        prompt_text = tokenizer.decode(prompt_ids)
+        input_requests.append(
+            DatasetRow(prompt=prompt_text, prompt_len=il, output_len=ol)
+        )
+
+    print(f"[npy] Loaded {dataset_path}: {lengths.shape[0]} samples, "
+          f"sampled {num_requests} requests")
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
@@ -1917,9 +2070,9 @@ async def benchmark(
                 lora_name = lora_names[lora_idx]
                 lora_idx = (lora_idx + 1) % len(lora_names)
             else:
-                assert (
-                    lora_request_distribution == "skewed"
-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                assert lora_request_distribution == "skewed", (
+                    f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                )
 
                 lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
@@ -1960,27 +2113,26 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
+    server_info = None
+    accept_length = None
     if "sglang" in backend:
-        server_info = requests.get(
-            base_url + "/get_server_info", headers=get_auth_headers()
-        )
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
-            if "decode" in server_info_json:
-                server_info_json = server_info_json["decode"][0]
-            if (
-                "internal_states" in server_info_json
-                and server_info_json["internal_states"]
-            ):
-                accept_length = server_info_json["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
-            else:
-                accept_length = None
-        else:
-            accept_length = None
-    else:
-        accept_length = None
+        try:
+            resp = requests.get(
+                base_url + "/get_server_info", headers=get_auth_headers(),
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                server_info = resp.json()
+                si = server_info
+                if "decode" in si:
+                    si = si["decode"][0]
+                if "internal_states" in si and si["internal_states"]:
+                    accept_length = si["internal_states"][0].get(
+                        "avg_spec_accept_length", None
+                    )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, Exception):
+            print("Warning: could not reach server for server_info (server may have exited)")
+            server_info = None
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
@@ -2216,9 +2368,9 @@ def run_benchmark(args_: argparse.Namespace):
         extra_request_body = json.loads(args.extra_request_body)
 
     if args.tokenize_prompt:
-        assert (
-            args.backend == "sglang"
-        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+        assert args.backend == "sglang", (
+            "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+        )
 
     # Set url
     if args.port is None:
@@ -2309,18 +2461,18 @@ def run_benchmark(args_: argparse.Namespace):
 
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
-        assert (
-            not args.tokenize_prompt
-        ), "`--tokenize-prompt` not compatible with image dataset"
+        assert not args.tokenize_prompt, (
+            "`--tokenize-prompt` not compatible with image dataset"
+        )
 
     if args.lora_request_distribution in ["distinct", "skewed"]:
-        assert (
-            args.lora_name is not None and len(args.lora_name) > 1
-        ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+        assert args.lora_name is not None and len(args.lora_name) > 1, (
+            "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+        )
 
-    assert (
-        args.lora_zipf_alpha > 1
-    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+    assert args.lora_zipf_alpha > 1, (
+        f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+    )
 
     print(f"{args}\n")
 
@@ -2421,12 +2573,14 @@ if __name__ == "__main__":
         default="sharegpt",
         choices=[
             "sharegpt",
+            "gsm8k",
             "random",
             "random-ids",
             "generated-shared-prefix",
             "mmmu",
             "image",
             "mooncake",
+            "npy",
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -2467,6 +2621,12 @@ if __name__ == "__main__":
         help="The context length of the model for the ShareGPT dataset. Requests longer than the context length will be dropped.",
     )
     parser.add_argument(
+        "--gsm8k-output-len",
+        type=int,
+        default=None,
+        help="Output length for each request. Overrides the output length from the GSM8K dataset.",
+    )
+    parser.add_argument(
         "--random-input-len",
         type=int,
         default=1024,
@@ -2505,13 +2665,13 @@ if __name__ == "__main__":
         "--image-format",
         type=str,
         default="jpeg",
-        help=("Format of images for image dataset. " "Supports jpeg and png."),
+        help=("Format of images for image dataset. Supports jpeg and png."),
     )
     parser.add_argument(
         "--image-content",
         type=str,
         default="random",
-        help=("Content for images for image dataset. " "Supports random and blank."),
+        help=("Content for images for image dataset. Supports random and blank."),
     )
     parser.add_argument(
         "--request-rate",

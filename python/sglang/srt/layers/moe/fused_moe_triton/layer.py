@@ -18,6 +18,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.moe_kernel_balance import (
+    get_local_tokens_gpu_buffer,
+)
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
@@ -75,7 +78,7 @@ logger = logging.getLogger(__name__)
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none():
+    if a2a_backend.is_none() or a2a_backend.is_mooncake_nccl():
         return StandardDispatcher(moe_runner_config)
     elif a2a_backend.is_deepep() or a2a_backend.is_mooncake():
         return MaybeTboDeepEPDispatcher(
@@ -205,11 +208,14 @@ class FusedMoE(torch.nn.Module):
             gemm1_clamp_limit=gemm1_clamp_limit,
         )
 
+        from sglang.srt.layers import deep_gemm_wrapper
+        use_deep_gemm = (self.moe_ep_size > 1 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM)
+
         self.quant_method: Optional[FusedMoEMethodBase] = None
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix)
         if self.quant_method is None:
-            self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels, use_deep_gemm=(self.moe_ep_size > 1))
+            self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels, use_deep_gemm=use_deep_gemm)
 
         self.quant_method.create_weights(
             layer=self,
@@ -226,6 +232,11 @@ class FusedMoE(torch.nn.Module):
             top_k=top_k,
             with_bias=with_bias,
         )
+
+        # A hack for using deepep with triton kernels: the token combination should be skipped in moe runner
+        if get_moe_a2a_backend().is_deepep():
+            if not use_deep_gemm:
+                self.moe_runner_config.no_combine = True
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
@@ -832,15 +843,29 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
-        
+
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
 
+        # Write local token count to GPU buffer (pure tensor ops — CUDA-graph safe).
+        # This is always executed (even inside compiled/graph-replayed code).
+        _lt_buf = get_local_tokens_gpu_buffer()
+        if _lt_buf is not None and self.moe_ep_size > 1 and hasattr(topk_output, "topk_ids"):
+            _local_start = self.moe_ep_rank * self.num_local_experts
+            _local_end = _local_start + self.num_local_experts
+            _lt_buf[self.layer_id] = (
+                (topk_output.topk_ids >= _local_start) & (topk_output.topk_ids < _local_end)
+            ).sum()
+
+        from sglang.srt.eplb.moe_kernel_balance import get_global_moe_kernel_balance_recorder
+        _kr = get_global_moe_kernel_balance_recorder()
+        _kr.record_moe_start(self.layer_id)
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
             **kwargs,
         )
+        _kr.record_moe_end(self.layer_id)
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()

@@ -326,8 +326,8 @@ class DataParallelController:
         logger.debug(f"Connecting to node 0 to receive worker ports")
 
         req_socket = get_zmq_socket(self.context, zmq.REQ, endpoint, False)
-        req_socket.setsockopt(zmq.RCVTIMEO, 60 * 1000)  # 1 minute timeout
-        req_socket.setsockopt(zmq.SNDTIMEO, 60 * 1000)
+        req_socket.setsockopt(zmq.RCVTIMEO, 120 * 1000)  # 2 minute timeout
+        req_socket.setsockopt(zmq.SNDTIMEO, 120 * 1000)
 
         try:
             # Send handshake with our node rank

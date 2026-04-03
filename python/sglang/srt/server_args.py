@@ -257,6 +257,8 @@ class ServerArgs:
 
     # Memory and scheduling
     enable_fake_prefill: bool = False
+    profile_driven_gate_path: Optional[str] = None
+    num_hidden_layers_override: Optional[int] = None
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
@@ -392,7 +394,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep", "mooncake"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mooncake", "mooncake-nccl"] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
@@ -1440,6 +1442,13 @@ class ServerArgs:
                 f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+        if self.moe_a2a_backend == "mooncake-nccl":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Mooncake-NCCL EP is enabled (standard EP with NCCL all-reduce, no Mooncake C++ runtime). "
+                f"The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
@@ -2096,6 +2105,24 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_fake_prefill,
             help="If set, the server will use fake prefill.",
+        )
+        parser.add_argument(
+            "--profile-driven-gate-path",
+            type=str,
+            default=ServerArgs.profile_driven_gate_path,
+            help="Path to a Parquet file with pre-profiled MoE routing outcomes. "
+            "When set with --enable-fake-prefill, expert routing uses these "
+            "deterministic outcomes instead of the learned gate. "
+            "Compatible with DisagMoE profile format.",
+        )
+        parser.add_argument(
+            "--num-hidden-layers-override",
+            type=int,
+            default=ServerArgs.num_hidden_layers_override,
+            help="Override the number of hidden layers in the model. "
+            "When set, the model will use this many layers instead of the "
+            "value from the HuggingFace config. Useful for experiments with "
+            "dummy weights where fewer layers are desired.",
         )
         parser.add_argument(
             "--mem-fraction-static",
@@ -2837,7 +2864,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep", "mooncake"],
+            choices=["none", "deepep", "mooncake", "mooncake-nccl"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )

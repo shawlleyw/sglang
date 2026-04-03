@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FORCE_STREAM_INTERVAL = 50
+DEFAULT_FORCE_STREAM_INTERVAL = 1
 
 
 class SchedulerOutputProcessorMixin:
@@ -1027,6 +1027,7 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
+                    num_waiting=len(self.waiting_queue),
                 )
             )
 

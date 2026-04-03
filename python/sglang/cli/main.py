@@ -1,7 +1,15 @@
 import argparse
 
-from sglang.cli.generate import generate
-from sglang.cli.serve import serve
+def _serve(args, extra_argv):
+    from sglang.cli.serve import serve
+
+    return serve(args, extra_argv)
+
+
+def _generate(args, extra_argv):
+    from sglang.cli.generate import generate
+
+    return generate(args, extra_argv)
 
 
 def main():
@@ -13,14 +21,14 @@ def main():
         help="Launch the SGLang server.",
         add_help=False,  # Defer help to the specific parser
     )
-    serve_parser.set_defaults(func=serve)
+    serve_parser.set_defaults(func=_serve)
 
     generate_parser = subparsers.add_parser(
         "generate",
         help="Run inference on a multimodal model.",
         add_help=False,  # Defer help to the specific parser
     )
-    generate_parser.set_defaults(func=generate)
+    generate_parser.set_defaults(func=_generate)
 
     args, extra_argv = parser.parse_known_args()
     args.func(args, extra_argv)

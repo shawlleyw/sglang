@@ -111,8 +111,8 @@ def get_moe_configs(
                 logger.warning(
                     f"Config file not found at {config_file_path}. Fallback to triton version {try_triton_version} and use MoE kernel config from {try_config_file_path}. Performance might be sub-optimal!",
                 )
-                # If a configuration has been found, return it
-                return {int(key): val for key, val in json.load(f).items()}
+            # If a configuration has been found, return it
+            return {int(key): val for key, val in json.load(f).items()}
 
     # If no optimized configuration is available, we will use the default
     # configuration
