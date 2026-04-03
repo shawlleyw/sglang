@@ -258,6 +258,7 @@ class ServerArgs:
     # Memory and scheduling
     enable_fake_prefill: bool = False
     profile_driven_gate_path: Optional[str] = None
+    num_hidden_layers_override: Optional[int] = None
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
@@ -2113,6 +2114,15 @@ class ServerArgs:
             "When set with --enable-fake-prefill, expert routing uses these "
             "deterministic outcomes instead of the learned gate. "
             "Compatible with DisagMoE profile format.",
+        )
+        parser.add_argument(
+            "--num-hidden-layers-override",
+            type=int,
+            default=ServerArgs.num_hidden_layers_override,
+            help="Override the number of hidden layers in the model. "
+            "When set, the model will use this many layers instead of the "
+            "value from the HuggingFace config. Useful for experiments with "
+            "dummy weights where fewer layers are desired.",
         )
         parser.add_argument(
             "--mem-fraction-static",

@@ -1095,6 +1095,17 @@ class Glm4MoeForCausalLM(nn.Module):
         if dense_offset > 0:
             config.num_hidden_layers -= dense_offset
             config.first_k_dense_replace = 0
+        server_args = get_global_server_args()
+        if (
+            server_args is not None
+            and getattr(server_args, "num_hidden_layers_override", None) is not None
+        ):
+            logger.info(
+                "Overriding num_hidden_layers from %d to %d",
+                config.num_hidden_layers,
+                server_args.num_hidden_layers_override,
+            )
+            config.num_hidden_layers = server_args.num_hidden_layers_override
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
