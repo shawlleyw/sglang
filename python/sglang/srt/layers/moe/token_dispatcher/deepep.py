@@ -162,13 +162,11 @@ class DeepEPBuffer:
                     num_nvl_bytes,
                 )
                 
-                if False:
+                if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
                     num_rdma_bytes = max(
                         config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
                         num_rdma_bytes,
                     )
-                else:
-                    num_rdma_bytes = 0
                     
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1

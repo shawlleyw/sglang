@@ -597,6 +597,120 @@ def pre_permute_deepep_normal_to_triton(
     )
 
 
+@register_pre_permute("deepep_ll", "triton")
+def pre_permute_deepep_ll_to_triton(
+    dispatch_output: "DeepEPLLDispatchOutput",
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> TritonRunnerInput:
+
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+        get_config_dtype_str,
+        moe_align_block_size,
+        try_get_optimal_moe_config,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLDispatchOutput
+
+    hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
+        dispatch_output
+    )
+
+    # hidden_states: [num_local_experts, E_tokens, hidden]
+    num_local_experts, E_tokens, K = hidden_states.shape
+
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+    running_state["hidden_states_shape"] = hidden_states.shape
+    running_state["hidden_states_dtype"] = hidden_states.dtype
+    running_state["hidden_states_device"] = hidden_states.device
+
+    # masked_m: [num_local_experts] — number of valid tokens per expert
+    # Flatten expert-contiguous layout into [total_tokens, hidden] with per-token expert ids
+    # We keep the full E_tokens dimension (including padding) and let moe_align_block_size handle it
+    # Each row in the flattened tensor maps to exactly one expert
+    input_tensor = hidden_states.reshape(-1, K)  # [num_local_experts * E_tokens, hidden]
+    total_rows = num_local_experts * E_tokens
+
+    # Build topk_ids: each token maps to its expert index
+    m_indices = torch.arange(num_local_experts, device=hidden_states.device, dtype=torch.int32)
+    m_indices = m_indices.unsqueeze(1).expand(-1, E_tokens).reshape(-1)  # [total_rows]
+    new_topk_ids = m_indices.unsqueeze(1).to(topk_ids.dtype)  # [total_rows, 1]
+    new_topk_weights = torch.ones(
+        (total_rows, 1), device=hidden_states.device, dtype=topk_weights.dtype
+    )
+
+    # Prepare triton kernel config
+    if (
+        not (quant_info.use_fp8_w8a8 or quant_info.use_int8_w8a8)
+        or quant_info.block_shape is not None
+        or _use_aiter
+    ):
+        padding_size = 0
+    else:
+        padding_size = _MOE_PADDING_SIZE
+
+    config_dtype = get_config_dtype_str(
+        use_fp8_w8a8=quant_info.use_fp8_w8a8,
+        use_int8_w8a8=quant_info.use_int8_w8a8,
+        use_int8_w8a16=quant_info.use_int8_w8a16,
+        use_int4_w4a16=quant_info.use_int4_w4a16,
+        dtype=input_tensor.dtype,
+    )
+
+    get_config_func = functools.partial(
+        try_get_optimal_moe_config,
+        quant_info.w13_weight.shape,
+        (
+            num_local_experts,
+            quant_info.w2_weight.shape[1],
+            quant_info.w2_weight.shape[2] - padding_size,
+        ),
+        new_topk_ids.shape[1],
+        config_dtype,
+        block_shape=quant_info.block_shape,
+    )
+
+    config = get_config_func(total_rows)
+
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        new_topk_ids, config["BLOCK_SIZE_M"], num_local_experts
+    )
+
+    running_state["config"] = config
+
+    return TritonRunnerInput(
+        hidden_states=input_tensor,
+        topk_weights=new_topk_weights,
+        topk_ids=new_topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+    )
+
+
+@register_post_permute("triton", "deepep_ll")
+def post_permute_triton_to_deepep_ll(
+    runner_output: TritonRunnerOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> "DeepEPLLCombineInput":
+
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+
+    # Reshape triton output [total_rows, hidden_out] back to [num_local_experts, E_tokens, hidden_out]
+    num_local_experts, E_tokens, _ = running_state["hidden_states_shape"]
+    output = runner_output.hidden_states.squeeze(1)
+    output = output.view(num_local_experts, E_tokens, -1)
+
+    return DeepEPLLCombineInput(
+        hidden_states=output,
+        topk_ids=running_state["topk_ids"],
+        topk_weights=running_state["topk_weights"],
+    )
+
+
 @register_post_permute("triton", "deepep_normal")
 def post_permute_triton_to_deepep_normal(
     runner_output: TritonRunnerOutput,

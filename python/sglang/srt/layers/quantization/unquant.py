@@ -279,11 +279,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             )
             return self.runner.run(dispatch_output, quant_info)
         else:
-            x = dispatch_output.hidden_states
-            topk_output = dispatch_output.topk_output
-
             if _use_aiter:
                 assert not moe_runner_config.no_combine, "unsupported"
+                x = dispatch_output.hidden_states
+                topk_output = dispatch_output.topk_output
                 topk_weights, topk_ids, _ = topk_output
                 if moe_runner_config.apply_router_weight_on_input:
                     assert (
