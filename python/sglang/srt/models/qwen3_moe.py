@@ -73,13 +73,6 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_non_idle_and_non_empty,
 )
-from sglang.srt.paras.utils import paras_func
-from sglang.srt.paras.layers.utils import paras_weight_buffer
-from sglang.srt.paras.layers.utils import paras_load_tp_experts_weight
-from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
-from sglang.srt.paras.layers.paras_attention import ParaSAttentionMixin
-from sglang.srt.paras.layers.paras_decoder_layer import ParaSDecoderLayerMixin
-from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 
 Qwen3MoeConfig = None
 
@@ -273,33 +266,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
 
-class Qwen3MoeSparseMoeBlockParaS(ParaSMoeBlockMixin, Qwen3MoeSparseMoeBlock):
-    """
-    ParaS-enabled Qwen3 MoE block that supports dynamic parallelism switching
-    between EP (Expert Parallel) and TP (Tensor Parallel) modes.
-    """
-
-    def __init__(
-        self,
-        layer_id: int,
-        config: Qwen3MoeConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__(layer_id, config, quant_config, prefix)
-        self.paras_init_moe(config, quant_config, prefix, layer_id)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
-        return self.paras_forward(hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter)
-
-
-class Qwen3MoeAttention(ParaSAttentionMixin, nn.Module):
+class Qwen3MoeAttention(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -484,7 +451,7 @@ class Qwen3MoeAttention(ParaSAttentionMixin, nn.Module):
 
 
 
-class Qwen3MoeDecoderLayer(ParaSDecoderLayerMixin, nn.Module):
+class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3MoeConfig,
@@ -541,16 +508,8 @@ class Qwen3MoeDecoderLayer(ParaSDecoderLayerMixin, nn.Module):
         )
 
         if self.is_layer_sparse:
-            qwen3_moe_impl_class = (
-                Qwen3MoeSparseMoeBlockParaS
-                if get_global_server_args().enable_paras_moe
-                else Qwen3MoeSparseMoeBlock
-            )
-            self.mlp = qwen3_moe_impl_class(
-                layer_id=self.layer_id,
-                config=config,
-                quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+            self.mlp = self._create_sparse_moe_block(
+                config, layer_id, quant_config, prefix
             )
         else:
             self.mlp = Qwen3MoeMLP(
@@ -573,8 +532,14 @@ class Qwen3MoeDecoderLayer(ParaSDecoderLayerMixin, nn.Module):
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
-        if get_global_server_args().enable_paras_moe:
-            self.paras_init_layer(config, layer_id, self.is_layer_sparse, is_previous_layer_sparse=True)
+    def _create_sparse_moe_block(self, config, layer_id, quant_config, prefix):
+        """Factory method for MoE block creation. Override in subclass for ParaS."""
+        return Qwen3MoeSparseMoeBlock(
+            layer_id=layer_id,
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
 
     def forward(
         self,
@@ -687,7 +652,7 @@ class Qwen3MoeDecoderLayer(ParaSDecoderLayerMixin, nn.Module):
         return output
 
 
-class Qwen3MoeModel(ParaSModelMixin, Qwen2MoeModel):
+class Qwen3MoeModel(Qwen2MoeModel):
     def __init__(
         self,
         config: Qwen3MoeConfig,
@@ -923,8 +888,6 @@ class Qwen3MoeForCausalLM(nn.Module):
                         expert_id=expert_id,
                     )
 
-                    if get_global_server_args().enable_paras_moe:
-                        paras_load_tp_experts_weight(params_dict, name, loaded_weight, shard_id, expert_id)
                     break
                 else:
                     if is_expert_weight:
@@ -948,14 +911,12 @@ class Qwen3MoeForCausalLM(nn.Module):
 
         # TODO mimic deepseek
         # Lazy initialization of expert weights cache to avoid slowing down load_weights
-        # Skip for ParaS mode as weights are handled differently
-        if not get_global_server_args().enable_paras_moe:
-            if not hasattr(self, "routed_experts_weights_of_layer"):
-                self.routed_experts_weights_of_layer = {
-                    layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                    for layer_id in range(self.start_layer, self.end_layer)
-                    if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
-                }
+        if not hasattr(self, "routed_experts_weights_of_layer"):
+            self.routed_experts_weights_of_layer = {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
+            }
 
         end_loading = time.time()
         torch.cuda.synchronize()
@@ -971,22 +932,6 @@ class Qwen3MoeForCausalLM(nn.Module):
             num_groups=None,
         )
 
-    def paras_configure_helper(self):
-        torch.cuda.synchronize()
-        paras_weight_buffer.release_all()
-
-    @paras_func
-    def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
-        """
-        Configure the model for tensor parallelism (TP).
-        Note(shaoyuw): the LMHead and logit processor are set to DP with enable_dp_lm_head=True,
-                       but they work for TP as well. There is no need to modify them.
-        """
-        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
-
-    @paras_func
-    def paras_configure_ep(self):
-        self.model.paras_configure_ep()
 
 
 EntryClass = Qwen3MoeForCausalLM
