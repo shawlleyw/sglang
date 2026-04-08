@@ -73,11 +73,13 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_non_idle_and_non_empty,
 )
-from sglang.srt.paras.utils import paras_func, paras_weight_buffer, paras_load_tp_experts_weight
-from sglang.srt.paras.paras_moe_block import ParaSMoeBlockMixin
-from sglang.srt.paras.paras_attention import ParaSAttentionMixin
-from sglang.srt.paras.paras_decoder_layer import ParaSDecoderLayerMixin
-from sglang.srt.paras.paras_model import ParaSModelMixin
+from sglang.srt.paras.utils import paras_func
+from sglang.srt.paras.layers.utils import paras_weight_buffer
+from sglang.srt.paras.layers.utils import paras_load_tp_experts_weight
+from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
+from sglang.srt.paras.layers.paras_attention import ParaSAttentionMixin
+from sglang.srt.paras.layers.paras_decoder_layer import ParaSDecoderLayerMixin
+from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 
 Qwen3MoeConfig = None
 

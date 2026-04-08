@@ -20,7 +20,8 @@ from sglang.srt.paras.paras_parallel_state import (
     get_paras_tp_rank,
     get_paras_tp_size,
 )
-from sglang.srt.paras.utils import paras_func, paras_weight_buffer
+from sglang.srt.paras.layers.utils import paras_weight_buffer
+from sglang.srt.paras.utils import paras_func
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
