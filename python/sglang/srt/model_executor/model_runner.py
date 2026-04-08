@@ -2404,11 +2404,9 @@ class ModelRunner:
 
         paras_comm_configure_tp()
 
-        # Import here to avoid circular imports
-        from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
-
-        assert isinstance(self.model, Qwen3MoeForCausalLM), (
-            "ParaS only supports Qwen3MoeForCausalLM model for now."
+        assert hasattr(self.model, 'paras_configure_tp') and hasattr(self.model, 'paras_configure_ep'), (
+            "ParaS requires model to have paras_configure_tp and paras_configure_ep methods. "
+            "Use ParaSModelMixin from sglang.srt.paras.paras_model."
         )
         self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
