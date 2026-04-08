@@ -58,7 +58,6 @@ if _is_cuda or _is_hip:
 
 @dataclass
 class TritonRunnerInput(RunnerInput):
-
     hidden_states: torch.Tensor
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
@@ -73,7 +72,6 @@ class TritonRunnerInput(RunnerInput):
 
 @dataclass
 class TritonRunnerOutput(RunnerOutput):
-
     hidden_states: torch.Tensor
 
     @property
@@ -102,7 +100,6 @@ class TritonMoeQuantInfo(MoeQuantInfo):
 
 
 class TritonRunnerCore(MoeRunnerCore):
-
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
 
@@ -212,7 +209,18 @@ class TritonRunnerCore(MoeRunnerCore):
             dtype=hidden_states.dtype,
         )
 
-        if activation == "silu":
+        masked_m = running_state.get("masked_m")
+        if masked_m is not None and activation == "silu" and gemm1_alpha is None:
+            from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_fwd
+
+            num_experts = running_state["num_local_experts"]
+            e_tokens = running_state["E_tokens"]
+            silu_and_mul_masked_fwd(
+                intermediate_cache1.view(num_experts, e_tokens, N),
+                intermediate_cache2.view(num_experts, e_tokens, N // 2),
+                masked_m,
+            )
+        elif activation == "silu":
             if gemm1_alpha is not None:
                 assert gemm1_limit is not None
                 intermediate_cache2 = swiglu_with_alpha_and_limit(
@@ -464,6 +472,7 @@ def post_permute_triton_to_standard(
         hidden_states=runner_output.hidden_states,
     )
 
+
 @register_pre_permute("deepep_normal", "triton")
 def pre_permute_deepep_normal_to_triton(
     dispatch_output: DeepEPNormalDispatchOutput,
@@ -612,9 +621,14 @@ def pre_permute_deepep_ll_to_triton(
     )
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLDispatchOutput
 
-    hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
-        dispatch_output
-    )
+    (
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        topk_weights,
+        masked_m,
+        expected_m,
+    ) = dispatch_output
 
     # hidden_states: [num_local_experts, E_tokens, hidden]
     num_local_experts, E_tokens, K = hidden_states.shape
@@ -624,23 +638,36 @@ def pre_permute_deepep_ll_to_triton(
     running_state["hidden_states_shape"] = hidden_states.shape
     running_state["hidden_states_dtype"] = hidden_states.dtype
     running_state["hidden_states_device"] = hidden_states.device
+    running_state["masked_m"] = masked_m
+    running_state["num_local_experts"] = num_local_experts
+    running_state["E_tokens"] = E_tokens
 
-    # masked_m: [num_local_experts] — number of valid tokens per expert
-    # Flatten expert-contiguous layout into [total_tokens, hidden] with per-token expert ids
-    # We keep the full E_tokens dimension (including padding) and let moe_align_block_size handle it
-    # Each row in the flattened tensor maps to exactly one expert
-    input_tensor = hidden_states.reshape(-1, K)  # [num_local_experts * E_tokens, hidden]
+    input_tensor = hidden_states.reshape(-1, K)
     total_rows = num_local_experts * E_tokens
 
-    # Build topk_ids: each token maps to its expert index
-    m_indices = torch.arange(num_local_experts, device=hidden_states.device, dtype=torch.int32)
-    m_indices = m_indices.unsqueeze(1).expand(-1, E_tokens).reshape(-1)  # [total_rows]
-    new_topk_ids = m_indices.unsqueeze(1).to(topk_ids.dtype)  # [total_rows, 1]
+    # Build per-row expert assignments using masked_m to skip padding.
+    # Valid tokens (j < masked_m[i]) get their real expert id; padding rows are
+    # assigned to a sentinel "trash" expert (id = num_local_experts).
+    # moe_align_block_size places trash-expert blocks at the end so that an
+    # adjusted num_tokens_post_padded makes the kernel early-return on them.
+    # All ops are fixed-shape → CUDA-graph safe.
+    row_range = torch.arange(E_tokens, device=hidden_states.device)
+    valid_mask = row_range.unsqueeze(0) < masked_m.unsqueeze(1)
+    expert_ids_per_row = (
+        torch.arange(num_local_experts, device=hidden_states.device)
+        .unsqueeze(1)
+        .expand(-1, E_tokens)
+    )
+    new_topk_ids = (
+        torch.where(valid_mask, expert_ids_per_row, num_local_experts)
+        .reshape(-1, 1)
+        .to(topk_ids.dtype)
+    )
     new_topk_weights = torch.ones(
         (total_rows, 1), device=hidden_states.device, dtype=topk_weights.dtype
     )
 
-    # Prepare triton kernel config
+    # --- triton kernel config ---
     if (
         not (quant_info.use_fp8_w8a8 or quant_info.use_int8_w8a8)
         or quant_info.block_shape is not None
@@ -657,8 +684,7 @@ def pre_permute_deepep_ll_to_triton(
         use_int4_w4a16=quant_info.use_int4_w4a16,
         dtype=input_tensor.dtype,
     )
-
-    get_config_func = functools.partial(
+    config = functools.partial(
         try_get_optimal_moe_config,
         quant_info.w13_weight.shape,
         (
@@ -669,12 +695,21 @@ def pre_permute_deepep_ll_to_triton(
         new_topk_ids.shape[1],
         config_dtype,
         block_shape=quant_info.block_shape,
+    )(total_rows)
+
+    # num_local_experts + 1 accounts for the trash expert.
+    sorted_token_ids, expert_ids, _ = moe_align_block_size(
+        new_topk_ids, config["BLOCK_SIZE_M"], num_local_experts + 1
     )
 
-    config = get_config_func(total_rows)
-
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        new_topk_ids, config["BLOCK_SIZE_M"], num_local_experts
+    # Restrict num_tokens_post_padded to real experts only so the kernel
+    # early-returns before reaching any trash-expert block.
+    bsm = config["BLOCK_SIZE_M"]
+    num_tokens_post_padded = (
+        ((masked_m.to(torch.int64) + bsm - 1) // bsm * bsm)
+        .sum()
+        .reshape(1)
+        .to(torch.int32)
     )
 
     running_state["config"] = config

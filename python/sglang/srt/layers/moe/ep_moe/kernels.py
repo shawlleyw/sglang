@@ -204,6 +204,100 @@ def pre_reorder_triton_kernel_for_cutlass_moe(
                 tl.store(dst_ptr + offset, out_data, mask=mask)
 
 
+@triton.jit
+def _silu_and_mul_masked_kernel(
+    input_ptr,
+    stride_input_0,
+    stride_input_1,
+    stride_input_2,
+    output_ptr,
+    stride_output_0,
+    stride_output_1,
+    stride_output_2,
+    masked_m_ptr,
+    size_n,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    expert_id = tl.program_id(2)
+    token_id = tl.program_id(1)
+    hidden_dim_block_index = tl.program_id(0)
+
+    block_num_per_expert = tl.num_programs(1)
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+
+    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
+    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+    stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
+    stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
+
+    offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
+    input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
+    output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
+
+    for token_index in tl.range(
+        token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
+    ):
+        gate = tl.load(
+            input_ptr_offs + token_index * stride_input_1,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            input_ptr_offs + token_index * stride_input_1 + size_n,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        )
+        gate = gate / (1 + tl.exp(-gate))
+        gate = gate.to(input_ptr.dtype.element_ty)
+        result = up * gate
+        tl.store(
+            output_ptr_offs + token_index * stride_output_1,
+            result,
+            mask=offs_in_d < size_n,
+        )
+
+
+def silu_and_mul_masked_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+):
+    """
+    Masked silu_and_mul: only processes the first masked_m[i] tokens per expert.
+    input shape  [expert_num, token_num_padded, hidden_dim]
+    output shape [expert_num, token_num_padded, hidden_dim // 2]
+    masked_m shape [expert_num]
+    """
+    assert input.is_contiguous()
+    assert output.is_contiguous()
+    assert len(input.shape) == 3
+    assert input.shape[0] == masked_m.shape[0]
+    assert input.shape[-1] % 2 == 0
+
+    size_n = input.shape[-1] // 2
+    expert_num = len(masked_m)
+
+    BLOCK_N = 128
+    BLOCK_NUM_PER_EXPERT = 32 if expert_num >= 4 else 64
+    NUM_STAGES = 6
+    hidden_dim_split_block_num = triton.cdiv(size_n, BLOCK_N)
+
+    grid = (hidden_dim_split_block_num, BLOCK_NUM_PER_EXPERT, expert_num)
+
+    _silu_and_mul_masked_kernel[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        masked_m,
+        size_n,
+        BLOCK_N=BLOCK_N,
+        NUM_STAGE=NUM_STAGES,
+        num_warps=1,
+    )
+
+
 # copy from https://github.com/ModelTC/lightllm/blob/a000ab69098654df4731f5b12587dd4e7f0a4f41/lightllm/common/fused_moe/moe_silu_and_mul_mix_quant_ep.py
 @triton.jit
 def _silu_and_mul_post_quant_kernel(
@@ -566,9 +660,9 @@ def ep_scatter(
         scale_hidden_size = ceil_div(scale_hidden_size, 4)
 
     assert m_indices.shape[0] % BLOCK_E == 0
-    assert (
-        recv_x_scale.dtype == output_tensor_scale.dtype
-    ), f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+    assert recv_x_scale.dtype == output_tensor_scale.dtype, (
+        f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+    )
     assert recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
 
     _fwd_kernel_ep_scatter_1[(grid,)](
@@ -694,7 +788,9 @@ def ep_gather(
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
     BLOCK_D = 128 if hidden_size % 1024 != 0 else 1024  # block size of quantization
-    assert hidden_size % BLOCK_D == 0, f"input shape: {input_tensor.shape}, hidden_size: {hidden_size}, BLOCK_D: {BLOCK_D}"
+    assert hidden_size % BLOCK_D == 0, (
+        f"input shape: {input_tensor.shape}, hidden_size: {hidden_size}, BLOCK_D: {BLOCK_D}"
+    )
     grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
     if num_tokens == 0:
         return
