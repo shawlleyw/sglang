@@ -60,14 +60,27 @@ for i in $(seq 1 20); do
 done
 ```
 
-### 4. Verify server is up
+### 4. Verify server is up and model type is correct
 
 ```bash
 curl -s --max-time 5 http://localhost:30000/health
 # Should return 200 (empty body)
+
+grep "Load weight end" /tmp/sglang_paras_test.log | head -1
+# Should show type=Qwen3MoeForCausalLMParaS (not Qwen3MoeForCausalLM)
 ```
 
-### 5. Trigger ParaS EP→TP switch
+### 5. Send request in EP mode (before ParaS switch)
+
+```bash
+curl -s --max-time 30 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model": "Qwen3-30B-A3B", "prompt": "The capital of China is", "max_tokens": 50, "temperature": 0}'
+```
+
+**Expected**: Coherent response mentioning "Beijing". Save this output for comparison.
+
+### 6. Trigger ParaS EP→TP switch
 
 ```bash
 curl -s --max-time 10 http://localhost:30000/paras_configure_tp
@@ -75,7 +88,7 @@ curl -s --max-time 10 http://localhost:30000/paras_configure_tp
 
 **Expected**: Returns `ParaS TP parallelism configured.` within ~1 second.
 
-### 6. Check timing
+### 7. Check timing
 
 ```bash
 grep "Time taken to configure TP\|transfer_weights" /tmp/sglang_paras_test.log
@@ -88,39 +101,71 @@ grep "Time taken to configure TP\|transfer_weights" /tmp/sglang_paras_test.log
 | `transfer_weights` | < 300ms |
 | `configure TP` total | < 400ms |
 
-### 7. Verify model type loaded
+### 8. Send same request in TP mode (after ParaS switch)
 
 ```bash
-grep "Load weight end" /tmp/sglang_paras_test.log | head -1
+curl -s --max-time 30 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model": "Qwen3-30B-A3B", "prompt": "The capital of China is", "max_tokens": 50, "temperature": 0}'
 ```
 
-Should show `type=Qwen3MoeForCausalLMParaS` (not `Qwen3MoeForCausalLM`).
+**Expected**: Coherent response mentioning "Beijing". The wording will differ from EP mode due to floating point precision differences, but the answer must be correct and readable.
 
-### 8. Cleanup
+### 9. Send additional requests to verify decode works
+
+```bash
+# Request 2: math
+curl -s --max-time 30 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model": "Qwen3-30B-A3B", "prompt": "1+1=", "max_tokens": 20, "temperature": 0}'
+# Expected: starts with "2"
+
+# Request 3: code
+curl -s --max-time 30 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model": "Qwen3-30B-A3B", "prompt": "Write a Python function to add two numbers:\ndef add(a, b):", "max_tokens": 30, "temperature": 0}'
+# Expected: "return a + b" or equivalent
+```
+
+**Critical check**: All responses must be coherent multi-token text, NOT degenerated output (e.g., repeated `\xa0` or empty spaces). If decode degenerates after the first token, the FlashInfer attention backend state is stale — check that `paras_configure_tp` on the attention backend is being called.
+
+### 10. Verify no errors
+
+```bash
+grep -i "error\|exception" /tmp/sglang_paras_test.log | grep -v "import error\|Config file"
+# Expected: empty (no errors)
+```
+
+### 11. Cleanup
 
 ```bash
 pkill -9 -f "sglang" 2>/dev/null
 rm -f /tmp/sglang_paras_test.log
 ```
 
+## Pass/Fail Criteria
+
+| Check | Pass | Fail |
+|-------|------|------|
+| Model type | `Qwen3MoeForCausalLMParaS` | `Qwen3MoeForCausalLM` |
+| EP request | Coherent response | Error or timeout |
+| ParaS switch | Returns in < 1s | Timeout or OOM |
+| `transfer_weights` | < 300ms | > 1000ms (profiler may be on) |
+| TP request (same prompt) | Coherent, mentions "Beijing" | Garbage, `\xa0`, or timeout |
+| TP decode (multi-token) | Readable continuation | Degenerates after first token |
+| Additional TP requests | All coherent | Any garbage output |
+| Server errors | None | Any scheduler/runtime exception |
+
 ## Important Notes
 
-- **mem-fraction-static=0.75 will OOM** during weight redistribution (`permute(...).contiguous()` needs 192 MiB, only ~145 MiB free). This is a pre-existing issue (original branch also OOMs). Use 0.6.
+- **mem-fraction-static=0.75 will OOM** during weight redistribution on A100-80GB. Use 0.6.
 - **ParaS configure is one-way** (EP→TP only). Once configured, you cannot call `/paras_configure_tp` again. Restart the server for a new test.
-- **Overlap mode**: To test overlapped conversion (faster by ~30%), modify `paras/models/qwen3_moe.py` line 256 to pass `overlap=True` to `self.model.paras_configure_tp(...)`. Expected: ~200ms transfer_weights.
-- **The 3s timing anomaly**: If you see ~3s instead of ~300ms, it's likely because the GPU was in a bad state from a previous OOM. Kill all processes, wait 5 seconds, and retry on a clean GPU.
+- **Overlap mode**: To test overlapped conversion (faster by ~30%), modify `paras/models/qwen3_moe.py` to pass `overlap=True` to `self.model.paras_configure_tp(...)`. Expected: ~200ms transfer_weights.
+- **Slow timing (~3s instead of ~300ms)**: Likely GPU in bad state from prior OOM. Kill all processes, wait 5 seconds, retry on clean GPU.
+- **Profiler overhead**: If `transfer_weights` > 500ms, check that `paras_start_profile`/`paras_stop_profile` are not called in `scheduler_paras_mixin.py` and `paras_memory_check` is not called in `model_runner.py`.
 
-## Quick One-Liner Test
+## Known Failure Modes
 
-For CI/quick verification after code changes:
-
-```bash
-pkill -9 -f sglang 2>/dev/null; sleep 3; \
-cd /home/shaoyuw/sglang && conda activate sgl_paras && \
-pip install -e python/ -q --no-deps && \
-bash /home/shaoyuw/scripts/sglang/launch_paras_sglang.sh 2>&1 | tee /tmp/sglang_paras_test.log &
-sleep 45 && curl -s --max-time 10 http://localhost:30000/paras_configure_tp && \
-grep "Time taken to configure TP" /tmp/sglang_paras_test.log
-```
-
-Note: The launch script uses `mem-fraction-static 0.75` which will OOM. Override with a modified script or use the full command above with `0.6`.
+1. **`TypeError: NoneType - int`** after configure_tp: `scheduler_paras_mixin.paras_configure_helper` is missing `max_queued_requests` in the tuple unpacking from `get_worker_info()`.
+2. **`RuntimeError: shape '[N, 2048]' is invalid`**: FusedMoE `no_combine=True` is set on tp_experts. Check that `FusedMoE.__init__` skips `no_combine=True` when `paras_force_standard_dispatcher=True`.
+3. **Decode degenerates to `\xa0`**: FlashInfer updaters have stale `req_to_token` / `num_kv_heads`. Check that `FlashInferAttnBackend.paras_configure_tp()` is called from `model_runner.paras_configure_tp()`.
