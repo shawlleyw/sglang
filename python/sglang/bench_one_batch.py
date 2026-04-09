@@ -714,10 +714,10 @@ def latency_test(
             ol,
             server_args.device,
             bench_args.log_decode_step,
-            bench_args.profile if tp_rank == 0 else None,
-            bench_args.profile_record_shapes if tp_rank == 0 else None,
+            bench_args.profile,
+            bench_args.profile_record_shapes,
             bench_args.profile_activities,
-            bench_args.profile_filename_prefix,
+            bench_args.profile_filename_prefix + f"_rank{tp_rank}" if bench_args.profile else "",
             bench_args.profile_stage,
             tp_rank,
         )

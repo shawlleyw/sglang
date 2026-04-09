@@ -134,6 +134,7 @@ class SchedulerParasMixin:
         self.server_args.ep_size = 1
         moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.NONE
         
+        self.paras_start_profile("/tmp/paras_configure_profile")
         self.tree_cache.reset()
         local_reqs = self.paras_get_local_reqs()
         
@@ -171,6 +172,8 @@ class SchedulerParasMixin:
         end_time = time.time()
         cost_ms = (end_time - start_time) * 1000
         logger.info(f"Time taken to configure TP: {cost_ms} ms")
+
+        self.paras_stop_profile()
 
         # drop-in replacement for scheduler tp configs 
         self.tp_size = self.paras_tp_size
@@ -244,11 +247,11 @@ class SchedulerParasMixin:
             raise ValueError(f"Unrecognized ParaSConfigureReqType: {recv_req.type}")
         return ParaSConfigureReqOutput()
     
-    def paras_start_profile(self, op_name: str = "paras_configure"):
+    def paras_start_profile(self, output_dir: str = "/tmp/paras_configure_profile"):
         self.profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                op_name,
+                output_dir,
                 worker_name=f"rank{self.tp_rank}",
             ),
             record_shapes=True,

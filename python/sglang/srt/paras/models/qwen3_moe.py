@@ -12,7 +12,11 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.distributed import get_moe_expert_parallel_world_size
+from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
+)
+from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.utils import get_layer_id
@@ -46,33 +50,27 @@ class Qwen3MoeSparseMoeBlockParaS(ParaSMoeBlockMixin, Qwen3MoeSparseMoeBlock):
     """ParaS-enabled Qwen3 MoE block with EP↔TP switching."""
 
     def __init__(self, layer_id, config, quant_config=None, prefix=""):
-        # Retrieve the memory manager that was attached to config by CausalLM.__init__.
-        # This threading-via-config pattern avoids modifying base class constructors.
+        # Grab manager ref before super().__init__ (config attr is temporary)
         manager = getattr(config, "_paras_memory_manager", None)
         super().__init__(layer_id, config, quant_config, prefix)
         self.paras_init_moe(
             config, quant_config, prefix, layer_id,
-            paras_memory_manager=manager,
         )
-        # EP experts were allocated by the base class with torch.empty (we can't
-        # change the base class constructor). Swap their weights to manager views
-        # so they live in the contiguous buffer alongside TP expert weights.
-        if manager is not None and manager.materialized:
-            ep_prefix = f"model.layers.{layer_id}.mlp.experts.ep"
-            self._swap_ep_expert_weights(self.ep_experts, manager, ep_prefix)
 
-    # ------------------------------------------------------------------
-    # EP expert weight swap helper
-    # ------------------------------------------------------------------
+        # Swap EP expert weights to manager-backed views
+        if manager is not None and manager.materialized:
+            ep_prefix = f"model.layers.{layer_id}.mlp.experts"
+            self._swap_ep_expert_weights(self.ep_experts, manager, ep_prefix)
 
     @staticmethod
     def _swap_ep_expert_weights(ep_experts, manager, prefix):
-        """Replace EP expert weight Parameters with manager-backed views."""
-        # For each weight/scale attribute: look up the corresponding entry in
-        # the manager's layout, create a view, and re-register the parameter.
-        # We copy metadata (weight_loader etc.) from the old param to preserve
-        # the checkpoint loading contract.
-        for attr_name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+        """Replace EP expert weight parameters with manager-backed views.
+
+        The manager buffer was pre-allocated in plan_qwen_moe_layout.
+        We swap the torch.empty-allocated parameters created by the base
+        class with zero-copy views into the contiguous managed buffer.
+        """
+        for attr_name in ("w13_weight", "w2_weight"):
             entry_name = f"{prefix}.{attr_name}"
             if entry_name not in manager._entries:
                 continue
@@ -81,7 +79,7 @@ class Qwen3MoeSparseMoeBlockParaS(ParaSMoeBlockMixin, Qwen3MoeSparseMoeBlock):
                 continue
             view = manager.get_view(entry_name)
             new_param = torch.nn.Parameter(view, requires_grad=False)
-            # Preserve weight_loader and other metadata attached by set_weight_attrs
+            # Carry over weight_loader and other custom attrs from old param
             for k in list(vars(old_param)):
                 if not k.startswith("_"):
                     setattr(new_param, k, getattr(old_param, k))
@@ -230,6 +228,9 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
 
+        moe_tp_size = get_moe_tensor_parallel_world_size()
+        use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+
         plan_qwen_moe_layout(
             manager,
             num_layers=config.num_hidden_layers,
@@ -241,6 +242,8 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             head_dim=head_dim,
             ep_size=get_moe_expert_parallel_world_size(),
             tp_size=get_paras_tp_size(),
+            moe_tp_size=moe_tp_size,
+            use_triton_kernels=use_triton_kernels,
             quant_name=quant_name,
             fp8_block_size=fp8_block_size,
             num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),

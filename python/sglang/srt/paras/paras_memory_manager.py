@@ -234,6 +234,26 @@ class ParaSMemoryManager:
         ]
         return byte_slice.view(entry.dtype).reshape(entry.shape)
 
+    def get_view_as(
+        self, name: str, shape: tuple, dtype: torch.dtype = None
+    ) -> torch.Tensor:
+        """
+        Return the same bytes as *name* but with a different shape/dtype.
+
+        Used for TP reuse: the TP experts share the same underlying buffer
+        as the EP experts but interpret it with a different view shape.
+        Total bytes must match the original reservation.
+        """
+        if not self._materialized:
+            raise RuntimeError("Buffer not materialized yet.")
+        entry = self._entries[name]
+        target_dtype = dtype or entry.dtype
+        assert self._buffer is not None
+        byte_slice = self._buffer[
+            entry.offset_bytes : entry.offset_bytes + entry.size_bytes
+        ]
+        return byte_slice.view(target_dtype).reshape(shape)
+
     # ----- queries --------------------------------------------------------
 
     def is_managed(self, tensor: torch.Tensor) -> bool:
@@ -300,74 +320,45 @@ def _reserve_moe_weights(
     hidden_size: int,
     intermediate_size: int,
     ep_size: int,
-    tp_size: int,
+    moe_tp_size: int,
+    use_triton_kernels: bool,
     quant_name: Optional[str],
     fp8_block_size: Optional[int],
 ) -> None:
     """
-    Reserve EP and TP MoE weight tensors (and FP8 scales) for one layer.
+    Reserve EP MoE weight tensors (and FP8 scales) for one layer.
 
-    Weight layout conventions follow FusedMoE / sglang:
-      - BF16/FP16 (triton): w13 = (E, H, 2*I),  w2 = (E, I, H)
-      - FP8:                 w13 = (E, 2*I, H),   w2 = (E, H, I)
+    Only EP expert buffers are reserved. TP experts reuse the same buffer
+    region with a different view shape via ``get_view_as`` — the total byte
+    count is identical when ``ep_size == tp_size``.
 
-    where E is the local expert count, H = hidden_size, I = intermediate_size
-    (or intermediate_size // tp_size for the TP variant).
+    Shape conventions must match what ``FusedMoE.__init__`` → ``create_weights``
+    actually produces at runtime:
+      - ``intermediate_size_per_partition = intermediate_size // moe_tp_size``
+      - BF16/FP16 with triton kernels: w13 = (E, H, 2*I'), w2 = (E, I', H)
+      - All other cases (FP8 / non-triton): w13 = (E, 2*I', H), w2 = (E, H, I')
 
-    WHY EP AND TP HAVE DIFFERENT SHAPES:
-      - EP (Expert Parallelism): Each rank holds ep_experts = num_experts // ep_size.
-        The intermediate dimension is FULL (not sharded), so each rank can compute
-        the full MLP output independently.
-      
-      - TP (Tensor Parallelism): Each rank holds ALL num_experts, but the intermediate
-        dimension is sharded: tp_inter = intermediate_size // tp_size. This allows
-        distributed matrix multiplication across ranks.
-
-    WHY BF16 TRITON LAYOUT IS TRANSPOSED VS FP8:
-      - BF16 (triton): w13 = (E, H, 2*I) — matches Triton kernel expectations.
-      - FP8: w13 = (E, 2*I, H) — transposed for efficient block-wise quantization
-        and to match FusedMoE's FP8 kernel layout.
-      
-      This layout difference is a historical artifact of kernel implementations;
-      both are valid, but consumers must know which layout to expect.
-
-    FP8 SCALE TENSORS:
-      FP8 quantization stores per-block or per-tensor scaling factors separately.
-      These scales are needed during dequantization in the forward pass.
-      - Block-quantized: scales have shape (E, ceil(dim0/block_size), ceil(dim1/block_size))
-      - Per-tensor: scales have shape (E,) or (E, 2) depending on the weight tensor
+    where E = num_experts // ep_size, H = hidden_size,
+    I' = intermediate_size // moe_tp_size.
     """
     is_fp8 = quant_name == "fp8"
     weight_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
     lp = f"{prefix}.layers.{layer_idx}.mlp.experts"
 
-    # --- EP experts -------------------------------------------------------
-    # Each rank in EP holds a subset of experts with full intermediate dimension.
-    ep_experts = num_experts // ep_size
+    # EP experts: subset of experts, intermediate partitioned by moe_tp_size
+    ep_local_experts = num_experts // ep_size
+    inter_per_partition = intermediate_size // moe_tp_size
 
-    if is_fp8:
-        ep_w13_shape = (ep_experts, 2 * intermediate_size, hidden_size)
-        ep_w2_shape = (ep_experts, hidden_size, intermediate_size)
+    # Shape depends on triton kernel usage (BF16 triton transposes dims)
+    if use_triton_kernels and not is_fp8:
+        w13_shape = (ep_local_experts, hidden_size, 2 * inter_per_partition)
+        w2_shape = (ep_local_experts, inter_per_partition, hidden_size)
     else:
-        ep_w13_shape = (ep_experts, hidden_size, 2 * intermediate_size)
-        ep_w2_shape = (ep_experts, intermediate_size, hidden_size)
+        w13_shape = (ep_local_experts, 2 * inter_per_partition, hidden_size)
+        w2_shape = (ep_local_experts, hidden_size, inter_per_partition)
 
-    manager.reserve(f"{lp}.ep.w13_weight", ep_w13_shape, weight_dtype)
-    manager.reserve(f"{lp}.ep.w2_weight", ep_w2_shape, weight_dtype)
-
-    # --- TP experts -------------------------------------------------------
-    # Each rank in TP holds all experts but with sharded intermediate dimension.
-    tp_inter = intermediate_size // tp_size
-
-    if is_fp8:
-        tp_w13_shape = (num_experts, 2 * tp_inter, hidden_size)
-        tp_w2_shape = (num_experts, hidden_size, tp_inter)
-    else:
-        tp_w13_shape = (num_experts, hidden_size, 2 * tp_inter)
-        tp_w2_shape = (num_experts, tp_inter, hidden_size)
-
-    manager.reserve(f"{lp}.tp.w13_weight", tp_w13_shape, weight_dtype)
-    manager.reserve(f"{lp}.tp.w2_weight", tp_w2_shape, weight_dtype)
+    manager.reserve(f"{lp}.w13_weight", w13_shape, weight_dtype)
+    manager.reserve(f"{lp}.w2_weight", w2_shape, weight_dtype)
 
     # --- FP8 scale tensors ------------------------------------------------
     if is_fp8:
@@ -376,61 +367,32 @@ def _reserve_moe_weights(
             def _ceil(a: int, b: int) -> int:
                 return (a + b - 1) // b
 
-            # EP scales
-            ep_w13_scale_shape = (
-                ep_experts,
-                _ceil(2 * intermediate_size, fp8_block_size),
+            w13_scale_shape = (
+                ep_local_experts,
+                _ceil(2 * inter_per_partition, fp8_block_size),
                 _ceil(hidden_size, fp8_block_size),
             )
-            ep_w2_scale_shape = (
-                ep_experts,
+            w2_scale_shape = (
+                ep_local_experts,
                 _ceil(hidden_size, fp8_block_size),
-                _ceil(intermediate_size, fp8_block_size),
+                _ceil(inter_per_partition, fp8_block_size),
             )
             manager.reserve(
-                f"{lp}.ep.w13_weight_scale", ep_w13_scale_shape, torch.float32
+                f"{lp}.w13_weight_scale", w13_scale_shape, torch.float32
             )
             manager.reserve(
-                f"{lp}.ep.w2_weight_scale", ep_w2_scale_shape, torch.float32
-            )
-
-            # TP scales
-            tp_w13_scale_shape = (
-                num_experts,
-                _ceil(2 * tp_inter, fp8_block_size),
-                _ceil(hidden_size, fp8_block_size),
-            )
-            tp_w2_scale_shape = (
-                num_experts,
-                _ceil(hidden_size, fp8_block_size),
-                _ceil(tp_inter, fp8_block_size),
-            )
-            manager.reserve(
-                f"{lp}.tp.w13_weight_scale", tp_w13_scale_shape, torch.float32
-            )
-            manager.reserve(
-                f"{lp}.tp.w2_weight_scale", tp_w2_scale_shape, torch.float32
+                f"{lp}.w2_weight_scale", w2_scale_shape, torch.float32
             )
         else:
             # Per-tensor scales
-            manager.reserve(
-                f"{lp}.ep.w13_weight_scale",
-                (ep_experts, 2),
+            manager.reserve(    
+                f"{lp}.w13_weight_scale",
+                (ep_local_experts, 2),
                 torch.float32,
             )
             manager.reserve(
-                f"{lp}.ep.w2_weight_scale",
-                (ep_experts,),
-                torch.float32,
-            )
-            manager.reserve(
-                f"{lp}.tp.w13_weight_scale",
-                (num_experts, 2),
-                torch.float32,
-            )
-            manager.reserve(
-                f"{lp}.tp.w2_weight_scale",
-                (num_experts,),
+                f"{lp}.w2_weight_scale",
+                (ep_local_experts,),
                 torch.float32,
             )
 
@@ -447,6 +409,8 @@ def plan_qwen_moe_layout(
     head_dim: int,
     ep_size: int,
     tp_size: int,
+    moe_tp_size: int,
+    use_triton_kernels: bool,
     quant_name: Optional[str] = None,
     fp8_block_size: Optional[int] = None,
     num_fused_shared_experts: int = 0,
@@ -471,7 +435,7 @@ def plan_qwen_moe_layout(
     _validate_v1_scope(num_fused_shared_experts, quant_name)
 
     for i in range(num_layers):
-        # -- MoE weights ---------------------------------------------------
+        # -- MoE weights (EP only — TP reuses same buffer via get_view_as) -
         _reserve_moe_weights(
             manager=manager,
             prefix=prefix,
@@ -480,7 +444,8 @@ def plan_qwen_moe_layout(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             ep_size=ep_size,
-            tp_size=tp_size,
+            moe_tp_size=moe_tp_size,
+            use_triton_kernels=use_triton_kernels,
             quant_name=quant_name,
             fp8_block_size=fp8_block_size,
         )
