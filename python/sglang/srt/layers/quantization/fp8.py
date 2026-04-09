@@ -550,7 +550,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        # Extract ParaS manager params before they reach set_weight_attrs
+        # ParaS integration: same pattern as unquant.py — extract manager,
+        # use get_view() for weights + scale tensors when manager is available.
         paras_mgr = extra_weight_attrs.pop("paras_memory_manager", None)
         paras_prefix = extra_weight_attrs.pop("paras_weight_name_prefix", "")
         use_manager = paras_mgr is not None and paras_mgr.materialized
@@ -584,6 +585,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # WEIGHTS
         if use_manager:
+            # Manager-backed FP8 weights: views come pre-shaped from the contiguous buffer.
+            # The buffer was reserved with FP8-specific shapes (non-transposed layout).
             w13_weight = torch.nn.Parameter(
                 paras_mgr.get_view(f"{paras_prefix}.w13_weight"),
                 requires_grad=False,
@@ -641,6 +644,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # WEIGHT_SCALES
         if self.block_quant:
             if use_manager:
+                # Manager-backed FP8 block scales: the manager reserves scale tensors
+                # alongside weight tensors to keep everything in one contiguous allocation.
                 w13_weight_scale = torch.nn.Parameter(
                     paras_mgr.get_view(f"{paras_prefix}.w13_weight_scale"),
                     requires_grad=False,

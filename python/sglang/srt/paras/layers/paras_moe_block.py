@@ -54,10 +54,16 @@ class ParaSMoeBlockMixin:
         # Save the EP experts that were created by the base class __init__
         self.ep_experts = self.experts
 
-        # Build the TP weight-name prefix that matches plan_qwen_moe_layout()
+        # Build the weight-name prefix matching plan_qwen_moe_layout() naming:
+        # "model.layers.{N}.mlp.experts.tp" → used by FusedMoE to look up
+        # get_view("model.layers.{N}.mlp.experts.tp.w13_weight") etc.
         tp_weight_prefix = f"model.layers.{layer_id}.mlp.experts.tp"
 
-        # Create the TP experts (skip_weights_init — weights arrive via all-to-all)
+        # TP experts: created with skip_weights_init=True because their weights
+        # arrive via all-to-all redistribution at runtime (not from checkpoint).
+        # When paras_memory_manager is provided, FusedMoE's quant_method will
+        # still call paras_set_extra_weight_attrs (due to skip_weights_init),
+        # but the manager reference flows through for later use during switching.
         self.tp_experts = FusedMoE(
             num_experts=config.num_experts
             + get_global_server_args().ep_num_redundant_experts,

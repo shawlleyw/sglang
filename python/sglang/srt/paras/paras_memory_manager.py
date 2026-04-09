@@ -2,6 +2,25 @@
 ParaSMemoryManager: Static contiguous weight buffer for ParaS EP↔TP switching.
 V1 scope: Qwen sparse-MoE (no shared experts, no dense MLPs).
 Supported dtypes: BF16/FP16 (unquantized) and FP8.
+
+LIFECYCLE & DESIGN:
+  The manager pre-plans a single contiguous uint8 buffer that holds all weight tensors
+  needed for Expert Parallelism (EP) ↔ Tensor Parallelism (TP) switching. This design
+  avoids repeated allocations and fragmentation during dynamic reconfiguration.
+
+  1. plan_qwen_moe_layout(manager, ...)  — reserves tensor slots (name, shape, dtype)
+  2. manager.materialize()                — computes aligned offsets, allocates one GPU buffer
+  3. manager.get_view("name")             — returns typed, shaped view for module to wrap as nn.Parameter
+
+MEMORY LAYOUT EXAMPLE (1 layer, BF16, 8 experts, ep_size=2, tp_size=4):
+  [EP_w13 | EP_w2 | TP_w13 | TP_w2 | QKV_full | O_proj | QKV_TP_buf | ...]
+   ^-- all in one contiguous torch.uint8 buffer, 256-byte aligned for GPU access
+
+WHY THIS APPROACH:
+  - Single allocation: Avoids GPU memory fragmentation and repeated malloc/free overhead.
+  - Deterministic offsets: Reservation order → fixed offsets enables reproducible layouts.
+  - Dtype-agnostic storage: uint8 buffer holds any dtype; views reinterpret as needed.
+  - Aligned access: 256-byte alignment matches GPU memory coalescing patterns.
 """
 
 import json
@@ -110,7 +129,14 @@ class ParaSMemoryManager:
         shape: Tuple[int, ...],
         dtype: torch.dtype,
     ) -> LayoutEntry:
-        """Register a tensor to be placed in the contiguous buffer."""
+        """
+        Register a tensor to be placed in the contiguous buffer.
+
+        WHY TRACK RESERVATION ORDER:
+          Offsets are assigned in the order tensors are reserved. This deterministic
+          ordering ensures reproducible memory layouts across runs, which is critical
+          for distributed training where all ranks must agree on the buffer structure.
+        """
         if self._materialized:
             raise RuntimeError(
                 "Cannot reserve after the buffer has been materialized."
@@ -138,7 +164,7 @@ class ParaSMemoryManager:
             size_bytes=size_bytes,
         )
         self._entries[name] = entry
-        self._reservation_order.append(name)
+        self._reservation_order.append(name)  # Preserve order for deterministic offset assignment
         return entry
 
     # ----- materialization ------------------------------------------------
@@ -149,6 +175,20 @@ class ParaSMemoryManager:
         backing ``uint8`` buffer on ``self.device``.
 
         Returns the total buffer size in bytes.
+
+        WHY UINT8 BUFFER:
+          We store raw bytes (uint8) instead of a typed buffer because different tensors
+          have different dtypes (BF16, FP8, FP32). A uint8 buffer is dtype-agnostic and
+          allows get_view() to reinterpret the same bytes as different types via .view(dtype).
+
+        WHY 256-BYTE ALIGNMENT:
+          GPU memory coalescing works best when tensors start at 256-byte boundaries.
+          This alignment ensures efficient memory access patterns during kernel execution.
+
+        WHY STORE BUFFER_START/BUFFER_END:
+          These pointers enable is_managed() to quickly check if a tensor's data pointer
+          falls within our managed buffer. This is used to distinguish managed vs. external
+          tensors during parameter wrapping.
         """
         offset = 0
         for name in self._reservation_order:
@@ -170,7 +210,18 @@ class ParaSMemoryManager:
     # ----- view access ----------------------------------------------------
 
     def get_view(self, name: str) -> torch.Tensor:
-        """Return a typed, shaped view into the buffer for *name*."""
+        """
+        Return a typed, shaped view into the buffer for *name*.
+
+        BYTE_SLICE → VIEW(DTYPE) → RESHAPE CHAIN:
+          1. byte_slice: Extract the raw bytes from the uint8 buffer using offsets.
+          2. .view(dtype): Reinterpret those bytes as the target dtype (BF16, FP8, etc.).
+             This is a zero-copy operation—no data is moved, just reinterpreted.
+          3. .reshape(shape): Reshape the flat 1-D tensor to the original shape.
+          
+          This chain allows a single uint8 buffer to serve tensors of different dtypes
+          without duplication or type conversion overhead.
+        """
         if not self._materialized:
             raise RuntimeError("Buffer not materialized yet.")
         if name not in self._entries:
@@ -262,12 +313,36 @@ def _reserve_moe_weights(
 
     where E is the local expert count, H = hidden_size, I = intermediate_size
     (or intermediate_size // tp_size for the TP variant).
+
+    WHY EP AND TP HAVE DIFFERENT SHAPES:
+      - EP (Expert Parallelism): Each rank holds ep_experts = num_experts // ep_size.
+        The intermediate dimension is FULL (not sharded), so each rank can compute
+        the full MLP output independently.
+      
+      - TP (Tensor Parallelism): Each rank holds ALL num_experts, but the intermediate
+        dimension is sharded: tp_inter = intermediate_size // tp_size. This allows
+        distributed matrix multiplication across ranks.
+
+    WHY BF16 TRITON LAYOUT IS TRANSPOSED VS FP8:
+      - BF16 (triton): w13 = (E, H, 2*I) — matches Triton kernel expectations.
+      - FP8: w13 = (E, 2*I, H) — transposed for efficient block-wise quantization
+        and to match FusedMoE's FP8 kernel layout.
+      
+      This layout difference is a historical artifact of kernel implementations;
+      both are valid, but consumers must know which layout to expect.
+
+    FP8 SCALE TENSORS:
+      FP8 quantization stores per-block or per-tensor scaling factors separately.
+      These scales are needed during dequantization in the forward pass.
+      - Block-quantized: scales have shape (E, ceil(dim0/block_size), ceil(dim1/block_size))
+      - Per-tensor: scales have shape (E,) or (E, 2) depending on the weight tensor
     """
     is_fp8 = quant_name == "fp8"
     weight_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
     lp = f"{prefix}.layers.{layer_idx}.mlp.experts"
 
     # --- EP experts -------------------------------------------------------
+    # Each rank in EP holds a subset of experts with full intermediate dimension.
     ep_experts = num_experts // ep_size
 
     if is_fp8:
@@ -281,6 +356,7 @@ def _reserve_moe_weights(
     manager.reserve(f"{lp}.ep.w2_weight", ep_w2_shape, weight_dtype)
 
     # --- TP experts -------------------------------------------------------
+    # Each rank in TP holds all experts but with sharded intermediate dimension.
     tp_inter = intermediate_size // tp_size
 
     if is_fp8:
@@ -379,8 +455,18 @@ def plan_qwen_moe_layout(
     """
     Reserve all weight tensors for a Qwen sparse-MoE model.
 
-    This pre-plans the contiguous buffer layout so that
-    ``manager.materialize()`` can allocate exactly once.
+    This is the main entry point for planning the contiguous buffer layout.
+    After calling this function, call manager.materialize() to allocate the GPU buffer.
+
+    NAMING CONVENTION:
+      Tensor names follow the pattern: {prefix}.layers.{i}.mlp.experts.{ep|tp}.{w13|w2}_weight
+      This naming MUST match what consumers (e.g., model loading code) expect to look up.
+      Changing names here requires coordinating with all code that wraps these tensors as nn.Parameter.
+
+    QKV TP BUFFER:
+      The QKV_TP buffer is separate from QKV_full because TP reconfiguration requires
+      copying q/k/v slices from the full QKV weight into this buffer. This avoids
+      modifying the original full weight and enables efficient in-place operations.
     """
     _validate_v1_scope(num_fused_shared_experts, quant_name)
 

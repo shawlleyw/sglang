@@ -152,7 +152,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
-        # Extract ParaS manager params before they reach set_weight_attrs
+        # ParaS integration: extract memory manager before extra_weight_attrs reaches
+        # set_weight_attrs (which would store unknown keys on the parameter).
+        # When use_manager is True, weights are sliced from a contiguous buffer
+        # instead of being allocated independently with torch.empty.
         paras_mgr = extra_weight_attrs.pop("paras_memory_manager", None)
         paras_prefix = extra_weight_attrs.pop("paras_weight_name_prefix", "")
         use_manager = paras_mgr is not None and paras_mgr.materialized
@@ -164,6 +167,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
         if use_manager:
+            # Manager-backed allocation: get a typed view into the contiguous buffer.
+            # Shape was pre-computed in plan_qwen_moe_layout() to match exactly.
             w13_weight = torch.nn.Parameter(
                 paras_mgr.get_view(f"{paras_prefix}.w13_weight"),
                 requires_grad=False,
@@ -196,6 +201,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         if self.use_triton_kernels:
             w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
         if use_manager:
+            # Manager-backed allocation: get a typed view into the contiguous buffer.
+            # Shape was pre-computed in plan_qwen_moe_layout() to match exactly.
             w2_weight = torch.nn.Parameter(
                 paras_mgr.get_view(f"{paras_prefix}.w2_weight"),
                 requires_grad=False,

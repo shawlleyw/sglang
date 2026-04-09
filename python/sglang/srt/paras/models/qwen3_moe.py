@@ -46,14 +46,17 @@ class Qwen3MoeSparseMoeBlockParaS(ParaSMoeBlockMixin, Qwen3MoeSparseMoeBlock):
     """ParaS-enabled Qwen3 MoE block with EP↔TP switching."""
 
     def __init__(self, layer_id, config, quant_config=None, prefix=""):
+        # Retrieve the memory manager that was attached to config by CausalLM.__init__.
+        # This threading-via-config pattern avoids modifying base class constructors.
         manager = getattr(config, "_paras_memory_manager", None)
         super().__init__(layer_id, config, quant_config, prefix)
         self.paras_init_moe(
             config, quant_config, prefix, layer_id,
             paras_memory_manager=manager,
         )
-        # Post-init: swap EP expert weights with manager-backed views so that
-        # EP weights live inside the contiguous buffer.
+        # EP experts were allocated by the base class with torch.empty (we can't
+        # change the base class constructor). Swap their weights to manager views
+        # so they live in the contiguous buffer alongside TP expert weights.
         if manager is not None and manager.materialized:
             ep_prefix = f"model.layers.{layer_id}.mlp.experts.ep"
             self._swap_ep_expert_weights(self.ep_experts, manager, ep_prefix)
@@ -65,6 +68,10 @@ class Qwen3MoeSparseMoeBlockParaS(ParaSMoeBlockMixin, Qwen3MoeSparseMoeBlock):
     @staticmethod
     def _swap_ep_expert_weights(ep_experts, manager, prefix):
         """Replace EP expert weight Parameters with manager-backed views."""
+        # For each weight/scale attribute: look up the corresponding entry in
+        # the manager's layout, create a view, and re-register the parameter.
+        # We copy metadata (weight_loader etc.) from the old param to preserve
+        # the checkpoint loading contract.
         for attr_name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
             entry_name = f"{prefix}.{attr_name}"
             if entry_name not in manager._entries:
@@ -119,8 +126,10 @@ class Qwen3MoeDecoderLayerParaS(ParaSDecoderLayerMixin, Qwen3MoeDecoderLayer):
         # ParaSAttentionMixin adds no __init__ state, just methods)
         self.self_attn.__class__ = Qwen3MoeAttentionParaS
 
-        # Post-init: swap QKV and o_proj weights with manager-backed views
-        # so that attention weights live inside the contiguous buffer.
+        # Post-init weight swap: the base class creates QKV and o_proj weights
+        # via torch.empty. We replace them with views from the contiguous buffer.
+        # This is the "post-replace" pattern — unavoidable because we can't
+        # modify the base Qwen3MoeAttention constructor.
         manager = getattr(config, "_paras_memory_manager", None)
         if manager is not None and manager.materialized:
             lp = f"model.layers.{layer_id}"
@@ -147,8 +156,9 @@ class Qwen3MoeDecoderLayerParaS(ParaSDecoderLayerMixin, Qwen3MoeDecoderLayer):
                     setattr(new_o, k, getattr(old_o, k))
             self.self_attn.o_proj.weight = new_o
 
-            # Store manager ref + TP weight name on the QKV module so
-            # paras_configure_tp can later swap to the TP view.
+            # Store manager ref on the QKV module so that paras_configure_tp()
+            # can later use it to copy q/k/v slices into the managed TP buffer
+            # instead of allocating a new tensor via torch.row_stack.
             self.self_attn.qkv_proj._paras_mgr = manager
             self.self_attn.qkv_proj._paras_prefix = (
                 f"{lp}.self_attn.qkv_proj"
@@ -195,10 +205,16 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         self.config = config
         self.quant_config = quant_config
 
-        # ------------------------------------------------------------------
-        # Create and materialize ParaSMemoryManager BEFORE model construction
-        # so that submodules can allocate weights from the contiguous buffer.
-        # ------------------------------------------------------------------
+        # ---- ParaS Memory Manager ----
+        # Create the static weight buffer BEFORE building the model so that
+        # submodule constructors can allocate from it.
+        #
+        # Flow:
+        #   1. Create manager + plan layout (reserves all tensor slots)
+        #   2. Materialize (allocates one big GPU buffer)
+        #   3. Attach to config._paras_memory_manager (temporary carrier)
+        #   4. Build model (submodules pick up manager from config)
+        #   5. Clean up config attribute
         manager = ParaSMemoryManager()
 
         quant_name = None
@@ -234,8 +250,9 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
 
-        # Thread the manager through config so decoder-layer / MoE-block
-        # constructors can pick it up without changing base-class signatures.
+        # Thread manager through config: this is the only way to pass it
+        # to deeply-nested constructors (DecoderLayer → MoeBlock → FusedMoE)
+        # without modifying base class signatures. Cleaned up in finally block.
         config._paras_memory_manager = manager
         try:
             self.model = Qwen3MoeModelParaS(

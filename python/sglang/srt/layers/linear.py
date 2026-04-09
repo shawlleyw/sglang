@@ -851,7 +851,10 @@ class QKVParallelLinear(ColumnParallelLinear):
             use_presharded_weights=self.use_presharded_weights,
         )
 
-        # ParaS manager-backed weight allocation
+        # ParaS static memory manager: replaces the weight allocated by the base class
+        # (ColumnParallelLinear) with a view from the contiguous buffer.
+        # We use "post-replace" because we can't modify the base class constructor.
+        # The original torch.empty allocation is freed by GC after replacement.
         self._paras_mgr = paras_memory_manager
         self._paras_prefix = paras_weight_name_prefix
         if paras_memory_manager is not None and paras_memory_manager.materialized:
@@ -1239,7 +1242,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         hs = self.head_size
 
         if self._paras_mgr is not None and self._paras_mgr.materialized:
-            # Copy q/k/v slices into pre-allocated managed TP buffer
+            # Manager-backed QKV TP switching: instead of torch.row_stack (which
+            # allocates a NEW unmanaged tensor), copy q/k/v slices into a 
+            # pre-allocated managed TP buffer. The copy is unavoidable because
+            # q/k/v are non-contiguous slices from the full weight, but the
+            # DESTINATION is now in managed memory (not a random allocation).
             tp_view = self._paras_mgr.get_view(
                 f"{self._paras_prefix}.tp_weight"
             )
@@ -1373,7 +1380,9 @@ class RowParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
-        # ParaS manager-backed weight allocation
+        # ParaS static memory manager: same post-replace pattern as QKVParallelLinear.
+        # For RowParallelLinear, TP reconfiguration uses dim-1 slicing which creates
+        # a view (not a copy), so the TP weight naturally stays manager-backed.
         self._paras_mgr = paras_memory_manager
         self._paras_prefix = paras_weight_name_prefix
         if paras_memory_manager is not None and paras_memory_manager.materialized:
