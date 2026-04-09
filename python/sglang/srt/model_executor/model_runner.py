@@ -2378,10 +2378,13 @@ class ModelRunner:
         assert not self.use_mla_backend, (
             "ParaS does not support MLA backend yet."
         )
-        if paras_tp_rank == 0:
-            paras_memory_check("before paras_configure_tp")
 
         paras_comm_configure_tp()
+
+        if hasattr(self.attn_backend, 'paras_configure_tp'):
+            self.attn_backend.paras_configure_tp(
+                paras_tp_size, self.req_to_token_pool.req_to_token
+            )
 
         # Import here to avoid circular imports
         from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
@@ -2390,9 +2393,6 @@ class ModelRunner:
             "ParaS only supports Qwen3MoeForCausalLM model for now."
         )
         self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
-
-        if paras_tp_rank == 0:
-            paras_memory_check("after paras_configure_tp")
 
     @paras_func
     def paras_configure_ep(self):
@@ -2403,6 +2403,9 @@ class ModelRunner:
         assert isinstance(self.token_to_kv_pool, MHATokenToKVPool)
         self.token_to_kv_pool.paras_configure_ep()
         paras_comm_configure_ep()
+
+        if hasattr(self.attn_backend, 'paras_configure_ep'):
+            self.attn_backend.paras_configure_ep(self.req_to_token_pool.req_to_token)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

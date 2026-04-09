@@ -126,7 +126,10 @@ class FlashInferAttnBackend(AttentionBackend):
             model_runner.server_args.multi_item_scoring_delimiter
         )
 
-        # Parse constants
+        # Parse constants (stored for ParaS recomputation in paras_configure_helper)
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.total_num_attention_heads = model_runner.model_config.num_attention_heads
+        self._get_num_kv_heads = model_runner.model_config.get_num_kv_heads
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
@@ -285,6 +288,36 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+
+    def paras_configure_helper(self):
+        if hasattr(self, 'indices_updater_decode'):
+            self.decode_use_tensor_cores = should_use_tensor_core(
+                kv_cache_dtype=self.kv_cache_dtype,
+                num_attention_heads=self.indices_updater_decode.num_qo_heads,
+                num_kv_heads=self.indices_updater_decode.num_kv_heads,
+            )
+
+    def paras_configure_tp(self, paras_tp_size: int, req_to_token: "torch.Tensor"):
+        num_qo_heads = self.total_num_attention_heads // paras_tp_size
+        num_kv_heads = self._get_num_kv_heads(paras_tp_size)
+        for updater_attr in ('indices_updater_decode', 'indices_updater_prefill'):
+            updater = getattr(self, updater_attr, None)
+            if updater is not None:
+                updater.num_qo_heads = num_qo_heads
+                updater.num_kv_heads = num_kv_heads
+                updater.req_to_token = req_to_token
+        self.paras_configure_helper()
+
+    def paras_configure_ep(self, req_to_token: "torch.Tensor"):
+        num_qo_heads = self.total_num_attention_heads
+        num_kv_heads = self._get_num_kv_heads(1)
+        for updater_attr in ('indices_updater_decode', 'indices_updater_prefill'):
+            updater = getattr(self, updater_attr, None)
+            if updater is not None:
+                updater.num_qo_heads = num_qo_heads
+                updater.num_kv_heads = num_kv_heads
+                updater.req_to_token = req_to_token
+        self.paras_configure_helper()
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
