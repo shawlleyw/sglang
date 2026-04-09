@@ -152,16 +152,27 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        # Extract ParaS manager params before they reach set_weight_attrs
+        paras_mgr = extra_weight_attrs.pop("paras_memory_manager", None)
+        paras_prefix = extra_weight_attrs.pop("paras_weight_name_prefix", "")
+        use_manager = paras_mgr is not None and paras_mgr.materialized
+
         self.with_bias = with_bias
 
         # Fused gate_up_proj (column parallel)
         w13_weight_n, w13_weight_k = 2 * intermediate_size_per_partition, hidden_size
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
-        w13_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype),
-            requires_grad=False,
-        )
+        if use_manager:
+            w13_weight = torch.nn.Parameter(
+                paras_mgr.get_view(f"{paras_prefix}.w13_weight"),
+                requires_grad=False,
+            )
+        else:
+            w13_weight = torch.nn.Parameter(
+                torch.empty(num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype),
+                requires_grad=False,
+            )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
@@ -184,10 +195,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
         if self.use_triton_kernels:
             w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
-        w2_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype),
-            requires_grad=False,
-        )
+        if use_manager:
+            w2_weight = torch.nn.Parameter(
+                paras_mgr.get_view(f"{paras_prefix}.w2_weight"),
+                requires_grad=False,
+            )
+        else:
+            w2_weight = torch.nn.Parameter(
+                torch.empty(num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype),
+                requires_grad=False,
+            )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 

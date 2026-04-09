@@ -12,6 +12,7 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.distributed import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.utils import get_layer_id
@@ -22,6 +23,8 @@ from sglang.srt.paras.layers.paras_decoder_layer import ParaSDecoderLayerMixin
 from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 from sglang.srt.paras.layers.utils import paras_load_tp_experts_weight, paras_weight_buffer
+from sglang.srt.paras.paras_memory_manager import ParaSMemoryManager, plan_qwen_moe_layout
+from sglang.srt.paras.paras_parallel_state import get_paras_tp_size
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -43,8 +46,39 @@ class Qwen3MoeSparseMoeBlockParaS(ParaSMoeBlockMixin, Qwen3MoeSparseMoeBlock):
     """ParaS-enabled Qwen3 MoE block with EP↔TP switching."""
 
     def __init__(self, layer_id, config, quant_config=None, prefix=""):
+        manager = getattr(config, "_paras_memory_manager", None)
         super().__init__(layer_id, config, quant_config, prefix)
-        self.paras_init_moe(config, quant_config, prefix, layer_id)
+        self.paras_init_moe(
+            config, quant_config, prefix, layer_id,
+            paras_memory_manager=manager,
+        )
+        # Post-init: swap EP expert weights with manager-backed views so that
+        # EP weights live inside the contiguous buffer.
+        if manager is not None and manager.materialized:
+            ep_prefix = f"model.layers.{layer_id}.mlp.experts.ep"
+            self._swap_ep_expert_weights(self.ep_experts, manager, ep_prefix)
+
+    # ------------------------------------------------------------------
+    # EP expert weight swap helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _swap_ep_expert_weights(ep_experts, manager, prefix):
+        """Replace EP expert weight Parameters with manager-backed views."""
+        for attr_name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+            entry_name = f"{prefix}.{attr_name}"
+            if entry_name not in manager._entries:
+                continue
+            old_param = getattr(ep_experts, attr_name, None)
+            if old_param is None:
+                continue
+            view = manager.get_view(entry_name)
+            new_param = torch.nn.Parameter(view, requires_grad=False)
+            # Preserve weight_loader and other metadata attached by set_weight_attrs
+            for k in list(vars(old_param)):
+                if not k.startswith("_"):
+                    setattr(new_param, k, getattr(old_param, k))
+            ep_experts.register_parameter(attr_name, new_param)
 
     def forward(
         self,
@@ -84,6 +118,41 @@ class Qwen3MoeDecoderLayerParaS(ParaSDecoderLayerMixin, Qwen3MoeDecoderLayer):
         # Swap attention class to add ParaS methods (no reconstruction needed —
         # ParaSAttentionMixin adds no __init__ state, just methods)
         self.self_attn.__class__ = Qwen3MoeAttentionParaS
+
+        # Post-init: swap QKV and o_proj weights with manager-backed views
+        # so that attention weights live inside the contiguous buffer.
+        manager = getattr(config, "_paras_memory_manager", None)
+        if manager is not None and manager.materialized:
+            lp = f"model.layers.{layer_id}"
+
+            # QKV projection
+            qkv_name = f"{lp}.self_attn.qkv_proj.weight"
+            old_qkv = self.self_attn.qkv_proj.weight
+            new_qkv = torch.nn.Parameter(
+                manager.get_view(qkv_name), requires_grad=False
+            )
+            for k in list(vars(old_qkv)):
+                if not k.startswith("_"):
+                    setattr(new_qkv, k, getattr(old_qkv, k))
+            self.self_attn.qkv_proj.weight = new_qkv
+
+            # Output projection
+            o_name = f"{lp}.self_attn.o_proj.weight"
+            old_o = self.self_attn.o_proj.weight
+            new_o = torch.nn.Parameter(
+                manager.get_view(o_name), requires_grad=False
+            )
+            for k in list(vars(old_o)):
+                if not k.startswith("_"):
+                    setattr(new_o, k, getattr(old_o, k))
+            self.self_attn.o_proj.weight = new_o
+
+            # Store manager ref + TP weight name on the QKV module so
+            # paras_configure_tp can later swap to the TP view.
+            self.self_attn.qkv_proj._paras_mgr = manager
+            self.self_attn.qkv_proj._paras_prefix = (
+                f"{lp}.self_attn.qkv_proj"
+            )
 
         # Initialize dual communicator state for EP↔TP switching
         # is_previous_layer_sparse=True because all Qwen3-MoE layers are sparse
@@ -125,9 +194,57 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen3MoeModelParaS(
-            config, quant_config, prefix=add_prefix("model", prefix)
+
+        # ------------------------------------------------------------------
+        # Create and materialize ParaSMemoryManager BEFORE model construction
+        # so that submodules can allocate weights from the contiguous buffer.
+        # ------------------------------------------------------------------
+        manager = ParaSMemoryManager()
+
+        quant_name = None
+        fp8_block_size = None
+        if quant_config is not None:
+            qn = quant_config.get_name()
+            if qn == "fp8":
+                quant_name = "fp8"
+                if hasattr(quant_config, "weight_block_size") and quant_config.weight_block_size:
+                    fp8_block_size = quant_config.weight_block_size[0]
+
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
         )
+
+        plan_qwen_moe_layout(
+            manager,
+            num_layers=config.num_hidden_layers,
+            num_experts=config.num_experts,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=head_dim,
+            ep_size=get_moe_expert_parallel_world_size(),
+            tp_size=get_paras_tp_size(),
+            quant_name=quant_name,
+            fp8_block_size=fp8_block_size,
+            num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
+            prefix="model",
+        )
+        total_bytes = manager.materialize()
+        logger.info("ParaSMemoryManager materialized: %s", manager)
+        self.paras_memory_manager = manager
+
+        # Thread the manager through config so decoder-layer / MoE-block
+        # constructors can pick it up without changing base-class signatures.
+        config._paras_memory_manager = manager
+        try:
+            self.model = Qwen3MoeModelParaS(
+                config, quant_config, prefix=add_prefix("model", prefix)
+            )
+        finally:
+            # Clean the temporary attribute regardless of success/failure
+            del config._paras_memory_manager
+
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,

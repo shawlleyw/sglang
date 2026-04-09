@@ -2,9 +2,12 @@
 
 import logging
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.paras.paras_memory_manager import ParaSMemoryManager
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
@@ -152,6 +155,8 @@ class FusedMoE(torch.nn.Module):
         moe_ep_rank_override: Optional[int] = None,
         moe_tp_rank_override: Optional[int] = None,
         paras_force_standard_dispatcher: bool = False,
+        paras_memory_manager: Optional["ParaSMemoryManager"] = None,
+        paras_weight_name_prefix: str = "",
     ):
         super().__init__()
         if params_dtype is None:
@@ -222,6 +227,7 @@ class FusedMoE(torch.nn.Module):
             self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels, use_deep_gemm=use_deep_gemm)
 
         self.skip_weights_init = skip_weights_init
+        self.paras_memory_manager = paras_memory_manager
         weights_init_func = self.quant_method.create_weights if not skip_weights_init else self.quant_method.paras_set_extra_weight_attrs
 
         weights_init_func(
@@ -238,6 +244,8 @@ class FusedMoE(torch.nn.Module):
             intermediate_size_full=intermediate_size,
             top_k=top_k,
             with_bias=with_bias,
+            paras_memory_manager=paras_memory_manager,
+            paras_weight_name_prefix=paras_weight_name_prefix,
         )
         
         # A hack for using deepep with triton kernels: the token combination should be skipped in moe runner.

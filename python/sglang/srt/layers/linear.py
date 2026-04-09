@@ -801,6 +801,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         load_presharded_attn: bool = False,
+        paras_memory_manager=None,
+        paras_weight_name_prefix: str = "",
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -848,6 +850,16 @@ class QKVParallelLinear(ColumnParallelLinear):
             tp_size=tp_size,
             use_presharded_weights=self.use_presharded_weights,
         )
+
+        # ParaS manager-backed weight allocation
+        self._paras_mgr = paras_memory_manager
+        self._paras_prefix = paras_weight_name_prefix
+        if paras_memory_manager is not None and paras_memory_manager.materialized:
+            managed_view = paras_memory_manager.get_view(
+                f"{paras_weight_name_prefix}.weight"
+            )
+            self.weight = torch.nn.Parameter(managed_view, requires_grad=False)
+            set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
@@ -1224,11 +1236,32 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         # column major
         full_weight_tensor = self.full_weight.data
-        new_weight_tensor = torch.row_stack((
-            full_weight_tensor[tp_head_start*self.head_size:tp_head_end*self.head_size, :],
-            full_weight_tensor[tp_k_head_start*self.head_size:tp_k_head_end*self.head_size, :],
-            full_weight_tensor[tp_v_head_start*self.head_size:tp_v_head_end*self.head_size, :]
-        ))
+        hs = self.head_size
+
+        if self._paras_mgr is not None and self._paras_mgr.materialized:
+            # Copy q/k/v slices into pre-allocated managed TP buffer
+            tp_view = self._paras_mgr.get_view(
+                f"{self._paras_prefix}.tp_weight"
+            )
+            q_rows = (tp_head_end - tp_head_start) * hs
+            k_rows = (tp_k_head_end - tp_k_head_start) * hs
+            tp_view[:q_rows, :].copy_(
+                full_weight_tensor[tp_head_start * hs : tp_head_end * hs, :]
+            )
+            tp_view[q_rows : q_rows + k_rows, :].copy_(
+                full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs, :]
+            )
+            tp_view[q_rows + k_rows :, :].copy_(
+                full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs, :]
+            )
+            new_weight_tensor = tp_view
+        else:
+            new_weight_tensor = torch.row_stack((
+                full_weight_tensor[tp_head_start * hs : tp_head_end * hs, :],
+                full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs, :],
+                full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs, :],
+            ))
+
         self.weight = torch.nn.Parameter(new_weight_tensor, requires_grad=False)
         set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
 
@@ -1293,6 +1326,8 @@ class RowParallelLinear(LinearBase):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
+        paras_memory_manager=None,
+        paras_weight_name_prefix: str = "",
     ):
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
@@ -1337,6 +1372,16 @@ class RowParallelLinear(LinearBase):
             )
         else:
             self.register_parameter("bias", None)
+
+        # ParaS manager-backed weight allocation
+        self._paras_mgr = paras_memory_manager
+        self._paras_prefix = paras_weight_name_prefix
+        if paras_memory_manager is not None and paras_memory_manager.materialized:
+            managed_view = paras_memory_manager.get_view(
+                f"{paras_weight_name_prefix}.weight"
+            )
+            self.weight = torch.nn.Parameter(managed_view, requires_grad=False)
+            set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)

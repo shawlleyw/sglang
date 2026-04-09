@@ -41,13 +41,21 @@ class ParaSMoeBlockMixin:
     # Initialization
     # ------------------------------------------------------------------
 
-    def paras_init_moe(self, config, quant_config, prefix, layer_id):
+    def paras_init_moe(
+        self, config, quant_config, prefix, layer_id, paras_memory_manager=None
+    ):
         """
         Set up EP and TP expert modules for ParaS switching.
         Call this at the end of the subclass ``__init__`` (after ``super().__init__``).
+
+        If *paras_memory_manager* is provided and materialized, the TP experts
+        will allocate their weights from the manager's contiguous buffer.
         """
         # Save the EP experts that were created by the base class __init__
         self.ep_experts = self.experts
+
+        # Build the TP weight-name prefix that matches plan_qwen_moe_layout()
+        tp_weight_prefix = f"model.layers.{layer_id}.mlp.experts.tp"
 
         # Create the TP experts (skip_weights_init — weights arrive via all-to-all)
         self.tp_experts = FusedMoE(
@@ -65,6 +73,8 @@ class ParaSMoeBlockMixin:
             moe_tp_size_override=get_paras_tp_size(),
             moe_tp_rank_override=get_paras_tp_rank(),
             paras_force_standard_dispatcher=True,
+            paras_memory_manager=paras_memory_manager,
+            paras_weight_name_prefix=tp_weight_prefix,
         )
 
         self.num_global_experts = config.num_experts
