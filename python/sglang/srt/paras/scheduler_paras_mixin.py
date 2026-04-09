@@ -90,9 +90,9 @@ class SchedulerParasMixin:
             self.max_total_num_tokens,
             self.max_prefill_tokens,
             self.max_running_requests,
+            self.max_queued_requests,
             self.max_req_len,
             self.max_req_input_len,
-            _,
             _,
             _,
             _,
@@ -137,8 +137,6 @@ class SchedulerParasMixin:
         self.tree_cache.reset()
         local_reqs = self.paras_get_local_reqs()
         
-        self.paras_start_profile("paras_configure_tp")
-        
         paras_gather_manager = ParaSReqGatherManager(
             local_reqs,
             self.paras_tp_group,
@@ -173,7 +171,6 @@ class SchedulerParasMixin:
         end_time = time.time()
         cost_ms = (end_time - start_time) * 1000
         logger.info(f"Time taken to configure TP: {cost_ms} ms")
-        self.paras_stop_profile()
 
         # drop-in replacement for scheduler tp configs 
         self.tp_size = self.paras_tp_size

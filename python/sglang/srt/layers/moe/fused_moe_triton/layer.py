@@ -240,8 +240,9 @@ class FusedMoE(torch.nn.Module):
             with_bias=with_bias,
         )
         
-        # A hack for using deepep with triton kernels: the token combination should be skipped in moe runner
-        if get_moe_a2a_backend().is_deepep():
+        # A hack for using deepep with triton kernels: the token combination should be skipped in moe runner.
+        # Skip when paras_force_standard_dispatcher is set — the StandardDispatcher handles combining.
+        if get_moe_a2a_backend().is_deepep() and not paras_force_standard_dispatcher:
             if not use_deep_gemm:
                 self.moe_runner_config.no_combine = True
 
