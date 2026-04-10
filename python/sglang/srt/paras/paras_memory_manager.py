@@ -425,6 +425,7 @@ def plan_qwen_moe_layout(
     head_dim: int,
     ep_size: int,
     tp_size: int,
+    dp_size: int,
     moe_tp_size: int,
     use_triton_kernels: bool,
     quant_name: Optional[str] = None,
@@ -489,3 +490,32 @@ def plan_qwen_moe_layout(
             (tp_q_size + 2 * tp_kv_size, hidden_size),
             torch.bfloat16,
         )
+
+    # -- Static staging buffers for EP→TP weight redistribution ------------
+    # Shared across all layers (reused layer-by-layer during switch).
+    # staging_a: all-gather destination (dp>1) or permuted input (dp==1)
+    # staging_b: permuted all-to-all input (dp>1), unused for dp==1
+    is_fp8 = quant_name == "fp8"
+    staging_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
+    staging_experts = (num_experts // ep_size) * dp_size
+
+    manager.reserve(
+        "staging.w13_a",
+        (staging_experts, 2 * intermediate_size, hidden_size),
+        staging_dtype,
+    )
+    manager.reserve(
+        "staging.w13_b",
+        (staging_experts, 2 * intermediate_size, hidden_size),
+        staging_dtype,
+    )
+    manager.reserve(
+        "staging.w2_a",
+        (staging_experts, hidden_size, intermediate_size),
+        staging_dtype,
+    )
+    manager.reserve(
+        "staging.w2_b",
+        (staging_experts, hidden_size, intermediate_size),
+        staging_dtype,
+    )

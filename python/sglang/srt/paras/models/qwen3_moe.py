@@ -26,13 +26,13 @@ from sglang.srt.paras.layers.paras_attention import ParaSAttentionMixin
 from sglang.srt.paras.layers.paras_decoder_layer import ParaSDecoderLayerMixin
 from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 from sglang.srt.paras.layers.paras_model import ParaSModelMixin
-from sglang.srt.paras.layers.utils import paras_load_tp_experts_weight, paras_weight_buffer
+from sglang.srt.paras.layers.utils import paras_load_tp_experts_weight
 from sglang.srt.paras.paras_memory_manager import (
     ParaSMemoryManager,
     plan_qwen_moe_layout,
     set_global_paras_memory_manager,
 )
-from sglang.srt.paras.paras_parallel_state import get_paras_tp_size
+from sglang.srt.paras.paras_parallel_state import get_paras_dp_size, get_paras_tp_size
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -163,6 +163,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
 
         moe_tp_size = get_moe_tensor_parallel_world_size()
         use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+        dp_size = get_paras_dp_size()
 
         plan_qwen_moe_layout(
             manager,
@@ -175,6 +176,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             head_dim=head_dim,
             ep_size=get_moe_expert_parallel_world_size(),
             tp_size=get_paras_tp_size(),
+            dp_size=dp_size,
             moe_tp_size=moe_tp_size,
             use_triton_kernels=use_triton_kernels,
             quant_name=quant_name,
@@ -314,7 +316,6 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
 
     def paras_configure_helper(self):
         torch.cuda.synchronize()
-        paras_weight_buffer.release_all()
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
