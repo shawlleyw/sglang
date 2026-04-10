@@ -184,6 +184,58 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
             prefix="model",
         )
+
+        # --- Compute KV token budgets -----------------------------------------
+        # We know exact weights+staging bytes from the manager plan.
+        # Remaining static budget goes to KV cache.
+        _server_args = get_global_server_args()
+        _mem_fraction = _server_args.mem_fraction_static
+        _page_size = getattr(_server_args, "page_size", 1)
+
+        # kv_cache_dtype: "auto" means use model dtype; fp8 stores as float8_e4m3fn
+        _kv_dtype_str = _server_args.kv_cache_dtype
+        if _kv_dtype_str == "auto":
+            _kv_store_dtype = torch.bfloat16
+        elif _kv_dtype_str in ("fp8", "fp8_e4m3fn"):
+            _kv_store_dtype = torch.float8_e4m3fn
+        else:
+            _kv_store_dtype = torch.bfloat16
+
+        # Total GPU memory
+        _total_gpu_bytes = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).total_memory
+
+        # Static budget for this rank (weights + staging + KV)
+        _static_budget_bytes = int(_total_gpu_bytes * _mem_fraction)
+
+        # KV budget = static budget minus weights+staging already reserved
+        _kv_budget_bytes = max(0, _static_budget_bytes - manager.weights_only_bytes)
+
+        # Per-token KV cost for EP mode (all heads per rank)
+        _num_layers = config.num_hidden_layers
+        _total_kv_heads = config.num_key_value_heads
+        _kv_elem_size = torch.tensor([], dtype=_kv_store_dtype).element_size()
+        _ep_cell_bytes = (
+            _total_kv_heads * head_dim * _num_layers * 2 * _kv_elem_size
+        )
+        _ep_max_tokens = max(1, int(_kv_budget_bytes // _ep_cell_bytes))
+        # TP has sharded heads → same bytes per token across tp_size more tokens
+        _tp_max_tokens = _ep_max_tokens * get_paras_tp_size()
+
+        # Reserve KV in manager (union layout: same bytes in both modes)
+        manager.reserve_kv_cache(
+            num_layers=_num_layers,
+            ep_max_tokens=_ep_max_tokens,
+            tp_max_tokens=_tp_max_tokens,
+            num_kv_heads=_total_kv_heads,
+            head_dim=head_dim,
+            kv_dtype=_kv_store_dtype,
+            page_size=_page_size,
+            prefix="model",
+        )
+        # --- End KV budget computation ----------------------------------------
+
         total_bytes = manager.materialize()
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager

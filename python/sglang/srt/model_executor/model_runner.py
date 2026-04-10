@@ -1588,7 +1588,17 @@ class ModelRunner:
 
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+        _paras_mgr = get_global_paras_memory_manager()
+        if (
+            _paras_mgr is not None
+            and _paras_mgr.materialized
+            and _paras_mgr.ep_max_kv_tokens > 0
+        ):
+            # Use manager-computed EP token count (budget already accounted for weights)
+            self.max_total_num_tokens = _paras_mgr.ep_max_kv_tokens
+        else:
+            self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
         if SGLANG_CI_SMALL_KV_SIZE:
             self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
 
@@ -1844,6 +1854,24 @@ class ModelRunner:
                     **extra_args,
                 )
             else:
+                # Check if ParaS manager can provide KV buffers
+                from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+                _paras_mgr = get_global_paras_memory_manager()
+                _paras_external_k = None
+                _paras_external_v = None
+                if (
+                    _paras_mgr is not None
+                    and _paras_mgr.materialized
+                    and _paras_mgr._kv_reserved
+                ):
+                    _paras_external_k, _paras_external_v = _paras_mgr.get_kv_views(
+                        num_layers=self.num_effective_layers,
+                        mode="ep",
+                        tp_size=1,  # EP mode: tp_size=1 for KV heads
+                        page_size=self.page_size,
+                        prefix="model",
+                    )
+
                 self.token_to_kv_pool = MHATokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1861,6 +1889,8 @@ class ModelRunner:
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
                     ),
+                    external_k_buffers=_paras_external_k,
+                    external_v_buffers=_paras_external_v,
                 )
 
         # Initialize token_to_kv_pool_allocator

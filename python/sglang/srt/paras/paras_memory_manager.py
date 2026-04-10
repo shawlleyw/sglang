@@ -120,6 +120,9 @@ class ParaSMemoryManager:
         self._total_bytes: int = 0
         self._buffer_start: int = 0
         self._buffer_end: int = 0
+        self.ep_max_kv_tokens: int = 0
+        self.tp_max_kv_tokens: int = 0
+        self._kv_reserved: bool = False
 
     # ----- reservation ----------------------------------------------------
 
@@ -166,6 +169,45 @@ class ParaSMemoryManager:
         self._entries[name] = entry
         self._reservation_order.append(name)  # Preserve order for deterministic offset assignment
         return entry
+
+    # ----- KV cache reservation -------------------------------------------
+
+    def reserve_kv_cache(
+        self,
+        *,
+        num_layers: int,
+        ep_max_tokens: int,
+        tp_max_tokens: int,
+        num_kv_heads: int,
+        head_dim: int,
+        kv_dtype: torch.dtype,
+        page_size: int = 1,
+        prefix: str = "model",
+    ) -> None:
+        """
+        Reserve KV cache entries using EP shapes (same bytes as TP via union layout).
+
+        Must be called AFTER plan_qwen_moe_layout() and BEFORE materialize().
+
+        EP and TP KV have same total bytes per layer:
+          ep_tokens × ep_kv_heads × head_dim == tp_tokens × tp_kv_heads × head_dim
+        so we reserve once in EP shape and use get_view_as() for TP access.
+        """
+        if self._materialized:
+            raise RuntimeError("Cannot reserve KV cache after materialize().")
+        if self._kv_reserved:
+            raise RuntimeError("KV cache already reserved.")
+
+        self.ep_max_kv_tokens = ep_max_tokens
+        self.tp_max_kv_tokens = tp_max_tokens
+
+        for i in range(num_layers):
+            lp = f"{prefix}.layers.{i}"
+            kv_shape = (ep_max_tokens + page_size, num_kv_heads, head_dim)
+            self.reserve(f"{lp}.kv.k", kv_shape, kv_dtype)
+            self.reserve(f"{lp}.kv.v", kv_shape, kv_dtype)
+
+        self._kv_reserved = True
 
     # ----- materialization ------------------------------------------------
 
@@ -254,6 +296,49 @@ class ParaSMemoryManager:
         ]
         return byte_slice.view(target_dtype).reshape(shape)
 
+    # ----- KV cache views -------------------------------------------------
+
+    def get_kv_views(
+        self,
+        num_layers: int,
+        mode: str,
+        tp_size: int = 1,
+        page_size: int = 1,
+        prefix: str = "model",
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Return k_buffers and v_buffers for the KV pool in the given mode.
+
+        EP mode: returns views with (ep_tokens + page, total_kv_heads, head_dim)
+        TP mode: returns views with (tp_tokens + page, total_kv_heads//tp_size, head_dim)
+                 using get_view_as to reinterpret the same bytes.
+        """
+        k_bufs: List[torch.Tensor] = []
+        v_bufs: List[torch.Tensor] = []
+        for i in range(num_layers):
+            lp = f"{prefix}.layers.{i}"
+            k_name = f"{lp}.kv.k"
+            v_name = f"{lp}.kv.v"
+
+            if mode == "ep":
+                k_bufs.append(self.get_view(k_name))
+                v_bufs.append(self.get_view(v_name))
+            elif mode == "tp":
+                k_entry = self._entries[k_name]
+                ep_heads = k_entry.shape[1]
+                tp_heads = ep_heads // tp_size
+                tp_shape = (
+                    self.tp_max_kv_tokens + page_size,
+                    tp_heads,
+                    k_entry.shape[2],
+                )
+                k_bufs.append(self.get_view_as(k_name, tp_shape))
+                v_bufs.append(self.get_view_as(v_name, tp_shape))
+            else:
+                raise ValueError(f"mode must be 'ep' or 'tp', got '{mode}'")
+
+        return k_bufs, v_bufs
+
     # ----- queries --------------------------------------------------------
 
     def is_managed(self, tensor: torch.Tensor) -> bool:
@@ -288,6 +373,16 @@ class ParaSMemoryManager:
     @property
     def buffer(self) -> Optional[torch.Tensor]:
         return self._buffer
+
+    @property
+    def weights_only_bytes(self) -> int:
+        """Total reserved bytes NOT including KV cache entries (for KV sizing)."""
+        kv_names = {n for n in self._reservation_order if ".kv." in n}
+        return sum(
+            self._entries[n].size_bytes
+            for n in self._reservation_order
+            if n not in kv_names
+        )
 
     # ----- dunder ---------------------------------------------------------
 
@@ -437,7 +532,10 @@ def plan_qwen_moe_layout(
     Reserve all weight tensors for a Qwen sparse-MoE model.
 
     This is the main entry point for planning the contiguous buffer layout.
-    After calling this function, call manager.materialize() to allocate the GPU buffer.
+    KV cache is reserved separately via reserve_kv_cache(). Call that before
+    materialize() to include KV buffers in the same contiguous allocation.
+    After calling this function (and optionally reserve_kv_cache), call
+    manager.materialize() to allocate the GPU buffer.
 
     NAMING CONVENTION:
       Tensor names follow the pattern: {prefix}.layers.{i}.mlp.experts.{ep|tp}.{w13|w2}_weight
