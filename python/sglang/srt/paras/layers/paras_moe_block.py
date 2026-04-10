@@ -23,7 +23,7 @@ from sglang.srt.paras.paras_parallel_state import (
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, set_weight_attrs
 
 
 class ParaSMoeBlockMixin:
@@ -77,6 +77,33 @@ class ParaSMoeBlockMixin:
         self.num_local_experts = self.num_global_experts // self.tp_size
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
+
+        # Pre-register TP expert weights pointing to EP buffer with TP shape.
+        # Data is initially invalid (holds EP weights), but after EP→TP switch
+        # the all-to-all writes TP data into the same buffer in-place.
+        # This eliminates paras_load_params calls during the switch.
+        mgr = get_global_paras_memory_manager()
+        if mgr is not None and mgr.materialized:
+            paras_tp_size = get_paras_tp_size()
+            tp_inter = self.moe_intermediate_size // paras_tp_size
+            ep_w13_name = f"model.layers.{layer_id}.mlp.experts.w13_weight"
+            ep_w2_name = f"model.layers.{layer_id}.mlp.experts.w2_weight"
+
+            tp_w13_view = mgr.get_view_as(
+                ep_w13_name,
+                (self.num_global_experts, 2 * tp_inter, self.hidden_size),
+            )
+            w13_param = torch.nn.Parameter(tp_w13_view, requires_grad=False)
+            set_weight_attrs(w13_param, self.tp_experts.extra_weight_attrs)
+            self.tp_experts.register_parameter("w13_weight", w13_param)
+
+            tp_w2_view = mgr.get_view_as(
+                ep_w2_name,
+                (self.num_global_experts, self.hidden_size, tp_inter),
+            )
+            w2_param = torch.nn.Parameter(tp_w2_view, requires_grad=False)
+            set_weight_attrs(w2_param, self.tp_experts.extra_weight_attrs)
+            self.tp_experts.register_parameter("w2_weight", w2_param)
 
         # Start in EP mode; will switch to TP after paras_configure_tp()
         self.parallelism_config = "ep"
@@ -202,28 +229,28 @@ class ParaSMoeBlockMixin:
                 output=w13_tp,
                 input=w13_ep_permuted.view(self.w13_ep_gathered.shape),
                 group=paras_tp_group,
-                async_op=True,
+                 async_op=True,
             )
 
             # -- w2: same pattern --
             w2_ep = self.w2_ep_gathered.view(
-                self.num_local_experts,
-                self.hidden_size,
-                paras_tp_size,
-                moe_intermediate_size_after_tp,
+               self.num_local_experts,
+               self.hidden_size,
+               paras_tp_size,
+               moe_intermediate_size_after_tp,
             )
             w2_staging_name = "staging.w2_b" if paras_dp_size > 1 else "staging.w2_a"
             w2_ep_permuted = mgr.get_view(w2_staging_name).view(
-                paras_tp_size, self.num_local_experts, self.hidden_size,
-                moe_intermediate_size_after_tp,
+               paras_tp_size, self.num_local_experts, self.hidden_size,
+               moe_intermediate_size_after_tp,
             )
             w2_ep_permuted.copy_(w2_ep.permute(2, 0, 1, 3))
             w2_tp = self.w2_ep_gathered
             w2_handle = dist.all_to_all_single(
-                output=w2_tp,
-                input=w2_ep_permuted.view(self.w2_ep_gathered.shape),
-                group=paras_tp_group,
-                async_op=True,
+               output=w2_tp,
+               input=w2_ep_permuted.view(self.w2_ep_gathered.shape),
+               group=paras_tp_group,
+               async_op=True,
             )
 
             # -- w13 post-processing: reinterpret as TP shape in EP buffer --
@@ -245,7 +272,6 @@ class ParaSMoeBlockMixin:
                     f"model.layers.{self._paras_layer_id}.mlp.experts.w13_weight",
                     (self.num_global_experts, 2 * moe_intermediate_size_after_tp, self.hidden_size),
                 )
-            self.tp_experts.paras_load_params(tp_w13, "w13_weight")
 
             # -- w2 post-processing --
             w2_handle.wait()
@@ -266,7 +292,6 @@ class ParaSMoeBlockMixin:
                     f"model.layers.{self._paras_layer_id}.mlp.experts.w2_weight",
                     (self.num_global_experts, self.hidden_size, moe_intermediate_size_after_tp),
                 )
-            self.tp_experts.paras_load_params(tp_w2, "w2_weight")
 
     # ------------------------------------------------------------------
     # Parallelism mode switching
