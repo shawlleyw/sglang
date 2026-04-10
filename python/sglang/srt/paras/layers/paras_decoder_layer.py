@@ -65,6 +65,11 @@ class ParaSDecoderLayerMixin:
             peer_ctx, transfer_plans, packed_plans, staging_suffix, stream
         )
 
+    def paras_configure_tp_mlp_fused_peer_access(self, peer_ctx, stream, handles):
+        for handle in (handles or []):
+            handle.wait()
+        return self.mlp.paras_configure_tp_fused_peer_access(peer_ctx, stream)
+
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
         """Switch from EP to TP mode for this layer."""

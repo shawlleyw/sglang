@@ -80,3 +80,171 @@ void launch_peer_access_transfer(
         printf("CUDA kernel launch error: %s\n", cudaGetErrorString(err));
     }
 }
+
+// Fused strided-read + peer-write kernel for EP→TP weight transfer.
+// Reads EP weights with stride (no staging buffer needed).
+// Each block handles one (dst_rank r, expert e, gate k) chunk of I'H elements.
+//
+// EP layout: (E_local, num_gates, tp_size, I'H) in memory
+// TP layout: (tp_size * E_local, num_gates, I'H) = (num_global_experts, num_gates * I'H) in memory
+//
+// For block (r, e, k):
+//   src = ep_base + (e * num_gates * tp_size + k * tp_size + r) * I'H * elem_size
+//   dst = peer_r_tp_base + (tp_rank * E_local * num_gates + e * num_gates + k) * I'H * elem_size
+__global__ void peer_access_fused_transfer_kernel(
+    const char* __restrict__ local_buffer,  // Local managed buffer base
+    char* const* peer_buffers,              // Peer buffer bases [MAX_PEERS]
+    int64_t src_ep_offset,                  // Byte offset of EP layer in local buffer
+    int64_t dst_tp_offset,                  // Byte offset of TP slot in peer buffer
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int64_t I_prime_H,                      // (intermediate/tp_size) * hidden, in elements
+    int num_gates,                          // 2 for w13, 1 for w2
+    int elem_size                           // 2 for bf16
+) {
+    // Decode block index → (r, e, k)
+    int block_idx = blockIdx.x;
+    int r = block_idx / (E_local * num_gates);
+    int rem = block_idx % (E_local * num_gates);
+    int e = rem / num_gates;
+    int k = rem % num_gates;
+
+    // Source: EP[e, k, r, :] — I'H contiguous elements
+    int64_t src_chunk = src_ep_offset +
+        (int64_t)(e * num_gates * tp_size + k * tp_size + r) * I_prime_H * elem_size;
+
+    // Destination: peer r's TP buffer at tp_rank's slot
+    int64_t dst_chunk = dst_tp_offset +
+        (int64_t)(tp_rank * E_local * num_gates + e * num_gates + k) * I_prime_H * elem_size;
+
+    const char* src = local_buffer + src_chunk;
+    char* dst = peer_buffers[r] + dst_chunk;
+
+    int64_t n_bytes = I_prime_H * elem_size;
+    int64_t n_int4 = n_bytes / 16;
+
+    const int4* src4 = reinterpret_cast<const int4*>(src);
+    int4* dst4 = reinterpret_cast<int4*>(dst);
+
+    for (int64_t i = threadIdx.x; i < n_int4; i += blockDim.x) {
+        dst4[i] = src4[i];
+    }
+
+    if (threadIdx.x == 0) {
+        for (int64_t i = n_int4 * 16; i < n_bytes; i++) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+// Host-side launch for fused kernel
+void launch_peer_access_fused_transfer(
+    int64_t local_buffer_ptr,
+    int64_t* peer_buffer_ptrs,      // device array [MAX_PEERS]
+    int64_t src_ep_offset,
+    int64_t dst_tp_offset,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int64_t I_prime_H,
+    int num_gates,
+    int elem_size,
+    cudaStream_t stream
+) {
+    int blocks = tp_size * E_local * num_gates;
+    int threads = 256;
+
+    peer_access_fused_transfer_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(local_buffer_ptr),
+        reinterpret_cast<char* const*>(peer_buffer_ptrs),
+        src_ep_offset,
+        dst_tp_offset,
+        tp_rank,
+        tp_size,
+        E_local,
+        I_prime_H,
+        num_gates,
+        elem_size
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA fused kernel error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+// Fused strided kernel for w2: EP shape (E_local, H, I) with tp split on last dim I.
+// Each block handles one (dst_rank r, expert e) pair.
+// Copies H rows of I' elements each, with source stride I between rows.
+__global__ void peer_access_fused_transfer_w2_kernel(
+    const char* __restrict__ local_buffer,
+    char* const* peer_buffers,
+    int64_t src_ep_offset,
+    int64_t dst_tp_offset,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int H,
+    int I_full,
+    int I_prime,
+    int elem_size
+) {
+    int block_idx = blockIdx.x;
+    int r = block_idx / E_local;
+    int e = block_idx % E_local;
+
+    const char* src_expert = local_buffer + src_ep_offset +
+        (int64_t)e * H * I_full * elem_size;
+    char* dst_expert = peer_buffers[r] + dst_tp_offset +
+        (int64_t)(tp_rank * E_local + e) * H * I_prime * elem_size;
+
+    int64_t total = (int64_t)H * I_prime;
+
+    const uint16_t* src16 = reinterpret_cast<const uint16_t*>(src_expert);
+    uint16_t* dst16 = reinterpret_cast<uint16_t*>(dst_expert);
+
+    for (int64_t idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        int h = idx / I_prime;
+        int ip = idx % I_prime;
+        dst16[(int64_t)h * I_prime + ip] =
+            src16[(int64_t)h * I_full + (int64_t)r * I_prime + ip];
+    }
+}
+
+void launch_peer_access_fused_transfer_w2(
+    int64_t local_buffer_ptr,
+    int64_t* peer_buffer_ptrs,
+    int64_t src_ep_offset,
+    int64_t dst_tp_offset,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int H,
+    int I_full,
+    int I_prime,
+    int elem_size,
+    cudaStream_t stream
+) {
+    int blocks = tp_size * E_local;
+    int threads = 256;
+
+    peer_access_fused_transfer_w2_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(local_buffer_ptr),
+        reinterpret_cast<char* const*>(peer_buffer_ptrs),
+        src_ep_offset,
+        dst_tp_offset,
+        tp_rank,
+        tp_size,
+        E_local,
+        H,
+        I_full,
+        I_prime,
+        elem_size
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA fused w2 kernel error: %s\n", cudaGetErrorString(err));
+    }
+}

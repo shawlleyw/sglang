@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <vector>
 
-// Forward declaration from .cu
+// Forward declarations from .cu
 void launch_peer_access_transfer(
     int64_t src_base_ptr,
     int64_t* dst_base_ptrs,
@@ -12,6 +12,35 @@ void launch_peer_access_transfer(
     const int64_t* sizes,
     const int32_t* dst_ranks,
     int num_entries,
+    cudaStream_t stream
+);
+
+void launch_peer_access_fused_transfer(
+    int64_t local_buffer_ptr,
+    int64_t* peer_buffer_ptrs,
+    int64_t src_ep_offset,
+    int64_t dst_tp_offset,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int64_t I_prime_H,
+    int num_gates,
+    int elem_size,
+    cudaStream_t stream
+);
+
+void launch_peer_access_fused_transfer_w2(
+    int64_t local_buffer_ptr,
+    int64_t* peer_buffer_ptrs,
+    int64_t src_ep_offset,
+    int64_t dst_tp_offset,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int H,
+    int I_full,
+    int I_prime,
+    int elem_size,
     cudaStream_t stream
 );
 
@@ -46,6 +75,68 @@ void launch_peer_access_transfer_py(
     );
 }
 
+void launch_peer_access_fused_transfer_py(
+    int64_t local_buffer_ptr,
+    torch::Tensor peer_buffer_ptrs,   // int64 tensor [MAX_PEERS] on GPU
+    int64_t src_ep_offset,
+    int64_t dst_tp_offset,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int64_t I_prime_H,
+    int num_gates,
+    int elem_size,
+    int64_t stream_ptr
+) {
+    TORCH_CHECK(peer_buffer_ptrs.is_cuda(), "peer_buffer_ptrs must be on GPU");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_peer_access_fused_transfer(
+        local_buffer_ptr,
+        peer_buffer_ptrs.data_ptr<int64_t>(),
+        src_ep_offset,
+        dst_tp_offset,
+        tp_rank,
+        tp_size,
+        E_local,
+        I_prime_H,
+        num_gates,
+        elem_size,
+        stream
+    );
+}
+
+void launch_peer_access_fused_transfer_w2_py(
+    int64_t local_buffer_ptr,
+    torch::Tensor peer_buffer_ptrs,
+    int64_t src_ep_offset,
+    int64_t dst_tp_offset,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int H,
+    int I_full,
+    int I_prime,
+    int elem_size,
+    int64_t stream_ptr
+) {
+    TORCH_CHECK(peer_buffer_ptrs.is_cuda(), "peer_buffer_ptrs must be on GPU");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_peer_access_fused_transfer_w2(
+        local_buffer_ptr,
+        peer_buffer_ptrs.data_ptr<int64_t>(),
+        src_ep_offset,
+        dst_tp_offset,
+        tp_rank,
+        tp_size,
+        E_local,
+        H,
+        I_full,
+        I_prime,
+        elem_size,
+        stream
+    );
+}
+
 PYBIND11_MODULE(paras_peer_access_cuda, m) {
     m.doc() = "ParaS CUDA peer access transfer kernels";
     m.def("launch_peer_access_transfer", &launch_peer_access_transfer_py,
@@ -57,4 +148,8 @@ PYBIND11_MODULE(paras_peer_access_cuda, m) {
           py::arg("sizes"),
           py::arg("dst_ranks"),
           py::arg("stream_ptr") = int64_t(0));
+    m.def("launch_peer_access_fused_transfer", &launch_peer_access_fused_transfer_py,
+          "Launch fused strided-read peer access transfer kernel");
+    m.def("launch_peer_access_fused_transfer_w2", &launch_peer_access_fused_transfer_w2_py,
+          "Launch fused strided peer access transfer kernel for w2");
 }

@@ -177,3 +177,67 @@ def peer_access_transfer(
         plan["dst_ranks"],
         stream_ptr,
     )
+
+
+def peer_access_fused_transfer(
+    local_buffer_ptr: int,
+    dst_base_ptrs_tensor: torch.Tensor,
+    src_ep_offset: int,
+    dst_tp_offset: int,
+    tp_rank: int,
+    tp_size: int,
+    E_local: int,
+    I_prime_H: int,
+    num_gates: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    """Fused contiguous-read + peer-write for w13 (tp split on 2nd dim)."""
+    import paras_peer_access_cuda
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    paras_peer_access_cuda.launch_peer_access_fused_transfer(
+        local_buffer_ptr,
+        dst_base_ptrs_tensor,
+        src_ep_offset,
+        dst_tp_offset,
+        tp_rank,
+        tp_size,
+        E_local,
+        I_prime_H,
+        num_gates,
+        elem_size,
+        stream_ptr,
+    )
+
+
+def peer_access_fused_transfer_w2(
+    local_buffer_ptr: int,
+    dst_base_ptrs_tensor: torch.Tensor,
+    src_ep_offset: int,
+    dst_tp_offset: int,
+    tp_rank: int,
+    tp_size: int,
+    E_local: int,
+    H: int,
+    I_full: int,
+    I_prime: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    """Fused strided-read + peer-write for w2 (tp split on last dim)."""
+    import paras_peer_access_cuda
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    paras_peer_access_cuda.launch_peer_access_fused_transfer_w2(
+        local_buffer_ptr,
+        dst_base_ptrs_tensor,
+        src_ep_offset,
+        dst_tp_offset,
+        tp_rank,
+        tp_size,
+        E_local,
+        H,
+        I_full,
+        I_prime,
+        elem_size,
+        stream_ptr,
+    )

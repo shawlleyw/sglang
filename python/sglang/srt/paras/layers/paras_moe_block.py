@@ -395,6 +395,78 @@ class ParaSMoeBlockMixin:
             (self.num_global_experts, self.hidden_size, moe_intermediate_size_after_tp),
         )
 
+    def paras_configure_tp_fused_peer_access(
+        self,
+        peer_ctx,
+        stream=None,
+    ):
+        """EP→TP via fused strided-read + NVLink peer write. No staging buffer."""
+        from sglang.srt.paras.peer_access import peer_access_fused_transfer, peer_access_fused_transfer_w2
+
+        mgr = get_global_paras_memory_manager()
+        paras_tp_size = get_paras_tp_size()
+        paras_dp_size = get_paras_dp_size()
+        assert paras_dp_size == 1, "fused_peer_access method only supports DP=1"
+
+        moe_intermediate_size_after_tp = self.moe_intermediate_size // paras_tp_size
+        paras_tp_group = get_paras_tp_group().device_group
+        paras_tp_rank = get_paras_tp_rank()
+        layer_id = self._paras_layer_id
+
+        ep_w13_name = f"model.layers.{layer_id}.mlp.experts.w13_weight"
+        ep_w2_name = f"model.layers.{layer_id}.mlp.experts.w2_weight"
+        ep_w13_entry = mgr._entries[ep_w13_name]
+        ep_w2_entry = mgr._entries[ep_w2_name]
+
+        if layer_id == 0:
+            tp_w13_name = "paras.fused_tp_slot0.w13"
+            tp_w2_name = "paras.fused_tp_slot0.w2"
+        else:
+            tp_w13_name = f"model.layers.{layer_id - 1}.mlp.experts.w13_weight"
+            tp_w2_name = f"model.layers.{layer_id - 1}.mlp.experts.w2_weight"
+        tp_w13_entry = mgr._entries[tp_w13_name]
+        tp_w2_entry = mgr._entries[tp_w2_name]
+
+        dst_base_ptrs = torch.tensor(
+            peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+        )
+        local_buffer_ptr = mgr._buffer.data_ptr()
+
+        I_prime_H = moe_intermediate_size_after_tp * self.hidden_size
+        E_local = self.num_local_experts
+        elem_size = 2  # bf16
+
+        with torch.cuda.stream(stream):
+            peer_access_fused_transfer(
+                local_buffer_ptr, dst_base_ptrs,
+                ep_w13_entry.offset_bytes, tp_w13_entry.offset_bytes,
+                paras_tp_rank, paras_tp_size, E_local, I_prime_H,
+                num_gates=2, elem_size=elem_size, stream=stream,
+            )
+            peer_access_fused_transfer_w2(
+                local_buffer_ptr, dst_base_ptrs,
+                ep_w2_entry.offset_bytes, tp_w2_entry.offset_bytes,
+                paras_tp_rank, paras_tp_size, E_local,
+                H=self.hidden_size,
+                I_full=self.moe_intermediate_size,
+                I_prime=moe_intermediate_size_after_tp,
+                elem_size=elem_size, stream=stream,
+            )
+
+        if stream is not None:
+            stream.synchronize()
+        torch.distributed.barrier(group=paras_tp_group)
+
+        if stream is not None:
+            stream.synchronize()
+        torch.distributed.barrier(group=paras_tp_group)
+
+        tp_inter = moe_intermediate_size_after_tp
+        tp_w13_view = mgr.get_view_as(tp_w13_name, (self.num_global_experts, 2 * tp_inter, self.hidden_size))
+        tp_w2_view = mgr.get_view_as(tp_w2_name, (self.num_global_experts, self.hidden_size, tp_inter))
+        self.tp_experts.w13_weight = torch.nn.Parameter(tp_w13_view, requires_grad=False)
+        self.tp_experts.w2_weight = torch.nn.Parameter(tp_w2_view, requires_grad=False)
+
     # ------------------------------------------------------------------
     # Parallelism mode switching
     # ------------------------------------------------------------------

@@ -549,6 +549,20 @@ def plan_qwen_moe_layout(
     """
     _validate_v1_scope(num_fused_shared_experts, quant_name)
 
+    # Reserve slot 0 for fused peer access TP views (layer 0's TP destination)
+    # EP uses slots 1..N, TP uses slots 0..N-1. This extra slot at the front
+    # ensures EP and TP buffers never alias during the fused transfer.
+    ep_local_experts = num_experts // ep_size
+    inter_per_partition = intermediate_size // moe_tp_size
+    if use_triton_kernels and quant_name is None:
+        _w13_shape = (ep_local_experts, hidden_size, 2 * inter_per_partition)
+        _w2_shape = (ep_local_experts, inter_per_partition, hidden_size)
+    else:
+        _w13_shape = (ep_local_experts, 2 * inter_per_partition, hidden_size)
+        _w2_shape = (ep_local_experts, hidden_size, inter_per_partition)
+    manager.reserve("paras.fused_tp_slot0.w13", _w13_shape, torch.bfloat16)
+    manager.reserve("paras.fused_tp_slot0.w2", _w2_shape, torch.bfloat16)
+
     for i in range(num_layers):
         # -- MoE weights (EP only — TP reuses same buffer via get_view_as) -
         _reserve_moe_weights(

@@ -101,6 +101,28 @@ class ParaSModelMixin:
                 last_layer_handles = new_handles
                 stream_1, stream_2 = stream_2, stream_1
 
+    def paras_configure_tp_fused_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
+        """EP→TP via fused strided-read + peer write. No staging buffer.
+        Processes layers in order 0..N-1 (required for N+1 slot correctness).
+        """
+        from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+        from sglang.srt.paras.peer_access import init_peer_access
+
+        mgr = get_global_paras_memory_manager()
+
+        if not hasattr(self, '_peer_access_ctx') or self._peer_access_ctx is None:
+            tp_group = get_paras_tp_group().device_group
+            tp_size = get_paras_tp_size()
+            self._peer_access_ctx = init_peer_access(mgr, tp_group, tp_size)
+
+        peer_ctx = self._peer_access_ctx
+
+        for layer in self.layers:
+            layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
+            layer.paras_configure_tp_mlp_fused_peer_access(peer_ctx, None, [])
+            layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
+
     def paras_configure_helper(self):
         pass
 
@@ -113,10 +135,12 @@ class ParaSModelMixin:
         Note: the embedding layer stays in DP mode, which also works for TP.
 
         Args:
-            method: "naive", "overlap", or "peer_access". If None, uses overlap flag.
+            method: "naive", "overlap", "peer_access", or "fused_peer_access". If None, uses overlap flag.
         """
         if method == "peer_access":
             self.paras_configure_tp_peer_access(paras_tp_size, paras_tp_rank)
+        elif method == "fused_peer_access":
+            self.paras_configure_tp_fused_peer_access(paras_tp_size, paras_tp_rank)
         elif method == "overlap" or (method is None and overlap):
             self.paras_configure_tp_overlap(paras_tp_size, paras_tp_rank)
         else:
