@@ -10,7 +10,7 @@ def get_extensions():
             sources=["peer_access_transfer.cu", "binding.cpp"],
             extra_compile_args={
                 "cxx": ["-O3"],
-                "nvcc": ["-O3", "-arch=sm_90", "--expt-relaxed-constexpr"],
+                "nvcc": ["-O3", "-gencode=arch=compute_80,code=sm_80", "-gencode=arch=compute_90,code=sm_90", "--expt-relaxed-constexpr"],
             },
         )
     ]
