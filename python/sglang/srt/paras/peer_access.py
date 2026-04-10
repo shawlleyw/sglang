@@ -94,6 +94,86 @@ def exchange_buffer_addresses(
     return addresses
 
 
+_IPC_HANDLE_SIZE = 64
+
+
+class _CudaIpcMemHandle(ctypes.Structure):
+    _fields_ = [("reserved", ctypes.c_ubyte * _IPC_HANDLE_SIZE)]
+
+
+def _setup_ipc_argtypes() -> None:
+    """Set ctypes argtypes/restype for CUDA IPC functions (idempotent)."""
+    if getattr(_setup_ipc_argtypes, "_done", False):
+        return
+    _cudart.cudaIpcGetMemHandle.argtypes = [
+        ctypes.POINTER(_CudaIpcMemHandle),
+        ctypes.c_void_p,
+    ]
+    _cudart.cudaIpcGetMemHandle.restype = ctypes.c_int
+    _cudart.cudaIpcOpenMemHandle.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        _CudaIpcMemHandle,
+        ctypes.c_uint,
+    ]
+    _cudart.cudaIpcOpenMemHandle.restype = ctypes.c_int
+    _setup_ipc_argtypes._done = True
+
+
+def exchange_buffer_addresses_ipc(
+    local_buffer_ptr: int, tp_group, world_size: int, rank: int
+) -> List[int]:
+    """Exchange managed-buffer addresses using CUDA IPC handles.
+
+    Unlike ``exchange_buffer_addresses`` (raw ``data_ptr()``), this works
+    across separate OS processes (torchrun / sglang server) because each
+    rank opens a cross-process IPC mapping for every remote buffer.
+    """
+    _setup_ipc_argtypes()
+
+    local_handle = _CudaIpcMemHandle()
+    ret = _cudart.cudaIpcGetMemHandle(
+        ctypes.byref(local_handle), ctypes.c_void_p(local_buffer_ptr)
+    )
+    assert ret == 0, f"cudaIpcGetMemHandle failed (cuda error {ret})"
+
+    handle_tensor = torch.tensor(
+        list(local_handle.reserved), dtype=torch.uint8, device="cuda"
+    )
+    all_handles = torch.zeros(
+        world_size * _IPC_HANDLE_SIZE, dtype=torch.uint8, device="cuda"
+    )
+    dist.all_gather_into_tensor(all_handles, handle_tensor, group=tp_group)
+
+    peer_addresses: List[int] = []
+    for r in range(world_size):
+        if r == rank:
+            peer_addresses.append(local_buffer_ptr)
+        else:
+            raw_bytes = (
+                all_handles[r * _IPC_HANDLE_SIZE : (r + 1) * _IPC_HANDLE_SIZE]
+                .cpu()
+                .tolist()
+            )
+            remote_handle = _CudaIpcMemHandle()
+            for idx, val in enumerate(raw_bytes):
+                remote_handle.reserved[idx] = val
+            remote_ptr = ctypes.c_void_p()
+            ret = _cudart.cudaIpcOpenMemHandle(
+                ctypes.byref(remote_ptr),
+                remote_handle,
+                1,  # cudaIpcMemLazyEnablePeerAccess
+            )
+            assert ret == 0, (
+                f"cudaIpcOpenMemHandle for rank {r} failed (cuda error {ret})"
+            )
+            peer_addresses.append(remote_ptr.value)
+
+    assert all(a != 0 for a in peer_addresses), (
+        f"Some IPC buffer addresses are null: {peer_addresses}"
+    )
+    return peer_addresses
+
+
 @dataclass
 class PeerAccessContext:
     """Holds all state needed for peer-access weight transfers."""
@@ -119,18 +199,17 @@ def init_peer_access(manager, tp_group, tp_size: int) -> PeerAccessContext:
     """
     assert manager.materialized, "manager must be materialized before init_peer_access"
 
-    # GPU IDs in the TP group — assume GPU 0..tp_size-1 for now
     device_ids = list(range(tp_size))
-
-    # Enable peer access
     enable_peer_access(device_ids)
 
-    # Exchange buffer addresses
     local_ptr = manager._buffer.data_ptr()
-    peer_addresses = exchange_buffer_addresses(local_ptr, tp_group, tp_size)
+    rank = dist.get_rank(group=tp_group)
+    peer_addresses = exchange_buffer_addresses_ipc(
+        local_ptr, tp_group, tp_size, rank
+    )
 
     logger.info(
-        "ParaS peer access initialized. Buffer addresses: %s",
+        "ParaS peer access initialized (IPC). Buffer addresses: %s",
         [hex(a) for a in peer_addresses],
     )
 
