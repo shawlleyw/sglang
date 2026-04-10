@@ -55,6 +55,16 @@ class ParaSDecoderLayerMixin:
     def paras_configure_tp_mlp_all_to_all(self, stream, handles):
         return self.mlp.paras_configure_tp_all_to_all(stream, handles)
 
+    def paras_configure_tp_mlp_peer_access(
+        self, peer_ctx, transfer_plans, packed_plans, staging_suffix, stream, handles
+    ):
+        """Wrapper: delegate to mlp.paras_configure_tp_peer_access."""
+        for handle in (handles or []):
+            handle.wait()
+        return self.mlp.paras_configure_tp_peer_access(
+            peer_ctx, transfer_plans, packed_plans, staging_suffix, stream
+        )
+
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
         """Switch from EP to TP mode for this layer."""
