@@ -94,14 +94,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+
+        mgr = get_global_paras_memory_manager()
+        prefix = getattr(layer, "prefix", "")
+        entry_name = f"{prefix}.weight" if prefix else None
+
+        if mgr is not None and mgr.materialized and entry_name and entry_name in mgr._entries:
+            # Allocate from managed contiguous buffer
+            weight = Parameter(mgr.get_view(entry_name), requires_grad=False)
+        else:
+            # Standard allocation
+            weight = Parameter(
+                torch.empty(
+                    sum(output_partition_sizes),
+                    input_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
@@ -152,13 +163,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
-        # ParaS integration: extract memory manager before extra_weight_attrs reaches
-        # set_weight_attrs (which would store unknown keys on the parameter).
-        # When use_manager is True, weights are sliced from a contiguous buffer
-        # instead of being allocated independently with torch.empty.
-        paras_mgr = extra_weight_attrs.pop("paras_memory_manager", None)
-        paras_prefix = extra_weight_attrs.pop("paras_weight_name_prefix", "")
-        use_manager = paras_mgr is not None and paras_mgr.materialized
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+
+        mgr = get_global_paras_memory_manager()
+        layer_id = getattr(layer, "layer_id", None)
+        use_manager = mgr is not None and mgr.materialized and layer_id is not None
 
         self.with_bias = with_bias
 
@@ -166,12 +175,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w13_weight_n, w13_weight_k = 2 * intermediate_size_per_partition, hidden_size
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
-        if use_manager:
-            # Manager-backed allocation: get a typed view into the contiguous buffer.
-            # Shape was pre-computed in plan_qwen_moe_layout() to match exactly.
+
+        w13_name = f"model.layers.{layer_id}.mlp.experts.w13_weight" if use_manager else None
+        if use_manager and w13_name in mgr._entries:
             w13_weight = torch.nn.Parameter(
-                paras_mgr.get_view(f"{paras_prefix}.w13_weight"),
-                requires_grad=False,
+                mgr.get_view(w13_name), requires_grad=False,
             )
         else:
             w13_weight = torch.nn.Parameter(
@@ -200,12 +208,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
         if self.use_triton_kernels:
             w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
-        if use_manager:
-            # Manager-backed allocation: get a typed view into the contiguous buffer.
-            # Shape was pre-computed in plan_qwen_moe_layout() to match exactly.
+
+        w2_name = f"model.layers.{layer_id}.mlp.experts.w2_weight" if use_manager else None
+        if use_manager and w2_name in mgr._entries:
             w2_weight = torch.nn.Parameter(
-                paras_mgr.get_view(f"{paras_prefix}.w2_weight"),
-                requires_grad=False,
+                mgr.get_view(w2_name), requires_grad=False,
             )
         else:
             w2_weight = torch.nn.Parameter(

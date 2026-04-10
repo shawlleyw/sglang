@@ -309,6 +309,22 @@ class ParaSMemoryManager:
 
 
 # ---------------------------------------------------------------------------
+# Global manager — set during model construction, checked in create_weights
+# ---------------------------------------------------------------------------
+
+_global_paras_memory_manager: Optional[ParaSMemoryManager] = None
+
+
+def set_global_paras_memory_manager(manager: Optional[ParaSMemoryManager]) -> None:
+    global _global_paras_memory_manager
+    _global_paras_memory_manager = manager
+
+
+def get_global_paras_memory_manager() -> Optional[ParaSMemoryManager]:
+    return _global_paras_memory_manager
+
+
+# ---------------------------------------------------------------------------
 # Qwen MoE layout planning
 # ---------------------------------------------------------------------------
 

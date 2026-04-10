@@ -164,6 +164,7 @@ class LinearBase(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
         self.quant_config = quant_config
+        self.prefix = prefix
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
@@ -801,8 +802,6 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         load_presharded_attn: bool = False,
-        paras_memory_manager=None,
-        paras_weight_name_prefix: str = "",
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -850,19 +849,6 @@ class QKVParallelLinear(ColumnParallelLinear):
             tp_size=tp_size,
             use_presharded_weights=self.use_presharded_weights,
         )
-
-        # ParaS static memory manager: replaces the weight allocated by the base class
-        # (ColumnParallelLinear) with a view from the contiguous buffer.
-        # We use "post-replace" because we can't modify the base class constructor.
-        # The original torch.empty allocation is freed by GC after replacement.
-        self._paras_mgr = paras_memory_manager
-        self._paras_prefix = paras_weight_name_prefix
-        if paras_memory_manager is not None and paras_memory_manager.materialized:
-            managed_view = paras_memory_manager.get_view(
-                f"{paras_weight_name_prefix}.weight"
-            )
-            self.weight = torch.nn.Parameter(managed_view, requires_grad=False)
-            set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
@@ -1241,33 +1227,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         full_weight_tensor = self.full_weight.data
         hs = self.head_size
 
-        if self._paras_mgr is not None and self._paras_mgr.materialized:
-            # Manager-backed QKV TP switching: instead of torch.row_stack (which
-            # allocates a NEW unmanaged tensor), copy q/k/v slices into a 
-            # pre-allocated managed TP buffer. The copy is unavoidable because
-            # q/k/v are non-contiguous slices from the full weight, but the
-            # DESTINATION is now in managed memory (not a random allocation).
-            tp_view = self._paras_mgr.get_view(
-                f"{self._paras_prefix}.tp_weight"
-            )
-            q_rows = (tp_head_end - tp_head_start) * hs
-            k_rows = (tp_k_head_end - tp_k_head_start) * hs
-            tp_view[:q_rows, :].copy_(
-                full_weight_tensor[tp_head_start * hs : tp_head_end * hs, :]
-            )
-            tp_view[q_rows : q_rows + k_rows, :].copy_(
-                full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs, :]
-            )
-            tp_view[q_rows + k_rows :, :].copy_(
-                full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs, :]
-            )
-            new_weight_tensor = tp_view
-        else:
-            new_weight_tensor = torch.row_stack((
-                full_weight_tensor[tp_head_start * hs : tp_head_end * hs, :],
-                full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs, :],
-                full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs, :],
-            ))
+        new_weight_tensor = torch.row_stack((
+            full_weight_tensor[tp_head_start * hs : tp_head_end * hs, :],
+            full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs, :],
+            full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs, :],
+        ))
 
         self.weight = torch.nn.Parameter(new_weight_tensor, requires_grad=False)
         set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
@@ -1333,8 +1297,6 @@ class RowParallelLinear(LinearBase):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
-        paras_memory_manager=None,
-        paras_weight_name_prefix: str = "",
     ):
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
@@ -1379,18 +1341,6 @@ class RowParallelLinear(LinearBase):
             )
         else:
             self.register_parameter("bias", None)
-
-        # ParaS static memory manager: same post-replace pattern as QKVParallelLinear.
-        # For RowParallelLinear, TP reconfiguration uses dim-1 slicing which creates
-        # a view (not a copy), so the TP weight naturally stays manager-backed.
-        self._paras_mgr = paras_memory_manager
-        self._paras_prefix = paras_weight_name_prefix
-        if paras_memory_manager is not None and paras_memory_manager.materialized:
-            managed_view = paras_memory_manager.get_view(
-                f"{paras_weight_name_prefix}.weight"
-            )
-            self.weight = torch.nn.Parameter(managed_view, requires_grad=False)
-            set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)
