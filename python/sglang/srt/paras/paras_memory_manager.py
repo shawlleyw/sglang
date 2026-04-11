@@ -689,7 +689,7 @@ def plan_qwen_moe_layout(
 # MoE alias creation (call after materialize)
 # ---------------------------------------------------------------------------
 
-def create_moe_aliases(
+def create_paras_moe_aliases(
     manager: ParaSMemoryManager,
     num_layers: int,
     prefix: str = "model",

@@ -106,9 +106,10 @@ def setup_paras_state(rank, world_size):
 # ---------------------------------------------------------------------------
 
 def build_manager(rank, world_size):
-    """Create ParaSMemoryManager with EP weight + staging buffers."""
+    """Create ParaSMemoryManager with N+1 slots + staging buffers."""
     from sglang.srt.paras.paras_memory_manager import (
         ParaSMemoryManager,
+        create_paras_moe_aliases,
         set_global_paras_memory_manager,
     )
 
@@ -117,18 +118,23 @@ def build_manager(rank, world_size):
 
     mgr = ParaSMemoryManager(device=f"cuda:{rank}")
 
-    # Per-layer EP weight buffers (non-triton shape: E_local, 2*I, H / E_local, H, I)
-    for layer_id in range(NUM_LAYERS):
+    # N+1 generic physical slots (non-triton shape: E_local, 2*I, H / E_local, H, I)
+    for slot in range(NUM_LAYERS + 1):
         mgr.reserve(
-            f"model.layers.{layer_id}.mlp.experts.w13_weight",
+            f"paras.moe_slot.{slot}.w13",
             (num_local, 2 * INTERMEDIATE, HIDDEN),
             torch.bfloat16,
         )
         mgr.reserve(
-            f"model.layers.{layer_id}.mlp.experts.w2_weight",
+            f"paras.moe_slot.{slot}.w2",
             (num_local, HIDDEN, INTERMEDIATE),
             torch.bfloat16,
         )
+
+    # 'experts' aliases → slot i+1 (for weight loading / EP access)
+    for i in range(NUM_LAYERS):
+        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[f"paras.moe_slot.{i+1}.w13"]
+        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[f"paras.moe_slot.{i+1}.w2"]
 
     # Staging buffers (same layout as plan_qwen_moe_layout for DP=1)
     staging_experts = num_local  # dp_size * (num_experts // ep_size) = 1 * num_local
@@ -154,6 +160,7 @@ def build_manager(rank, world_size):
     )
 
     mgr.materialize()
+    create_paras_moe_aliases(mgr, NUM_LAYERS)
     set_global_paras_memory_manager(mgr)
     return mgr, num_local
 
@@ -225,84 +232,30 @@ def _make_mixin(layer_id, num_local, mgr):
 
 
 def run_nccl_path(mgr, num_local):
-    """Run NCCL all-to-all for all layers. Returns {layer_id: (w13, w2)} clones."""
+    """Run NCCL all-to-all for all layers. Returns {layer_id: (w13, w2)} clones.
+
+    Reads from tp_experts entries (slot i) to verify the N+1 fix:
+    all-to-all writes to EP slot (i+1), then copies to TP slot (i).
+    """
+    from sglang.srt.paras.paras_parallel_state import get_paras_tp_size
+
     results = {}
+    tp_size = get_paras_tp_size()
+    tp_inter = INTERMEDIATE // tp_size
     for layer_id in range(NUM_LAYERS):
         mixin = _make_mixin(layer_id, num_local, mgr)
         mixin.paras_configure_tp_all_to_all()
         results[layer_id] = (
-            mgr.get_view(
-                f"model.layers.{layer_id}.mlp.experts.w13_weight"
+            mgr.get_view_as(
+                f"model.layers.{layer_id}.mlp.tp_experts.w13_weight",
+                (NUM_EXPERTS, 2 * tp_inter, HIDDEN),
             ).clone(),
-            mgr.get_view(
-                f"model.layers.{layer_id}.mlp.experts.w2_weight"
+            mgr.get_view_as(
+                f"model.layers.{layer_id}.mlp.tp_experts.w2_weight",
+                (NUM_EXPERTS, HIDDEN, tp_inter),
             ).clone(),
         )
     return results
-
-
-def build_peer_access_manager(rank, world_size):
-    """Create ParaSMemoryManager with N+1 slots + staging for peer access path."""
-    from sglang.srt.paras.paras_memory_manager import (
-        ParaSMemoryManager,
-        create_moe_aliases,
-        set_global_paras_memory_manager,
-    )
-
-    ep_size = world_size
-    num_local = NUM_EXPERTS // ep_size
-
-    mgr = ParaSMemoryManager(device=f"cuda:{rank}")
-
-    # N+1 generic physical slots
-    for slot in range(NUM_LAYERS + 1):
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w13",
-            (num_local, 2 * INTERMEDIATE, HIDDEN),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w2",
-            (num_local, HIDDEN, INTERMEDIATE),
-            torch.bfloat16,
-        )
-
-    # Create 'experts' aliases (dict ref trick — same LayoutEntry, no duplication)
-    for i in range(NUM_LAYERS):
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[f"paras.moe_slot.{i+1}.w13"]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[f"paras.moe_slot.{i+1}.w2"]
-
-    staging_experts = num_local
-    mgr.reserve("staging.w13_a", (staging_experts, 2 * INTERMEDIATE, HIDDEN), torch.bfloat16)
-    mgr.reserve("staging.w13_b", (staging_experts, 2 * INTERMEDIATE, HIDDEN), torch.bfloat16)
-    mgr.reserve("staging.w2_a", (staging_experts, HIDDEN, INTERMEDIATE), torch.bfloat16)
-    mgr.reserve("staging.w2_b", (staging_experts, HIDDEN, INTERMEDIATE), torch.bfloat16)
-
-    mgr.materialize()
-    create_moe_aliases(mgr, NUM_LAYERS)
-    set_global_paras_memory_manager(mgr)
-    return mgr, num_local
-
-
-def fill_ep_weights_peer_access(mgr, rank):
-    """Fill EP weight buffers with same rank-deterministic data as fill_ep_weights."""
-    for layer_id in range(NUM_LAYERS):
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(SEED + layer_id * 100 + rank)
-        w13 = mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w13_weight")
-        w2 = mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w2_weight")
-        w13.copy_(
-            torch.randn(w13.shape, generator=gen, dtype=torch.float32).to(
-                dtype=w13.dtype, device=w13.device
-            )
-        )
-        gen2 = torch.Generator(device="cpu")
-        gen2.manual_seed(SEED + layer_id * 100 + rank + 50)
-        w2.copy_(
-            torch.randn(w2.shape, generator=gen2, dtype=torch.float32).to(
-                dtype=w2.dtype, device=w2.device
-            )
-        )
 
 
 def run_peer_access_path(mgr, num_local, peer_ctx):
@@ -419,22 +372,27 @@ def setup_peer_ctx(mgr, rank, world_size, tp_group):
 # ---------------------------------------------------------------------------
 
 def run_comparison_test(rank, world_size):
-    """Verify bitwise match between NCCL and peer access (v2) paths."""
+    """Verify bitwise match between NCCL and peer access (v2) paths.
+
+    Both paths use the same N+1 slot manager to exercise the NCCL fix
+    (copy from EP slot i+1 to TP slot i).
+    """
     tp_group = setup_paras_state(rank, world_size)
     mgr, num_local = build_manager(rank, world_size)
 
     fill_ep_weights(mgr, rank)
     snap = snapshot_weights(mgr)
 
+    # NCCL path: all-to-all writes to EP slot, then copies to TP slot
     nccl_results = run_nccl_path(mgr, num_local)
 
+    # Restore EP weights for peer access run
+    restore_weights(mgr, snap)
+
+    peer_ctx = setup_peer_ctx(mgr, rank, world_size, tp_group)
+    pa_results = run_peer_access_path(mgr, num_local, peer_ctx)
+
     all_ok = True
-
-    pa_mgr, pa_num_local = build_peer_access_manager(rank, world_size)
-    fill_ep_weights_peer_access(pa_mgr, rank)
-    peer_ctx = setup_peer_ctx(pa_mgr, rank, world_size, tp_group)
-    pa_results = run_peer_access_path(pa_mgr, pa_num_local, peer_ctx)
-
     if rank == 0:
         print("\n--- NCCL vs Peer Access ---", flush=True)
     for layer_id in range(NUM_LAYERS):
@@ -459,10 +417,7 @@ def run_comparison_test(rank, world_size):
     del nccl_results, pa_results
     torch.cuda.empty_cache()
 
-    from sglang.srt.paras.paras_memory_manager import set_global_paras_memory_manager
-    set_global_paras_memory_manager(mgr)
-
-    return all_ok, tp_group, mgr, num_local, snap, pa_mgr, peer_ctx
+    return all_ok, tp_group, mgr, num_local, snap, peer_ctx
 
 
 # ---------------------------------------------------------------------------
@@ -470,26 +425,19 @@ def run_comparison_test(rank, world_size):
 # ---------------------------------------------------------------------------
 
 def run_benchmark(
-    rank, world_size, tp_group, mgr, num_local, snap,
-    pa_mgr, peer_ctx,
+    rank, world_size, tp_group, mgr, num_local, snap, peer_ctx,
 ):
-    from sglang.srt.paras.paras_memory_manager import set_global_paras_memory_manager
-
-    pa_snap = snapshot_weights(pa_mgr)
-
-    set_global_paras_memory_manager(mgr)
+    """Benchmark NCCL vs peer access using the same N+1 manager."""
     for _ in range(BENCHMARK_WARMUP):
         restore_weights(mgr, snap)
         run_nccl_path(mgr, num_local)
-    set_global_paras_memory_manager(pa_mgr)
     for _ in range(BENCHMARK_WARMUP):
-        restore_weights(pa_mgr, pa_snap)
-        run_peer_access_path(pa_mgr, num_local, peer_ctx)
+        restore_weights(mgr, snap)
+        run_peer_access_path(mgr, num_local, peer_ctx)
 
     torch.cuda.synchronize()
     dist.barrier()
 
-    set_global_paras_memory_manager(mgr)
     nccl_times = []
     for _ in range(BENCHMARK_RUNS):
         restore_weights(mgr, snap)
@@ -500,18 +448,15 @@ def run_benchmark(
         torch.cuda.synchronize()
         nccl_times.append(time.perf_counter() - t0)
 
-    set_global_paras_memory_manager(pa_mgr)
     pa_times = []
     for _ in range(BENCHMARK_RUNS):
-        restore_weights(pa_mgr, pa_snap)
+        restore_weights(mgr, snap)
         torch.cuda.synchronize()
         dist.barrier()
         t0 = time.perf_counter()
-        run_peer_access_path(pa_mgr, num_local, peer_ctx)
+        run_peer_access_path(mgr, num_local, peer_ctx)
         torch.cuda.synchronize()
         pa_times.append(time.perf_counter() - t0)
-
-    set_global_paras_memory_manager(mgr)
 
     if rank == 0:
         na = sum(nccl_times) / len(nccl_times)
@@ -584,10 +529,9 @@ def main():
             )
 
         if args.benchmark:
-            _, tp_group, mgr, num_local, snap, pa_mgr, peer_ctx = result
+            _, tp_group, mgr, num_local, snap, peer_ctx = result
             run_benchmark(
-                rank, world_size, tp_group, mgr, num_local, snap,
-                pa_mgr, peer_ctx,
+                rank, world_size, tp_group, mgr, num_local, snap, peer_ctx,
             )
 
         dist.barrier()

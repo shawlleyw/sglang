@@ -253,8 +253,11 @@ class ParaSMoeBlockMixin:
                async_op=True,
             )
 
-            # -- w13 post-processing: reinterpret as TP shape in EP buffer --
+            # -- w13 post-processing: copy result into TP slot --
+            # N+1 layout: all-to-all wrote into EP slot (i+1). TP slot (i) is
+            # where tp_experts points, so we must copy there.
             w13_handle.wait()
+            tp_w13_shape = (self.num_global_experts, 2 * moe_intermediate_size_after_tp, self.hidden_size)
             if paras_dp_size > 1:
                 w13_post = mgr.get_view("staging.w13_b").view(
                     paras_dp_size, paras_tp_size, -1
@@ -263,18 +266,25 @@ class ParaSMoeBlockMixin:
                     w13_tp.view(paras_tp_size, paras_dp_size, -1).transpose(0, 1)
                 )
                 tp_w13 = mgr.get_view_as(
-                    f"model.layers.{self._paras_layer_id}.mlp.experts.w13_weight",
-                    (self.num_global_experts, 2 * moe_intermediate_size_after_tp, self.hidden_size),
+                    f"model.layers.{self._paras_layer_id}.mlp.tp_experts.w13_weight",
+                    tp_w13_shape,
                 )
                 tp_w13.copy_(w13_post.view_as(tp_w13))
             else:
-                tp_w13 = mgr.get_view_as(
-                    f"model.layers.{self._paras_layer_id}.mlp.experts.w13_weight",
-                    (self.num_global_experts, 2 * moe_intermediate_size_after_tp, self.hidden_size),
+                # DP=1: copy from EP slot (i+1) to TP slot (i)
+                ep_w13 = mgr.get_view_as(
+                    f"model.layers.{self._paras_layer_id}.mlp.ep_experts.w13_weight",
+                    tp_w13_shape,
                 )
+                tp_w13 = mgr.get_view_as(
+                    f"model.layers.{self._paras_layer_id}.mlp.tp_experts.w13_weight",
+                    tp_w13_shape,
+                )
+                tp_w13.copy_(ep_w13)
 
-            # -- w2 post-processing --
+            # -- w2 post-processing: copy result into TP slot --
             w2_handle.wait()
+            tp_w2_shape = (self.num_global_experts, self.hidden_size, moe_intermediate_size_after_tp)
             if paras_dp_size > 1:
                 w2_post = mgr.get_view("staging.w2_b").view(
                     paras_dp_size, paras_tp_size, -1
@@ -283,15 +293,21 @@ class ParaSMoeBlockMixin:
                     w2_tp.view(paras_tp_size, paras_dp_size, -1).transpose(0, 1)
                 )
                 tp_w2 = mgr.get_view_as(
-                    f"model.layers.{self._paras_layer_id}.mlp.experts.w2_weight",
-                    (self.num_global_experts, self.hidden_size, moe_intermediate_size_after_tp),
+                    f"model.layers.{self._paras_layer_id}.mlp.tp_experts.w2_weight",
+                    tp_w2_shape,
                 )
                 tp_w2.copy_(w2_post.view_as(tp_w2))
             else:
-                tp_w2 = mgr.get_view_as(
-                    f"model.layers.{self._paras_layer_id}.mlp.experts.w2_weight",
-                    (self.num_global_experts, self.hidden_size, moe_intermediate_size_after_tp),
+                # DP=1: copy from EP slot (i+1) to TP slot (i)
+                ep_w2 = mgr.get_view_as(
+                    f"model.layers.{self._paras_layer_id}.mlp.ep_experts.w2_weight",
+                    tp_w2_shape,
                 )
+                tp_w2 = mgr.get_view_as(
+                    f"model.layers.{self._paras_layer_id}.mlp.tp_experts.w2_weight",
+                    tp_w2_shape,
+                )
+                tp_w2.copy_(ep_w2)
 
     def paras_configure_tp_fused_peer_access_kernel(
         self,
@@ -314,8 +330,8 @@ class ParaSMoeBlockMixin:
         layer_id = self._paras_layer_id
         moe_intermediate_size_after_tp = self.moe_intermediate_size // paras_tp_size
 
-        ep_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.experts.w13_weight"]
-        ep_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.experts.w2_weight"]
+        ep_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.ep_experts.w13_weight"]
+        ep_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.ep_experts.w2_weight"]
 
         # TP alias entries — uniform lookup, no layer_id branching
         tp_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"]
