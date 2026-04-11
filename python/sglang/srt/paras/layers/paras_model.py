@@ -102,12 +102,10 @@ class ParaSModelMixin:
                 stream_1, stream_2 = stream_2, stream_1
 
     def paras_configure_tp_fused_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
-        """EP→TP via fused strided-read + peer write. No staging buffer.
-        Processes layers in order 0..N-1 (required for N+1 slot correctness).
-        """
         from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         from sglang.srt.paras.peer_access import init_peer_access
+        import torch
 
         mgr = get_global_paras_memory_manager()
 
@@ -117,10 +115,28 @@ class ParaSModelMixin:
             self._peer_access_ctx = init_peer_access(mgr, tp_group, tp_size)
 
         peer_ctx = self._peer_access_ctx
+        tp_group = get_paras_tp_group().device_group
 
+        # Build dst_base_ptrs once (reused for all layers)
+        dst_base_ptrs = torch.tensor(
+            peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+        )
+
+        # Barrier 1: ensure all ranks finished EP inference reads before any writes
+        torch.distributed.barrier(group=tp_group)
+
+        # Launch all layer kernels — no inter-layer barriers needed (N+1 slot design)
         for layer in self.layers:
             layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
-            layer.paras_configure_tp_mlp_fused_peer_access(peer_ctx, None, [])
+            layer.paras_configure_tp_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
+
+        # Barrier 2: ensure all peer writes complete before TP mode begins
+        torch.cuda.synchronize()
+        torch.distributed.barrier(group=tp_group)
+
+        # Update TP views and switch mode for all layers
+        for layer in self.layers:
+            layer.paras_configure_tp_mlp_fused_peer_access_update_views()
             layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
     def paras_configure_helper(self):
