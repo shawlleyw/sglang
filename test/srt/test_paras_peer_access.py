@@ -259,19 +259,34 @@ def run_nccl_path(mgr, num_local):
 
 
 def run_peer_access_path(mgr, num_local, peer_ctx):
-    """Run v2 peer access for all layers. Returns {layer_id: (w13, w2)} clones."""
+    """Run v2 peer access for all layers. Returns {layer_id: (w13, w2)} clones.
+    
+    Uses model-level barrier pattern: one barrier before, all kernels, one barrier after.
+    """
+    from sglang.srt.paras.paras_parallel_state import get_paras_tp_size, get_paras_tp_group
+    
     results = {}
+    tp_size = get_paras_tp_size()
+    tp_inter = INTERMEDIATE // tp_size
+    
+    # Model-level barrier pattern: barrier before all kernels
+    paras_tp_group = get_paras_tp_group().device_group
+    dst_base_ptrs = torch.tensor(peer_ctx.peer_addresses, dtype=torch.int64, device="cuda")
+    dist.barrier(group=paras_tp_group)
+    
+    # Run all kernels
     for layer_id in range(NUM_LAYERS):
         mixin = _make_mixin(layer_id, num_local, mgr)
-        mixin.paras_configure_tp_fused_peer_access(peer_ctx=peer_ctx, stream=None)
+        mixin.paras_configure_tp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
 
-        # Read from TP alias — uniform lookup, no layer_id branching
+    # Synchronize and barrier after all kernels
+    torch.cuda.synchronize()
+    dist.barrier(group=paras_tp_group)
+    
+    # Read results from TP alias
+    for layer_id in range(NUM_LAYERS):
         tp_w13_name = f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"
         tp_w2_name = f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"
-
-        from sglang.srt.paras.paras_parallel_state import get_paras_tp_size
-        tp_size = get_paras_tp_size()
-        tp_inter = INTERMEDIATE // tp_size
         results[layer_id] = (
             mgr.get_view_as(tp_w13_name, (NUM_EXPERTS, 2 * tp_inter, HIDDEN)).clone(),
             mgr.get_view_as(tp_w2_name, (NUM_EXPERTS, HIDDEN, tp_inter)).clone(),

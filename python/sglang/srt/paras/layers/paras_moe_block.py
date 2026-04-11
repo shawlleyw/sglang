@@ -358,18 +358,6 @@ class ParaSMoeBlockMixin:
             elem_size=elem_size, stream=stream,
         )
 
-    def paras_configure_tp_fused_peer_access(self, peer_ctx, stream=None):
-        """Convenience wrapper: kernel + barriers for single-layer use (e.g. tests).
-
-        TP views already point to the correct slot from init — no update_views needed.
-        """
-        paras_tp_group = get_paras_tp_group().device_group
-        dst_base_ptrs = torch.tensor(peer_ctx.peer_addresses, dtype=torch.int64, device="cuda")
-        torch.distributed.barrier(group=paras_tp_group)
-        self.paras_configure_tp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
-        torch.cuda.synchronize()
-        torch.distributed.barrier(group=paras_tp_group)
-
     # ------------------------------------------------------------------
     # Parallelism mode switching
     # ------------------------------------------------------------------
