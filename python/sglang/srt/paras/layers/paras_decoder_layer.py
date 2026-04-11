@@ -55,18 +55,8 @@ class ParaSDecoderLayerMixin:
     def paras_configure_tp_mlp_all_to_all(self, stream, handles):
         return self.mlp.paras_configure_tp_all_to_all(stream, handles)
 
-    def paras_configure_tp_mlp_peer_access(
-        self, peer_ctx, transfer_plans, packed_plans, staging_suffix, stream, handles
-    ):
-        """Wrapper: delegate to mlp.paras_configure_tp_peer_access."""
-        for handle in (handles or []):
-            handle.wait()
-        return self.mlp.paras_configure_tp_peer_access(
-            peer_ctx, transfer_plans, packed_plans, staging_suffix, stream
-        )
-
-    def paras_configure_tp_mlp_combined_peer_access_kernel(self, peer_ctx, dst_base_ptrs, stream):
-        return self.mlp.paras_configure_tp_combined_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
+    def paras_configure_tp_mlp_peer_access_kernel(self, peer_ctx, dst_base_ptrs, stream):
+        return self.mlp.paras_configure_tp_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
 
     def paras_configure_tp_mlp_fused_peer_access_kernel(self, peer_ctx, dst_base_ptrs, stream):
         """Launch fused kernels for this layer (no barriers — model level manages them)."""

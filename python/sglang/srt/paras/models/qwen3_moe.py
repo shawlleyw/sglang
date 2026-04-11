@@ -32,7 +32,7 @@ from sglang.srt.paras.paras_memory_manager import (
     plan_qwen_moe_layout,
     set_global_paras_memory_manager,
 )
-from sglang.srt.paras.paras_parallel_state import get_paras_dp_size, get_paras_tp_size
+from sglang.srt.paras.paras_parallel_state import get_paras_dp_size, get_paras_tp_group, get_paras_tp_size
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -247,7 +247,6 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         # cudaDeviceEnablePeerAccess() and cudaIpcOpenMemHandle() are slow on first call.
         try:
             from sglang.srt.paras.peer_access import init_peer_access
-            from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
             self._fused_peer_access_ctx = init_peer_access(
                 manager, get_paras_tp_group().device_group, get_paras_tp_size()
             )
@@ -387,7 +386,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
-        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank, method="fused_peer_access")
+        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank, method="peer_access")
 
     @paras_func
     def paras_configure_ep(self):

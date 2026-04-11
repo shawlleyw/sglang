@@ -8,7 +8,7 @@ via NVLink / NVSwitch (CUDA Unified Virtual Addressing).
 import ctypes
 import logging
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -221,43 +221,6 @@ def init_peer_access(manager, tp_group, tp_size: int) -> PeerAccessContext:
     )
 
 
-def peer_access_transfer(
-    src_base_ptr: int,
-    dst_base_ptrs_tensor: torch.Tensor,
-    plan: dict,
-    stream: Optional[torch.cuda.Stream] = None,
-) -> None:
-    """Execute peer access transfer: copy from local staging to peer GPU EP buffers.
-
-    Args:
-        src_base_ptr: Local managed buffer base address (int from data_ptr())
-        dst_base_ptrs_tensor: int64 GPU tensor of shape [MAX_PEERS] with each rank's buffer address
-        plan: dict from pack_transfer_plan() with src_offsets, dst_offsets, sizes, dst_ranks
-        stream: CUDA stream to launch on (None = current stream)
-    """
-    try:
-        import paras_peer_access_cuda
-    except ImportError:
-        raise ImportError(
-            "paras_peer_access_cuda extension not found. "
-            "Build it first: pip install -e python/sglang/srt/paras/csrc/"
-        )
-
-    stream_ptr = 0
-    if stream is not None:
-        stream_ptr = stream.cuda_stream
-
-    paras_peer_access_cuda.launch_peer_access_transfer(
-        src_base_ptr,
-        dst_base_ptrs_tensor,
-        plan["src_offsets"],
-        plan["dst_offsets"],
-        plan["sizes"],
-        plan["dst_ranks"],
-        stream_ptr,
-    )
-
-
 def peer_access_fused_transfer(
     local_buffer_ptr: int,
     dst_base_ptrs_tensor: torch.Tensor,
@@ -317,40 +280,6 @@ def peer_access_fused_transfer_w2(
         H,
         I_full * elem_size,    # I_full_bytes
         I_prime * elem_size,   # I_prime_bytes
-        stream_ptr,
-    )
-
-
-def peer_access_mega_transfer(
-    local_buffer_ptr: int,
-    dst_base_ptrs_tensor: torch.Tensor,
-    ep_offsets: torch.Tensor,
-    tp_offsets: torch.Tensor,
-    tp_rank: int,
-    tp_size: int,
-    E_local: int,
-    I_prime_H: int,
-    num_gates: int,
-    elem_size: int,
-    num_layers: int,
-    num_threads: int = 512,
-    stream=None,
-) -> None:
-    import paras_peer_access_cuda
-    stream_ptr = stream.cuda_stream if stream is not None else 0
-    paras_peer_access_cuda.launch_peer_access_mega_transfer(
-        local_buffer_ptr,
-        dst_base_ptrs_tensor,
-        ep_offsets,
-        tp_offsets,
-        tp_rank,
-        tp_size,
-        E_local,
-        I_prime_H,
-        num_gates,
-        elem_size,
-        num_layers,
-        num_threads,
         stream_ptr,
     )
 
@@ -433,36 +362,4 @@ def peer_access_fused_transfer_combined_single_layer(
     )
 
 
-def peer_access_mega_transfer_w2(
-    local_buffer_ptr: int,
-    dst_base_ptrs_tensor: torch.Tensor,
-    ep_offsets: torch.Tensor,
-    tp_offsets: torch.Tensor,
-    tp_rank: int,
-    tp_size: int,
-    E_local: int,
-    H: int,
-    I_full: int,
-    I_prime: int,
-    elem_size: int,
-    num_layers: int,
-    num_threads: int = 512,
-    stream=None,
-) -> None:
-    import paras_peer_access_cuda
-    stream_ptr = stream.cuda_stream if stream is not None else 0
-    paras_peer_access_cuda.launch_peer_access_mega_transfer_w2(
-        local_buffer_ptr,
-        dst_base_ptrs_tensor,
-        ep_offsets,
-        tp_offsets,
-        tp_rank,
-        tp_size,
-        E_local,
-        H,
-        I_full * elem_size,
-        I_prime * elem_size,
-        num_layers,
-        num_threads,
-        stream_ptr,
-    )
+

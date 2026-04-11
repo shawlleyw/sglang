@@ -42,36 +42,6 @@ class ParaSModelMixin:
             layer.paras_configure_tp_mlp(paras_tp_size, paras_tp_rank)
             layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
-    def paras_configure_tp_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
-        """
-        Sequential EP→TP conversion using NVLink peer access per layer.
-
-        Note: Real layer-to-layer overlap would require separating the barrier
-        into pre-barrier (after permute) and post-barrier (after write), which
-        requires a 2-pass approach. Left as a future optimization.
-        """
-        from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
-        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-        from sglang.srt.paras.peer_access import init_peer_access
-
-        mgr = get_global_paras_memory_manager()
-
-        # Initialize peer access if not already done
-        if not hasattr(self, '_peer_access_ctx') or self._peer_access_ctx is None:
-            tp_group = get_paras_tp_group().device_group
-            tp_size = get_paras_tp_size()
-            self._peer_access_ctx = init_peer_access(mgr, tp_group, tp_size)
-
-        peer_ctx = self._peer_access_ctx
-        packed_plans = {}
-
-        for layer in self.layers:
-            layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
-            layer.paras_configure_tp_mlp_peer_access(
-                peer_ctx, {}, packed_plans, "a", None, []
-            )
-            layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
-
     def paras_configure_tp_overlap(self, paras_tp_size: int, paras_tp_rank: int):
         """
         Overlapped EP→TP conversion using dual CUDA streams for pipelining.
@@ -205,7 +175,7 @@ class ParaSModelMixin:
             f"total={1000*(t8-t0):.1f}ms"
         )
 
-    def paras_configure_tp_combined_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
+    def paras_configure_tp_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
         from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         from sglang.srt.paras.peer_access import init_peer_access
@@ -235,7 +205,7 @@ class ParaSModelMixin:
         t3 = time.perf_counter()
 
         for layer in self.layers:
-            layer.paras_configure_tp_mlp_combined_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
+            layer.paras_configure_tp_mlp_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
         t4 = time.perf_counter()
 
         torch.cuda.synchronize()
@@ -250,7 +220,7 @@ class ParaSModelMixin:
         t7 = time.perf_counter()
 
         logger.warning(
-            f"[combined_peer_access timing] "
+            f"[peer_access timing] "
             f"init={1000*(t1-t0):.1f}ms "
             f"barrier1={1000*(t3-t2):.1f}ms "
             f"kernels={1000*(t4-t3):.1f}ms "
@@ -267,19 +237,8 @@ class ParaSModelMixin:
     def paras_configure_tp(
         self, paras_tp_size: int, paras_tp_rank: int, overlap: bool = False, method: str = None
     ):
-        """
-        Configure the model for tensor parallelism.
-        Note: the embedding layer stays in DP mode, which also works for TP.
-
-        Args:
-            method: "naive", "overlap", "peer_access", "fused_peer_access", or "combined_peer_access". If None, uses overlap flag.
-        """
         if method == "peer_access":
             self.paras_configure_tp_peer_access(paras_tp_size, paras_tp_rank)
-        elif method == "combined_peer_access":
-            self.paras_configure_tp_combined_peer_access(paras_tp_size, paras_tp_rank)
-        elif method == "fused_peer_access":
-            self.paras_configure_tp_fused_peer_access(paras_tp_size, paras_tp_rank)
         elif method == "overlap" or (method is None and overlap):
             self.paras_configure_tp_overlap(paras_tp_size, paras_tp_rank)
         else:
