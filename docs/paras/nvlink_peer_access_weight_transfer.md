@@ -2,15 +2,17 @@
 
 ## Overview
 
-This document describes the NVLink peer access weight transfer optimization for the ParaS EP→TP parallelism switch. Instead of using NCCL `all_to_all` collectives for MoE weight redistribution, we use custom CUDA kernels that write directly to peer GPU memory via NVLink, achieving a **1.56× speedup** over NCCL sequential on Qwen3-30B-A3B with 4×H100-80GB.
+This document describes the NVLink peer access weight transfer optimization for the ParaS EP→TP parallelism switch. Instead of using NCCL `all_to_all` collectives for MoE weight redistribution, we use custom CUDA kernels that write directly to peer GPU memory via NVLink.
 
-### Performance Summary
+### Performance Summary (Qwen3-30B-A3B, 48 layers, 4×A100-80GB)
 
 | Method | transfer_weights | configure TP total | vs naive |
 |--------|-----------------|-------------------|----------|
-| `naive` (NCCL sequential) | ~114ms | ~145ms | baseline |
-| `overlap` (NCCL pipelined) | ~95ms | ~127ms | 1.14× |
-| `peer_access` (NVLink direct) | **~73ms** | **~88ms** | **1.56×** |
+| `naive` (NCCL sequential) | ~96 ms | ~117 ms | baseline |
+| `overlap` (NCCL pipelined) | ~83 ms | ~100 ms | 1.17× |
+| `peer_access` (NVLink direct) | **~61 ms** | **~97 ms** | **1.57×** |
+
+The peer access kernel time is only **~9 ms** for all 48 layers. The remaining `transfer_weights` time is dominated by attention and TP reconfiguration overhead shared by all methods. The `configure TP` total includes cache migration, request gathering, and weight transfer.
 
 ## Background
 
@@ -64,13 +66,31 @@ This eliminates the aliasing race condition without staging buffers. The overhea
 
 Both EP and TP views are created at model init time and never change, eliminating the need for `update_views()` after the transfer.
 
-**Layer ordering constraint**: EP→TP must process layers in forward order (0, 1, 2, ..., N-1). Layer `i+1`'s write to slot `i+1` must not overlap with layer `i`'s read from slot `i+1`. Sequential kernel launches on the same CUDA stream enforce this ordering.
+**Layer ordering constraint**: EP→TP must process layers in forward order (0, 1, 2, ..., N-1). Layer `i+1`'s write to slot `i+1` must not overlap with layer `i`'s read from slot `i+1`. Sequential kernel launches on the same CUDA stream enforce intra-rank ordering. Cross-rank ordering requires a per-layer synchronization barrier (see Section 3).
 
-### 3. Synchronization
+### 3. Cross-Rank Synchronization
 
-The peer access path requires **no explicit barriers or synchronization** in the model-level method. The N+1 slot design prevents inter-layer aliasing, and sequential kernel launches on the same CUDA stream enforce ordering. After all layers complete, `ParaSModelMixin.paras_configure_helper()` calls `torch.cuda.synchronize()` (invoked automatically by the `@paras_func` decorator).
+**The problem**: The N+1 slot design prevents intra-rank aliasing (layer `i` reads slot `i+1`, writes slot `i` — different slots). However, **cross-rank temporal aliasing** exists: Rank A processing layer `i+1` writes to Rank B's slot `i+1` via NVLink, while Rank B may still be processing layer `i` which reads from its own slot `i+1`. CUDA stream ordering only guarantees ordering on a **single device** — cross-rank NVLink writes have no ordering guarantee.
 
-For the NCCL overlap path, `stream.synchronize()` ensures non-default streams complete before the helper's global sync.
+**Solution — per-layer NCCL all-reduce barrier**: After each layer's kernel, a lightweight `dist.all_reduce()` on a 1-element tensor provides GPU-side cross-rank synchronization with near-zero overhead:
+
+```python
+barrier_tensor = torch.zeros(1, device="cuda")
+for layer in self.layers:
+    layer.paras_configure_tp_mlp_fused_peer_access_kernel(...)
+    dist.all_reduce(barrier_tensor, group=paras_tp_group)
+```
+
+**Why this is correct**: The NCCL all-reduce is a collective that doesn't complete on any rank until all ranks participate. PyTorch synchronizes the current stream with the NCCL stream via `cudaStreamWaitEvent`, ensuring:
+1. The kernel's NVLink writes complete before NCCL starts (CUDA memory model guarantees peer write visibility at kernel retirement)
+2. All ranks finish the current layer before any rank starts the next
+3. The next kernel launch waits for the all-reduce to complete
+
+**Why this is fast**: All synchronization happens via GPU-side `cudaStreamWaitEvent` — no CPU-GPU round trips. Measured overhead is <0.5 ms for 48 layers.
+
+**Why not `cuda.synchronize() + dist.barrier()`**: That approach forces two CPU-GPU round trips per layer (~100μs each), adding ~10 ms for 48 layers. The NCCL all-reduce stays entirely on the GPU.
+
+After all layers complete, `ParaSModelMixin.paras_configure_helper()` calls `torch.cuda.synchronize()` (invoked automatically by the `@paras_func` decorator).
 
 ### 4. Kernel Design: NVLink Store Optimization
 
@@ -157,10 +177,41 @@ Both reads and writes are coalesced within each row. The row stride causes 25% H
 The N+1 slot design is not exclusive to peer access — the NCCL naive and overlap paths also use it. This means all three methods share the same memory layout and alias structure:
 
 - **All-to-all output target**: NCCL writes directly to the TP slot (slot `i`) for each layer. Since `tp_experts` already points to slot `i` from init, no copy or view update is needed after the collective completes.
-- **Staging buffers still required**: NCCL's `all_to_all_single` requires contiguous, permuted input. The permute step writes EP data into a staging buffer before the collective reads from it. Staging buffers are reserved when `skip_staging=False` (the default for naive/overlap methods).
-- **No staging for peer access**: The peer access kernel reads directly from the EP slot with strided access, bypassing the permute step entirely. Staging buffers are skipped via `skip_staging=True`.
+- **No staging for peer access**: The peer access kernel reads directly from the EP slot with strided access, bypassing the permute step entirely. Staging buffers are skipped via `skip_staging=True`, saving ~1.16 GiB.
 
 In all cases, the TP slot (slot `i`) holds valid TP data after the transfer, and `tp_experts` views remain correct without any post-transfer alias updates.
+
+#### Staging Buffer Requirements
+
+NCCL's `all_to_all_single` requires contiguous, permuted input. The permute step writes EP data into a staging buffer before the collective reads from it. The staging requirements differ by method:
+
+| Method | Staging buffers | Memory cost | Reason |
+|--------|----------------|-------------|--------|
+| `naive` | 1 set (`staging.{w13,w2}_a`) | ~580 MB | Sequential — one layer at a time, reuses same buffer |
+| `overlap` | 2 sets (`staging.{w13,w2}_{a,b}`) | ~1.16 GiB | Pipelined — two layers in flight on different streams need separate buffers to avoid races |
+| `peer_access` | None (`skip_staging=True`) | 0 | Reads directly from EP slot with strided access |
+
+The `plan_qwen_moe_layout()` function accepts `skip_staging=True` to omit staging buffer reservation, controlled by the `PARAS_CONFIGURE_METHOD` environment variable.
+
+#### Overlap Path: Dual-Stream Pipelining and NCCL Stream Behavior
+
+The overlap path pipelines the all-gather of layer `i+1` with the all-to-all of layer `i` using two CUDA streams (`stream_1`, `stream_2`). The streams and staging buffers swap each iteration:
+
+```python
+stream_1, stream_2 = stream_2, stream_1
+staging_1, staging_2 = staging_2, staging_1  # "a" ↔ "b"
+```
+
+**Why two staging buffers are required**: Without alternating, both layers write their permuted EP data to the same staging buffer concurrently on different streams — a data race. Alternating between `staging_a` and `staging_b` ensures each stream has its own buffer.
+
+**NCCL stream behavior**: Despite being issued from different user streams (`stream_1`, `stream_2`), all NCCL collectives execute on a **single internal NCCL stream** managed by PyTorch's `ProcessGroupNCCL`. When `dist.all_to_all_single(async_op=True)` is called:
+
+1. PyTorch records an event on the current user stream
+2. The NCCL stream waits on that event (ensuring the permute completes)
+3. NCCL enqueues the all-to-all on its own stream
+4. `handle.wait()` later makes the user stream wait on the NCCL completion
+
+This means NCCL collectives **serialize** on the NCCL stream regardless of which user stream issued them. The overlap benefit comes from the **permute/copy** on user streams running concurrently with NCCL work, not from NCCL ops overlapping each other. In profiler traces, all `all_to_all` operations appear on the same NCCL stream.
 
 ## Theoretical Analysis
 
@@ -174,10 +225,11 @@ NVLink send per GPU, 48 layers: 10.4 GB
 A100 NVLink bandwidth: ~150 GB/s unidirectional (achieved)
 Theoretical minimum: 10.4 GB / 150 GB/s = 69 ms (48 layers)
 
-Measured: ~88 ms (48 layers projected) = 78% of peak NVLink bandwidth
+Measured v2 kernel time: ~9 ms (48 layers) = way below NVLink-bound
+Measured transfer_weights: ~61 ms (includes attn/TP reconfiguration)
 ```
 
-The 22% gap is primarily from integer division overhead in index computation and the w2 strided read pattern.
+The v2 kernel time (9 ms) is well below the NVLink-bound theoretical minimum (69 ms), indicating kernel launch overhead, NCCL barrier overhead, and attn reconfiguration dominate the total `transfer_weights` time.
 
 ## File Map
 
@@ -195,7 +247,9 @@ The 22% gap is primarily from integer division overhead in index computation and
 
 ## Future Work
 
-1. **TP→EP reverse switch**: The N+1 slot design supports this by processing layers in reverse order (N-1, N-2, ..., 0). Layer `i`'s read from slot `i` completes before layer `i-1`'s write to slot `i`.
+1. **FP8 scale transfer**: The peer access kernels currently only transfer weight data (w13, w2). FP8 quantized models also need their per-expert scale tensors (`w13_weight_scale`, `w2_weight_scale`) redistributed during EP→TP switching. This is not yet implemented.
+
+2. **TP→EP reverse switch**: The N+1 slot design supports this by processing layers in reverse order (N-1, N-2, ..., 0). Layer `i`'s read from slot `i` completes before layer `i-1`'s write to slot `i`.
 
 2. **KV cache migration**: Currently uses NCCL. Could use the same peer access approach since KV buffers are also in the managed buffer.
 
@@ -209,12 +263,10 @@ The 22% gap is primarily from integer division overhead in index computation and
 
 1. **Eliminate index division**: The inner loop computes `chunk_id = idx / int4_per_chunk` and `pos = idx % int4_per_chunk` per element. Restructuring to iterate over (chunk, position) pairs would remove this (~20 cycles per division × millions of iterations).
 
-2. **Two-phase even/odd launch**: Launch even layers (0,2,4,...) as one kernel, sync, then odd layers (1,3,5,...). Even layers' reads (odd slots) and writes (even slots) never overlap. This enables a mega-kernel launch for half the layers at once.
+2. **Reduce per-layer barrier overhead**: The current per-layer NCCL all-reduce barrier is lightweight but adds up over many layers. An N+2 slot design (EP layer `i` → slot `i+2`, TP layer `i` → slot `i`) would allow processing consecutive layer pairs simultaneously, halving the number of barriers from N to N/2. More generally, an offset of `d` allows groups of `d` layers per phase with `⌈N/d⌉ - 1` barriers, at the cost of `d` extra slots. With the current N+1 (offset 1) design, every consecutive layer pair shares a slot, making per-layer barriers unavoidable.
 
-3. **Cooperative groups grid sync**: Use `cooperative_launch` with `__grid_sync()` to synchronize between even and odd phases within a single kernel launch, eliminating the inter-phase sync overhead.
+3. **Warp specialization**: Dedicate specific warps to specific chunk sizes. w13 chunks (1.5MB) benefit from many warps; w2 rows (768B) might benefit from fewer warps with better cache locality.
 
-4. **Warp specialization**: Dedicate specific warps to specific chunk sizes. w13 chunks (1.5MB) benefit from many warps; w2 rows (768B) might benefit from fewer warps with better cache locality.
+4. **L2 cache prefetch**: Use `__prefetch_l2()` hints to pre-load the next chunk's source data while the current chunk's NVLink writes are in flight.
 
-5. **L2 cache prefetch**: Use `__prefetch_l2()` hints to pre-load the next chunk's source data while the current chunk's NVLink writes are in flight.
-
-6. **Adaptive grid sizing**: Instead of fixed `num_SMs × tp_size`, dynamically compute grid size based on total data volume and per-SM NVLink bandwidth target.
+5. **Adaptive grid sizing**: Instead of fixed `num_SMs × tp_size`, dynamically compute grid size based on total data volume and per-SM NVLink bandwidth target.

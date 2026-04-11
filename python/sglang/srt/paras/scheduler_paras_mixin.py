@@ -248,6 +248,8 @@ class SchedulerParasMixin:
         return ParaSConfigureReqOutput()
     
     def paras_start_profile(self, output_dir: str = "/tmp/paras_configure_profile"):
+        import os
+        output_dir = os.environ.get("PARAS_PROFILE_DIR", output_dir)
         self.profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             on_trace_ready=torch.profiler.tensorboard_trace_handler(

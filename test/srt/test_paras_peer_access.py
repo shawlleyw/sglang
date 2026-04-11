@@ -22,8 +22,6 @@ import torch.distributed as dist
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.join(_TEST_DIR, "..", "..")
 sys.path.insert(0, os.path.join(_ROOT_DIR, "python"))
-# CUDA extension path (built with setup.py build_ext --inplace)
-sys.path.insert(0, os.path.join(_ROOT_DIR, "python", "sglang", "srt", "paras", "csrc"))
 
 # ---- test constants (Qwen3-30B-A3B) ----
 NUM_LAYERS = 8
@@ -136,28 +134,12 @@ def build_manager(rank, world_size):
         mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[f"paras.moe_slot.{i+1}.w13"]
         mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[f"paras.moe_slot.{i+1}.w2"]
 
-    # Staging buffers (same layout as plan_qwen_moe_layout for DP=1)
-    staging_experts = num_local  # dp_size * (num_experts // ep_size) = 1 * num_local
-    mgr.reserve(
-        "staging.w13_a",
-        (staging_experts, 2 * INTERMEDIATE, HIDDEN),
-        torch.bfloat16,
-    )
-    mgr.reserve(
-        "staging.w13_b",
-        (staging_experts, 2 * INTERMEDIATE, HIDDEN),
-        torch.bfloat16,
-    )
-    mgr.reserve(
-        "staging.w2_a",
-        (staging_experts, HIDDEN, INTERMEDIATE),
-        torch.bfloat16,
-    )
-    mgr.reserve(
-        "staging.w2_b",
-        (staging_experts, HIDDEN, INTERMEDIATE),
-        torch.bfloat16,
-    )
+    staging_experts = num_local
+    w13_staging_shape = (staging_experts, 2 * INTERMEDIATE, HIDDEN)
+    w2_staging_shape = (staging_experts, HIDDEN, INTERMEDIATE)
+    for sfx in ("", "_1", "_2"):
+        mgr.reserve(f"staging.w13_pre_permute{sfx}", w13_staging_shape, torch.bfloat16)
+        mgr.reserve(f"staging.w2_pre_permute{sfx}", w2_staging_shape, torch.bfloat16)
 
     mgr.materialize()
     create_paras_moe_aliases(mgr, NUM_LAYERS)
@@ -212,8 +194,13 @@ def restore_weights(mgr, snap):
 # Mixin construction + path runners
 # ---------------------------------------------------------------------------
 
-def _make_mixin(layer_id, num_local, mgr):
-    """Create minimal ParaSMoeBlockMixin — mimics paras_configure_tp_all_gather(DP=1)."""
+class _MockExperts:
+    def __init__(self, w13_view, w2_view):
+        self.w13_weight = torch.nn.Parameter(w13_view, requires_grad=False)
+        self.w2_weight = torch.nn.Parameter(w2_view, requires_grad=False)
+
+
+def _make_mixin(layer_id, num_local, mgr, set_gathered=True):
     from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 
     m = object.__new__(ParaSMoeBlockMixin)
@@ -223,28 +210,38 @@ def _make_mixin(layer_id, num_local, mgr):
     m.hidden_size = HIDDEN
     m.moe_intermediate_size = INTERMEDIATE
 
-    # For DP=1 the all_gather is a no-op: ep_gathered IS the EP buffer view
     w13 = mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w13_weight")
     w2 = mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w2_weight")
-    m.w13_ep_gathered = w13.view(num_local, 2 * INTERMEDIATE, HIDDEN)
-    m.w2_ep_gathered = w2.view(num_local, HIDDEN, INTERMEDIATE)
+    m.ep_experts = _MockExperts(w13, w2)
+
+    if set_gathered:
+        m.w13_ep_gathered = w13.view(num_local, 2 * INTERMEDIATE, HIDDEN)
+        m.w2_ep_gathered = w2.view(num_local, HIDDEN, INTERMEDIATE)
     return m
 
 
-def run_nccl_path(mgr, num_local):
-    """Run NCCL all-to-all for all layers. Returns {layer_id: (w13, w2)} clones.
+class _MockLayer:
+    """Wraps a ParaSMoeBlockMixin to satisfy the overlap path's layer interface."""
 
-    Reads from tp_experts entries (slot i) to verify the N+1 fix:
-    all-to-all writes to EP slot (i+1), then copies to TP slot (i).
-    """
-    from sglang.srt.paras.paras_parallel_state import get_paras_tp_size
+    def __init__(self, mixin):
+        self.mlp = mixin
 
+    def paras_configure_tp_attn(self, tp_size, tp_rank):
+        pass
+
+    def paras_configure_tp_mlp_all_gather(self, stream, handles, async_op=False, staging_suffix=""):
+        return self.mlp.paras_configure_tp_all_gather(stream, handles, async_op, staging_suffix)
+
+    def paras_configure_tp_mlp_all_to_all(self, stream, handles, staging_suffix=""):
+        return self.mlp.paras_configure_tp_all_to_all(stream, handles, staging_suffix)
+
+    def paras_configure_tp(self, tp_size, tp_rank):
+        pass
+
+
+def _read_tp_results(mgr, tp_inter):
     results = {}
-    tp_size = get_paras_tp_size()
-    tp_inter = INTERMEDIATE // tp_size
     for layer_id in range(NUM_LAYERS):
-        mixin = _make_mixin(layer_id, num_local, mgr)
-        mixin.paras_configure_tp_all_to_all()
         results[layer_id] = (
             mgr.get_view_as(
                 f"model.layers.{layer_id}.mlp.tp_experts.w13_weight",
@@ -258,40 +255,73 @@ def run_nccl_path(mgr, num_local):
     return results
 
 
-def run_peer_access_path(mgr, num_local, peer_ctx):
-    """Run v2 peer access for all layers. Returns {layer_id: (w13, w2)} clones.
-    
-    Uses model-level barrier pattern: one barrier before, all kernels, one barrier after.
-    """
-    from sglang.srt.paras.paras_parallel_state import get_paras_tp_size, get_paras_tp_group
-    
-    results = {}
+def run_naive_path(mgr, num_local):
+    from sglang.srt.paras.paras_parallel_state import get_paras_tp_size
+
     tp_size = get_paras_tp_size()
     tp_inter = INTERMEDIATE // tp_size
-    
-    # Model-level barrier pattern: barrier before all kernels
+    for layer_id in range(NUM_LAYERS):
+        mixin = _make_mixin(layer_id, num_local, mgr)
+        mixin.paras_configure_tp_all_to_all()
+    return _read_tp_results(mgr, tp_inter)
+
+
+def run_overlap_path(mgr, num_local):
+    from sglang.srt.paras.paras_parallel_state import get_paras_tp_size
+
+    tp_size = get_paras_tp_size()
+    tp_inter = INTERMEDIATE // tp_size
+
+    layers = [_MockLayer(_make_mixin(i, num_local, mgr, set_gathered=False)) for i in range(NUM_LAYERS)]
+
+    stream_1 = torch.cuda.Stream()
+    stream_2 = torch.cuda.Stream()
+    staging_1 = "_1"
+    staging_2 = "_2"
+
+    layers[0].paras_configure_tp_attn(tp_size, 0)
+    last_layer_handles = layers[0].paras_configure_tp_mlp_all_gather(
+        stream_1, [], async_op=True, staging_suffix=staging_1
+    )
+    nlayers = len(layers)
+    for i, layer in enumerate(layers):
+        not_last_layer = i < nlayers - 1
+        if not_last_layer:
+            next_layer = layers[i + 1]
+            next_layer.paras_configure_tp_attn(tp_size, 0)
+            new_handles = next_layer.paras_configure_tp_mlp_all_gather(
+                stream_2, last_layer_handles, async_op=True, staging_suffix=staging_2
+            )
+
+        layer.paras_configure_tp_mlp_all_to_all(stream_1, last_layer_handles, staging_1)
+        layer.paras_configure_tp(tp_size, 0)
+
+        if not_last_layer:
+            last_layer_handles = new_handles
+            stream_1, stream_2 = stream_2, stream_1
+            staging_1, staging_2 = staging_2, staging_1
+
+    torch.cuda.synchronize()
+    return _read_tp_results(mgr, tp_inter)
+
+
+def run_peer_access_path(mgr, num_local, peer_ctx):
+    from sglang.srt.paras.paras_parallel_state import get_paras_tp_size, get_paras_tp_group
+
+    tp_size = get_paras_tp_size()
+    tp_inter = INTERMEDIATE // tp_size
+
     paras_tp_group = get_paras_tp_group().device_group
     dst_base_ptrs = torch.tensor(peer_ctx.peer_addresses, dtype=torch.int64, device="cuda")
+    barrier_tensor = torch.zeros(1, device="cuda")
     dist.barrier(group=paras_tp_group)
-    
-    # Run all kernels
+
     for layer_id in range(NUM_LAYERS):
         mixin = _make_mixin(layer_id, num_local, mgr)
         mixin.paras_configure_tp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
+        dist.all_reduce(barrier_tensor, op=dist.ReduceOp.SUM, group=paras_tp_group)
 
-    # Synchronize and barrier after all kernels
-    torch.cuda.synchronize()
-    dist.barrier(group=paras_tp_group)
-    
-    # Read results from TP alias
-    for layer_id in range(NUM_LAYERS):
-        tp_w13_name = f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"
-        tp_w2_name = f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"
-        results[layer_id] = (
-            mgr.get_view_as(tp_w13_name, (NUM_EXPERTS, 2 * tp_inter, HIDDEN)).clone(),
-            mgr.get_view_as(tp_w2_name, (NUM_EXPERTS, HIDDEN, tp_inter)).clone(),
-        )
-    return results
+    return _read_tp_results(mgr, tp_inter)
 
 
 # ---------------------------------------------------------------------------
@@ -386,50 +416,55 @@ def setup_peer_ctx(mgr, rank, world_size, tp_group):
 # Comparison test
 # ---------------------------------------------------------------------------
 
-def run_comparison_test(rank, world_size):
-    """Verify bitwise match between NCCL and peer access (v2) paths.
+def _compare_results(ref_results, test_results, ref_name, test_name, rank):
+    all_ok = True
+    for layer_id in range(NUM_LAYERS):
+        for i, wt in enumerate(("w13", "w2")):
+            ref_flat = ref_results[layer_id][i].reshape(-1)
+            test_flat = test_results[layer_id][i].reshape(-1)
+            if not torch.equal(ref_flat, test_flat):
+                diff = (ref_flat != test_flat).sum().item()
+                print(
+                    f"[Rank {rank}] FAIL {test_name} layer={layer_id} {wt}: "
+                    f"{diff}/{ref_flat.numel()} elements differ",
+                    flush=True,
+                )
+                all_ok = False
+            elif rank == 0:
+                print(
+                    f"  [OK] {test_name} layer={layer_id} {wt} bitwise match vs {ref_name}",
+                    flush=True,
+                )
+    return all_ok
 
-    Both paths use the same N+1 slot manager to exercise the NCCL fix
-    (copy from EP slot i+1 to TP slot i).
-    """
+
+def run_comparison_test(rank, world_size):
     tp_group = setup_paras_state(rank, world_size)
     mgr, num_local = build_manager(rank, world_size)
 
     fill_ep_weights(mgr, rank)
     snap = snapshot_weights(mgr)
 
-    # NCCL path: all-to-all writes to EP slot, then copies to TP slot
-    nccl_results = run_nccl_path(mgr, num_local)
+    naive_results = run_naive_path(mgr, num_local)
 
-    # Restore EP weights for peer access run
     restore_weights(mgr, snap)
-
     peer_ctx = setup_peer_ctx(mgr, rank, world_size, tp_group)
     pa_results = run_peer_access_path(mgr, num_local, peer_ctx)
 
     all_ok = True
-    if rank == 0:
-        print("\n--- NCCL vs Peer Access ---", flush=True)
-    for layer_id in range(NUM_LAYERS):
-        for i, wt in enumerate(("w13", "w2")):
-            nccl_flat = nccl_results[layer_id][i].reshape(-1)
-            pa_flat = pa_results[layer_id][i].reshape(-1)
-            if not torch.equal(nccl_flat, pa_flat):
-                diff = (nccl_flat != pa_flat).sum().item()
-                print(
-                    f"[Rank {rank}] FAIL peer_access layer={layer_id} {wt}: "
-                    f"{diff}/{nccl_flat.numel()} elements differ",
-                    flush=True,
-                )
-                all_ok = False
-            else:
-                if rank == 0:
-                    print(
-                        f"  [OK] peer_access layer={layer_id} {wt} bitwise match",
-                        flush=True,
-                    )
 
-    del nccl_results, pa_results
+    if rank == 0:
+        print("\n--- naive vs peer_access ---", flush=True)
+    all_ok &= _compare_results(naive_results, pa_results, "naive", "peer_access", rank)
+
+    restore_weights(mgr, snap)
+    overlap_results = run_overlap_path(mgr, num_local)
+
+    if rank == 0:
+        print("\n--- naive vs overlap ---", flush=True)
+    all_ok &= _compare_results(naive_results, overlap_results, "naive", "overlap", rank)
+
+    del naive_results, overlap_results, pa_results
     torch.cuda.empty_cache()
 
     return all_ok, tp_group, mgr, num_local, snap, peer_ctx
@@ -439,73 +474,60 @@ def run_comparison_test(rank, world_size):
 # Latency benchmark
 # ---------------------------------------------------------------------------
 
-def run_benchmark(
-    rank, world_size, tp_group, mgr, num_local, snap, peer_ctx,
-):
-    """Benchmark NCCL vs peer access using the same N+1 manager."""
+def _bench_method(name, run_fn, mgr, num_local, snap, peer_ctx=None):
+    args = (mgr, num_local, peer_ctx) if peer_ctx else (mgr, num_local)
     for _ in range(BENCHMARK_WARMUP):
         restore_weights(mgr, snap)
-        run_nccl_path(mgr, num_local)
-    for _ in range(BENCHMARK_WARMUP):
-        restore_weights(mgr, snap)
-        run_peer_access_path(mgr, num_local, peer_ctx)
-
+        run_fn(*args)
     torch.cuda.synchronize()
     dist.barrier()
 
-    nccl_times = []
+    times = []
     for _ in range(BENCHMARK_RUNS):
         restore_weights(mgr, snap)
         torch.cuda.synchronize()
         dist.barrier()
         t0 = time.perf_counter()
-        run_nccl_path(mgr, num_local)
+        run_fn(*args)
         torch.cuda.synchronize()
-        nccl_times.append(time.perf_counter() - t0)
+        times.append(time.perf_counter() - t0)
+    return times
 
-    pa_times = []
-    for _ in range(BENCHMARK_RUNS):
-        restore_weights(mgr, snap)
-        torch.cuda.synchronize()
-        dist.barrier()
-        t0 = time.perf_counter()
-        run_peer_access_path(mgr, num_local, peer_ctx)
-        torch.cuda.synchronize()
-        pa_times.append(time.perf_counter() - t0)
+
+def run_benchmark(
+    rank, world_size, tp_group, mgr, num_local, snap, peer_ctx,
+):
+    naive_times = _bench_method("naive", run_naive_path, mgr, num_local, snap)
+    overlap_times = _bench_method("overlap", run_overlap_path, mgr, num_local, snap)
+    pa_times = _bench_method("peer_access", run_peer_access_path, mgr, num_local, snap, peer_ctx)
 
     if rank == 0:
-        na = sum(nccl_times) / len(nccl_times)
-        nm = min(nccl_times)
-        nx = max(nccl_times)
-        pa = sum(pa_times) / len(pa_times)
-        pm = min(pa_times)
-        px = max(pa_times)
-        speedup = na / pa if pa > 0 else float("inf")
+        def _stats(t):
+            return sum(t) / len(t), min(t), max(t)
 
-        print(f"\n{'=' * 72}")
+        na, nm, nx = _stats(naive_times)
+        oa, om, ox = _stats(overlap_times)
+        pa, pm, px = _stats(pa_times)
+
+        print(f"\n{'=' * 80}")
         print(
             f"BENCHMARK ({NUM_LAYERS} layers, {NUM_EXPERTS} experts, "
             f"hidden={HIDDEN}, inter={INTERMEDIATE}, TP={world_size}, "
             f"runs={BENCHMARK_RUNS})"
         )
-        print(f"{'=' * 72}")
-        print(
-            f"  NCCL:         avg={na * 1000:8.3f}ms  "
-            f"min={nm * 1000:8.3f}ms  max={nx * 1000:8.3f}ms"
-        )
-        print(
-            f"  Peer Access:  avg={pa * 1000:8.3f}ms  "
-            f"min={pm * 1000:8.3f}ms  max={px * 1000:8.3f}ms"
-        )
-        print(f"  Speedup peer_access vs NCCL: {speedup:.2f}x")
-        print(f"{'=' * 72}")
+        print(f"{'=' * 80}")
+        print(f"  {'Method':<14s}  {'avg':>10s}  {'min':>10s}  {'max':>10s}  {'vs naive':>10s}")
+        print(f"  {'naive':<14s}  {na*1000:10.3f}  {nm*1000:10.3f}  {nx*1000:10.3f}  {'1.00x':>10s}")
+        print(f"  {'overlap':<14s}  {oa*1000:10.3f}  {om*1000:10.3f}  {ox*1000:10.3f}  {na/oa:10.2f}x")
+        print(f"  {'peer_access':<14s}  {pa*1000:10.3f}  {pm*1000:10.3f}  {px*1000:10.3f}  {na/pa:10.2f}x")
+        print(f"{'=' * 80}")
 
         print(f"\nPer-run times (ms):")
-        print(f"  {'Run':>4s}  {'NCCL':>10s}  {'Peer Access':>12s}")
+        print(f"  {'Run':>4s}  {'naive':>10s}  {'overlap':>10s}  {'peer_access':>12s}")
         for i in range(BENCHMARK_RUNS):
             print(
-                f"  {i:4d}  {nccl_times[i] * 1000:10.3f}  "
-                f"{pa_times[i] * 1000:12.3f}"
+                f"  {i:4d}  {naive_times[i]*1000:10.3f}  "
+                f"{overlap_times[i]*1000:10.3f}  {pa_times[i]*1000:12.3f}"
             )
 
 
@@ -539,7 +561,7 @@ def main():
         if rank == 0:
             print(
                 f"\nSUCCESS: All {NUM_LAYERS} layers × 2 weights × "
-                f"{world_size} ranks bitwise match (NCCL vs peer_access)!",
+                f"{world_size} ranks bitwise match (naive vs overlap vs peer_access)!",
                 flush=True,
             )
 

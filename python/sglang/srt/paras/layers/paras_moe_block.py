@@ -112,11 +112,7 @@ class ParaSMoeBlockMixin:
     # Weight redistribution helpers
     # ------------------------------------------------------------------
 
-    def paras_configure_tp_all_gather(self, stream=None, handles=None, async_op=False):
-        """
-        All-gather EP weights across DP group to prepare for TP conversion.
-        EP → DPxEP transformation.
-        """
+    def paras_configure_tp_all_gather(self, stream=None, handles=None, async_op=False, staging_suffix=""):
         handles = handles or []
 
         paras_dp_group = get_paras_dp_group().device_group
@@ -133,7 +129,7 @@ class ParaSMoeBlockMixin:
                     2 * self.moe_intermediate_size,
                     self.hidden_size,
                 )
-                self.w13_ep_gathered = mgr.get_view("staging.w13_a").view(
+                self.w13_ep_gathered = mgr.get_view(f"staging.w13_gather{staging_suffix}").view(
                     self.num_local_experts * paras_dp_size,
                     2 * self.moe_intermediate_size,
                     self.hidden_size,
@@ -146,14 +142,13 @@ class ParaSMoeBlockMixin:
                         async_op=True,
                     )
                 )
-                self.ep_experts.paras_drop_params("w13_weight")
 
                 w2_ep = self.ep_experts.w2_weight.data.view(
                     self.num_local_experts,
                     self.hidden_size,
                     self.moe_intermediate_size,
                 )
-                self.w2_ep_gathered = mgr.get_view("staging.w2_a").view(
+                self.w2_ep_gathered = mgr.get_view(f"staging.w2_gather{staging_suffix}").view(
                     self.num_local_experts * paras_dp_size,
                     self.hidden_size,
                     self.moe_intermediate_size,
@@ -166,25 +161,19 @@ class ParaSMoeBlockMixin:
                         async_op=True,
                     )
                 )
-                self.ep_experts.paras_drop_params("w2_weight")
 
                 self.num_local_experts *= paras_dp_size
             else:
-                w13_ep_gathered = self.ep_experts.w13_weight.data.view(
+                self.w13_ep_gathered = self.ep_experts.w13_weight.data.view(
                     self.num_local_experts,
                     2 * self.moe_intermediate_size,
                     self.hidden_size,
                 )
-                self.w13_ep_gathered = w13_ep_gathered
-                self.ep_experts.paras_drop_params("w13_weight")
-
-                w2_ep_gathered = self.ep_experts.w2_weight.data.view(
+                self.w2_ep_gathered = self.ep_experts.w2_weight.data.view(
                     self.num_local_experts,
                     self.hidden_size,
                     self.moe_intermediate_size,
                 )
-                self.w2_ep_gathered = w2_ep_gathered
-                self.ep_experts.paras_drop_params("w2_weight")
 
         if async_op:
             return all_gather_handles
@@ -192,12 +181,7 @@ class ParaSMoeBlockMixin:
             for handle in all_gather_handles:
                 handle.wait()
 
-    def paras_configure_tp_all_to_all(self, stream=None, handles=None):
-        """
-        All-to-all weight redistribution from DPxEP to DPxTP layout.
-        Uses static staging buffers from the memory manager instead of
-        dynamic allocation, and reuses the EP managed buffer for TP weights.
-        """
+    def paras_configure_tp_all_to_all(self, stream=None, handles=None, staging_suffix=""):
         handles = handles or []
 
         mgr = get_global_paras_memory_manager()
@@ -205,101 +189,83 @@ class ParaSMoeBlockMixin:
         paras_dp_size = get_paras_dp_size()
         paras_tp_group = get_paras_tp_group().device_group
         moe_intermediate_size_after_tp = self.moe_intermediate_size // paras_tp_size
+        layer_id = self._paras_layer_id
+        tp_w13_name = f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"
+        tp_w2_name = f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"
 
         with torch.cuda.stream(stream):
             for handle in handles:
                 handle.wait()
 
-            # -- w13: permute into staging, all-to-all back into gathered buf --
             w13_ep = self.w13_ep_gathered.view(
                 self.num_local_experts,
                 2,
                 paras_tp_size,
                 moe_intermediate_size_after_tp * self.hidden_size,
             )
-            # Use staging_b (dp>1) or staging_a (dp==1) for the permuted copy
-            w13_staging_name = "staging.w13_b" if paras_dp_size > 1 else "staging.w13_a"
-            w13_ep_permuted = mgr.get_view(w13_staging_name).view(
+            w13_ep_permuted = mgr.get_view(f"staging.w13_pre_permute{staging_suffix}").view(
                 paras_tp_size, self.num_local_experts, 2,
                 moe_intermediate_size_after_tp * self.hidden_size,
             )
             w13_ep_permuted.copy_(w13_ep.permute(2, 0, 1, 3))
-            w13_tp = self.w13_ep_gathered  # all-to-all writes into gathered buf
+
+            if paras_dp_size > 1:
+                w13_tp = self.w13_ep_gathered
+            else:
+                w13_tp = mgr.get_view(tp_w13_name).reshape(self.w13_ep_gathered.shape)
             w13_handle = dist.all_to_all_single(
                 output=w13_tp,
                 input=w13_ep_permuted.view(self.w13_ep_gathered.shape),
                 group=paras_tp_group,
-                 async_op=True,
+                async_op=True,
             )
 
-            # -- w2: same pattern --
             w2_ep = self.w2_ep_gathered.view(
-               self.num_local_experts,
-               self.hidden_size,
-               paras_tp_size,
-               moe_intermediate_size_after_tp,
+                self.num_local_experts,
+                self.hidden_size,
+                paras_tp_size,
+                moe_intermediate_size_after_tp,
             )
-            w2_staging_name = "staging.w2_b" if paras_dp_size > 1 else "staging.w2_a"
-            w2_ep_permuted = mgr.get_view(w2_staging_name).view(
-               paras_tp_size, self.num_local_experts, self.hidden_size,
-               moe_intermediate_size_after_tp,
+            w2_ep_permuted = mgr.get_view(f"staging.w2_pre_permute{staging_suffix}").view(
+                paras_tp_size, self.num_local_experts, self.hidden_size,
+                moe_intermediate_size_after_tp,
             )
             w2_ep_permuted.copy_(w2_ep.permute(2, 0, 1, 3))
-            w2_tp = self.w2_ep_gathered
+
+            if paras_dp_size > 1:
+                w2_tp = self.w2_ep_gathered
+            else:
+                w2_tp = mgr.get_view(tp_w2_name).reshape(self.w2_ep_gathered.shape)
             w2_handle = dist.all_to_all_single(
-               output=w2_tp,
-               input=w2_ep_permuted.view(self.w2_ep_gathered.shape),
-               group=paras_tp_group,
-               async_op=True,
+                output=w2_tp,
+                input=w2_ep_permuted.view(self.w2_ep_gathered.shape),
+                group=paras_tp_group,
+                async_op=True,
             )
 
-            # -- w13 post-processing: copy result into TP slot --
-            # N+1 layout: all-to-all wrote into EP slot (i+1). TP slot (i) is
-            # where tp_experts points, so we must copy there.
             w13_handle.wait()
-            tp_w13_shape = (self.num_global_experts, 2 * moe_intermediate_size_after_tp, self.hidden_size)
             if paras_dp_size > 1:
-                w13_post = mgr.get_view("staging.w13_b").view(
+                tp_w13_shape = (self.num_global_experts, 2 * moe_intermediate_size_after_tp, self.hidden_size)
+                w13_post = mgr.get_view(f"staging.w13_pre_permute{staging_suffix}").view(
                     paras_dp_size, paras_tp_size, -1
                 )
                 w13_post.copy_(
                     w13_tp.view(paras_tp_size, paras_dp_size, -1).transpose(0, 1)
                 )
-                tp_w13 = mgr.get_view_as(
-                    f"model.layers.{self._paras_layer_id}.mlp.tp_experts.w13_weight",
-                    tp_w13_shape,
-                )
+                tp_w13 = mgr.get_view_as(tp_w13_name, tp_w13_shape)
                 tp_w13.copy_(w13_post.view_as(tp_w13))
-            else:
-                # DP=1: data is already in EP slot (i+1) after all-to-all.
-                # Re-point tp_experts to EP slot (avoid extra copy).
-                tp_w13 = mgr.get_view_as(
-                    f"model.layers.{self._paras_layer_id}.mlp.ep_experts.w13_weight",
-                    tp_w13_shape,
-                )
-                self.tp_experts.w13_weight = torch.nn.Parameter(tp_w13, requires_grad=False)
 
-            # -- w2 post-processing: copy result into TP slot --
             w2_handle.wait()
-            tp_w2_shape = (self.num_global_experts, self.hidden_size, moe_intermediate_size_after_tp)
             if paras_dp_size > 1:
-                w2_post = mgr.get_view("staging.w2_b").view(
+                tp_w2_shape = (self.num_global_experts, self.hidden_size, moe_intermediate_size_after_tp)
+                w2_post = mgr.get_view(f"staging.w2_pre_permute{staging_suffix}").view(
                     paras_dp_size, paras_tp_size, -1
                 )
                 w2_post.copy_(
                     w2_tp.view(paras_tp_size, paras_dp_size, -1).transpose(0, 1)
                 )
-                tp_w2 = mgr.get_view_as(
-                    f"model.layers.{self._paras_layer_id}.mlp.tp_experts.w2_weight",
-                    tp_w2_shape,
-                )
+                tp_w2 = mgr.get_view_as(tp_w2_name, tp_w2_shape)
                 tp_w2.copy_(w2_post.view_as(tp_w2))
-            else:
-                tp_w2 = mgr.get_view_as(
-                    f"model.layers.{self._paras_layer_id}.mlp.ep_experts.w2_weight",
-                    tp_w2_shape,
-                )
-                self.tp_experts.w2_weight = torch.nn.Parameter(tp_w2, requires_grad=False)
 
     def paras_configure_tp_fused_peer_access_kernel(
         self,
@@ -330,24 +296,25 @@ class ParaSMoeBlockMixin:
         tp_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"]
 
         local_buffer_ptr = mgr._buffer.data_ptr()
-        I_prime_H = moe_intermediate_size_after_tp * self.hidden_size
-        E_local = self.num_local_experts
-        elem_size = ep_w13_entry.dtype.itemsize
+        dtype_bytes = ep_w13_entry.dtype.itemsize
 
         peer_access_fused_transfer_w13_v2(
             local_buffer_ptr, dst_base_ptrs,
             ep_w13_entry.offset_bytes, tp_w13_entry.offset_bytes,
-            paras_tp_rank, paras_tp_size, E_local, I_prime_H,
-            num_gates=2, elem_size=elem_size, stream=stream,
+            paras_tp_rank, paras_tp_size,
+            self.num_local_experts,
+            moe_intermediate_size_after_tp * self.hidden_size,
+            num_gates=2, elem_size=dtype_bytes, stream=stream,
         )
         peer_access_fused_transfer_w2_v2(
             local_buffer_ptr, dst_base_ptrs,
             ep_w2_entry.offset_bytes, tp_w2_entry.offset_bytes,
-            paras_tp_rank, paras_tp_size, E_local,
-            H=self.hidden_size,
-            I_full=self.moe_intermediate_size,
-            I_prime=moe_intermediate_size_after_tp,
-            elem_size=elem_size, stream=stream,
+            paras_tp_rank, paras_tp_size,
+            self.num_local_experts,
+            hidden_size=self.hidden_size,
+            full_intermediate=self.moe_intermediate_size,
+            tp_intermediate=moe_intermediate_size_after_tp,
+            elem_size=dtype_bytes, stream=stream,
         )
 
     # ------------------------------------------------------------------

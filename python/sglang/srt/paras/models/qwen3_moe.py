@@ -16,7 +16,6 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_world_size,
 )
-from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.utils import get_layer_id
@@ -163,8 +162,10 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         )
 
         moe_tp_size = get_moe_tensor_parallel_world_size()
-        use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         dp_size = get_paras_dp_size()
+
+        import os
+        configure_method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
 
         plan_qwen_moe_layout(
             manager,
@@ -179,10 +180,10 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             tp_size=get_paras_tp_size(),
             dp_size=dp_size,
             moe_tp_size=moe_tp_size,
-            use_triton_kernels=use_triton_kernels,
             quant_name=quant_name,
             fp8_block_size=fp8_block_size,
             num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
+            configure_method=configure_method,
             prefix="model",
         )
 

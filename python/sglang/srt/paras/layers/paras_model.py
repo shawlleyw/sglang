@@ -43,16 +43,14 @@ class ParaSModelMixin:
             layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
     def paras_configure_tp_overlap(self, paras_tp_size: int, paras_tp_rank: int):
-        """
-        Overlapped EP→TP conversion using dual CUDA streams for pipelining.
-        Overlaps the all-gather of layer i+1 with all-to-all of layer i.
-        """
         stream_1 = torch.cuda.Stream()
         stream_2 = torch.cuda.Stream()
+        staging_1 = "_1"
+        staging_2 = "_2"
 
         self.layers[0].paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
         last_layer_handles = self.layers[0].paras_configure_tp_mlp_all_gather(
-            stream_1, [], async_op=True
+            stream_1, [], async_op=True, staging_suffix=staging_1
         )
         nlayers = len(self.layers)
         for i, layer in enumerate(self.layers):
@@ -61,15 +59,16 @@ class ParaSModelMixin:
                 next_layer = self.layers[i + 1]
                 next_layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
                 new_handles = next_layer.paras_configure_tp_mlp_all_gather(
-                    stream_2, last_layer_handles, async_op=True
+                    stream_2, last_layer_handles, async_op=True, staging_suffix=staging_2
                 )
 
-            layer.paras_configure_tp_mlp_all_to_all(stream_1, last_layer_handles)
+            layer.paras_configure_tp_mlp_all_to_all(stream_1, last_layer_handles, staging_1)
             layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
             if not_last_layer:
                 last_layer_handles = new_handles
                 stream_1, stream_2 = stream_2, stream_1
+                staging_1, staging_2 = staging_2, staging_1
 
     def paras_configure_tp_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
         """EP→TP conversion using NVLink-optimized v2 peer access kernels for all layers.
@@ -100,12 +99,17 @@ class ParaSModelMixin:
             peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
         )
 
-        # Launch v2 kernels for each layer — no barriers between layers,
-        # N+1 slot design guarantees no inter-layer aliasing.
-        # No barrier needed at sweep start — scheduler ensures quiescence.
+        import torch.distributed as dist
+
+        paras_tp_group = get_paras_tp_group().device_group
+        barrier_tensor = torch.zeros(1, device="cuda")
+
         t2 = time.perf_counter()
+
         for layer in self.layers:
             layer.paras_configure_tp_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
+            dist.all_reduce(barrier_tensor, group=paras_tp_group)
+
         t3 = time.perf_counter()
 
         # Reconfigure attention + switch mode.

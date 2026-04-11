@@ -348,7 +348,13 @@ The old `ParaSWeightBuffer` class in `paras/layers/utils.py` is a dynamic pool t
 
 **Improvement**: Audit all usages and remove the class entirely once all callers use the manager's staging buffers.
 
-### 8. FP8 KV Cache Support
+### 8. FP8 Scale Transfer for Peer Access
+
+The peer access kernels transfer weight data (w13, w2) but do not yet handle FP8 scale tensors (`w13_weight_scale`, `w2_weight_scale`). For FP8 quantized models, these scales must also be redistributed during EP→TP switching via the same NVLink peer access mechanism.
+
+**Improvement**: Add scale transfer kernels or extend the existing v2 kernels to also copy the corresponding scale tensors alongside the weights.
+
+### 9. FP8 KV Cache Support
 
 The manager supports FP8 weight dtypes but the KV cache reservation currently uses BF16. FP8 KV cache would halve the KV memory, doubling the token capacity.
 

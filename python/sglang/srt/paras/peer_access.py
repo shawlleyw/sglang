@@ -201,13 +201,12 @@ def peer_access_fused_transfer_w13_v2(
     dst_tp_offset: int,
     tp_rank: int,
     tp_size: int,
-    E_local: int,
-    I_prime_H: int,
+    num_local_experts: int,
+    intermediate_per_tp_times_hidden: int,
     num_gates: int,
     elem_size: int = 2,
     stream=None,
 ) -> None:
-    """NVLink-optimized v2 w13 transfer with warp-level peer assignment."""
     import paras_peer_access_cuda
     stream_ptr = stream.cuda_stream if stream is not None else 0
     paras_peer_access_cuda.launch_peer_access_fused_transfer_w13_v2(
@@ -217,8 +216,8 @@ def peer_access_fused_transfer_w13_v2(
         dst_tp_offset,
         tp_rank,
         tp_size,
-        E_local,
-        I_prime_H,
+        num_local_experts,
+        intermediate_per_tp_times_hidden,
         num_gates,
         elem_size,
         stream_ptr,
@@ -232,14 +231,13 @@ def peer_access_fused_transfer_w2_v2(
     dst_tp_offset: int,
     tp_rank: int,
     tp_size: int,
-    E_local: int,
-    H: int,
-    I_full: int,
-    I_prime: int,
+    num_local_experts: int,
+    hidden_size: int,
+    full_intermediate: int,
+    tp_intermediate: int,
     elem_size: int = 2,
     stream=None,
 ) -> None:
-    """NVLink-optimized v2 w2 transfer with warp-level peer assignment."""
     import paras_peer_access_cuda
     stream_ptr = stream.cuda_stream if stream is not None else 0
     paras_peer_access_cuda.launch_peer_access_fused_transfer_w2_v2(
@@ -249,10 +247,10 @@ def peer_access_fused_transfer_w2_v2(
         dst_tp_offset,
         tp_rank,
         tp_size,
-        E_local,
-        H,
-        I_full * elem_size,    # I_full_bytes
-        I_prime * elem_size,   # I_prime_bytes
+        num_local_experts,
+        hidden_size,
+        full_intermediate * elem_size,
+        tp_intermediate * elem_size,
         stream_ptr,
     )
 

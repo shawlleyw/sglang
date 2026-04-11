@@ -455,91 +455,6 @@ def get_global_paras_memory_manager() -> Optional[ParaSMemoryManager]:
 # Qwen MoE layout planning
 # ---------------------------------------------------------------------------
 
-def _reserve_moe_weights(
-    manager: ParaSMemoryManager,
-    prefix: str,
-    layer_idx: int,
-    num_experts: int,
-    hidden_size: int,
-    intermediate_size: int,
-    ep_size: int,
-    moe_tp_size: int,
-    use_triton_kernels: bool,
-    quant_name: Optional[str],
-    fp8_block_size: Optional[int],
-) -> None:
-    """
-    Reserve EP MoE weight tensors (and FP8 scales) for one layer.
-
-    Only EP expert buffers are reserved. TP experts reuse the same buffer
-    region with a different view shape via ``get_view_as`` — the total byte
-    count is identical when ``ep_size == tp_size``.
-
-    Shape conventions must match what ``FusedMoE.__init__`` → ``create_weights``
-    actually produces at runtime:
-      - ``intermediate_size_per_partition = intermediate_size // moe_tp_size``
-      - BF16/FP16 with triton kernels: w13 = (E, H, 2*I'), w2 = (E, I', H)
-      - All other cases (FP8 / non-triton): w13 = (E, 2*I', H), w2 = (E, H, I')
-
-    where E = num_experts // ep_size, H = hidden_size,
-    I' = intermediate_size // moe_tp_size.
-    """
-    is_fp8 = quant_name == "fp8"
-    weight_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
-    lp = f"{prefix}.layers.{layer_idx}.mlp.experts"
-
-    # EP experts: subset of experts, intermediate partitioned by moe_tp_size
-    ep_local_experts = num_experts // ep_size
-    inter_per_partition = intermediate_size // moe_tp_size
-
-    # Shape depends on triton kernel usage (BF16 triton transposes dims)
-    if use_triton_kernels and not is_fp8:
-        w13_shape = (ep_local_experts, hidden_size, 2 * inter_per_partition)
-        w2_shape = (ep_local_experts, inter_per_partition, hidden_size)
-    else:
-        w13_shape = (ep_local_experts, 2 * inter_per_partition, hidden_size)
-        w2_shape = (ep_local_experts, hidden_size, inter_per_partition)
-
-    manager.reserve(f"{lp}.w13_weight", w13_shape, weight_dtype)
-    manager.reserve(f"{lp}.w2_weight", w2_shape, weight_dtype)
-
-    # --- FP8 scale tensors ------------------------------------------------
-    if is_fp8:
-        if fp8_block_size is not None and fp8_block_size > 0:
-            # Block-quantised scales — 3-D with ceil division
-            def _ceil(a: int, b: int) -> int:
-                return (a + b - 1) // b
-
-            w13_scale_shape = (
-                ep_local_experts,
-                _ceil(2 * inter_per_partition, fp8_block_size),
-                _ceil(hidden_size, fp8_block_size),
-            )
-            w2_scale_shape = (
-                ep_local_experts,
-                _ceil(hidden_size, fp8_block_size),
-                _ceil(inter_per_partition, fp8_block_size),
-            )
-            manager.reserve(
-                f"{lp}.w13_weight_scale", w13_scale_shape, torch.float32
-            )
-            manager.reserve(
-                f"{lp}.w2_weight_scale", w2_scale_shape, torch.float32
-            )
-        else:
-            # Per-tensor scales
-            manager.reserve(    
-                f"{lp}.w13_weight_scale",
-                (ep_local_experts, 2),
-                torch.float32,
-            )
-            manager.reserve(
-                f"{lp}.w2_weight_scale",
-                (ep_local_experts,),
-                torch.float32,
-            )
-
-
 def plan_qwen_moe_layout(
     manager: ParaSMemoryManager,
     *,
@@ -554,10 +469,10 @@ def plan_qwen_moe_layout(
     tp_size: int,
     dp_size: int,
     moe_tp_size: int,
-    use_triton_kernels: bool,
     quant_name: Optional[str] = None,
     fp8_block_size: Optional[int] = None,
     num_fused_shared_experts: int = 0,
+    configure_method: str = "peer_access",
     prefix: str = "model",
 ) -> None:
     """
@@ -581,21 +496,12 @@ def plan_qwen_moe_layout(
     """
     _validate_v1_scope(num_fused_shared_experts, quant_name)
 
-    # --- N+1 generic physical slots for MoE weights -----------------------
-    # Slot 0..N-1 hold TP views; slots 1..N hold EP views.
-    # EP layer i uses slot i+1, TP layer i uses slot i.
-    # This extra slot at the front ensures EP and TP buffers never alias
-    # during the fused peer access transfer.
     is_fp8 = quant_name == "fp8"
     weight_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
     ep_local_experts = num_experts // ep_size
     inter_per_partition = intermediate_size // moe_tp_size
-    if use_triton_kernels and not is_fp8:
-        w13_shape = (ep_local_experts, hidden_size, 2 * inter_per_partition)
-        w2_shape = (ep_local_experts, inter_per_partition, hidden_size)
-    else:
-        w13_shape = (ep_local_experts, 2 * inter_per_partition, hidden_size)
-        w2_shape = (ep_local_experts, hidden_size, inter_per_partition)
+    w13_shape = (ep_local_experts, 2 * inter_per_partition, hidden_size)
+    w2_shape = (ep_local_experts, hidden_size, inter_per_partition)
 
     for slot in range(num_layers + 1):
         manager.reserve(f"paras.moe_slot.{slot}.w13", w13_shape, weight_dtype)
@@ -655,34 +561,23 @@ def plan_qwen_moe_layout(
             torch.bfloat16,
         )
 
-    # -- Static staging buffers for EP→TP weight redistribution ------------
-    # Shared across all layers (reused layer-by-layer during switch).
-    # staging_a: all-gather destination (dp>1) or permuted input (dp==1)
-    # staging_b: permuted all-to-all input (dp>1), unused for dp==1
-    is_fp8 = quant_name == "fp8"
-    staging_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
-    staging_experts = (num_experts // ep_size) * dp_size
+    if configure_method != "peer_access":
+        staging_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
+        staging_experts = (num_experts // ep_size) * dp_size
+        w13_shape = (staging_experts, 2 * intermediate_size, hidden_size)
+        w2_shape = (staging_experts, hidden_size, intermediate_size)
 
-    manager.reserve(
-        "staging.w13_a",
-        (staging_experts, 2 * intermediate_size, hidden_size),
-        staging_dtype,
-    )
-    manager.reserve(
-        "staging.w13_b",
-        (staging_experts, 2 * intermediate_size, hidden_size),
-        staging_dtype,
-    )
-    manager.reserve(
-        "staging.w2_a",
-        (staging_experts, hidden_size, intermediate_size),
-        staging_dtype,
-    )
-    manager.reserve(
-        "staging.w2_b",
-        (staging_experts, hidden_size, intermediate_size),
-        staging_dtype,
-    )
+        if configure_method == "overlap":
+            suffixes = ("_1", "_2")
+        else:
+            suffixes = ("",)
+
+        for sfx in suffixes:
+            manager.reserve(f"staging.w13_pre_permute{sfx}", w13_shape, staging_dtype)
+            manager.reserve(f"staging.w2_pre_permute{sfx}", w2_shape, staging_dtype)
+            if dp_size > 1:
+                manager.reserve(f"staging.w13_gather{sfx}", w13_shape, staging_dtype)
+                manager.reserve(f"staging.w2_gather{sfx}", w2_shape, staging_dtype)
 
 
 # ---------------------------------------------------------------------------
