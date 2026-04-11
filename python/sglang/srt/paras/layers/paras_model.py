@@ -7,7 +7,6 @@ For a CausalLM class to support ParaS, define these methods:
 
     def paras_configure_helper(self):
         torch.cuda.synchronize()
-        paras_weight_buffer.release_all()
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
@@ -19,7 +18,7 @@ For a CausalLM class to support ParaS, define these methods:
 
 Where ``self.model`` is the transformer body (inheriting ParaSModelMixin).
 After the switch completes, paras_configure_helper() is called by @paras_func to
-synchronize CUDA and free the temporary weight redistribution buffers.
+synchronize CUDA.
 """
 
 import torch
