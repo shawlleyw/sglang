@@ -78,19 +78,19 @@ class ParaSMoeBlockMixin:
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
 
-        # Pre-register TP expert weights pointing to EP buffer with TP shape.
-        # Data is initially invalid (holds EP weights), but after EP→TP switch
-        # the all-to-all writes TP data into the same buffer in-place.
-        # This eliminates paras_load_params calls during the switch.
+        # Pre-register TP expert weights using TP alias entries.
+        # TP aliases point to slot i (one before EP slot i+1), so after the
+        # fused peer access transfer writes TP data into slot i, these views
+        # are already correct — no update_views() needed.
         mgr = get_global_paras_memory_manager()
         if mgr is not None and mgr.materialized:
             paras_tp_size = get_paras_tp_size()
             tp_inter = self.moe_intermediate_size // paras_tp_size
-            ep_w13_name = f"model.layers.{layer_id}.mlp.experts.w13_weight"
-            ep_w2_name = f"model.layers.{layer_id}.mlp.experts.w2_weight"
+            tp_w13_name = f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"
+            tp_w2_name = f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"
 
             tp_w13_view = mgr.get_view_as(
-                ep_w13_name,
+                tp_w13_name,
                 (self.num_global_experts, 2 * tp_inter, self.hidden_size),
             )
             w13_param = torch.nn.Parameter(tp_w13_view, requires_grad=False)
@@ -98,7 +98,7 @@ class ParaSMoeBlockMixin:
             self.tp_experts.register_parameter("w13_weight", w13_param)
 
             tp_w2_view = mgr.get_view_as(
-                ep_w2_name,
+                tp_w2_name,
                 (self.num_global_experts, self.hidden_size, tp_inter),
             )
             w2_param = torch.nn.Parameter(tp_w2_view, requires_grad=False)
@@ -317,17 +317,14 @@ class ParaSMoeBlockMixin:
         ep_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.experts.w13_weight"]
         ep_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.experts.w2_weight"]
 
-        if layer_id == 0:
-            tp_w13_entry = mgr._entries["paras.fused_tp_slot0.w13"]
-            tp_w2_entry = mgr._entries["paras.fused_tp_slot0.w2"]
-        else:
-            tp_w13_entry = mgr._entries[f"model.layers.{layer_id - 1}.mlp.experts.w13_weight"]
-            tp_w2_entry = mgr._entries[f"model.layers.{layer_id - 1}.mlp.experts.w2_weight"]
+        # TP alias entries — uniform lookup, no layer_id branching
+        tp_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"]
+        tp_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"]
 
         local_buffer_ptr = mgr._buffer.data_ptr()
         I_prime_H = moe_intermediate_size_after_tp * self.hidden_size
         E_local = self.num_local_experts
-        elem_size = 2  # bf16
+        elem_size = ep_w13_entry.dtype.itemsize
 
         peer_access_fused_transfer_w13_v2(
             local_buffer_ptr, dst_base_ptrs,
@@ -346,34 +343,16 @@ class ParaSMoeBlockMixin:
         )
 
     def paras_configure_tp_fused_peer_access(self, peer_ctx, stream=None):
-        """Convenience wrapper: kernel + barriers + view update for single-layer use (e.g. tests)."""
+        """Convenience wrapper: kernel + barriers for single-layer use (e.g. tests).
+
+        TP views already point to the correct slot from init — no update_views needed.
+        """
         paras_tp_group = get_paras_tp_group().device_group
         dst_base_ptrs = torch.tensor(peer_ctx.peer_addresses, dtype=torch.int64, device="cuda")
         torch.distributed.barrier(group=paras_tp_group)
         self.paras_configure_tp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
         torch.cuda.synchronize()
         torch.distributed.barrier(group=paras_tp_group)
-        self.paras_configure_tp_fused_peer_access_update_views()
-
-    def paras_configure_tp_fused_peer_access_update_views(self):
-        """Update TP expert weight views to point to the TP slot after fused transfer."""
-        mgr = get_global_paras_memory_manager()
-        paras_tp_size = get_paras_tp_size()
-        layer_id = self._paras_layer_id
-        moe_intermediate_size_after_tp = self.moe_intermediate_size // paras_tp_size
-        tp_inter = moe_intermediate_size_after_tp
-
-        if layer_id == 0:
-            tp_w13_name = "paras.fused_tp_slot0.w13"
-            tp_w2_name = "paras.fused_tp_slot0.w2"
-        else:
-            tp_w13_name = f"model.layers.{layer_id - 1}.mlp.experts.w13_weight"
-            tp_w2_name = f"model.layers.{layer_id - 1}.mlp.experts.w2_weight"
-
-        tp_w13_view = mgr.get_view_as(tp_w13_name, (self.num_global_experts, 2 * tp_inter, self.hidden_size))
-        tp_w2_view = mgr.get_view_as(tp_w2_name, (self.num_global_experts, self.hidden_size, tp_inter))
-        self.tp_experts.w13_weight = torch.nn.Parameter(tp_w13_view, requires_grad=False)
-        self.tp_experts.w2_weight = torch.nn.Parameter(tp_w2_view, requires_grad=False)
 
     # ------------------------------------------------------------------
     # Parallelism mode switching
