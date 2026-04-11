@@ -183,15 +183,38 @@ In all cases, the TP slot (slot `i`) holds valid TP data after the transfer, and
 
 #### Staging Buffer Requirements
 
-NCCL's `all_to_all_single` requires contiguous, permuted input. The permute step writes EP data into a staging buffer (`pre_permute`) before the collective reads from it. For DP>1, an additional all-gather staging buffer (`gather`) is needed. The overlap path requires two independent sets of buffers to avoid cross-stream races. Buffer names encode their purpose and stream affinity:
+NCCL's `all_to_all_single` requires contiguous, permuted input. Before calling the collective, EP weights are permuted (rearranging the TP dimension to the leading axis) and written into a **pre_permute** staging buffer. The all-to-all reads from this buffer and writes the result to either the TP slot (DP=1) or back to the gather buffer (DP>1, requiring a post-transpose).
 
-| Method | DP | Buffers | Names | Memory |
-|--------|-----|---------|-------|--------|
-| `naive` | =1 | 1 pre_permute | `staging.{w13,w2}_pre_permute` | ~580 MB |
-| `naive` | >1 | 1 pre_permute + 1 gather | `staging.{w13,w2}_{pre_permute,gather}` | ~1.16 GiB |
-| `overlap` | =1 | 2 pre_permute | `staging.{w13,w2}_pre_permute_{1,2}` | ~1.16 GiB |
-| `overlap` | >1 | 2 pre_permute + 2 gather | `staging.{w13,w2}_{pre_permute,gather}_{1,2}` | ~2.32 GiB |
-| `peer_access` | any | None | — | 0 |
+For DP>1, an additional **gather** staging buffer is needed because the all-gather step must first collect EP weights from all DP ranks into a contiguous region before the permute+all-to-all can proceed. The data flow for DP>1 is:
+
+```
+EP slot → [all-gather] → gather buffer → [permute] → pre_permute buffer
+    → [all-to-all] → gather buffer → [transpose] → pre_permute buffer → [copy] → TP slot
+```
+
+This reuses the two buffers alternately: gather receives the all-gather output and the all-to-all output, while pre_permute holds the permuted input and the transposed result. For DP=1, the all-gather is a no-op (EP weights are read directly from the EP slot), so only the pre_permute buffer is needed.
+
+The overlap path pipelines two layers on different streams. Each stream requires its own independent set of staging buffers to avoid cross-stream data races. This doubles the staging requirement.
+
+| Method | DP | Buffers per set | Sets | Buffer names | Memory |
+|--------|-----|----------------|------|--------------|--------|
+| `naive` | =1 | 1 pre_permute | 1 | `staging.{w13,w2}_pre_permute` | ~580 MB |
+| `naive` | >1 | 1 pre_permute + 1 gather | 1 | `staging.{w13,w2}_{pre_permute,gather}` | ~1.16 GiB |
+| `overlap` | =1 | 1 pre_permute | 2 | `staging.{w13,w2}_pre_permute_{1,2}` | ~1.16 GiB |
+| `overlap` | >1 | 1 pre_permute + 1 gather | 2 | `staging.{w13,w2}_{pre_permute,gather}_{1,2}` | ~2.32 GiB |
+| `peer_access` | any | None | 0 | — | 0 |
+
+**Memory formula** (Qwen3-30B-A3B, BF16):
+
+```
+E_local = num_experts / ep_size                           (e.g. 64/4 = 16)
+staging_experts = E_local × dp_size                       (e.g. 16×1 = 16 for DP=1)
+pre_permute size = staging_experts × (2×I×H + H×I) × 2B  (w13 + w2, BF16)
+                 = 16 × (2×1536×2048 + 2048×1536) × 2    = 580 MB
+gather size      = same as pre_permute                    = 580 MB  (DP>1 only)
+```
+
+For DP>1 the `staging_experts` grows by `dp_size`, making each buffer proportionally larger. With `dp_size=2`, each buffer is 2× larger (1.16 GiB), and the overlap path needs 4 such buffers (4.64 GiB total). This makes peer_access especially attractive for DP>1 configurations where staging memory pressure is highest.
 
 The `plan_qwen_moe_layout()` function accepts `configure_method` to reserve only the buffers needed, controlled by the `PARAS_CONFIGURE_METHOD` environment variable.
 
@@ -229,16 +252,25 @@ All numbers are for Qwen3-30B-A3B (48 MoE layers, 64 experts, hidden=2048, inter
 
 ### Memory Footprint (per GPU)
 
+**DP=1** (current production configuration):
+
 | Component | naive | overlap | peer_access |
 |-----------|------:|--------:|------------:|
 | N+1 MoE weight slots (49 × 288 MB) | 14.06 GiB | 14.06 GiB | 14.06 GiB |
-| Staging: pre_permute (580 MB × sets) | 0.57 GiB (×1) | 1.13 GiB (×2) | 0 |
-| Staging: gather (DP>1 only) | 0 | 0 | 0 |
+| Staging: pre_permute | 0.57 GiB (×1) | 1.13 GiB (×2) | 0 |
 | IPC peer buffer mappings | 0 | 0 | ~0 (virtual) |
-| NCCL all-reduce barrier tensor | 0 | 0 | 4 B |
 | **Total staging overhead** | **0.57 GiB** | **1.13 GiB** | **0** |
 
-For DP>1 (not currently used), naive adds 1 gather buffer (+0.57 GiB) and overlap adds 2 gather + 2 pre_permute buffers (+2.27 GiB total).
+**DP=2** (hypothetical, ep_size=2, tp_size=4):
+
+| Component | naive | overlap | peer_access |
+|-----------|------:|--------:|------------:|
+| N+1 MoE weight slots (49 × 288 MB) | 14.06 GiB | 14.06 GiB | 14.06 GiB |
+| Staging: pre_permute (1.16 GiB each) | 1.13 GiB (×1) | 2.27 GiB (×2) | 0 |
+| Staging: gather (1.16 GiB each) | 1.13 GiB (×1) | 2.27 GiB (×2) | 0 |
+| **Total staging overhead** | **2.27 GiB** | **4.54 GiB** | **0** |
+
+The staging overhead scales linearly with `dp_size` (each buffer grows by `dp_size×`) and with pipeline depth (overlap doubles the buffer count). At DP=2, the overlap path's 4.54 GiB staging cost approaches the size of 16 MoE layer slots — a significant fraction of available GPU memory. The peer_access path avoids this entirely.
 
 ### Latency Breakdown (E2E, `configure_tp`)
 
