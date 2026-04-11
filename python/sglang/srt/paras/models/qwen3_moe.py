@@ -25,7 +25,7 @@ from sglang.srt.paras.layers.paras_attention import ParaSAttentionMixin
 from sglang.srt.paras.layers.paras_decoder_layer import ParaSDecoderLayerMixin
 from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 from sglang.srt.paras.layers.paras_model import ParaSModelMixin
-from sglang.srt.paras.layers.utils import paras_load_tp_experts_weight
+
 from sglang.srt.paras.paras_memory_manager import (
     ParaSMemoryManager,
     create_paras_moe_aliases,
@@ -351,10 +351,6 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
                         expert_id=expert_id,
                     )
 
-                    # ParaS: also load into tp_experts
-                    paras_load_tp_experts_weight(
-                        params_dict, name, loaded_weight, shard_id, expert_id
-                    )
                     break
                 else:
                     if is_expert_weight:
