@@ -284,6 +284,69 @@ def peer_access_fused_transfer_w2(
     )
 
 
+def peer_access_fused_transfer_w13_v2(
+    local_buffer_ptr: int,
+    dst_base_ptrs_tensor: torch.Tensor,
+    src_ep_offset: int,
+    dst_tp_offset: int,
+    tp_rank: int,
+    tp_size: int,
+    E_local: int,
+    I_prime_H: int,
+    num_gates: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    """NVLink-optimized v2 w13 transfer with warp-level peer assignment."""
+    import paras_peer_access_cuda
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    paras_peer_access_cuda.launch_peer_access_fused_transfer_w13_v2(
+        local_buffer_ptr,
+        dst_base_ptrs_tensor,
+        src_ep_offset,
+        dst_tp_offset,
+        tp_rank,
+        tp_size,
+        E_local,
+        I_prime_H,
+        num_gates,
+        elem_size,
+        stream_ptr,
+    )
+
+
+def peer_access_fused_transfer_w2_v2(
+    local_buffer_ptr: int,
+    dst_base_ptrs_tensor: torch.Tensor,
+    src_ep_offset: int,
+    dst_tp_offset: int,
+    tp_rank: int,
+    tp_size: int,
+    E_local: int,
+    H: int,
+    I_full: int,
+    I_prime: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    """NVLink-optimized v2 w2 transfer with warp-level peer assignment."""
+    import paras_peer_access_cuda
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    paras_peer_access_cuda.launch_peer_access_fused_transfer_w2_v2(
+        local_buffer_ptr,
+        dst_base_ptrs_tensor,
+        src_ep_offset,
+        dst_tp_offset,
+        tp_rank,
+        tp_size,
+        E_local,
+        H,
+        I_full * elem_size,    # I_full_bytes
+        I_prime * elem_size,   # I_prime_bytes
+        stream_ptr,
+    )
+
+
 def peer_access_fused_transfer_combined(
     local_buffer_ptr: int,
     dst_base_ptrs_tensor: torch.Tensor,

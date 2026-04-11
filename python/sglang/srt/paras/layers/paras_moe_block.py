@@ -340,14 +340,14 @@ class ParaSMoeBlockMixin:
         dst_base_ptrs: torch.Tensor,
         stream=None,
     ):
-        """Launch fused peer access kernels for this layer. NO barriers — caller manages them.
+        """Launch NVLink-optimized v2 peer access kernels for this layer. NO barriers — caller manages them.
 
         The N+1 slot design guarantees no inter-layer aliasing:
           - Layer i reads local slot[i+1], writes to peer slot[i]
           - Layer i+1 reads local slot[i+2], writes to peer slot[i+1]
           - Different slots → no race → barriers only needed at sweep start/end.
         """
-        from sglang.srt.paras.peer_access import peer_access_fused_transfer, peer_access_fused_transfer_w2
+        from sglang.srt.paras.peer_access import peer_access_fused_transfer_w13_v2, peer_access_fused_transfer_w2_v2
 
         mgr = get_global_paras_memory_manager()
         paras_tp_size = get_paras_tp_size()
@@ -370,13 +370,13 @@ class ParaSMoeBlockMixin:
         E_local = self.num_local_experts
         elem_size = 2  # bf16
 
-        peer_access_fused_transfer(
+        peer_access_fused_transfer_w13_v2(
             local_buffer_ptr, dst_base_ptrs,
             ep_w13_entry.offset_bytes, tp_w13_entry.offset_bytes,
             paras_tp_rank, paras_tp_size, E_local, I_prime_H,
             num_gates=2, elem_size=elem_size, stream=stream,
         )
-        peer_access_fused_transfer_w2(
+        peer_access_fused_transfer_w2_v2(
             local_buffer_ptr, dst_base_ptrs,
             ep_w2_entry.offset_bytes, tp_w2_entry.offset_bytes,
             paras_tp_rank, paras_tp_size, E_local,

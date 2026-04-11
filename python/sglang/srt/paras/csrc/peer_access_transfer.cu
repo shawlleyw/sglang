@@ -173,6 +173,219 @@ void launch_peer_access_fused_transfer_w2(
 }
 
 // =============================================================================
+// V2 kernels: NVLink-optimized with warp-level peer assignment
+// Following NVLink store guidelines:
+//   - Grid: num_sms × tp_size blocks (divisible by tp_size for balanced load)
+//   - Block: 256 threads = 8 warps (occupancy target: 8 blocks/SM)
+//   - Peer assigned at warp level: peer = global_warp_id % tp_size
+//   - 8 unrolled int4 (16B) stores per thread (#pragma unroll)
+//   - Per warp: 32 lanes × 16B = 512B contiguous per store, 4KB per 8 stores
+// =============================================================================
+
+// V2 w13 kernel: warp-level peer assignment with NVLink-optimal access pattern.
+// EP layout: (E_local, num_gates, tp_size, I'H)
+// TP layout: (tp_size * E_local, num_gates, I'H) — contiguous per (e, k) chunk.
+__global__ void peer_access_fused_transfer_w13_v2(
+    const char* __restrict__ local_buffer,
+    char* const* __restrict__ peer_buffers,
+    int64_t src_ep_offset,
+    int64_t dst_tp_offset,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int64_t I_prime_H,
+    int num_gates,
+    int elem_size
+) {
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int global_warp = blockIdx.x * 8 + warp_in_block;
+    const int total_warps = gridDim.x * 8;
+
+    // Warp-level peer assignment (NVLink guideline)
+    const int peer = global_warp % tp_size;
+    const int warp_index = global_warp / tp_size;
+    const int warps_per_peer = total_warps / tp_size;
+
+    char* const dst_buf = peer_buffers[peer];
+
+    // Each chunk = one (expert, gate) pair: I'H * elem_size contiguous bytes
+    const int64_t chunk_bytes = I_prime_H * elem_size;
+    const int chunks_per_peer = E_local * num_gates;
+    const int64_t int4_per_chunk = chunk_bytes >> 4;  // / 16
+    const int64_t total_int4 = (int64_t)chunks_per_peer * int4_per_chunk;
+
+    // Destination base: tp_rank's expert slot (contiguous across all chunks)
+    const int64_t dst_expert_base = dst_tp_offset +
+        (int64_t)tp_rank * chunks_per_peer * chunk_bytes;
+
+    // 8 unrolled × 32 lanes = 256 int4 per warp per iteration = 4KB
+    int64_t pos = (int64_t)warp_index * 256 + lane;
+    const int64_t stride = (int64_t)warps_per_peer * 256;
+
+    while (pos < total_int4) {
+        #pragma unroll 8
+        for (int u = 0; u < 8; u++) {
+            const int64_t idx = pos + (int64_t)u * 32;
+            if (idx < total_int4) {
+                const int64_t chunk_id = idx / int4_per_chunk;
+                const int64_t in_chunk = idx - chunk_id * int4_per_chunk;
+
+                const int e = (int)(chunk_id / num_gates);
+                const int k = (int)(chunk_id - (int64_t)e * num_gates);
+
+                // Source: EP[e, k, peer, :] — strided layout
+                const int64_t src_off = src_ep_offset +
+                    (int64_t)(e * num_gates * tp_size + k * tp_size + peer) * chunk_bytes +
+                    in_chunk * 16;
+
+                // Dest: TP[tp_rank, e, k, :] — contiguous
+                const int64_t dst_off = dst_expert_base +
+                    (int64_t)(e * num_gates + k) * chunk_bytes +
+                    in_chunk * 16;
+
+                *reinterpret_cast<int4*>(dst_buf + dst_off) =
+                    *reinterpret_cast<const int4*>(local_buffer + src_off);
+            }
+        }
+        pos += stride;
+    }
+}
+
+void launch_peer_access_fused_transfer_w13_v2(
+    int64_t local_buffer_ptr,
+    int64_t* peer_buffer_ptrs,
+    int64_t src_ep_offset,
+    int64_t dst_tp_offset,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int64_t I_prime_H,
+    int num_gates,
+    int elem_size,
+    cudaStream_t stream
+) {
+    int device;
+    cudaGetDevice(&device);
+    int num_sms;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
+
+    // Grid divisible by tp_size for balanced warp-level peer assignment
+    int blocks = num_sms * tp_size;
+    int threads = 256;
+
+    peer_access_fused_transfer_w13_v2<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(local_buffer_ptr),
+        reinterpret_cast<char* const*>(peer_buffer_ptrs),
+        src_ep_offset, dst_tp_offset,
+        tp_rank, tp_size, E_local, I_prime_H, num_gates, elem_size
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA w13_v2 kernel error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+// V2 w2 kernel: warp-level peer assignment for strided row copies.
+// EP layout: (E_local, H, I_full) with TP split on last dim.
+// For peer r, copies columns [r*I_prime, (r+1)*I_prime) — contiguous within each row.
+__global__ void peer_access_fused_transfer_w2_v2(
+    const char* __restrict__ local_buffer,
+    char* const* __restrict__ peer_buffers,
+    int64_t src_ep_offset,
+    int64_t dst_tp_offset,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int H,
+    int I_full_bytes,
+    int I_prime_bytes
+) {
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int global_warp = blockIdx.x * 8 + warp_in_block;
+    const int total_warps = gridDim.x * 8;
+
+    const int peer = global_warp % tp_size;
+    const int warp_index = global_warp / tp_size;
+    const int warps_per_peer = total_warps / tp_size;
+
+    char* const dst_buf = peer_buffers[peer];
+
+    const int n_int4_per_row_dst = I_prime_bytes >> 4;  // I_prime_bytes / 16
+    const int peer_shard_byte_off = peer * I_prime_bytes;
+    const int64_t total_int4 = (int64_t)E_local * H * n_int4_per_row_dst;
+
+    // 8 unrolled × 32 lanes = 256 int4 per warp per iteration = 4KB
+    int64_t pos = (int64_t)warp_index * 256 + lane;
+    const int64_t stride = (int64_t)warps_per_peer * 256;
+
+    while (pos < total_int4) {
+        #pragma unroll 8
+        for (int u = 0; u < 8; u++) {
+            const int64_t idx = pos + (int64_t)u * 32;
+            if (idx < total_int4) {
+                // Decompose: idx → (e, h, col_in_shard)
+                const int64_t eh_idx = idx / n_int4_per_row_dst;
+                const int col = (int)(idx - eh_idx * (int64_t)n_int4_per_row_dst);
+                const int e = (int)(eh_idx / H);
+                const int h = (int)(eh_idx - (int64_t)e * H);
+
+                // Source: EP[e, h, peer*I_prime + col] — strided rows
+                const int64_t src_off = src_ep_offset +
+                    (int64_t)e * H * I_full_bytes +
+                    (int64_t)h * I_full_bytes +
+                    peer_shard_byte_off + col * 16;
+
+                // Dest: TP[(tp_rank*E_local+e), h, col]
+                const int64_t dst_off = dst_tp_offset +
+                    (int64_t)(tp_rank * E_local + e) * H * I_prime_bytes +
+                    (int64_t)h * I_prime_bytes + col * 16;
+
+                *reinterpret_cast<int4*>(dst_buf + dst_off) =
+                    *reinterpret_cast<const int4*>(local_buffer + src_off);
+            }
+        }
+        pos += stride;
+    }
+}
+
+void launch_peer_access_fused_transfer_w2_v2(
+    int64_t local_buffer_ptr,
+    int64_t* peer_buffer_ptrs,
+    int64_t src_ep_offset,
+    int64_t dst_tp_offset,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int H,
+    int I_full_bytes,
+    int I_prime_bytes,
+    cudaStream_t stream
+) {
+    int device;
+    cudaGetDevice(&device);
+    int num_sms;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
+
+    int blocks = num_sms * tp_size;
+    int threads = 256;
+
+    peer_access_fused_transfer_w2_v2<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(local_buffer_ptr),
+        reinterpret_cast<char* const*>(peer_buffer_ptrs),
+        src_ep_offset, dst_tp_offset,
+        tp_rank, tp_size, E_local, H, I_full_bytes, I_prime_bytes
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA w2_v2 kernel error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+// =============================================================================
 // Combined kernel: fuses w13 + w2 into a single launch per layer set
 // =============================================================================
 
