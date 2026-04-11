@@ -242,10 +242,10 @@ def run_nccl_path(mgr, num_local):
 
 
 def build_peer_access_manager(rank, world_size):
-    """Create ParaSMemoryManager with slot0 + EP weights + staging for peer access path."""
+    """Create ParaSMemoryManager with N+1 slots + staging for peer access path."""
     from sglang.srt.paras.paras_memory_manager import (
         ParaSMemoryManager,
-        create_tp_aliases,
+        create_moe_aliases,
         set_global_paras_memory_manager,
     )
 
@@ -254,29 +254,23 @@ def build_peer_access_manager(rank, world_size):
 
     mgr = ParaSMemoryManager(device=f"cuda:{rank}")
 
-    # Slot 0 for TP destination (layer 0)
-    mgr.reserve(
-        "paras.moe_slot0.w13",
-        (num_local, 2 * INTERMEDIATE, HIDDEN),
-        torch.bfloat16,
-    )
-    mgr.reserve(
-        "paras.moe_slot0.w2",
-        (num_local, HIDDEN, INTERMEDIATE),
-        torch.bfloat16,
-    )
-
-    for layer_id in range(NUM_LAYERS):
+    # N+1 generic physical slots
+    for slot in range(NUM_LAYERS + 1):
         mgr.reserve(
-            f"model.layers.{layer_id}.mlp.experts.w13_weight",
+            f"paras.moe_slot.{slot}.w13",
             (num_local, 2 * INTERMEDIATE, HIDDEN),
             torch.bfloat16,
         )
         mgr.reserve(
-            f"model.layers.{layer_id}.mlp.experts.w2_weight",
+            f"paras.moe_slot.{slot}.w2",
             (num_local, HIDDEN, INTERMEDIATE),
             torch.bfloat16,
         )
+
+    # Create 'experts' aliases (dict ref trick — same LayoutEntry, no duplication)
+    for i in range(NUM_LAYERS):
+        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[f"paras.moe_slot.{i+1}.w13"]
+        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[f"paras.moe_slot.{i+1}.w2"]
 
     staging_experts = num_local
     mgr.reserve("staging.w13_a", (staging_experts, 2 * INTERMEDIATE, HIDDEN), torch.bfloat16)
@@ -285,7 +279,7 @@ def build_peer_access_manager(rank, world_size):
     mgr.reserve("staging.w2_b", (staging_experts, HIDDEN, INTERMEDIATE), torch.bfloat16)
 
     mgr.materialize()
-    create_tp_aliases(mgr, NUM_LAYERS)
+    create_moe_aliases(mgr, NUM_LAYERS)
     set_global_paras_memory_manager(mgr)
     return mgr, num_local
 

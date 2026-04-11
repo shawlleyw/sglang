@@ -581,37 +581,57 @@ def plan_qwen_moe_layout(
     """
     _validate_v1_scope(num_fused_shared_experts, quant_name)
 
-    # Reserve slot 0 for fused peer access TP views (layer 0's TP destination)
-    # EP uses slots 1..N, TP uses slots 0..N-1. This extra slot at the front
-    # ensures EP and TP buffers never alias during the fused transfer.
+    # --- N+1 generic physical slots for MoE weights -----------------------
+    # Slot 0..N-1 hold TP views; slots 1..N hold EP views.
+    # EP layer i uses slot i+1, TP layer i uses slot i.
+    # This extra slot at the front ensures EP and TP buffers never alias
+    # during the fused peer access transfer.
+    is_fp8 = quant_name == "fp8"
+    weight_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
     ep_local_experts = num_experts // ep_size
     inter_per_partition = intermediate_size // moe_tp_size
-    if use_triton_kernels and quant_name is None:
-        _w13_shape = (ep_local_experts, hidden_size, 2 * inter_per_partition)
-        _w2_shape = (ep_local_experts, inter_per_partition, hidden_size)
+    if use_triton_kernels and not is_fp8:
+        w13_shape = (ep_local_experts, hidden_size, 2 * inter_per_partition)
+        w2_shape = (ep_local_experts, inter_per_partition, hidden_size)
     else:
-        _w13_shape = (ep_local_experts, 2 * inter_per_partition, hidden_size)
-        _w2_shape = (ep_local_experts, hidden_size, inter_per_partition)
-    manager.reserve("paras.moe_slot0.w13", _w13_shape, torch.bfloat16)
-    manager.reserve("paras.moe_slot0.w2", _w2_shape, torch.bfloat16)
+        w13_shape = (ep_local_experts, 2 * inter_per_partition, hidden_size)
+        w2_shape = (ep_local_experts, hidden_size, inter_per_partition)
+
+    for slot in range(num_layers + 1):
+        manager.reserve(f"paras.moe_slot.{slot}.w13", w13_shape, weight_dtype)
+        manager.reserve(f"paras.moe_slot.{slot}.w2", w2_shape, weight_dtype)
+
+    # Create 'experts' aliases for create_weights() / weight loading compatibility.
+    # These point to the same LayoutEntry objects as slot i+1 — no copy, no duplication.
+    # materialize() processes _reservation_order, so aliases won't be double-processed.
+    for i in range(num_layers):
+        manager._entries[f"{prefix}.layers.{i}.mlp.experts.w13_weight"] = manager._entries[f"paras.moe_slot.{i+1}.w13"]
+        manager._entries[f"{prefix}.layers.{i}.mlp.experts.w2_weight"] = manager._entries[f"paras.moe_slot.{i+1}.w2"]
 
     for i in range(num_layers):
-        # -- MoE weights (EP only — TP reuses same buffer via get_view_as) -
-        _reserve_moe_weights(
-            manager=manager,
-            prefix=prefix,
-            layer_idx=i,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            ep_size=ep_size,
-            moe_tp_size=moe_tp_size,
-            use_triton_kernels=use_triton_kernels,
-            quant_name=quant_name,
-            fp8_block_size=fp8_block_size,
-        )
-
         lp = f"{prefix}.layers.{i}"
+
+        # -- FP8 scale tensors (if applicable) -----------------------------
+        if is_fp8:
+            elp = f"{lp}.mlp.experts"
+            if fp8_block_size is not None and fp8_block_size > 0:
+                def _ceil(a: int, b: int) -> int:
+                    return (a + b - 1) // b
+                w13_scale_shape = (
+                    ep_local_experts,
+                    _ceil(2 * inter_per_partition, fp8_block_size),
+                    _ceil(hidden_size, fp8_block_size),
+                )
+                w2_scale_shape = (
+                    ep_local_experts,
+                    _ceil(hidden_size, fp8_block_size),
+                    _ceil(inter_per_partition, fp8_block_size),
+                )
+                manager.reserve(f"{elp}.w13_weight_scale", w13_scale_shape, torch.float32)
+                manager.reserve(f"{elp}.w2_weight_scale", w2_scale_shape, torch.float32)
+            else:
+                manager.reserve(f"{elp}.w13_weight_scale", (ep_local_experts, 2), torch.float32)
+                manager.reserve(f"{elp}.w2_weight_scale", (ep_local_experts,), torch.float32)
 
         # -- Attention weights ---------------------------------------------
         qkv_out = num_heads * head_dim + 2 * num_kv_heads * head_dim
@@ -666,33 +686,23 @@ def plan_qwen_moe_layout(
 
 
 # ---------------------------------------------------------------------------
-# TP alias creation (call after materialize)
+# MoE alias creation (call after materialize)
 # ---------------------------------------------------------------------------
 
-def create_tp_aliases(
+def create_moe_aliases(
     manager: ParaSMemoryManager,
     num_layers: int,
     prefix: str = "model",
 ) -> None:
     """
-    Create TP expert aliases using the N+1 slot virtual-to-physical mapping.
+    Create ep_experts and tp_experts aliases for the N+1 slot layout.
+    Call after materialize().
 
-    After materialize(), this registers TP alias names that point to the same
-    physical memory as the corresponding slot:
-
-      TP layer i → slot i:
-        - i == 0: points to ``paras.moe_slot0.{w13,w2}``
-        - i > 0:  points to ``{prefix}.layers.{i-1}.mlp.experts.{w13,w2}_weight``
-
-    This eliminates the need for ``update_views()`` after fused peer access
-    transfer — TP views are correct from init and never need re-pointing.
+    ep_experts layer i → slot i+1 (same physical buffer as EP weights)
+    tp_experts layer i → slot i   (one slot before EP, for fused transfer)
     """
     for i in range(num_layers):
-        if i == 0:
-            src_w13 = "paras.moe_slot0.w13"
-            src_w2 = "paras.moe_slot0.w2"
-        else:
-            src_w13 = f"{prefix}.layers.{i - 1}.mlp.experts.w13_weight"
-            src_w2 = f"{prefix}.layers.{i - 1}.mlp.experts.w2_weight"
-        manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w13_weight", src_w13)
-        manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w2_weight", src_w2)
+        manager.alias(f"{prefix}.layers.{i}.mlp.ep_experts.w13_weight", f"paras.moe_slot.{i+1}.w13")
+        manager.alias(f"{prefix}.layers.{i}.mlp.ep_experts.w2_weight", f"paras.moe_slot.{i+1}.w2")
+        manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w13_weight", f"paras.moe_slot.{i}.w13")
+        manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w2_weight", f"paras.moe_slot.{i}.w2")
