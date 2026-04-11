@@ -183,26 +183,28 @@ In all cases, the TP slot (slot `i`) holds valid TP data after the transfer, and
 
 #### Staging Buffer Requirements
 
-NCCL's `all_to_all_single` requires contiguous, permuted input. The permute step writes EP data into a staging buffer before the collective reads from it. The staging requirements differ by method:
+NCCL's `all_to_all_single` requires contiguous, permuted input. The permute step writes EP data into a staging buffer (`pre_permute`) before the collective reads from it. For DP>1, an additional all-gather staging buffer (`gather`) is needed. The overlap path requires two independent sets of buffers to avoid cross-stream races. Buffer names encode their purpose and stream affinity:
 
-| Method | Staging buffers | Memory cost | Reason |
-|--------|----------------|-------------|--------|
-| `naive` | 1 set (`staging.{w13,w2}_a`) | ~580 MB | Sequential — one layer at a time, reuses same buffer |
-| `overlap` | 2 sets (`staging.{w13,w2}_{a,b}`) | ~1.16 GiB | Pipelined — two layers in flight on different streams need separate buffers to avoid races |
-| `peer_access` | None (`skip_staging=True`) | 0 | Reads directly from EP slot with strided access |
+| Method | DP | Buffers | Names | Memory |
+|--------|-----|---------|-------|--------|
+| `naive` | =1 | 1 pre_permute | `staging.{w13,w2}_pre_permute` | ~580 MB |
+| `naive` | >1 | 1 pre_permute + 1 gather | `staging.{w13,w2}_{pre_permute,gather}` | ~1.16 GiB |
+| `overlap` | =1 | 2 pre_permute | `staging.{w13,w2}_pre_permute_{1,2}` | ~1.16 GiB |
+| `overlap` | >1 | 2 pre_permute + 2 gather | `staging.{w13,w2}_{pre_permute,gather}_{1,2}` | ~2.32 GiB |
+| `peer_access` | any | None | — | 0 |
 
-The `plan_qwen_moe_layout()` function accepts `skip_staging=True` to omit staging buffer reservation, controlled by the `PARAS_CONFIGURE_METHOD` environment variable.
+The `plan_qwen_moe_layout()` function accepts `configure_method` to reserve only the buffers needed, controlled by the `PARAS_CONFIGURE_METHOD` environment variable.
 
 #### Overlap Path: Dual-Stream Pipelining and NCCL Stream Behavior
 
-The overlap path pipelines the all-gather of layer `i+1` with the all-to-all of layer `i` using two CUDA streams (`stream_1`, `stream_2`). The streams and staging buffers swap each iteration:
+The overlap path pipelines the all-gather of layer `i+1` with the all-to-all of layer `i` using two CUDA streams (`stream_1`, `stream_2`). Each stream uses its own staging buffer set, identified by a suffix (`_1` or `_2`). The streams and suffixes swap each iteration:
 
 ```python
 stream_1, stream_2 = stream_2, stream_1
-staging_1, staging_2 = staging_2, staging_1  # "a" ↔ "b"
+staging_1, staging_2 = staging_2, staging_1  # "_1" ↔ "_2"
 ```
 
-**Why two staging buffers are required**: Without alternating, both layers write their permuted EP data to the same staging buffer concurrently on different streams — a data race. Alternating between `staging_a` and `staging_b` ensures each stream has its own buffer.
+**Why two staging buffer sets are required**: Without separate sets, both layers write their permuted EP data to the same `pre_permute` buffer concurrently on different streams — a data race. Each stream's suffix (`_1` or `_2`) selects an independent `pre_permute` (and for DP>1, `gather`) buffer.
 
 **NCCL stream behavior**: Despite being issued from different user streams (`stream_1`, `stream_2`), all NCCL collectives execute on a **single internal NCCL stream** managed by PyTorch's `ProcessGroupNCCL`. When `dist.all_to_all_single(async_op=True)` is called:
 
@@ -213,23 +215,72 @@ staging_1, staging_2 = staging_2, staging_1  # "a" ↔ "b"
 
 This means NCCL collectives **serialize** on the NCCL stream regardless of which user stream issued them. The overlap benefit comes from the **permute/copy** on user streams running concurrently with NCCL work, not from NCCL ops overlapping each other. In profiler traces, all `all_to_all` operations appear on the same NCCL stream.
 
-## Theoretical Analysis
+## Method Comparison: Memory Footprint and Latency
 
-For Qwen3-30B-A3B, 4×A100-80GB:
+All numbers are for Qwen3-30B-A3B (48 MoE layers, 64 experts, hidden=2048, intermediate=1536) on 4×A100-80GB SXM with NVLink.
+
+### Per-Layer Weight Sizes
+
+| Weight | Shape (EP, per GPU) | Size (BF16) |
+|--------|-------------------|-------------|
+| w13 (gate+up) | (16, 3072, 2048) | 192 MB |
+| w2 (down) | (16, 2048, 1536) | 96 MB |
+| **Total per layer** | | **288 MB** |
+
+### Memory Footprint (per GPU)
+
+| Component | naive | overlap | peer_access |
+|-----------|------:|--------:|------------:|
+| N+1 MoE weight slots (49 × 288 MB) | 14.06 GiB | 14.06 GiB | 14.06 GiB |
+| Staging: pre_permute (580 MB × sets) | 0.57 GiB (×1) | 1.13 GiB (×2) | 0 |
+| Staging: gather (DP>1 only) | 0 | 0 | 0 |
+| IPC peer buffer mappings | 0 | 0 | ~0 (virtual) |
+| NCCL all-reduce barrier tensor | 0 | 0 | 4 B |
+| **Total staging overhead** | **0.57 GiB** | **1.13 GiB** | **0** |
+
+For DP>1 (not currently used), naive adds 1 gather buffer (+0.57 GiB) and overlap adds 2 gather + 2 pre_permute buffers (+2.27 GiB total).
+
+### Latency Breakdown (E2E, `configure_tp`)
+
+Measured via `torch.profiler` with `PARAS_CONFIGURE_METHOD` env var. Each method was tested with a fresh server launch, 1 EP warmup request, then `paras_configure_tp`.
+
+| Phase | naive | overlap | peer_access |
+|-------|------:|--------:|------------:|
+| `gather_global_reqs` | 2.7 ms | 2.8 ms | 2.7 ms* |
+| `reorchestrate_cache` | 4.9 ms | 5.2 ms | 4.8 ms |
+| `gather_cache` | 7.4 ms | 7.3 ms | 7.4 ms |
+| **`transfer_weights`** | **96 ms** | **83 ms** | **61 ms** |
+| **`configure_tp` total** | **117 ms** | **100 ms** | **97 ms** |
+
+*Jitter in `gather_global_reqs` is scheduling-dependent, not method-dependent.
+
+### `transfer_weights` Decomposition
+
+| Sub-phase | naive | overlap | peer_access |
+|-----------|------:|--------:|------------:|
+| EP→staging permute (48 layers) | ~15 ms | ~15 ms (pipelined) | — |
+| NCCL all-to-all (48 layers) | ~55 ms | ~45 ms (pipelined) | — |
+| Peer access v2 kernels (48 layers) | — | — | **9 ms** |
+| NCCL all-reduce barriers (48×) | — | — | <0.5 ms |
+| Attn + TP reconfiguration | ~26 ms | ~23 ms | ~22 ms |
+| **Total** | **~96 ms** | **~83 ms** | **~61 ms** |
+
+The overlap path saves ~13 ms vs naive by pipelining the permute of layer `i+1` with the NCCL all-to-all of layer `i`. However, NCCL collectives serialize on a single internal stream, limiting the overlap to permute↔NCCL only.
+
+The peer access path eliminates both the permute and NCCL all-to-all, replacing them with direct NVLink stores that complete in 9 ms for all 48 layers.
+
+### Theoretical NVLink Analysis
 
 ```
-Per layer: 288 MB total (192 MB w13 + 96 MB w2)
-NVLink send per GPU per layer: 216 MB (3/4 to peers)
+NVLink send per GPU per layer: 216 MB (3/4 of 288 MB sent to 3 peers)
 NVLink send per GPU, 48 layers: 10.4 GB
-
 A100 NVLink bandwidth: ~150 GB/s unidirectional (achieved)
-Theoretical minimum: 10.4 GB / 150 GB/s = 69 ms (48 layers)
+Theoretical minimum: 10.4 GB / 150 GB/s = 69 ms
 
-Measured v2 kernel time: ~9 ms (48 layers) = way below NVLink-bound
-Measured transfer_weights: ~61 ms (includes attn/TP reconfiguration)
+Measured v2 kernel time: ~9 ms (48 layers)
 ```
 
-The v2 kernel time (9 ms) is well below the NVLink-bound theoretical minimum (69 ms), indicating kernel launch overhead, NCCL barrier overhead, and attn reconfiguration dominate the total `transfer_weights` time.
+The v2 kernel time (9 ms) is well below the NVLink-bound theoretical minimum (69 ms). This apparent discrepancy is because the 69 ms estimate assumes serial unidirectional transfer, while in practice all 4 GPUs write simultaneously and NVLink is bidirectional. With 4 GPUs each writing 3/4 of their data, the effective aggregate bandwidth is 4×150 = 600 GB/s, giving a theoretical minimum of 10.4 GB / (600/4) = 10.4 / 150 ≈ 69 ms per GPU — but each GPU only needs to *initiate* stores for its 3/4 share, and the NVLink fabric handles the routing in parallel. The measured 9 ms kernel time reflects the GPU's ability to saturate NVLink write buffers faster than the data can physically traverse the fabric; the actual transfer may still be in flight when the kernel retires, with visibility guaranteed by the NCCL all-reduce barrier before the next layer.
 
 ## File Map
 
