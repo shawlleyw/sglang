@@ -271,16 +271,13 @@ class ParaSMoeBlockMixin:
                 )
                 tp_w13.copy_(w13_post.view_as(tp_w13))
             else:
-                # DP=1: copy from EP slot (i+1) to TP slot (i)
-                ep_w13 = mgr.get_view_as(
+                # DP=1: data is already in EP slot (i+1) after all-to-all.
+                # Re-point tp_experts to EP slot (avoid extra copy).
+                tp_w13 = mgr.get_view_as(
                     f"model.layers.{self._paras_layer_id}.mlp.ep_experts.w13_weight",
                     tp_w13_shape,
                 )
-                tp_w13 = mgr.get_view_as(
-                    f"model.layers.{self._paras_layer_id}.mlp.tp_experts.w13_weight",
-                    tp_w13_shape,
-                )
-                tp_w13.copy_(ep_w13)
+                self.tp_experts.w13_weight = torch.nn.Parameter(tp_w13, requires_grad=False)
 
             # -- w2 post-processing: copy result into TP slot --
             w2_handle.wait()
@@ -298,16 +295,11 @@ class ParaSMoeBlockMixin:
                 )
                 tp_w2.copy_(w2_post.view_as(tp_w2))
             else:
-                # DP=1: copy from EP slot (i+1) to TP slot (i)
-                ep_w2 = mgr.get_view_as(
+                tp_w2 = mgr.get_view_as(
                     f"model.layers.{self._paras_layer_id}.mlp.ep_experts.w2_weight",
                     tp_w2_shape,
                 )
-                tp_w2 = mgr.get_view_as(
-                    f"model.layers.{self._paras_layer_id}.mlp.tp_experts.w2_weight",
-                    tp_w2_shape,
-                )
-                tp_w2.copy_(ep_w2)
+                self.tp_experts.w2_weight = torch.nn.Parameter(tp_w2, requires_grad=False)
 
     def paras_configure_tp_fused_peer_access_kernel(
         self,
