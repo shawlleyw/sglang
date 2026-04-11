@@ -1,0 +1,8 @@
+[build-system]
+requires = ["setuptools", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paras_peer_access_cuda"
+version = "0.1.0"
+description = "ParaS CUDA peer access transfer kernels"

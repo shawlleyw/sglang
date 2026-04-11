@@ -49,11 +49,15 @@ class ParaSDecoderLayerMixin:
         self.mlp.paras_configure_tp_all_gather()
         self.mlp.paras_configure_tp_all_to_all()
 
-    def paras_configure_tp_mlp_all_gather(self, stream, handles, async_op=False):
-        return self.mlp.paras_configure_tp_all_gather(stream, handles, async_op)
+    def paras_configure_tp_mlp_all_gather(self, stream, handles, async_op=False, staging_suffix=""):
+        return self.mlp.paras_configure_tp_all_gather(stream, handles, async_op, staging_suffix)
 
-    def paras_configure_tp_mlp_all_to_all(self, stream, handles):
-        return self.mlp.paras_configure_tp_all_to_all(stream, handles)
+    def paras_configure_tp_mlp_all_to_all(self, stream, handles, staging_suffix=""):
+        return self.mlp.paras_configure_tp_all_to_all(stream, handles, staging_suffix)
+
+    def paras_configure_tp_mlp_fused_peer_access_kernel(self, peer_ctx, dst_base_ptrs, stream):
+        """Launch fused kernels for this layer (no barriers — model level manages them)."""
+        return self.mlp.paras_configure_tp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):

@@ -16,7 +16,6 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_world_size,
 )
-from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.utils import get_layer_id
@@ -26,13 +25,14 @@ from sglang.srt.paras.layers.paras_attention import ParaSAttentionMixin
 from sglang.srt.paras.layers.paras_decoder_layer import ParaSDecoderLayerMixin
 from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 from sglang.srt.paras.layers.paras_model import ParaSModelMixin
-from sglang.srt.paras.layers.utils import paras_load_tp_experts_weight
+
 from sglang.srt.paras.paras_memory_manager import (
     ParaSMemoryManager,
+    create_paras_moe_aliases,
     plan_qwen_moe_layout,
     set_global_paras_memory_manager,
 )
-from sglang.srt.paras.paras_parallel_state import get_paras_dp_size, get_paras_tp_size
+from sglang.srt.paras.paras_parallel_state import get_paras_dp_size, get_paras_tp_group, get_paras_tp_size
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -162,8 +162,10 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         )
 
         moe_tp_size = get_moe_tensor_parallel_world_size()
-        use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         dp_size = get_paras_dp_size()
+
+        import os
+        configure_method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
 
         plan_qwen_moe_layout(
             manager,
@@ -178,10 +180,10 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             tp_size=get_paras_tp_size(),
             dp_size=dp_size,
             moe_tp_size=moe_tp_size,
-            use_triton_kernels=use_triton_kernels,
             quant_name=quant_name,
             fp8_block_size=fp8_block_size,
             num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
+            configure_method=configure_method,
             prefix="model",
         )
 
@@ -237,15 +239,31 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         # --- End KV budget computation ----------------------------------------
 
         total_bytes = manager.materialize()
+        create_paras_moe_aliases(manager, config.num_hidden_layers, prefix="model")
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
 
         # Set global so create_weights() can find the manager
         set_global_paras_memory_manager(manager)
 
+        # Pre-initialize NVLink peer access during model init to avoid 6s overhead at switch time.
+        # cudaDeviceEnablePeerAccess() and cudaIpcOpenMemHandle() are slow on first call.
+        try:
+            from sglang.srt.paras.peer_access import init_peer_access
+            self._fused_peer_access_ctx = init_peer_access(
+                manager, get_paras_tp_group().device_group, get_paras_tp_size()
+            )
+            logger.info("ParaS fused peer access pre-initialized.")
+        except Exception as e:
+            logger.warning(f"ParaS fused peer access pre-init failed (will retry at switch): {e}")
+            self._fused_peer_access_ctx = None
+
         self.model = Qwen3MoeModelParaS(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        # Inject pre-initialized peer access context so the switch doesn't pay 6s init cost
+        if self._fused_peer_access_ctx is not None:
+            self.model._peer_access_ctx = self._fused_peer_access_ctx
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -333,10 +351,6 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
                         expert_id=expert_id,
                     )
 
-                    # ParaS: also load into tp_experts
-                    paras_load_tp_experts_weight(
-                        params_dict, name, loaded_weight, shard_id, expert_id
-                    )
                     break
                 else:
                     if is_expert_weight:
@@ -367,11 +381,13 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         )
 
     def paras_configure_helper(self):
-        torch.cuda.synchronize()
+        pass
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
-        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
+        import os
+        method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
+        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank, method=method)
 
     @paras_func
     def paras_configure_ep(self):
