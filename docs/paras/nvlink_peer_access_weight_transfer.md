@@ -2,14 +2,15 @@
 
 ## Overview
 
-This document describes the NVLink peer access weight transfer optimization for the ParaS EP→TP parallelism switch. Instead of using NCCL `all_to_all` collectives for MoE weight redistribution, we use custom CUDA kernels that write directly to peer GPU memory via NVLink, achieving a **1.23× speedup** over NCCL on Qwen3-30B-A3B with 4×A100-80GB.
+This document describes the NVLink peer access weight transfer optimization for the ParaS EP→TP parallelism switch. Instead of using NCCL `all_to_all` collectives for MoE weight redistribution, we use custom CUDA kernels that write directly to peer GPU memory via NVLink, achieving a **1.56× speedup** over NCCL sequential on Qwen3-30B-A3B with 4×H100-80GB.
 
 ### Performance Summary
 
-| Method | 8 layers | 48 layers (projected) | vs NCCL |
-|--------|----------|----------------------|---------|
-| NCCL `all_to_all` | 18.2ms | ~109ms | baseline |
-| Peer access (NVLink direct) | 14.7ms | ~88ms | **1.23×** |
+| Method | transfer_weights | configure TP total | vs naive |
+|--------|-----------------|-------------------|----------|
+| `naive` (NCCL sequential) | ~114ms | ~145ms | baseline |
+| `overlap` (NCCL pipelined) | ~95ms | ~127ms | 1.14× |
+| `peer_access` (NVLink direct) | **~73ms** | **~88ms** | **1.56×** |
 
 ## Background
 
@@ -56,25 +57,20 @@ Buffer slots:  [ slot 0 | slot 1 | slot 2 | ... | slot N ]
 
 This eliminates the aliasing race condition without staging buffers. The overhead is 1 extra layer slot ≈ 288 MB (0.4% of 65 GiB total).
 
-**Virtual-to-physical slot mapping**: The memory manager's `alias()` method creates virtual entries that map to the same physical offset as a target entry. After `materialize()`, `create_tp_aliases()` registers two aliases per layer — an EP alias (`model.layers.{i}.mlp.experts.*`) pointing to slot `i+1`, and a TP alias (`model.layers.{i}.mlp.tp_experts.*`) pointing to slot `i`. Both views are created at model init time and never change, eliminating the need for `update_views()` after fused transfer. The kernel and MoeBlock code use uniform TP alias lookups with no `layer_id == 0` branching.
+**Virtual-to-physical slot mapping**: The memory manager's `alias()` method creates virtual entries that map to the same physical offset as a target entry. After `materialize()`, `create_paras_moe_aliases()` registers three alias families per layer:
+- `model.layers.{i}.mlp.experts.*` → slot `i+1` (weight loading compatibility)
+- `model.layers.{i}.mlp.ep_experts.*` → slot `i+1` (explicit EP)
+- `model.layers.{i}.mlp.tp_experts.*` → slot `i` (explicit TP)
+
+Both EP and TP views are created at model init time and never change, eliminating the need for `update_views()` after the transfer.
 
 **Layer ordering constraint**: EP→TP must process layers in forward order (0, 1, 2, ..., N-1). Layer `i+1`'s write to slot `i+1` must not overlap with layer `i`'s read from slot `i+1`. Sequential kernel launches on the same CUDA stream enforce this ordering.
 
-### 3. Process Streamline: Barrier Placement
+### 3. Synchronization
 
-**Initial design** (96 barriers, 4+ seconds): Two `dist.barrier()` calls per layer — before peer writes and after peer writes. With 48 layers, this produced 96 barriers at ~40ms each.
+The peer access path requires **no explicit barriers or synchronization** in the model-level method. The N+1 slot design prevents inter-layer aliasing, and sequential kernel launches on the same CUDA stream enforce ordering. After all layers complete, `ParaSModelMixin.paras_configure_helper()` calls `torch.cuda.synchronize()` (invoked automatically by the `@paras_func` decorator).
 
-**Optimized design** (0 barriers): Since the N+1 slot design eliminates inter-layer aliasing and the scheduler ensures quiescence before the switch, no barriers are needed in the model-level method:
-
-```python
-for layer in layers:
-    launch_kernel(layer)     # No barriers between layers
-for layer in layers:
-    configure_tp_attn(layer) # Reconfigure attention
-    configure_tp(layer)      # Switch to TP mode (views already correct)
-```
-
-TP views point to the correct physical slots from init (via virtual-to-physical alias mapping), so no `update_views()` pass is needed. The per-layer convenience wrapper retains barriers for standalone test use.
+For the NCCL overlap path, `stream.synchronize()` ensures non-default streams complete before the helper's global sync.
 
 ### 4. Kernel Design: NVLink Store Optimization
 
@@ -156,6 +152,16 @@ Destination: row h of expert (tp_rank × E_local + e) on peer r
 
 Both reads and writes are coalesced within each row. The row stride causes 25% HBM cache utilization (read 768B from 3072B cache line), but HBM bandwidth (3.35 TB/s) is not the bottleneck — NVLink (150 GB/s) is.
 
+### NCCL Path Compatibility
+
+The N+1 slot design is not exclusive to peer access — the NCCL naive and overlap paths also use it. This means all three methods share the same memory layout and alias structure:
+
+- **All-to-all output target**: NCCL writes directly to the TP slot (slot `i`) for each layer. Since `tp_experts` already points to slot `i` from init, no copy or view update is needed after the collective completes.
+- **Staging buffers still required**: NCCL's `all_to_all_single` requires contiguous, permuted input. The permute step writes EP data into a staging buffer before the collective reads from it. Staging buffers are reserved when `skip_staging=False` (the default for naive/overlap methods).
+- **No staging for peer access**: The peer access kernel reads directly from the EP slot with strided access, bypassing the permute step entirely. Staging buffers are skipped via `skip_staging=True`.
+
+In all cases, the TP slot (slot `i`) holds valid TP data after the transfer, and `tp_experts` views remain correct without any post-transfer alias updates.
+
 ## Theoretical Analysis
 
 For Qwen3-30B-A3B, 4×A100-80GB:
@@ -182,9 +188,9 @@ The 22% gap is primarily from integer division overhead in index computation and
 | `paras/csrc/setup.py` | Standalone CUDA extension build (`pip install -e`) |
 | `paras/peer_access.py` | Peer access init (IPC handles), Python kernel wrappers |
 | `paras/layers/paras_moe_block.py` | Per-layer kernel launch (`paras_configure_tp_fused_peer_access_kernel`) |
-| `paras/layers/paras_model.py` | Model-level orchestration with 2-barrier design |
+| `paras/layers/paras_model.py` | No-barrier orchestration, `@paras_func` handles sync via `paras_configure_helper()` |
 | `paras/models/qwen3_moe.py` | Pre-initializes peer access during model load |
-| `paras/paras_memory_manager.py` | N+1 slot reservation (`paras.moe_slot0.*`), `alias()`, `create_tp_aliases()` |
+| `paras/paras_memory_manager.py` | N+1 slot reservation (`paras.moe_slot.{0..N}.*`), `alias()`, `create_paras_moe_aliases()` |
 | `test/srt/test_paras_peer_access.py` | 4-GPU correctness + benchmark test |
 
 ## Future Work

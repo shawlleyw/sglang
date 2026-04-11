@@ -36,65 +36,66 @@ For a 2-GPU setup with `ep_size=2, tp_size=2, paras_tp_size=2`:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Contiguous uint8 Buffer (~65 GiB)            │
+│                    Contiguous uint8 Buffer                       │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  ┌─── Per-Layer Weights (×48 layers) ────────────────────────┐  │
-│  │  EP MoE w13_weight  (64, 2048, 1536) bf16   ~386 MB      │  │
-│  │  EP MoE w2_weight   (64, 768, 2048)  bf16   ~193 MB      │  │
-│  │  QKV full weight    (2560, 2048)     bf16   ~10 MB       │  │
-│  │  O_proj weight      (2048, 2048)     bf16   ~8 MB        │  │
-│  │  QKV TP buffer      (640, 2048)      bf16   ~2.5 MB      │  │
-│  │  KV cache K         (ep_tokens+1, 4, 128) bf16           │  │
-│  │  KV cache V         (ep_tokens+1, 4, 128) bf16           │  │
-│  └───────────────────────────────────────────────────────────┘  │
+│  ┌─── MoE Weight Slots (×(N+1) = 49 for 48 layers) ─────────┐  │
+│  │  paras.moe_slot.0.w13  (16, 3072, 2048) bf16  ~192 MB    │  │
+│  │  paras.moe_slot.0.w2   (16, 2048, 1536) bf16  ~96 MB     │  │
+│  │  ...                                                       │  │
+│  │  paras.moe_slot.48.w13 (16, 3072, 2048) bf16  ~192 MB    │  │
+│  │  paras.moe_slot.48.w2  (16, 2048, 1536) bf16  ~96 MB     │  │
+│  └────────────────────────────────────────────────────────────┘  │
 │                                                                 │
-│  ┌─── Staging Buffers (shared across all layers) ────────────┐  │
-│  │  staging.w13_a      (64, 1536, 2048) bf16   ~386 MB      │  │
-│  │  staging.w13_b      (64, 1536, 2048) bf16   ~386 MB      │  │
-│  │  staging.w2_a       (64, 2048, 768)  bf16   ~193 MB      │  │
-│  │  staging.w2_b       (64, 2048, 768)  bf16   ~193 MB      │  │
-│  └───────────────────────────────────────────────────────────┘  │
+│  ┌─── Per-Layer Attention + KV (×48 layers) ─────────────────┐  │
+│  │  QKV full weight    (2560, 2048)     bf16   ~10 MB        │  │
+│  │  O_proj weight      (2048, 2048)     bf16   ~8 MB         │  │
+│  │  QKV TP buffer      (640, 2048)      bf16   ~2.5 MB       │  │
+│  │  KV cache K         (ep_tokens+1, 4, 128) bf16            │  │
+│  │  KV cache V         (ep_tokens+1, 4, 128) bf16            │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  ┌─── Staging Buffers (NCCL path only, optional) ────────────┐  │
+│  │  staging.w13_a/b, staging.w2_a/b   ~1.16 GB total         │  │
+│  │  (Skipped when using peer_access method)                   │  │
+│  └────────────────────────────────────────────────────────────┘  │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 Each entry is 256-byte aligned. All tensors share one backing allocation.
 
-### Union Layout: EP and TP Views Over the Same Bytes
+### N+1 Slot Layout with EP/TP Aliases
 
-The key insight is that EP and TP modes use the **same total bytes** per module when `ep_size == tp_size`:
+EP and TP modes use the **same total bytes** per MoE module when `ep_size == tp_size`. However, they cannot share the same physical memory during the transfer — one GPU reads its EP data while another writes TP data simultaneously. The N+1 slot design solves this.
 
-**MoE Weights:**
-```
-EP: (num_experts / ep_size) × hidden × 2 × intermediate  elements
-TP: num_experts × hidden × 2 × (intermediate / tp_size)  elements
-    ────────────────────────────────────────────────────
-    Equal when ep_size == tp_size
-```
+**Physical slots**: The manager reserves N+1 identical MoE weight slots (`paras.moe_slot.0` through `paras.moe_slot.N`) for a model with N layers.
 
-**KV Cache:**
+**Virtual-to-physical mapping** (via `alias()`):
 ```
-EP: ep_tokens × total_kv_heads × head_dim  elements
-TP: tp_tokens × (total_kv_heads / tp_size) × head_dim  elements
-    where tp_tokens = ep_tokens × tp_size
-    ────────────────────────────────────────────────────
-    Equal (same total bytes, different shape interpretation)
+Physical slots:  [ slot 0 | slot 1 | slot 2 | ... | slot N ]
+
+experts     (weight loading):  layer i → slot i+1
+ep_experts  (explicit EP):     layer i → slot i+1
+tp_experts  (explicit TP):     layer i → slot i
 ```
 
-This enables the "union layout" — one buffer region serves both modes via `get_view_as()`:
+- `model.layers.{i}.mlp.experts.w13_weight` → slot i+1 (for `create_weights()` and checkpoint loading)
+- `model.layers.{i}.mlp.ep_experts.w13_weight` → slot i+1 (explicit EP alias)
+- `model.layers.{i}.mlp.tp_experts.w13_weight` → slot i (explicit TP alias)
+
+The `experts` aliases are created before `materialize()` (as dict references to the same `LayoutEntry` objects) so that `create_weights()` in `unquant.py` can find them during model construction. The `ep_experts` and `tp_experts` aliases are created after `materialize()` via `create_paras_moe_aliases()`.
+
+Both EP and TP views are established at model init time and **never change** — eliminating the need for `update_views()` after weight transfer.
 
 ```python
-# EP mode: (64 experts, 2048 hidden, 1536 intermediate)
-ep_view = manager.get_view("model.layers.0.mlp.experts.w13_weight")
-# shape: (64, 2048, 1536)
+# EP mode: layer 0's weights at slot 1
+ep_view = manager.get_view("model.layers.0.mlp.ep_experts.w13_weight")
 
-# TP mode: same bytes, different shape (128 experts, 768 intermediate)
-tp_view = manager.get_view_as(
-    "model.layers.0.mlp.experts.w13_weight",
-    (128, 768, 2048),
-)
-# Same data_ptr, same byte count, different shape
+# TP mode: layer 0's weights at slot 0 (different physical memory)
+tp_view = manager.get_view("model.layers.0.mlp.tp_experts.w13_weight")
+
+# ep_view.data_ptr() != tp_view.data_ptr() — separate slots, no aliasing
 ```
 
 ## Lifecycle
@@ -102,20 +103,28 @@ tp_view = manager.get_view_as(
 ### 1. Planning Phase (model `__init__`)
 
 ```
-plan_qwen_moe_layout(manager, ...)
+plan_qwen_moe_layout(manager, ..., skip_staging=False)
+    │
+    ├── Reserve N+1 MoE weight slots:
+    │   └── paras.moe_slot.{0..N}.w13, paras.moe_slot.{0..N}.w2
+    │
+    ├── Create 'experts' aliases (before materialize):
+    │   └── model.layers.{i}.mlp.experts.w13_weight → slot i+1
     │
     ├── For each layer:
-    │   ├── Reserve EP MoE weights (w13, w2)
-    │   ├── Reserve attention weights (QKV full, O_proj, QKV TP buffer)
-    │   └── (FP8: also reserve scale tensors)
+    │   └── Reserve attention weights (QKV full, O_proj, QKV TP buffer)
     │
-    └── Reserve staging buffers (w13_a/b, w2_a/b)
+    ├── (If not skip_staging): Reserve staging buffers (w13_a/b, w2_a/b)
+    │
+    └── (FP8: also reserve scale tensors per layer)
+
+After materialize():
+    create_paras_moe_aliases(manager, num_layers)
+        ├── ep_experts alias: layer i → slot i+1
+        └── tp_experts alias: layer i → slot i
 
 reserve_kv_cache(manager, ...)
-    │
-    └── For each layer:
-        ├── Reserve K buffer in EP shape
-        └── Reserve V buffer in EP shape
+    └── For each layer: Reserve K and V buffers
 ```
 
 ### 2. Materialization
@@ -166,33 +175,33 @@ The pool's `data_ptrs` and `data_strides` are built from these external buffers.
 
 ### 5. EP→TP Switch
 
-During the switch, the buffer contents are overwritten in-place:
+Three methods are available, selected via `PARAS_CONFIGURE_METHOD` environment variable:
 
-```
-                    EP Buffer Contents                 TP Buffer Contents
-                    ──────────────────                 ──────────────────
-MoE w13_weight:     (64, H, 2*I) EP data      →       (128, 2*I_tp, H) TP data
-MoE w2_weight:      (64, I, H) EP data        →       (128, H, I_tp) TP data
-KV K per layer:     (ep_tok+1, 4, 128)        →       (tp_tok+1, 2, 128)
-KV V per layer:     (ep_tok+1, 4, 128)        →       (tp_tok+1, 2, 128)
-Attention weights:  unchanged (full, unsharded)
-Staging buffers:    reused as scratch during switch
-```
+**Method: `naive` (NCCL sequential)**
 
-**MoE weight redistribution flow:**
+Per layer, sequentially:
+1. All-gather EP weights across DP group (DP>1 only; no-op for DP=1)
+2. Permute EP weights → staging buffer
+3. NCCL `all_to_all_single`: staging → TP slot (slot i) directly
+4. Reconfigure attention and switch mode
 
-```
-1. all_gather (dp>1 only):
-   EP buffer ──all-gather──→ staging.w13_a (gathered from all DP ranks)
+**Method: `overlap` (NCCL pipelined)**
 
-2. all_to_all:
-   staging.w13_a ──permute──→ staging.w13_b (contiguous for all-to-all)
-   staging.w13_b ──all-to-all──→ EP buffer (overwritten with TP layout)
+Same as naive but with dual CUDA streams:
+- Stream 1: all-to-all for layer i
+- Stream 2: all-gather for layer i+1 (overlapped)
+- Streams swap between layers
 
-3. TP experts already registered:
-   tp_experts.w13_weight points to EP buffer via get_view_as()
-   → Data is valid immediately after all-to-all, no re-registration needed
-```
+**Method: `peer_access` (NVLink direct, fastest)**
+
+Per layer, no barriers between layers:
+1. Custom CUDA kernel reads EP slot (i+1) with strided access
+2. Kernel writes directly to peer GPU's TP slot (i) via NVLink
+3. No staging buffer, no NCCL overhead
+
+See `nvlink_peer_access_weight_transfer.md` for kernel design details.
+
+All three methods write TP data to the TP slot (slot i), where `tp_experts` already points from init. No `update_views()` is needed.
 
 **KV cache migration flow:**
 
@@ -248,6 +257,10 @@ manager.get_view_as(name, shape, dtype) -> Tensor # same bytes, different shape
 manager.get_kv_views(num_layers, mode="ep"|"tp", tp_size, page_size)
     -> (List[Tensor], List[Tensor])  # k_buffers, v_buffers
 
+# Aliasing (post-materialize)
+manager.alias(alias_name, target_name)    # create entry sharing target's offset
+create_paras_moe_aliases(manager, num_layers)  # create ep_experts + tp_experts aliases
+
 # Queries
 manager.is_managed(tensor) -> bool
 manager.dump_layout() -> List[Dict]
@@ -298,7 +311,7 @@ Currently, QKV TP reconfiguration still copies q/k/v slices from the full weight
 
 ### 2. Carve Staging Buffers from KV Cache Region
 
-The 4 staging buffers currently occupy ~1.16 GiB permanently. Since the EP→TP switch only happens when requests are paused, the KV cache region has unused capacity during the switch.
+Staging buffers are now conditional via the `skip_staging` parameter — they're skipped entirely for the `peer_access` method, which writes directly to TP slots via NVLink. For the NCCL naive/overlap paths, the 4 staging buffers still occupy ~1.16 GiB permanently.
 
 **Improvement**: Instead of separate staging reservations, dynamically carve scratch space from the end of the KV cache region during the switch. This reclaims ~1.16 GiB for KV tokens during normal operation. The manager would need a `get_scratch(size_bytes)` method that returns a view into the KV tail.
 
@@ -317,9 +330,9 @@ Qwen models can have fused shared experts that run alongside routed experts. The
 
 **Improvement**: Reserve shared expert weights in the managed buffer. They don't participate in EP→TP redistribution (they're replicated on all ranks), so they just need a fixed reservation with no union layout.
 
-### 5. Fused Cross-Rank Weight Transfer
+### 5. Fused Cross-Rank Weight Transfer (DONE — see `nvlink_peer_access_weight_transfer.md`)
 
-The contiguous, deterministic layout enables fused NCCL/RDMA transfers during the switch. Instead of per-tensor all-to-all calls, a single large transfer could move all weights for all layers at once.
+The contiguous, deterministic layout enables fused NVLink transfers during the switch. The peer access method uses custom CUDA kernels that write directly to peer GPU memory, achieving 1.56× speedup over NCCL sequential.
 
 **Improvement**: Since all MoE weights across all layers are contiguous in the buffer, a single `all_to_all` on the entire MoE weight region could replace the per-layer loop. This would reduce NCCL launch overhead from 48x2 kernel launches to 2 (one for w13, one for w2).
 
