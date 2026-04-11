@@ -388,7 +388,9 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
-        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank, method="peer_access")
+        import os
+        method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
+        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank, method=method)
 
     @paras_func
     def paras_configure_ep(self):
