@@ -71,6 +71,9 @@ class ParaSModelMixin:
                 last_layer_handles = new_handles
                 stream_1, stream_2 = stream_2, stream_1
 
+        stream_1.synchronize()
+        stream_2.synchronize()
+
     def paras_configure_tp_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
         """EP→TP conversion using NVLink-optimized v2 peer access kernels for all layers.
 
