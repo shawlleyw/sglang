@@ -21,6 +21,7 @@ from sglang.srt.paras.paras_parallel_state import (
     get_paras_tp_size,
 )
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+from sglang.srt.paras.peer_access import peer_access_fused_transfer_w13_v2, peer_access_fused_transfer_w2_v2
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, set_weight_attrs
@@ -280,8 +281,6 @@ class ParaSMoeBlockMixin:
           - Layer i+1 reads local slot[i+2], writes to peer slot[i+1]
           - Different slots → no race → barriers only needed at sweep start/end.
         """
-        from sglang.srt.paras.peer_access import peer_access_fused_transfer_w13_v2, peer_access_fused_transfer_w2_v2
-
         mgr = get_global_paras_memory_manager()
         paras_tp_size = get_paras_tp_size()
         paras_tp_rank = get_paras_tp_rank()

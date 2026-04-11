@@ -23,7 +23,11 @@ synchronize CUDA and free the temporary weight redistribution buffers.
 """
 
 import torch
+import torch.distributed as dist
 
+from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
+from sglang.srt.paras.peer_access import init_peer_access
 from sglang.srt.paras.utils import paras_func
 
 
@@ -71,61 +75,28 @@ class ParaSModelMixin:
                 staging_1, staging_2 = staging_2, staging_1
 
     def paras_configure_tp_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
-        """EP→TP conversion using NVLink-optimized v2 peer access kernels for all layers.
-
-        No barriers needed — the scheduler ensures quiescence before the switch,
-        and TP views are correct from init (virtual-to-physical slot mapping).
-        """
-        from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
-        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-        from sglang.srt.paras.peer_access import init_peer_access
-        import torch
-        import time
-        import logging
-        logger = logging.getLogger(__name__)
-
         mgr = get_global_paras_memory_manager()
 
-        t0 = time.perf_counter()
         if not hasattr(self, '_peer_access_ctx') or self._peer_access_ctx is None:
             tp_group_tmp = get_paras_tp_group().device_group
             tp_size_tmp = get_paras_tp_size()
             self._peer_access_ctx = init_peer_access(mgr, tp_group_tmp, tp_size_tmp)
-        t1 = time.perf_counter()
 
         peer_ctx = self._peer_access_ctx
-
         dst_base_ptrs = torch.tensor(
             peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
         )
 
-        import torch.distributed as dist
-
         paras_tp_group = get_paras_tp_group().device_group
         barrier_tensor = torch.zeros(1, device="cuda")
-
-        t2 = time.perf_counter()
 
         for layer in self.layers:
             layer.paras_configure_tp_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
             dist.all_reduce(barrier_tensor, group=paras_tp_group)
 
-        t3 = time.perf_counter()
-
-        # Reconfigure attention + switch mode.
-        # TP views already point to correct slots — no update_views needed.
         for layer in self.layers:
             layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
             layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
-        t4 = time.perf_counter()
-
-        logger.warning(
-            f"[peer_access timing] "
-            f"init={1000*(t1-t0):.1f}ms "
-            f"v2_kernels={1000*(t3-t2):.1f}ms "
-            f"attn+tp={1000*(t4-t3):.1f}ms "
-            f"total={1000*(t4-t0):.1f}ms"
-        )
 
     def paras_configure_helper(self):
         torch.cuda.synchronize()
