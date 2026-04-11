@@ -25,13 +25,13 @@ sys.path.insert(0, os.path.join(_ROOT_DIR, "python"))
 # CUDA extension path (built with setup.py build_ext --inplace)
 sys.path.insert(0, os.path.join(_ROOT_DIR, "python", "sglang", "srt", "paras", "csrc"))
 
-# ---- test constants ----
-NUM_LAYERS = 4
-HIDDEN = 512
-INTERMEDIATE = 512
-NUM_EXPERTS = 16
+# ---- test constants (Qwen3-30B-A3B) ----
+NUM_LAYERS = 48
+HIDDEN = 2048
+INTERMEDIATE = 1536
+NUM_EXPERTS = 64
 SEED = 42
-BENCHMARK_WARMUP = 3
+BENCHMARK_WARMUP = 5
 BENCHMARK_RUNS = 10
 
 
@@ -481,12 +481,6 @@ def run_comparison_test(rank, world_size):
     packed_plans = build_packed_plans(mgr, world_size)
     peer_results = run_peer_path(mgr, num_local, peer_ctx, packed_plans)
 
-    # ---- Fused peer access path (needs different manager with slot0) ----
-    fused_mgr, fused_num_local = build_fused_manager(rank, world_size)
-    fill_ep_weights_fused(fused_mgr, rank)
-    fused_peer_ctx = setup_peer_ctx(fused_mgr, rank, world_size, tp_group)
-    fused_results = run_fused_path(fused_mgr, fused_num_local, fused_peer_ctx)
-
     # ---- Compare NCCL vs peer access ----
     all_ok = True
     if rank == 0:
@@ -510,6 +504,16 @@ def run_comparison_test(rank, world_size):
                         flush=True,
                     )
 
+    # Free peer results to reclaim GPU memory before fused path
+    del peer_results
+    torch.cuda.empty_cache()
+
+    # ---- Fused peer access path (needs different manager with slot0) ----
+    fused_mgr, fused_num_local = build_fused_manager(rank, world_size)
+    fill_ep_weights_fused(fused_mgr, rank)
+    fused_peer_ctx = setup_peer_ctx(fused_mgr, rank, world_size, tp_group)
+    fused_results = run_fused_path(fused_mgr, fused_num_local, fused_peer_ctx)
+
     # ---- Compare NCCL vs fused peer access (flatten: different view shapes, same bytes) ----
     if rank == 0:
         print("\n--- NCCL vs Fused Peer Access ---", flush=True)
@@ -531,6 +535,10 @@ def run_comparison_test(rank, world_size):
                         f"  [OK] fused layer={layer_id} {wt} bitwise match",
                         flush=True,
                     )
+
+    # Free comparison results to reclaim GPU memory
+    del nccl_results, fused_results
+    torch.cuda.empty_cache()
 
     # Restore original manager as global for benchmark
     from sglang.srt.paras.paras_memory_manager import set_global_paras_memory_manager
