@@ -245,6 +245,7 @@ def build_peer_access_manager(rank, world_size):
     """Create ParaSMemoryManager with slot0 + EP weights + staging for peer access path."""
     from sglang.srt.paras.paras_memory_manager import (
         ParaSMemoryManager,
+        create_tp_aliases,
         set_global_paras_memory_manager,
     )
 
@@ -255,12 +256,12 @@ def build_peer_access_manager(rank, world_size):
 
     # Slot 0 for TP destination (layer 0)
     mgr.reserve(
-        "paras.fused_tp_slot0.w13",
+        "paras.moe_slot0.w13",
         (num_local, 2 * INTERMEDIATE, HIDDEN),
         torch.bfloat16,
     )
     mgr.reserve(
-        "paras.fused_tp_slot0.w2",
+        "paras.moe_slot0.w2",
         (num_local, HIDDEN, INTERMEDIATE),
         torch.bfloat16,
     )
@@ -284,6 +285,7 @@ def build_peer_access_manager(rank, world_size):
     mgr.reserve("staging.w2_b", (staging_experts, HIDDEN, INTERMEDIATE), torch.bfloat16)
 
     mgr.materialize()
+    create_tp_aliases(mgr, NUM_LAYERS)
     set_global_paras_memory_manager(mgr)
     return mgr, num_local
 
@@ -314,17 +316,11 @@ def run_peer_access_path(mgr, num_local, peer_ctx):
     results = {}
     for layer_id in range(NUM_LAYERS):
         mixin = _make_mixin(layer_id, num_local, mgr)
-        # Peer access path needs tp_experts for weight assignment at the end
-        mixin.tp_experts = type('_NS', (), {})()
         mixin.paras_configure_tp_fused_peer_access(peer_ctx=peer_ctx, stream=None)
 
-        # Peer access writes to TP slot (slot i = previous layer's EP slot or slot0)
-        if layer_id == 0:
-            tp_w13_name = "paras.fused_tp_slot0.w13"
-            tp_w2_name = "paras.fused_tp_slot0.w2"
-        else:
-            tp_w13_name = f"model.layers.{layer_id - 1}.mlp.experts.w13_weight"
-            tp_w2_name = f"model.layers.{layer_id - 1}.mlp.experts.w2_weight"
+        # Read from TP alias — uniform lookup, no layer_id branching
+        tp_w13_name = f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"
+        tp_w2_name = f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"
 
         from sglang.srt.paras.paras_parallel_state import get_paras_tp_size
         tp_size = get_paras_tp_size()

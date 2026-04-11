@@ -72,7 +72,11 @@ class ParaSModelMixin:
                 stream_1, stream_2 = stream_2, stream_1
 
     def paras_configure_tp_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
-        """EP→TP conversion using NVLink-optimized v2 peer access kernels for all layers."""
+        """EP→TP conversion using NVLink-optimized v2 peer access kernels for all layers.
+
+        No barriers needed — the scheduler ensures quiescence before the switch,
+        and TP views are correct from init (virtual-to-physical slot mapping).
+        """
         from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         from sglang.srt.paras.peer_access import init_peer_access
@@ -91,48 +95,32 @@ class ParaSModelMixin:
         t1 = time.perf_counter()
 
         peer_ctx = self._peer_access_ctx
-        tp_group = get_paras_tp_group().device_group
 
         dst_base_ptrs = torch.tensor(
             peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
         )
 
-        # Move attn reconfig out of kernel hot loop
+        # Launch v2 kernels for each layer — no barriers between layers,
+        # N+1 slot design guarantees no inter-layer aliasing.
+        # No barrier needed at sweep start — scheduler ensures quiescence.
         t2 = time.perf_counter()
         for layer in self.layers:
-            layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
+            layer.paras_configure_tp_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
         t3 = time.perf_counter()
 
-        torch.distributed.barrier(group=tp_group)
-        t4 = time.perf_counter()
-
-        # Launch v2 kernels for each layer (no barriers between layers —
-        # N+1 slot design guarantees no inter-layer aliasing)
+        # Reconfigure attention + switch mode.
+        # TP views already point to correct slots — no update_views needed.
         for layer in self.layers:
-            layer.paras_configure_tp_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
-        t5 = time.perf_counter()
-
-        torch.cuda.synchronize()
-        t6 = time.perf_counter()
-        torch.distributed.barrier(group=tp_group)
-        t7 = time.perf_counter()
-
-        # Update views and configure TP (no kernel work)
-        for layer in self.layers:
-            layer.paras_configure_tp_mlp_fused_peer_access_update_views()
+            layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
             layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
-        t8 = time.perf_counter()
+        t4 = time.perf_counter()
 
         logger.warning(
             f"[peer_access timing] "
             f"init={1000*(t1-t0):.1f}ms "
-            f"attn_reconfig={1000*(t3-t2):.1f}ms "
-            f"barrier1={1000*(t4-t3):.1f}ms "
-            f"v2_kernels={1000*(t5-t4):.1f}ms "
-            f"sync={1000*(t6-t5):.1f}ms "
-            f"barrier2={1000*(t7-t6):.1f}ms "
-            f"views+tp={1000*(t8-t7):.1f}ms "
-            f"total={1000*(t8-t0):.1f}ms"
+            f"v2_kernels={1000*(t3-t2):.1f}ms "
+            f"attn+tp={1000*(t4-t3):.1f}ms "
+            f"total={1000*(t4-t0):.1f}ms"
         )
 
     def paras_configure_helper(self):

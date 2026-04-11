@@ -29,6 +29,7 @@ from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 from sglang.srt.paras.layers.utils import paras_load_tp_experts_weight
 from sglang.srt.paras.paras_memory_manager import (
     ParaSMemoryManager,
+    create_tp_aliases,
     plan_qwen_moe_layout,
     set_global_paras_memory_manager,
 )
@@ -237,6 +238,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         # --- End KV budget computation ----------------------------------------
 
         total_bytes = manager.materialize()
+        create_tp_aliases(manager, config.num_hidden_layers, prefix="model")
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
 

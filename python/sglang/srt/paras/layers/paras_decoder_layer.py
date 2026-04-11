@@ -59,10 +59,6 @@ class ParaSDecoderLayerMixin:
         """Launch fused kernels for this layer (no barriers — model level manages them)."""
         return self.mlp.paras_configure_tp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
 
-    def paras_configure_tp_mlp_fused_peer_access_update_views(self):
-        """Update TP views after all layers' kernels complete."""
-        return self.mlp.paras_configure_tp_fused_peer_access_update_views()
-
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
         """Switch from EP to TP mode for this layer."""

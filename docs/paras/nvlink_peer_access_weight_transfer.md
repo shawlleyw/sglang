@@ -56,25 +56,25 @@ Buffer slots:  [ slot 0 | slot 1 | slot 2 | ... | slot N ]
 
 This eliminates the aliasing race condition without staging buffers. The overhead is 1 extra layer slot ≈ 288 MB (0.4% of 65 GiB total).
 
+**Virtual-to-physical slot mapping**: The memory manager's `alias()` method creates virtual entries that map to the same physical offset as a target entry. After `materialize()`, `create_tp_aliases()` registers two aliases per layer — an EP alias (`model.layers.{i}.mlp.experts.*`) pointing to slot `i+1`, and a TP alias (`model.layers.{i}.mlp.tp_experts.*`) pointing to slot `i`. Both views are created at model init time and never change, eliminating the need for `update_views()` after fused transfer. The kernel and MoeBlock code use uniform TP alias lookups with no `layer_id == 0` branching.
+
 **Layer ordering constraint**: EP→TP must process layers in forward order (0, 1, 2, ..., N-1). Layer `i+1`'s write to slot `i+1` must not overlap with layer `i`'s read from slot `i+1`. Sequential kernel launches on the same CUDA stream enforce this ordering.
 
 ### 3. Process Streamline: Barrier Placement
 
 **Initial design** (96 barriers, 4+ seconds): Two `dist.barrier()` calls per layer — before peer writes and after peer writes. With 48 layers, this produced 96 barriers at ~40ms each.
 
-**Optimized design** (2 barriers, ~20ms): Since the N+1 slot design eliminates inter-layer aliasing, barriers are only needed at the sweep boundaries:
+**Optimized design** (0 barriers): Since the N+1 slot design eliminates inter-layer aliasing and the scheduler ensures quiescence before the switch, no barriers are needed in the model-level method:
 
 ```python
-barrier()                    # Ensure all ranks finished EP inference
 for layer in layers:
     launch_kernel(layer)     # No barriers between layers
-cuda.synchronize()           # Wait for all NVLink writes
-barrier()                    # Ensure all ranks received data
 for layer in layers:
-    update_tp_views(layer)   # Reconfigure attention + MoE
+    configure_tp_attn(layer) # Reconfigure attention
+    configure_tp(layer)      # Switch to TP mode (views already correct)
 ```
 
-Additionally, attention reconfiguration (`paras_configure_tp_attn`) was moved from the kernel-launch loop to the view-update loop, eliminating ~24ms of CPU-side torch operations from the hot path.
+TP views point to the correct physical slots from init (via virtual-to-physical alias mapping), so no `update_views()` pass is needed. The per-layer convenience wrapper retains barriers for standalone test use.
 
 ### 4. Kernel Design: NVLink Store Optimization
 
@@ -184,7 +184,7 @@ The 22% gap is primarily from integer division overhead in index computation and
 | `paras/layers/paras_moe_block.py` | Per-layer kernel launch (`paras_configure_tp_fused_peer_access_kernel`) |
 | `paras/layers/paras_model.py` | Model-level orchestration with 2-barrier design |
 | `paras/models/qwen3_moe.py` | Pre-initializes peer access during model load |
-| `paras/paras_memory_manager.py` | N+1 slot reservation (`paras.fused_tp_slot0.*`) |
+| `paras/paras_memory_manager.py` | N+1 slot reservation (`paras.moe_slot0.*`), `alias()`, `create_tp_aliases()` |
 | `test/srt/test_paras_peer_access.py` | 4-GPU correctness + benchmark test |
 
 ## Future Work
@@ -198,3 +198,17 @@ The 22% gap is primarily from integer division overhead in index computation and
 4. **Kernel fusion**: Fusing w13 and w2 into a single kernel launch per layer halves launch overhead. A combined kernel was prototyped but showed marginal improvement (~0.1ms) since NVLink bandwidth dominates.
 
 5. **Eliminate index division**: Restructuring the kernel to iterate over (chunk, position) pairs instead of flat indices would remove the per-element integer division, potentially closing the remaining 22% gap to theoretical peak.
+
+### Kernel Optimization Opportunities
+
+1. **Eliminate index division**: The inner loop computes `chunk_id = idx / int4_per_chunk` and `pos = idx % int4_per_chunk` per element. Restructuring to iterate over (chunk, position) pairs would remove this (~20 cycles per division × millions of iterations).
+
+2. **Two-phase even/odd launch**: Launch even layers (0,2,4,...) as one kernel, sync, then odd layers (1,3,5,...). Even layers' reads (odd slots) and writes (even slots) never overlap. This enables a mega-kernel launch for half the layers at once.
+
+3. **Cooperative groups grid sync**: Use `cooperative_launch` with `__grid_sync()` to synchronize between even and odd phases within a single kernel launch, eliminating the inter-phase sync overhead.
+
+4. **Warp specialization**: Dedicate specific warps to specific chunk sizes. w13 chunks (1.5MB) benefit from many warps; w2 rows (768B) might benefit from fewer warps with better cache locality.
+
+5. **L2 cache prefetch**: Use `__prefetch_l2()` hints to pre-load the next chunk's source data while the current chunk's NVLink writes are in flight.
+
+6. **Adaptive grid sizing**: Instead of fixed `num_SMs × tp_size`, dynamically compute grid size based on total data volume and per-SM NVLink bandwidth target.

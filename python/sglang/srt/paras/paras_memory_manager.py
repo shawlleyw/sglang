@@ -339,6 +339,38 @@ class ParaSMemoryManager:
 
         return k_bufs, v_bufs
 
+    # ----- aliasing -------------------------------------------------------
+
+    def alias(self, alias_name: str, target_name: str) -> LayoutEntry:
+        """
+        Create an alias entry that points to the same physical memory as *target*.
+
+        Aliases inherit the target's shape, dtype, offset, and size. They enable
+        multiple logical names (e.g., EP vs TP views) to map to the same physical
+        slot without duplicating buffer space.
+
+        Must be called after ``materialize()`` because offsets are only valid then.
+        """
+        if not self._materialized:
+            raise RuntimeError("alias() can only be called after materialize().")
+        if alias_name in self._entries:
+            raise ValueError(f"Alias name already exists: '{alias_name}'")
+        if target_name not in self._entries:
+            raise KeyError(f"Alias target not found: '{target_name}'")
+
+        target = self._entries[target_name]
+        entry = LayoutEntry(
+            name=alias_name,
+            shape=target.shape,
+            dtype=target.dtype,
+            numel=target.numel,
+            element_size=target.element_size,
+            size_bytes=target.size_bytes,
+            offset_bytes=target.offset_bytes,
+        )
+        self._entries[alias_name] = entry
+        return entry
+
     # ----- queries --------------------------------------------------------
 
     def is_managed(self, tensor: torch.Tensor) -> bool:
@@ -560,8 +592,8 @@ def plan_qwen_moe_layout(
     else:
         _w13_shape = (ep_local_experts, 2 * inter_per_partition, hidden_size)
         _w2_shape = (ep_local_experts, hidden_size, inter_per_partition)
-    manager.reserve("paras.fused_tp_slot0.w13", _w13_shape, torch.bfloat16)
-    manager.reserve("paras.fused_tp_slot0.w2", _w2_shape, torch.bfloat16)
+    manager.reserve("paras.moe_slot0.w13", _w13_shape, torch.bfloat16)
+    manager.reserve("paras.moe_slot0.w2", _w2_shape, torch.bfloat16)
 
     for i in range(num_layers):
         # -- MoE weights (EP only — TP reuses same buffer via get_view_as) -
@@ -631,3 +663,36 @@ def plan_qwen_moe_layout(
         (staging_experts, hidden_size, intermediate_size),
         staging_dtype,
     )
+
+
+# ---------------------------------------------------------------------------
+# TP alias creation (call after materialize)
+# ---------------------------------------------------------------------------
+
+def create_tp_aliases(
+    manager: ParaSMemoryManager,
+    num_layers: int,
+    prefix: str = "model",
+) -> None:
+    """
+    Create TP expert aliases using the N+1 slot virtual-to-physical mapping.
+
+    After materialize(), this registers TP alias names that point to the same
+    physical memory as the corresponding slot:
+
+      TP layer i → slot i:
+        - i == 0: points to ``paras.moe_slot0.{w13,w2}``
+        - i > 0:  points to ``{prefix}.layers.{i-1}.mlp.experts.{w13,w2}_weight``
+
+    This eliminates the need for ``update_views()`` after fused peer access
+    transfer — TP views are correct from init and never need re-pointing.
+    """
+    for i in range(num_layers):
+        if i == 0:
+            src_w13 = "paras.moe_slot0.w13"
+            src_w2 = "paras.moe_slot0.w2"
+        else:
+            src_w13 = f"{prefix}.layers.{i - 1}.mlp.experts.w13_weight"
+            src_w2 = f"{prefix}.layers.{i - 1}.mlp.experts.w2_weight"
+        manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w13_weight", src_w13)
+        manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w2_weight", src_w2)
