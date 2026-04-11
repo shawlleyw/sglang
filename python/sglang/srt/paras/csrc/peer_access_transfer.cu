@@ -197,17 +197,19 @@ __global__ void peer_access_fused_transfer_w13_v2(
     int num_gates,
     int elem_size
 ) {
+    const int warps_in_block = blockDim.x >> 5;
     const int warp_in_block = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int global_warp = blockIdx.x * 8 + warp_in_block;
-    const int total_warps = gridDim.x * 8;
+    const int global_warp = blockIdx.x * warps_in_block + warp_in_block;
+    const int total_warps = gridDim.x * warps_in_block;
 
     // Warp-level peer assignment (NVLink guideline)
     const int peer = global_warp % tp_size;
     const int warp_index = global_warp / tp_size;
     const int warps_per_peer = total_warps / tp_size;
 
-    char* const dst_buf = peer_buffers[peer];
+    // Self-write bypass: avoid IPC pointer for local rank (no UVA overhead)
+    char* const dst_buf = (peer == tp_rank) ? const_cast<char*>(local_buffer) : peer_buffers[peer];
 
     // Each chunk = one (expert, gate) pair: I'H * elem_size contiguous bytes
     const int64_t chunk_bytes = I_prime_H * elem_size;
@@ -223,29 +225,36 @@ __global__ void peer_access_fused_transfer_w13_v2(
     int64_t pos = (int64_t)warp_index * 256 + lane;
     const int64_t stride = (int64_t)warps_per_peer * 256;
 
+    // Use uint32 for decomposition math — avoids expensive int64 software division
+    // total_int4 fits in uint32 (e.g. 32 chunks × 98304 = 3,145,728 < 2^32)
+    const unsigned int int4_per_chunk_u = (unsigned int)int4_per_chunk;
+
     while (pos < total_int4) {
         #pragma unroll 8
         for (int u = 0; u < 8; u++) {
             const int64_t idx = pos + (int64_t)u * 32;
             if (idx < total_int4) {
-                const int64_t chunk_id = idx / int4_per_chunk;
-                const int64_t in_chunk = idx - chunk_id * int4_per_chunk;
+                // Fast uint32 decomposition (hardware divider, ~20 cycles vs ~100 for int64)
+                const unsigned int idx_u = (unsigned int)idx;
+                const unsigned int chunk_id = idx_u / int4_per_chunk_u;
+                const unsigned int in_chunk = idx_u - chunk_id * int4_per_chunk_u;
 
-                const int e = (int)(chunk_id / num_gates);
-                const int k = (int)(chunk_id - (int64_t)e * num_gates);
+                // num_gates is typically 2 — compiler optimizes to shift+mask
+                const unsigned int e = chunk_id / (unsigned int)num_gates;
+                const unsigned int k = chunk_id - e * (unsigned int)num_gates;
 
                 // Source: EP[e, k, peer, :] — strided layout
                 const int64_t src_off = src_ep_offset +
                     (int64_t)(e * num_gates * tp_size + k * tp_size + peer) * chunk_bytes +
-                    in_chunk * 16;
+                    (int64_t)in_chunk * 16;
 
                 // Dest: TP[tp_rank, e, k, :] — contiguous
                 const int64_t dst_off = dst_expert_base +
                     (int64_t)(e * num_gates + k) * chunk_bytes +
-                    in_chunk * 16;
+                    (int64_t)in_chunk * 16;
 
                 *reinterpret_cast<int4*>(dst_buf + dst_off) =
-                    *reinterpret_cast<const int4*>(local_buffer + src_off);
+                    __ldg(reinterpret_cast<const int4*>(local_buffer + src_off));
             }
         }
         pos += stride;
@@ -271,8 +280,12 @@ void launch_peer_access_fused_transfer_w13_v2(
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
 
     // Grid divisible by tp_size for balanced warp-level peer assignment
-    int blocks = num_sms * tp_size;
-    int threads = 256;
+    // Env vars for tuning sweep (V2_GRID_MULT × tp_size blocks, V2_THREADS threads)
+    const char* grid_env = getenv("V2_GRID_MULT");
+    int grid_mult = grid_env ? atoi(grid_env) : num_sms;
+    int blocks = grid_mult * tp_size;
+    const char* thr_env = getenv("V2_THREADS");
+    int threads = thr_env ? atoi(thr_env) : 256;
 
     peer_access_fused_transfer_w13_v2<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const char*>(local_buffer_ptr),
@@ -302,16 +315,18 @@ __global__ void peer_access_fused_transfer_w2_v2(
     int I_full_bytes,
     int I_prime_bytes
 ) {
+    const int warps_in_block = blockDim.x >> 5;
     const int warp_in_block = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int global_warp = blockIdx.x * 8 + warp_in_block;
-    const int total_warps = gridDim.x * 8;
+    const int global_warp = blockIdx.x * warps_in_block + warp_in_block;
+    const int total_warps = gridDim.x * warps_in_block;
 
     const int peer = global_warp % tp_size;
     const int warp_index = global_warp / tp_size;
     const int warps_per_peer = total_warps / tp_size;
 
-    char* const dst_buf = peer_buffers[peer];
+    // Self-write bypass: avoid IPC pointer for local rank (no UVA overhead)
+    char* const dst_buf = (peer == tp_rank) ? const_cast<char*>(local_buffer) : peer_buffers[peer];
 
     const int n_int4_per_row_dst = I_prime_bytes >> 4;  // I_prime_bytes / 16
     const int peer_shard_byte_off = peer * I_prime_bytes;
@@ -321,16 +336,22 @@ __global__ void peer_access_fused_transfer_w2_v2(
     int64_t pos = (int64_t)warp_index * 256 + lane;
     const int64_t stride = (int64_t)warps_per_peer * 256;
 
+    // Use uint32 for decomposition math — avoids expensive int64 software division
+    // total_int4 fits in uint32 (e.g. 16*2048*48 = 1,572,864 < 2^32)
+    const unsigned int n_int4_per_row_dst_u = (unsigned int)n_int4_per_row_dst;
+    const unsigned int H_u = (unsigned int)H;
+
     while (pos < total_int4) {
         #pragma unroll 8
         for (int u = 0; u < 8; u++) {
             const int64_t idx = pos + (int64_t)u * 32;
             if (idx < total_int4) {
-                // Decompose: idx → (e, h, col_in_shard)
-                const int64_t eh_idx = idx / n_int4_per_row_dst;
-                const int col = (int)(idx - eh_idx * (int64_t)n_int4_per_row_dst);
-                const int e = (int)(eh_idx / H);
-                const int h = (int)(eh_idx - (int64_t)e * H);
+                // Fast uint32 decomposition (hardware divider)
+                const unsigned int idx_u = (unsigned int)idx;
+                const unsigned int eh_idx = idx_u / n_int4_per_row_dst_u;
+                const unsigned int col = idx_u - eh_idx * n_int4_per_row_dst_u;
+                const unsigned int e = eh_idx / H_u;
+                const unsigned int h = eh_idx - e * H_u;
 
                 // Source: EP[e, h, peer*I_prime + col] — strided rows
                 const int64_t src_off = src_ep_offset +
@@ -344,7 +365,7 @@ __global__ void peer_access_fused_transfer_w2_v2(
                     (int64_t)h * I_prime_bytes + col * 16;
 
                 *reinterpret_cast<int4*>(dst_buf + dst_off) =
-                    *reinterpret_cast<const int4*>(local_buffer + src_off);
+                    __ldg(reinterpret_cast<const int4*>(local_buffer + src_off));
             }
         }
         pos += stride;
@@ -369,8 +390,11 @@ void launch_peer_access_fused_transfer_w2_v2(
     int num_sms;
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
 
-    int blocks = num_sms * tp_size;
-    int threads = 256;
+    const char* grid_env = getenv("V2_GRID_MULT");
+    int grid_mult = grid_env ? atoi(grid_env) : num_sms;
+    int blocks = grid_mult * tp_size;
+    const char* thr_env = getenv("V2_THREADS");
+    int threads = thr_env ? atoi(thr_env) : 256;
 
     peer_access_fused_transfer_w2_v2<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const char*>(local_buffer_ptr),
