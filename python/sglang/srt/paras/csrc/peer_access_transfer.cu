@@ -247,3 +247,335 @@ void launch_peer_access_fused_transfer_w2(
         printf("CUDA fused w2 kernel error: %s\n", cudaGetErrorString(err));
     }
 }
+
+// =============================================================================
+// Mega-kernels: fuse all layers into a single kernel launch
+// =============================================================================
+
+// Mega-kernel for w13: processes all layers in one launch.
+// Grid: num_layers * tp_size * E_local * num_gates blocks.
+// Each block decodes its layer from blockIdx.x and uses per-layer offsets.
+__global__ void peer_access_mega_transfer_kernel(
+    const char* __restrict__ local_buffer,
+    char* const* peer_buffers,
+    const int64_t* __restrict__ ep_offsets,    // [num_layers] EP byte offsets
+    const int64_t* __restrict__ tp_offsets,    // [num_layers] TP byte offsets
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int64_t I_prime_H,
+    int num_gates,
+    int elem_size,
+    int num_layers
+) {
+    int blocks_per_layer = tp_size * E_local * num_gates;
+    int layer = blockIdx.x / blocks_per_layer;
+    int block_in_layer = blockIdx.x % blocks_per_layer;
+
+    if (layer >= num_layers) return;
+
+    int r = block_in_layer / (E_local * num_gates);
+    int rem = block_in_layer % (E_local * num_gates);
+    int e = rem / num_gates;
+    int k = rem % num_gates;
+
+    int64_t src_ep_offset = ep_offsets[layer];
+    int64_t dst_tp_offset = tp_offsets[layer];
+
+    int64_t src_chunk = src_ep_offset +
+        (int64_t)(e * num_gates * tp_size + k * tp_size + r) * I_prime_H * elem_size;
+    int64_t dst_chunk = dst_tp_offset +
+        (int64_t)(tp_rank * E_local * num_gates + e * num_gates + k) * I_prime_H * elem_size;
+
+    const char* src = local_buffer + src_chunk;
+    char* dst = peer_buffers[r] + dst_chunk;
+
+    int64_t n_bytes = I_prime_H * elem_size;
+    int64_t n_int4 = n_bytes / 16;
+
+    const int4* src4 = reinterpret_cast<const int4*>(src);
+    int4* dst4 = reinterpret_cast<int4*>(dst);
+
+    for (int64_t i = threadIdx.x; i < n_int4; i += blockDim.x) {
+        dst4[i] = src4[i];
+    }
+
+    if (threadIdx.x == 0) {
+        for (int64_t i = n_int4 * 16; i < n_bytes; i++) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+// Mega-kernel for w2: processes all layers in one launch.
+// Grid: num_layers * tp_size * E_local blocks.
+__global__ void peer_access_mega_transfer_w2_kernel(
+    const char* __restrict__ local_buffer,
+    char* const* peer_buffers,
+    const int64_t* __restrict__ ep_offsets,
+    const int64_t* __restrict__ tp_offsets,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int H,
+    int I_full_bytes,
+    int I_prime_bytes,
+    int num_layers
+) {
+    int blocks_per_layer = tp_size * E_local;
+    int layer = blockIdx.x / blocks_per_layer;
+    int block_in_layer = blockIdx.x % blocks_per_layer;
+
+    if (layer >= num_layers) return;
+
+    int r = block_in_layer / E_local;
+    int e = block_in_layer % E_local;
+
+    int64_t src_ep_offset = ep_offsets[layer];
+    int64_t dst_tp_offset = tp_offsets[layer];
+
+    int n_int4_src = I_full_bytes / 16;
+    int n_int4_dst = I_prime_bytes / 16;
+    int r_int4 = r * n_int4_dst;
+
+    const int4* src_base = reinterpret_cast<const int4*>(local_buffer + src_ep_offset)
+                           + (int64_t)e * H * n_int4_src;
+    int4* dst_base = reinterpret_cast<int4*>(peer_buffers[r] + dst_tp_offset)
+                     + (int64_t)(tp_rank * E_local + e) * H * n_int4_dst;
+
+    int64_t total_int4 = (int64_t)H * n_int4_dst;
+
+    for (int64_t idx = threadIdx.x; idx < total_int4; idx += blockDim.x) {
+        int64_t h  = idx / n_int4_dst;
+        int64_t ii = idx % n_int4_dst;
+        dst_base[h * n_int4_dst + ii] = src_base[h * n_int4_src + r_int4 + ii];
+    }
+}
+
+// Host-side launch for mega w13 kernel
+void launch_peer_access_mega_transfer(
+    int64_t local_buffer_ptr,
+    int64_t* peer_buffer_ptrs,
+    const int64_t* ep_offsets,
+    const int64_t* tp_offsets,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int64_t I_prime_H,
+    int num_gates,
+    int elem_size,
+    int num_layers,
+    int num_threads,
+    cudaStream_t stream
+) {
+    int blocks_per_layer = tp_size * E_local * num_gates;
+    int total_blocks = num_layers * blocks_per_layer;
+    int threads = num_threads > 0 ? num_threads : 256;
+
+    peer_access_mega_transfer_kernel<<<total_blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(local_buffer_ptr),
+        reinterpret_cast<char* const*>(peer_buffer_ptrs),
+        ep_offsets,
+        tp_offsets,
+        tp_rank,
+        tp_size,
+        E_local,
+        I_prime_H,
+        num_gates,
+        elem_size,
+        num_layers
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA mega w13 kernel error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+// =============================================================================
+// Combined kernel: fuses w13 + w2 into a single launch per layer set
+// =============================================================================
+
+// Combined kernel for w13+w2: processes all layers in one launch.
+// Grid: num_layers * (w13_blocks_per_layer + w2_blocks_per_layer) blocks.
+// First w13_blocks_per_layer blocks per layer do w13, rest do w2.
+__global__ void peer_access_fused_transfer_combined_kernel(
+    const char* __restrict__ local_buffer,
+    char* const* peer_buffers,
+    const int64_t* __restrict__ w13_ep_offsets,    // [num_layers]
+    const int64_t* __restrict__ w13_tp_offsets,    // [num_layers]
+    const int64_t* __restrict__ w2_ep_offsets,     // [num_layers]
+    const int64_t* __restrict__ w2_tp_offsets,     // [num_layers]
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int64_t I_prime_H,
+    int num_gates,          // = 2
+    int elem_size,          // = 2 for bf16
+    int H,
+    int I_full_bytes,
+    int I_prime_bytes,
+    int w13_blocks_per_layer,  // = tp_size * E_local * num_gates
+    int w2_blocks_per_layer,   // = tp_size * E_local
+    int num_layers
+) {
+    int blocks_per_layer = w13_blocks_per_layer + w2_blocks_per_layer;
+    int layer = blockIdx.x / blocks_per_layer;
+    int block_in_layer = blockIdx.x % blocks_per_layer;
+
+    if (layer >= num_layers) return;
+
+    if (block_in_layer < w13_blocks_per_layer) {
+        // w13 path
+        int r = block_in_layer / (E_local * num_gates);
+        int rem = block_in_layer % (E_local * num_gates);
+        int e = rem / num_gates;
+        int k = rem % num_gates;
+
+        int64_t src_ep_offset = w13_ep_offsets[layer];
+        int64_t dst_tp_offset = w13_tp_offsets[layer];
+
+        int64_t src_chunk = src_ep_offset +
+            (int64_t)(e * num_gates * tp_size + k * tp_size + r) * I_prime_H * elem_size;
+        int64_t dst_chunk = dst_tp_offset +
+            (int64_t)(tp_rank * E_local * num_gates + e * num_gates + k) * I_prime_H * elem_size;
+
+        const char* src = local_buffer + src_chunk;
+        char* dst = peer_buffers[r] + dst_chunk;
+
+        int64_t n_bytes = I_prime_H * elem_size;
+        int64_t n_int4 = n_bytes / 16;
+
+        const int4* src4 = reinterpret_cast<const int4*>(src);
+        int4* dst4 = reinterpret_cast<int4*>(dst);
+
+        for (int64_t i = threadIdx.x; i < n_int4; i += blockDim.x) {
+            dst4[i] = src4[i];
+        }
+
+        if (threadIdx.x == 0) {
+            for (int64_t i = n_int4 * 16; i < n_bytes; i++) {
+                dst[i] = src[i];
+            }
+        }
+    } else {
+        // w2 path
+        int blk = block_in_layer - w13_blocks_per_layer;
+        int r = blk / E_local;
+        int e = blk % E_local;
+
+        int64_t src_ep_offset = w2_ep_offsets[layer];
+        int64_t dst_tp_offset = w2_tp_offsets[layer];
+
+        int n_int4_src = I_full_bytes / 16;
+        int n_int4_dst = I_prime_bytes / 16;
+        int r_int4 = r * n_int4_dst;
+
+        const int4* src_base = reinterpret_cast<const int4*>(local_buffer + src_ep_offset)
+                               + (int64_t)e * H * n_int4_src;
+        int4* dst_base = reinterpret_cast<int4*>(peer_buffers[r] + dst_tp_offset)
+                         + (int64_t)(tp_rank * E_local + e) * H * n_int4_dst;
+
+        int64_t total_int4 = (int64_t)H * n_int4_dst;
+
+        for (int64_t idx = threadIdx.x; idx < total_int4; idx += blockDim.x) {
+            int64_t h  = idx / n_int4_dst;
+            int64_t ii = idx % n_int4_dst;
+            dst_base[h * n_int4_dst + ii] = src_base[h * n_int4_src + r_int4 + ii];
+        }
+    }
+}
+
+// Host-side launch for combined w13+w2 kernel
+void launch_peer_access_fused_transfer_combined(
+    int64_t local_buffer_ptr,
+    int64_t* peer_buffer_ptrs,
+    const int64_t* w13_ep_offsets,
+    const int64_t* w13_tp_offsets,
+    const int64_t* w2_ep_offsets,
+    const int64_t* w2_tp_offsets,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int64_t I_prime_H,
+    int num_gates,
+    int elem_size,
+    int H,
+    int I_full_bytes,
+    int I_prime_bytes,
+    int num_layers,
+    int num_threads,
+    cudaStream_t stream
+) {
+    int w13_blocks_per_layer = tp_size * E_local * num_gates;
+    int w2_blocks_per_layer = tp_size * E_local;
+    int blocks_per_layer = w13_blocks_per_layer + w2_blocks_per_layer;
+    int total_blocks = num_layers * blocks_per_layer;
+    int threads = num_threads > 0 ? num_threads : 256;
+
+    peer_access_fused_transfer_combined_kernel<<<total_blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(local_buffer_ptr),
+        reinterpret_cast<char* const*>(peer_buffer_ptrs),
+        w13_ep_offsets,
+        w13_tp_offsets,
+        w2_ep_offsets,
+        w2_tp_offsets,
+        tp_rank,
+        tp_size,
+        E_local,
+        I_prime_H,
+        num_gates,
+        elem_size,
+        H,
+        I_full_bytes,
+        I_prime_bytes,
+        w13_blocks_per_layer,
+        w2_blocks_per_layer,
+        num_layers
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA combined w13+w2 kernel error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+// Host-side launch for mega w2 kernel
+void launch_peer_access_mega_transfer_w2(
+    int64_t local_buffer_ptr,
+    int64_t* peer_buffer_ptrs,
+    const int64_t* ep_offsets,
+    const int64_t* tp_offsets,
+    int tp_rank,
+    int tp_size,
+    int E_local,
+    int H,
+    int I_full_bytes,
+    int I_prime_bytes,
+    int num_layers,
+    int num_threads,
+    cudaStream_t stream
+) {
+    int blocks_per_layer = tp_size * E_local;
+    int total_blocks = num_layers * blocks_per_layer;
+    int threads = num_threads > 0 ? num_threads : 256;
+
+    peer_access_mega_transfer_w2_kernel<<<total_blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(local_buffer_ptr),
+        reinterpret_cast<char* const*>(peer_buffer_ptrs),
+        ep_offsets,
+        tp_offsets,
+        tp_rank,
+        tp_size,
+        E_local,
+        H,
+        I_full_bytes,
+        I_prime_bytes,
+        num_layers
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA mega w2 kernel error: %s\n", cudaGetErrorString(err));
+    }
+}

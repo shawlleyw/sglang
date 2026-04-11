@@ -102,6 +102,110 @@ class ParaSModelMixin:
                 stream_1, stream_2 = stream_2, stream_1
 
     def paras_configure_tp_fused_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
+        from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size, get_paras_tp_rank
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+        from sglang.srt.paras.peer_access import init_peer_access, peer_access_fused_transfer_combined
+        import torch
+        import time
+        import logging
+        logger = logging.getLogger(__name__)
+
+        mgr = get_global_paras_memory_manager()
+
+        t0 = time.perf_counter()
+        if not hasattr(self, '_peer_access_ctx') or self._peer_access_ctx is None:
+            tp_group_tmp = get_paras_tp_group().device_group
+            tp_size_tmp = get_paras_tp_size()
+            self._peer_access_ctx = init_peer_access(mgr, tp_group_tmp, tp_size_tmp)
+        t1 = time.perf_counter()
+
+        peer_ctx = self._peer_access_ctx
+        tp_group = get_paras_tp_group().device_group
+        tp_rank_val = get_paras_tp_rank()
+        tp_size_val = get_paras_tp_size()
+
+        dst_base_ptrs = torch.tensor(
+            peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+        )
+
+        num_layers = len(self.layers)
+        first_layer = self.layers[0]
+        E_local = first_layer.mlp.num_local_experts
+        hidden = first_layer.mlp.hidden_size
+        intermediate = first_layer.mlp.moe_intermediate_size
+        moe_inter_tp = intermediate // tp_size_val
+        I_prime_H = moe_inter_tp * hidden
+        elem_size = 2
+
+        w13_ep_offsets = []
+        w13_tp_offsets = []
+        w2_ep_offsets = []
+        w2_tp_offsets = []
+        for i, layer in enumerate(self.layers):
+            lid = layer.mlp._paras_layer_id
+            ep_w13 = mgr._entries[f"model.layers.{lid}.mlp.experts.w13_weight"]
+            ep_w2 = mgr._entries[f"model.layers.{lid}.mlp.experts.w2_weight"]
+            if lid == 0:
+                tp_w13 = mgr._entries["paras.fused_tp_slot0.w13"]
+                tp_w2 = mgr._entries["paras.fused_tp_slot0.w2"]
+            else:
+                tp_w13 = mgr._entries[f"model.layers.{lid - 1}.mlp.experts.w13_weight"]
+                tp_w2 = mgr._entries[f"model.layers.{lid - 1}.mlp.experts.w2_weight"]
+            w13_ep_offsets.append(ep_w13.offset_bytes)
+            w13_tp_offsets.append(tp_w13.offset_bytes)
+            w2_ep_offsets.append(ep_w2.offset_bytes)
+            w2_tp_offsets.append(tp_w2.offset_bytes)
+
+        w13_ep_t = torch.tensor(w13_ep_offsets, dtype=torch.int64, device="cuda")
+        w13_tp_t = torch.tensor(w13_tp_offsets, dtype=torch.int64, device="cuda")
+        w2_ep_t = torch.tensor(w2_ep_offsets, dtype=torch.int64, device="cuda")
+        w2_tp_t = torch.tensor(w2_tp_offsets, dtype=torch.int64, device="cuda")
+        local_buffer_ptr = mgr._buffer.data_ptr()
+
+        # Move attn reconfig out of kernel hot loop — do it before the transfer
+        t2 = time.perf_counter()
+        for layer in self.layers:
+            layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
+        t3 = time.perf_counter()
+
+        torch.distributed.barrier(group=tp_group)
+        t4 = time.perf_counter()
+
+        # Single combined kernel launch for all layers (w13+w2 fused)
+        peer_access_fused_transfer_combined(
+            local_buffer_ptr, dst_base_ptrs,
+            w13_ep_t, w13_tp_t, w2_ep_t, w2_tp_t,
+            tp_rank_val, tp_size_val, E_local, I_prime_H,
+            num_gates=2, elem_size=elem_size,
+            H=hidden, I_full=intermediate, I_prime=moe_inter_tp,
+            num_layers=num_layers,
+        )
+        t5 = time.perf_counter()
+
+        torch.cuda.synchronize()
+        t6 = time.perf_counter()
+        torch.distributed.barrier(group=tp_group)
+        t7 = time.perf_counter()
+
+        # Update views and configure TP (no kernel work)
+        for layer in self.layers:
+            layer.paras_configure_tp_mlp_fused_peer_access_update_views()
+            layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
+        t8 = time.perf_counter()
+
+        logger.warning(
+            f"[fused_peer_access timing] "
+            f"init={1000*(t1-t0):.1f}ms "
+            f"attn_reconfig={1000*(t3-t2):.1f}ms "
+            f"barrier1={1000*(t4-t3):.1f}ms "
+            f"combined_launch={1000*(t5-t4):.1f}ms "
+            f"sync={1000*(t6-t5):.1f}ms "
+            f"barrier2={1000*(t7-t6):.1f}ms "
+            f"views+tp={1000*(t8-t7):.1f}ms "
+            f"total={1000*(t8-t0):.1f}ms"
+        )
+
+    def paras_configure_tp_combined_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
         from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         from sglang.srt.paras.peer_access import init_peer_access
@@ -131,8 +235,7 @@ class ParaSModelMixin:
         t3 = time.perf_counter()
 
         for layer in self.layers:
-            layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
-            layer.paras_configure_tp_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
+            layer.paras_configure_tp_mlp_combined_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
         t4 = time.perf_counter()
 
         torch.cuda.synchronize()
@@ -141,12 +244,13 @@ class ParaSModelMixin:
         t6 = time.perf_counter()
 
         for layer in self.layers:
+            layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
             layer.paras_configure_tp_mlp_fused_peer_access_update_views()
             layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
         t7 = time.perf_counter()
 
         logger.warning(
-            f"[fused_peer_access timing] "
+            f"[combined_peer_access timing] "
             f"init={1000*(t1-t0):.1f}ms "
             f"barrier1={1000*(t3-t2):.1f}ms "
             f"kernels={1000*(t4-t3):.1f}ms "
@@ -168,10 +272,12 @@ class ParaSModelMixin:
         Note: the embedding layer stays in DP mode, which also works for TP.
 
         Args:
-            method: "naive", "overlap", "peer_access", or "fused_peer_access". If None, uses overlap flag.
+            method: "naive", "overlap", "peer_access", "fused_peer_access", or "combined_peer_access". If None, uses overlap flag.
         """
         if method == "peer_access":
             self.paras_configure_tp_peer_access(paras_tp_size, paras_tp_rank)
+        elif method == "combined_peer_access":
+            self.paras_configure_tp_combined_peer_access(paras_tp_size, paras_tp_rank)
         elif method == "fused_peer_access":
             self.paras_configure_tp_fused_peer_access(paras_tp_size, paras_tp_rank)
         elif method == "overlap" or (method is None and overlap):

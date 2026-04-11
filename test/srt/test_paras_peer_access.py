@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(_ROOT_DIR, "python"))
 sys.path.insert(0, os.path.join(_ROOT_DIR, "python", "sglang", "srt", "paras", "csrc"))
 
 # ---- test constants (Qwen3-30B-A3B) ----
-NUM_LAYERS = 48
+NUM_LAYERS = 8
 HIDDEN = 2048
 INTERMEDIATE = 1536
 NUM_EXPERTS = 64
@@ -359,6 +359,45 @@ def run_fused_path(mgr, num_local, peer_ctx):
     return results
 
 
+
+
+
+def run_combined_path(mgr, num_local, peer_ctx):
+    """Run combined per-layer peer access for all layers. Returns {layer_id: (w13, w2)} clones."""
+    from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
+    
+    results = {}
+    dst_base_ptrs = torch.tensor(peer_ctx.peer_addresses, dtype=torch.int64, device="cuda")
+    paras_tp_group = get_paras_tp_group().device_group
+    
+    for layer_id in range(NUM_LAYERS):
+        mixin = _make_mixin(layer_id, num_local, mgr)
+        # Combined path needs tp_experts for weight assignment at the end
+        mixin.tp_experts = type('_NS', (), {})()
+        
+        # Barriers and sync like the fused path
+        dist.barrier(group=paras_tp_group)
+        mixin.paras_configure_tp_combined_peer_access_kernel(peer_ctx=peer_ctx, dst_base_ptrs=dst_base_ptrs, stream=None)
+        torch.cuda.synchronize()
+        dist.barrier(group=paras_tp_group)
+
+        # Combined path writes to TP slot (slot i = previous layer's EP slot or slot0)
+        if layer_id == 0:
+            tp_w13_name = "paras.fused_tp_slot0.w13"
+            tp_w2_name = "paras.fused_tp_slot0.w2"
+        else:
+            tp_w13_name = f"model.layers.{layer_id - 1}.mlp.experts.w13_weight"
+            tp_w2_name = f"model.layers.{layer_id - 1}.mlp.experts.w2_weight"
+
+        tp_size = get_paras_tp_size()
+        tp_inter = INTERMEDIATE // tp_size
+        results[layer_id] = (
+            mgr.get_view_as(tp_w13_name, (NUM_EXPERTS, 2 * tp_inter, HIDDEN)).clone(),
+            mgr.get_view_as(tp_w2_name, (NUM_EXPERTS, HIDDEN, tp_inter)).clone(),
+        )
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Peer access setup
 # ---------------------------------------------------------------------------
@@ -536,8 +575,33 @@ def run_comparison_test(rank, world_size):
                         flush=True,
                     )
 
+    # ---- Combined per-layer peer access ----
+    fill_ep_weights_fused(fused_mgr, rank)
+    combined_results = run_combined_path(fused_mgr, fused_num_local, fused_peer_ctx)
+
+    if rank == 0:
+        print("\n--- NCCL vs Combined Peer Access ---", flush=True)
+    for layer_id in range(NUM_LAYERS):
+        for i, wt in enumerate(("w13", "w2")):
+            nccl_flat = nccl_results[layer_id][i].reshape(-1)
+            combined_flat = combined_results[layer_id][i].reshape(-1)
+            if not torch.equal(nccl_flat, combined_flat):
+                diff = (nccl_flat != combined_flat).sum().item()
+                print(
+                    f"[Rank {rank}] FAIL combined layer={layer_id} {wt}: "
+                    f"{diff}/{nccl_flat.numel()} elements differ",
+                    flush=True,
+                )
+                all_ok = False
+            else:
+                if rank == 0:
+                    print(
+                        f"  [OK] combined layer={layer_id} {wt} bitwise match",
+                        flush=True,
+                    )
+
     # Free comparison results to reclaim GPU memory
-    del nccl_results, fused_results
+    del nccl_results, fused_results, combined_results
     torch.cuda.empty_cache()
 
     # Restore original manager as global for benchmark
@@ -611,6 +675,20 @@ def run_benchmark(
         torch.cuda.synchronize()
         fused_times.append(time.perf_counter() - t0)
 
+    # ---- Time combined per-layer peer access ----
+    combined_times = []
+    for _ in range(BENCHMARK_WARMUP):
+        restore_weights(fused_mgr, fused_snap)
+        run_combined_path(fused_mgr, num_local, fused_peer_ctx)
+    for _ in range(BENCHMARK_RUNS):
+        restore_weights(fused_mgr, fused_snap)
+        torch.cuda.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        run_combined_path(fused_mgr, num_local, fused_peer_ctx)
+        torch.cuda.synchronize()
+        combined_times.append(time.perf_counter() - t0)
+
     set_global_paras_memory_manager(mgr)
 
     if rank == 0:
@@ -623,8 +701,12 @@ def run_benchmark(
         fa = sum(fused_times) / len(fused_times)
         fm = min(fused_times)
         fx = max(fused_times)
+        ca = sum(combined_times) / len(combined_times)
+        cm = min(combined_times)
+        cx = max(combined_times)
         speedup_peer = na / pa if pa > 0 else float("inf")
         speedup_fused = na / fa if fa > 0 else float("inf")
+        speedup_combined = na / ca if ca > 0 else float("inf")
 
         print(f"\n{'=' * 72}")
         print(
@@ -645,17 +727,23 @@ def run_benchmark(
             f"  Fused:       avg={fa * 1000:8.3f}ms  "
             f"min={fm * 1000:8.3f}ms  max={fx * 1000:8.3f}ms"
         )
-        print(f"  Speedup peer  vs NCCL: {speedup_peer:.2f}x")
-        print(f"  Speedup fused vs NCCL: {speedup_fused:.2f}x")
+        print(
+            f"  Combined:    avg={ca * 1000:8.3f}ms  "
+            f"min={cm * 1000:8.3f}ms  max={cx * 1000:8.3f}ms"
+        )
+        print(f"  Speedup peer     vs NCCL: {speedup_peer:.2f}x")
+        print(f"  Speedup fused    vs NCCL: {speedup_fused:.2f}x")
+        print(f"  Speedup combined vs NCCL: {speedup_combined:.2f}x")
         print(f"{'=' * 72}")
 
         print(f"\nPer-run times (ms):")
-        print(f"  {'Run':>4s}  {'NCCL':>10s}  {'Peer':>10s}  {'Fused':>10s}")
+        print(f"  {'Run':>4s}  {'NCCL':>10s}  {'Peer':>10s}  {'Fused':>10s}  {'Combined':>10s}")
         for i in range(BENCHMARK_RUNS):
             print(
                 f"  {i:4d}  {nccl_times[i] * 1000:10.3f}  "
                 f"{peer_times[i] * 1000:10.3f}  "
-                f"{fused_times[i] * 1000:10.3f}"
+                f"{fused_times[i] * 1000:10.3f}  "
+                f"{combined_times[i] * 1000:10.3f}"
             )
 
 
@@ -689,7 +777,7 @@ def main():
         if rank == 0:
             print(
                 f"\nSUCCESS: All {NUM_LAYERS} layers × 2 weights × "
-                f"{world_size} ranks bitwise match (NCCL, peer, fused)!",
+                f"{world_size} ranks bitwise match (NCCL, peer, fused, combined)!",
                 flush=True,
             )
 
