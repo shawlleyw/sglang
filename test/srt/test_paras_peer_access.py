@@ -2,7 +2,7 @@
 """
 4-GPU comparison test for ParaS peer access weight transfers.
 
-Tests that peer access kernels produce bitwise-identical results to
+Tests that peer access v2 kernels produce bitwise-identical results to
 NCCL all-to-all for DP=1 configuration.
 
 Usage:
@@ -241,8 +241,8 @@ def run_nccl_path(mgr, num_local):
     return results
 
 
-def build_fused_manager(rank, world_size):
-    """Create ParaSMemoryManager with slot0 + EP weights + staging for fused path."""
+def build_peer_access_manager(rank, world_size):
+    """Create ParaSMemoryManager with slot0 + EP weights + staging for peer access path."""
     from sglang.srt.paras.paras_memory_manager import (
         ParaSMemoryManager,
         set_global_paras_memory_manager,
@@ -253,7 +253,7 @@ def build_fused_manager(rank, world_size):
 
     mgr = ParaSMemoryManager(device=f"cuda:{rank}")
 
-    # Slot 0 for fused TP destination (layer 0)
+    # Slot 0 for TP destination (layer 0)
     mgr.reserve(
         "paras.fused_tp_slot0.w13",
         (num_local, 2 * INTERMEDIATE, HIDDEN),
@@ -288,7 +288,7 @@ def build_fused_manager(rank, world_size):
     return mgr, num_local
 
 
-def fill_ep_weights_fused(mgr, rank):
+def fill_ep_weights_peer_access(mgr, rank):
     """Fill EP weight buffers with same rank-deterministic data as fill_ep_weights."""
     for layer_id in range(NUM_LAYERS):
         gen = torch.Generator(device="cpu")
@@ -309,16 +309,16 @@ def fill_ep_weights_fused(mgr, rank):
         )
 
 
-def run_fused_path(mgr, num_local, peer_ctx):
-    """Run fused peer access for all layers. Returns {layer_id: (w13, w2)} clones."""
+def run_peer_access_path(mgr, num_local, peer_ctx):
+    """Run v2 peer access for all layers. Returns {layer_id: (w13, w2)} clones."""
     results = {}
     for layer_id in range(NUM_LAYERS):
         mixin = _make_mixin(layer_id, num_local, mgr)
-        # Fused path needs tp_experts for weight assignment at the end
+        # Peer access path needs tp_experts for weight assignment at the end
         mixin.tp_experts = type('_NS', (), {})()
         mixin.paras_configure_tp_fused_peer_access(peer_ctx=peer_ctx, stream=None)
 
-        # Fused path writes to TP slot (slot i = previous layer's EP slot or slot0)
+        # Peer access writes to TP slot (slot i = previous layer's EP slot or slot0)
         if layer_id == 0:
             tp_w13_name = "paras.fused_tp_slot0.w13"
             tp_w2_name = "paras.fused_tp_slot0.w2"
@@ -327,45 +327,6 @@ def run_fused_path(mgr, num_local, peer_ctx):
             tp_w2_name = f"model.layers.{layer_id - 1}.mlp.experts.w2_weight"
 
         from sglang.srt.paras.paras_parallel_state import get_paras_tp_size
-        tp_size = get_paras_tp_size()
-        tp_inter = INTERMEDIATE // tp_size
-        results[layer_id] = (
-            mgr.get_view_as(tp_w13_name, (NUM_EXPERTS, 2 * tp_inter, HIDDEN)).clone(),
-            mgr.get_view_as(tp_w2_name, (NUM_EXPERTS, HIDDEN, tp_inter)).clone(),
-        )
-    return results
-
-
-
-
-
-def run_peer_access_path(mgr, num_local, peer_ctx):
-    """Run per-layer peer access for all layers. Returns {layer_id: (w13, w2)} clones."""
-    from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
-    
-    results = {}
-    dst_base_ptrs = torch.tensor(peer_ctx.peer_addresses, dtype=torch.int64, device="cuda")
-    paras_tp_group = get_paras_tp_group().device_group
-    
-    for layer_id in range(NUM_LAYERS):
-        mixin = _make_mixin(layer_id, num_local, mgr)
-        # Combined path needs tp_experts for weight assignment at the end
-        mixin.tp_experts = type('_NS', (), {})()
-        
-        # Barriers and sync like the fused path
-        dist.barrier(group=paras_tp_group)
-        mixin.paras_configure_tp_peer_access_kernel(peer_ctx=peer_ctx, dst_base_ptrs=dst_base_ptrs, stream=None)
-        torch.cuda.synchronize()
-        dist.barrier(group=paras_tp_group)
-
-        # Combined path writes to TP slot (slot i = previous layer's EP slot or slot0)
-        if layer_id == 0:
-            tp_w13_name = "paras.fused_tp_slot0.w13"
-            tp_w2_name = "paras.fused_tp_slot0.w2"
-        else:
-            tp_w13_name = f"model.layers.{layer_id - 1}.mlp.experts.w13_weight"
-            tp_w2_name = f"model.layers.{layer_id - 1}.mlp.experts.w2_weight"
-
         tp_size = get_paras_tp_size()
         tp_inter = INTERMEDIATE // tp_size
         results[layer_id] = (
@@ -468,7 +429,7 @@ def setup_peer_ctx(mgr, rank, world_size, tp_group):
 # ---------------------------------------------------------------------------
 
 def run_comparison_test(rank, world_size):
-    """Verify bitwise match between NCCL, fused, and peer access paths."""
+    """Verify bitwise match between NCCL and peer access (v2) paths."""
     tp_group = setup_paras_state(rank, world_size)
     mgr, num_local = build_manager(rank, world_size)
 
@@ -479,41 +440,17 @@ def run_comparison_test(rank, world_size):
 
     all_ok = True
 
-    fused_mgr, fused_num_local = build_fused_manager(rank, world_size)
-    fill_ep_weights_fused(fused_mgr, rank)
-    fused_peer_ctx = setup_peer_ctx(fused_mgr, rank, world_size, tp_group)
-    fused_results = run_fused_path(fused_mgr, fused_num_local, fused_peer_ctx)
-
-    if rank == 0:
-        print("\n--- NCCL vs Fused Peer Access ---", flush=True)
-    for layer_id in range(NUM_LAYERS):
-        for i, wt in enumerate(("w13", "w2")):
-            nccl_flat = nccl_results[layer_id][i].reshape(-1)
-            fused_flat = fused_results[layer_id][i].reshape(-1)
-            if not torch.equal(nccl_flat, fused_flat):
-                diff = (nccl_flat != fused_flat).sum().item()
-                print(
-                    f"[Rank {rank}] FAIL fused layer={layer_id} {wt}: "
-                    f"{diff}/{nccl_flat.numel()} elements differ",
-                    flush=True,
-                )
-                all_ok = False
-            else:
-                if rank == 0:
-                    print(
-                        f"  [OK] fused layer={layer_id} {wt} bitwise match",
-                        flush=True,
-                    )
-
-    fill_ep_weights_fused(fused_mgr, rank)
-    peer_access_results = run_peer_access_path(fused_mgr, fused_num_local, fused_peer_ctx)
+    pa_mgr, pa_num_local = build_peer_access_manager(rank, world_size)
+    fill_ep_weights_peer_access(pa_mgr, rank)
+    peer_ctx = setup_peer_ctx(pa_mgr, rank, world_size, tp_group)
+    pa_results = run_peer_access_path(pa_mgr, pa_num_local, peer_ctx)
 
     if rank == 0:
         print("\n--- NCCL vs Peer Access ---", flush=True)
     for layer_id in range(NUM_LAYERS):
         for i, wt in enumerate(("w13", "w2")):
             nccl_flat = nccl_results[layer_id][i].reshape(-1)
-            pa_flat = peer_access_results[layer_id][i].reshape(-1)
+            pa_flat = pa_results[layer_id][i].reshape(-1)
             if not torch.equal(nccl_flat, pa_flat):
                 diff = (nccl_flat != pa_flat).sum().item()
                 print(
@@ -529,13 +466,13 @@ def run_comparison_test(rank, world_size):
                         flush=True,
                     )
 
-    del nccl_results, fused_results, peer_access_results
+    del nccl_results, pa_results
     torch.cuda.empty_cache()
 
     from sglang.srt.paras.paras_memory_manager import set_global_paras_memory_manager
     set_global_paras_memory_manager(mgr)
 
-    return all_ok, tp_group, mgr, num_local, snap, fused_mgr, fused_peer_ctx
+    return all_ok, tp_group, mgr, num_local, snap, pa_mgr, peer_ctx
 
 
 # ---------------------------------------------------------------------------
@@ -544,23 +481,20 @@ def run_comparison_test(rank, world_size):
 
 def run_benchmark(
     rank, world_size, tp_group, mgr, num_local, snap,
-    fused_mgr, fused_peer_ctx,
+    pa_mgr, peer_ctx,
 ):
     from sglang.srt.paras.paras_memory_manager import set_global_paras_memory_manager
 
-    fused_snap = snapshot_weights(fused_mgr)
+    pa_snap = snapshot_weights(pa_mgr)
 
     set_global_paras_memory_manager(mgr)
     for _ in range(BENCHMARK_WARMUP):
         restore_weights(mgr, snap)
         run_nccl_path(mgr, num_local)
-    set_global_paras_memory_manager(fused_mgr)
+    set_global_paras_memory_manager(pa_mgr)
     for _ in range(BENCHMARK_WARMUP):
-        restore_weights(fused_mgr, fused_snap)
-        run_fused_path(fused_mgr, num_local, fused_peer_ctx)
-    for _ in range(BENCHMARK_WARMUP):
-        restore_weights(fused_mgr, fused_snap)
-        run_peer_access_path(fused_mgr, num_local, fused_peer_ctx)
+        restore_weights(pa_mgr, pa_snap)
+        run_peer_access_path(pa_mgr, num_local, peer_ctx)
 
     torch.cuda.synchronize()
     dist.barrier()
@@ -576,26 +510,16 @@ def run_benchmark(
         torch.cuda.synchronize()
         nccl_times.append(time.perf_counter() - t0)
 
-    set_global_paras_memory_manager(fused_mgr)
-    fused_times = []
+    set_global_paras_memory_manager(pa_mgr)
+    pa_times = []
     for _ in range(BENCHMARK_RUNS):
-        restore_weights(fused_mgr, fused_snap)
+        restore_weights(pa_mgr, pa_snap)
         torch.cuda.synchronize()
         dist.barrier()
         t0 = time.perf_counter()
-        run_fused_path(fused_mgr, num_local, fused_peer_ctx)
+        run_peer_access_path(pa_mgr, num_local, peer_ctx)
         torch.cuda.synchronize()
-        fused_times.append(time.perf_counter() - t0)
-
-    peer_access_times = []
-    for _ in range(BENCHMARK_RUNS):
-        restore_weights(fused_mgr, fused_snap)
-        torch.cuda.synchronize()
-        dist.barrier()
-        t0 = time.perf_counter()
-        run_peer_access_path(fused_mgr, num_local, fused_peer_ctx)
-        torch.cuda.synchronize()
-        peer_access_times.append(time.perf_counter() - t0)
+        pa_times.append(time.perf_counter() - t0)
 
     set_global_paras_memory_manager(mgr)
 
@@ -603,14 +527,10 @@ def run_benchmark(
         na = sum(nccl_times) / len(nccl_times)
         nm = min(nccl_times)
         nx = max(nccl_times)
-        fa = sum(fused_times) / len(fused_times)
-        fm = min(fused_times)
-        fx = max(fused_times)
-        pa = sum(peer_access_times) / len(peer_access_times)
-        pm = min(peer_access_times)
-        px = max(peer_access_times)
-        speedup_fused = na / fa if fa > 0 else float("inf")
-        speedup_pa = na / pa if pa > 0 else float("inf")
+        pa = sum(pa_times) / len(pa_times)
+        pm = min(pa_times)
+        px = max(pa_times)
+        speedup = na / pa if pa > 0 else float("inf")
 
         print(f"\n{'=' * 72}")
         print(
@@ -624,24 +544,18 @@ def run_benchmark(
             f"min={nm * 1000:8.3f}ms  max={nx * 1000:8.3f}ms"
         )
         print(
-            f"  Fused:        avg={fa * 1000:8.3f}ms  "
-            f"min={fm * 1000:8.3f}ms  max={fx * 1000:8.3f}ms"
-        )
-        print(
             f"  Peer Access:  avg={pa * 1000:8.3f}ms  "
             f"min={pm * 1000:8.3f}ms  max={px * 1000:8.3f}ms"
         )
-        print(f"  Speedup fused       vs NCCL: {speedup_fused:.2f}x")
-        print(f"  Speedup peer_access vs NCCL: {speedup_pa:.2f}x")
+        print(f"  Speedup peer_access vs NCCL: {speedup:.2f}x")
         print(f"{'=' * 72}")
 
         print(f"\nPer-run times (ms):")
-        print(f"  {'Run':>4s}  {'NCCL':>10s}  {'Fused':>10s}  {'Peer Access':>12s}")
+        print(f"  {'Run':>4s}  {'NCCL':>10s}  {'Peer Access':>12s}")
         for i in range(BENCHMARK_RUNS):
             print(
                 f"  {i:4d}  {nccl_times[i] * 1000:10.3f}  "
-                f"{fused_times[i] * 1000:10.3f}  "
-                f"{peer_access_times[i] * 1000:12.3f}"
+                f"{pa_times[i] * 1000:12.3f}"
             )
 
 
@@ -675,15 +589,15 @@ def main():
         if rank == 0:
             print(
                 f"\nSUCCESS: All {NUM_LAYERS} layers × 2 weights × "
-                f"{world_size} ranks bitwise match (NCCL, fused, peer_access)!",
+                f"{world_size} ranks bitwise match (NCCL vs peer_access)!",
                 flush=True,
             )
 
         if args.benchmark:
-            _, tp_group, mgr, num_local, snap, fused_mgr, fused_peer_ctx = result
+            _, tp_group, mgr, num_local, snap, pa_mgr, peer_ctx = result
             run_benchmark(
                 rank, world_size, tp_group, mgr, num_local, snap,
-                fused_mgr, fused_peer_ctx,
+                pa_mgr, peer_ctx,
             )
 
         dist.barrier()

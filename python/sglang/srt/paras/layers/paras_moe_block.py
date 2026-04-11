@@ -293,47 +293,6 @@ class ParaSMoeBlockMixin:
                     (self.num_global_experts, self.hidden_size, moe_intermediate_size_after_tp),
                 )
 
-    def paras_configure_tp_peer_access_kernel(
-        self,
-        peer_ctx,
-        dst_base_ptrs: torch.Tensor,
-        stream=None,
-    ):
-        """Launch combined w13+w2 kernel for this layer (192 blocks, single launch)."""
-        from sglang.srt.paras.peer_access import peer_access_fused_transfer_combined_single_layer
-
-        mgr = get_global_paras_memory_manager()
-        paras_tp_size = get_paras_tp_size()
-        paras_tp_rank = get_paras_tp_rank()
-        layer_id = self._paras_layer_id
-        moe_intermediate_size_after_tp = self.moe_intermediate_size // paras_tp_size
-
-        ep_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.experts.w13_weight"]
-        ep_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.experts.w2_weight"]
-
-        if layer_id == 0:
-            tp_w13_entry = mgr._entries["paras.fused_tp_slot0.w13"]
-            tp_w2_entry = mgr._entries["paras.fused_tp_slot0.w2"]
-        else:
-            tp_w13_entry = mgr._entries[f"model.layers.{layer_id - 1}.mlp.experts.w13_weight"]
-            tp_w2_entry = mgr._entries[f"model.layers.{layer_id - 1}.mlp.experts.w2_weight"]
-
-        local_buffer_ptr = mgr._buffer.data_ptr()
-        elem_size = 2
-
-        peer_access_fused_transfer_combined_single_layer(
-            local_buffer_ptr, dst_base_ptrs,
-            ep_w13_entry.offset_bytes, tp_w13_entry.offset_bytes,
-            ep_w2_entry.offset_bytes, tp_w2_entry.offset_bytes,
-            paras_tp_rank, paras_tp_size, self.num_local_experts,
-            moe_intermediate_size_after_tp * self.hidden_size,
-            num_gates=2, elem_size=elem_size,
-            H=self.hidden_size,
-            I_full=self.moe_intermediate_size,
-            I_prime=moe_intermediate_size_after_tp,
-            stream=stream,
-        )
-
     def paras_configure_tp_fused_peer_access_kernel(
         self,
         peer_ctx,

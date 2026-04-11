@@ -67,33 +67,6 @@ def enable_peer_access(device_ids: List[int]) -> None:
                 pass
 
 
-def exchange_buffer_addresses(
-    local_buffer_ptr: int, tp_group, world_size: int
-) -> List[int]:
-    """Exchange managed-buffer base addresses across all TP ranks via all_gather.
-
-    Returns a list of length *world_size* where index ``r`` contains rank ``r``'s
-    buffer address.  With CUDA UVA + peer access enabled these pointers can be
-    used directly in kernels.
-    """
-    # Pack local pointer as int64 tensor
-    local_addr = torch.tensor([local_buffer_ptr], dtype=torch.int64, device="cuda")
-
-    # Gather all addresses
-    all_addrs = torch.zeros(world_size, dtype=torch.int64, device="cuda")
-    dist.all_gather_into_tensor(all_addrs, local_addr, group=tp_group)
-
-    addresses = all_addrs.tolist()
-
-    # Validate: all addresses must be non-zero and distinct
-    assert all(a != 0 for a in addresses), f"Some buffer addresses are null: {addresses}"
-    assert len(set(addresses)) == len(addresses), (
-        f"Buffer addresses are not unique: {addresses}"
-    )
-
-    return addresses
-
-
 _IPC_HANDLE_SIZE = 64
 
 
@@ -221,69 +194,6 @@ def init_peer_access(manager, tp_group, tp_size: int) -> PeerAccessContext:
     )
 
 
-def peer_access_fused_transfer(
-    local_buffer_ptr: int,
-    dst_base_ptrs_tensor: torch.Tensor,
-    src_ep_offset: int,
-    dst_tp_offset: int,
-    tp_rank: int,
-    tp_size: int,
-    E_local: int,
-    I_prime_H: int,
-    num_gates: int,
-    elem_size: int = 2,
-    stream=None,
-) -> None:
-    """Fused contiguous-read + peer-write for w13 (tp split on 2nd dim)."""
-    import paras_peer_access_cuda
-    stream_ptr = stream.cuda_stream if stream is not None else 0
-    paras_peer_access_cuda.launch_peer_access_fused_transfer(
-        local_buffer_ptr,
-        dst_base_ptrs_tensor,
-        src_ep_offset,
-        dst_tp_offset,
-        tp_rank,
-        tp_size,
-        E_local,
-        I_prime_H,
-        num_gates,
-        elem_size,
-        stream_ptr,
-    )
-
-
-def peer_access_fused_transfer_w2(
-    local_buffer_ptr: int,
-    dst_base_ptrs_tensor: torch.Tensor,
-    src_ep_offset: int,
-    dst_tp_offset: int,
-    tp_rank: int,
-    tp_size: int,
-    E_local: int,
-    H: int,
-    I_full: int,
-    I_prime: int,
-    elem_size: int = 2,
-    stream=None,
-) -> None:
-    """Fused w2 peer write using int4-vectorized row copies (coalesced reads and writes)."""
-    import paras_peer_access_cuda
-    stream_ptr = stream.cuda_stream if stream is not None else 0
-    paras_peer_access_cuda.launch_peer_access_fused_transfer_w2(
-        local_buffer_ptr,
-        dst_base_ptrs_tensor,
-        src_ep_offset,
-        dst_tp_offset,
-        tp_rank,
-        tp_size,
-        E_local,
-        H,
-        I_full * elem_size,    # I_full_bytes
-        I_prime * elem_size,   # I_prime_bytes
-        stream_ptr,
-    )
-
-
 def peer_access_fused_transfer_w13_v2(
     local_buffer_ptr: int,
     dst_base_ptrs_tensor: torch.Tensor,
@@ -344,84 +254,6 @@ def peer_access_fused_transfer_w2_v2(
         I_full * elem_size,    # I_full_bytes
         I_prime * elem_size,   # I_prime_bytes
         stream_ptr,
-    )
-
-
-def peer_access_fused_transfer_combined(
-    local_buffer_ptr: int,
-    dst_base_ptrs_tensor: torch.Tensor,
-    w13_ep_offsets: torch.Tensor,
-    w13_tp_offsets: torch.Tensor,
-    w2_ep_offsets: torch.Tensor,
-    w2_tp_offsets: torch.Tensor,
-    tp_rank: int,
-    tp_size: int,
-    E_local: int,
-    I_prime_H: int,
-    num_gates: int,
-    elem_size: int,
-    H: int,
-    I_full: int,
-    I_prime: int,
-    num_layers: int,
-    num_threads: int = 256,
-    stream=None,
-) -> None:
-    """Combined w13+w2 mega-kernel: single launch for all layers."""
-    import paras_peer_access_cuda
-    stream_ptr = stream.cuda_stream if stream is not None else 0
-    paras_peer_access_cuda.launch_peer_access_fused_transfer_combined(
-        local_buffer_ptr,
-        dst_base_ptrs_tensor,
-        w13_ep_offsets,
-        w13_tp_offsets,
-        w2_ep_offsets,
-        w2_tp_offsets,
-        tp_rank,
-        tp_size,
-        E_local,
-        I_prime_H,
-        num_gates,
-        elem_size,
-        H,
-        I_full * elem_size,
-        I_prime * elem_size,
-        num_layers,
-        num_threads,
-        stream_ptr,
-    )
-
-
-def peer_access_fused_transfer_combined_single_layer(
-    local_buffer_ptr: int,
-    dst_base_ptrs_tensor: torch.Tensor,
-    w13_ep_offset: int,
-    w13_tp_offset: int,
-    w2_ep_offset: int,
-    w2_tp_offset: int,
-    tp_rank: int,
-    tp_size: int,
-    E_local: int,
-    I_prime_H: int,
-    num_gates: int,
-    elem_size: int,
-    H: int,
-    I_full: int,
-    I_prime: int,
-    stream=None,
-) -> None:
-    """Combined w13+w2 kernel for a single layer (192 blocks = 128 w13 + 64 w2)."""
-    import paras_peer_access_cuda
-    stream_ptr = stream.cuda_stream if stream is not None else 0
-    w13_ep = torch.tensor([w13_ep_offset], dtype=torch.int64, device="cuda")
-    w13_tp = torch.tensor([w13_tp_offset], dtype=torch.int64, device="cuda")
-    w2_ep = torch.tensor([w2_ep_offset], dtype=torch.int64, device="cuda")
-    w2_tp = torch.tensor([w2_tp_offset], dtype=torch.int64, device="cuda")
-    paras_peer_access_cuda.launch_peer_access_fused_transfer_combined(
-        local_buffer_ptr, dst_base_ptrs_tensor,
-        w13_ep, w13_tp, w2_ep, w2_tp,
-        tp_rank, tp_size, E_local, I_prime_H, num_gates, elem_size,
-        H, I_full * elem_size, I_prime * elem_size, 1, 256, stream_ptr,
     )
 
 
