@@ -254,24 +254,30 @@ All numbers are for Qwen3-30B-A3B (48 MoE layers, 64 experts, hidden=2048, inter
 
 The table below shows the **inherent memory overhead** of each method vs the original N-slot system (no ParaS). The naive and overlap methods only require staging buffers — they could work with the original N-slot layout. The peer_access method requires the N+1 extra slot to avoid source/destination aliasing but needs no staging. (In the current implementation, all methods share the N+1 layout for code simplicity, but the inherent cost is what matters for comparison.)
 
+Each staging buffer (pre_permute or gather) holds one layer's worth of MoE weights (`E_local × dp_size` experts for w13 + w2), which is exactly the same size as a physical slot for DP=1 (288 MB). This makes the overhead directly comparable in units of "slots."
+
 **DP=1** (current production configuration):
 
 | Component | naive | overlap | peer_access |
 |-----------|------:|--------:|------------:|
-| N+1 extra slot | — | — | +288 MB |
-| Staging: pre_permute | +580 MB (×1) | +1160 MB (×2) | — |
-| **Total inherent overhead** | **~580 MB (≈2 slots)** | **~1160 MB (≈4 slots)** | **~288 MB (≈1 slot)** |
+| N+1 extra slot | — | — | +1 slot |
+| Staging: pre_permute | +1 slot (×1) | +1 slot (×2) | — |
+| **Total inherent overhead** | **1 slot (288 MB)** | **2 slots (576 MB)** | **1 slot (288 MB)** |
+
+Naive and peer_access have identical memory overhead (1 slot each). Peer_access wins purely on latency.
 
 **DP=2** (hypothetical, ep_size=2, tp_size=4):
 
+Each staging buffer grows by `dp_size×` (holding `E_local × dp_size` experts), so each buffer = `dp_size` slots = 2 slots (576 MB).
+
 | Component | naive | overlap | peer_access |
 |-----------|------:|--------:|------------:|
-| N+1 extra slot | — | — | +288 MB |
-| Staging: pre_permute | +1160 MB (×1) | +2320 MB (×2) | — |
-| Staging: gather | +1160 MB (×1) | +2320 MB (×2) | — |
-| **Total inherent overhead** | **~2.27 GiB (≈8 slots)** | **~4.54 GiB (≈16 slots)** | **~288 MB (≈1 slot)** |
+| N+1 extra slot | — | — | +1 slot |
+| Staging: pre_permute (2 slots each) | +2 slots (×1) | +2 slots (×2) | — |
+| Staging: gather (2 slots each) | +2 slots (×1) | +2 slots (×2) | — |
+| **Total inherent overhead** | **4 slots (1.13 GiB)** | **8 slots (2.25 GiB)** | **1 slot (288 MB)** |
 
-The staging overhead scales linearly with `dp_size` (each buffer grows by `dp_size×`) and with pipeline depth (overlap doubles the buffer count). At DP=2, the overlap path's 4.54 GiB staging cost is equivalent to 16 MoE layer slots. The peer_access path's overhead is fixed at 1 slot regardless of DP size — a **16× advantage** at DP=2.
+At DP=2, the peer_access memory advantage grows to **4× vs naive** and **8× vs overlap**. The overhead gap widens further at higher DP sizes since staging scales as `O(dp_size × num_pipeline_stages)` while peer_access remains fixed at 1 slot.
 
 ### Latency Breakdown (E2E, `configure_tp`)
 
