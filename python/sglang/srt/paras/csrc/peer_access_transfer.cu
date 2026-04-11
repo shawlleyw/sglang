@@ -174,9 +174,12 @@ void launch_peer_access_fused_transfer(
     }
 }
 
-// Fused strided kernel for w2: EP shape (E_local, H, I) with tp split on last dim I.
+// Fused kernel for w2: EP shape (E_local, H, I_full) with TP split on last dim.
 // Each block handles one (dst_rank r, expert e) pair.
-// Copies H rows of I' elements each, with source stride I between rows.
+// Within each row h, the I_prime elements are contiguous — exploited with int4.
+// Source: row h at offset (e*H + h)*I_full_bytes + r*I_prime_bytes (contiguous I_prime bytes)
+// Dest:   row h at offset ((tp_rank*E_local+e)*H + h)*I_prime_bytes (contiguous I_prime bytes)
+// Both reads and writes are coalesced within each row.
 __global__ void peer_access_fused_transfer_w2_kernel(
     const char* __restrict__ local_buffer,
     char* const* peer_buffers,
@@ -186,29 +189,27 @@ __global__ void peer_access_fused_transfer_w2_kernel(
     int tp_size,
     int E_local,
     int H,
-    int I_full,
-    int I_prime,
-    int elem_size
+    int I_full_bytes,   // I_full * elem_size  (divisible by 16)
+    int I_prime_bytes   // I_prime * elem_size  (divisible by 16, = I_full_bytes / tp_size)
 ) {
-    int block_idx = blockIdx.x;
-    int r = block_idx / E_local;
-    int e = block_idx % E_local;
+    int r = blockIdx.x / E_local;
+    int e = blockIdx.x % E_local;
 
-    const char* src_expert = local_buffer + src_ep_offset +
-        (int64_t)e * H * I_full * elem_size;
-    char* dst_expert = peer_buffers[r] + dst_tp_offset +
-        (int64_t)(tp_rank * E_local + e) * H * I_prime * elem_size;
+    int n_int4_src = I_full_bytes / 16;   // int4 per source row
+    int n_int4_dst = I_prime_bytes / 16;  // int4 per dest row (shard size)
+    int r_int4 = r * n_int4_dst;          // int4 offset of shard r in source row
 
-    int64_t total = (int64_t)H * I_prime;
+    const int4* src_base = reinterpret_cast<const int4*>(local_buffer + src_ep_offset)
+                           + (int64_t)e * H * n_int4_src;
+    int4* dst_base = reinterpret_cast<int4*>(peer_buffers[r] + dst_tp_offset)
+                     + (int64_t)(tp_rank * E_local + e) * H * n_int4_dst;
 
-    const uint16_t* src16 = reinterpret_cast<const uint16_t*>(src_expert);
-    uint16_t* dst16 = reinterpret_cast<uint16_t*>(dst_expert);
+    int64_t total_int4 = (int64_t)H * n_int4_dst;
 
-    for (int64_t idx = threadIdx.x; idx < total; idx += blockDim.x) {
-        int h = idx / I_prime;
-        int ip = idx % I_prime;
-        dst16[(int64_t)h * I_prime + ip] =
-            src16[(int64_t)h * I_full + (int64_t)r * I_prime + ip];
+    for (int64_t idx = threadIdx.x; idx < total_int4; idx += blockDim.x) {
+        int64_t h  = idx / n_int4_dst;
+        int64_t ii = idx % n_int4_dst;
+        dst_base[h * n_int4_dst + ii] = src_base[h * n_int4_src + r_int4 + ii];
     }
 }
 
@@ -221,9 +222,8 @@ void launch_peer_access_fused_transfer_w2(
     int tp_size,
     int E_local,
     int H,
-    int I_full,
-    int I_prime,
-    int elem_size,
+    int I_full_bytes,
+    int I_prime_bytes,
     cudaStream_t stream
 ) {
     int blocks = tp_size * E_local;
@@ -238,9 +238,8 @@ void launch_peer_access_fused_transfer_w2(
         tp_size,
         E_local,
         H,
-        I_full,
-        I_prime,
-        elem_size
+        I_full_bytes,
+        I_prime_bytes
     );
 
     cudaError_t err = cudaGetLastError();

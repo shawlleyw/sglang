@@ -38,9 +38,8 @@ void launch_peer_access_fused_transfer_w2(
     int tp_size,
     int E_local,
     int H,
-    int I_full,
-    int I_prime,
-    int elem_size,
+    int I_full_bytes,
+    int I_prime_bytes,
     cudaStream_t stream
 );
 
@@ -114,9 +113,8 @@ void launch_peer_access_fused_transfer_w2_py(
     int tp_size,
     int E_local,
     int H,
-    int I_full,
-    int I_prime,
-    int elem_size,
+    int I_full_bytes,
+    int I_prime_bytes,
     int64_t stream_ptr
 ) {
     TORCH_CHECK(peer_buffer_ptrs.is_cuda(), "peer_buffer_ptrs must be on GPU");
@@ -130,9 +128,8 @@ void launch_peer_access_fused_transfer_w2_py(
         tp_size,
         E_local,
         H,
-        I_full,
-        I_prime,
-        elem_size,
+        I_full_bytes,
+        I_prime_bytes,
         stream
     );
 }

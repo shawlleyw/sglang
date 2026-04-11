@@ -106,38 +106,55 @@ class ParaSModelMixin:
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         from sglang.srt.paras.peer_access import init_peer_access
         import torch
+        import time
+        import logging
+        logger = logging.getLogger(__name__)
 
         mgr = get_global_paras_memory_manager()
 
+        t0 = time.perf_counter()
         if not hasattr(self, '_peer_access_ctx') or self._peer_access_ctx is None:
-            tp_group = get_paras_tp_group().device_group
-            tp_size = get_paras_tp_size()
-            self._peer_access_ctx = init_peer_access(mgr, tp_group, tp_size)
+            tp_group_tmp = get_paras_tp_group().device_group
+            tp_size_tmp = get_paras_tp_size()
+            self._peer_access_ctx = init_peer_access(mgr, tp_group_tmp, tp_size_tmp)
+        t1 = time.perf_counter()
 
         peer_ctx = self._peer_access_ctx
         tp_group = get_paras_tp_group().device_group
 
-        # Build dst_base_ptrs once (reused for all layers)
         dst_base_ptrs = torch.tensor(
             peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
         )
 
-        # Barrier 1: ensure all ranks finished EP inference reads before any writes
+        t2 = time.perf_counter()
         torch.distributed.barrier(group=tp_group)
+        t3 = time.perf_counter()
 
-        # Launch all layer kernels — no inter-layer barriers needed (N+1 slot design)
         for layer in self.layers:
             layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
             layer.paras_configure_tp_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
+        t4 = time.perf_counter()
 
-        # Barrier 2: ensure all peer writes complete before TP mode begins
         torch.cuda.synchronize()
+        t5 = time.perf_counter()
         torch.distributed.barrier(group=tp_group)
+        t6 = time.perf_counter()
 
-        # Update TP views and switch mode for all layers
         for layer in self.layers:
             layer.paras_configure_tp_mlp_fused_peer_access_update_views()
             layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
+        t7 = time.perf_counter()
+
+        logger.warning(
+            f"[fused_peer_access timing] "
+            f"init={1000*(t1-t0):.1f}ms "
+            f"barrier1={1000*(t3-t2):.1f}ms "
+            f"kernels={1000*(t4-t3):.1f}ms "
+            f"sync={1000*(t5-t4):.1f}ms "
+            f"barrier2={1000*(t6-t5):.1f}ms "
+            f"views={1000*(t7-t6):.1f}ms "
+            f"total={1000*(t7-t0):.1f}ms"
+        )
 
     def paras_configure_helper(self):
         pass

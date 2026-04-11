@@ -303,7 +303,7 @@ def peer_access_fused_transfer_w2(
     elem_size: int = 2,
     stream=None,
 ) -> None:
-    """Fused strided-read + peer-write for w2 (tp split on last dim)."""
+    """Fused w2 peer write using int4-vectorized row copies (coalesced reads and writes)."""
     import paras_peer_access_cuda
     stream_ptr = stream.cuda_stream if stream is not None else 0
     paras_peer_access_cuda.launch_peer_access_fused_transfer_w2(
@@ -315,8 +315,7 @@ def peer_access_fused_transfer_w2(
         tp_size,
         E_local,
         H,
-        I_full,
-        I_prime,
-        elem_size,
+        I_full * elem_size,    # I_full_bytes
+        I_prime * elem_size,   # I_prime_bytes
         stream_ptr,
     )
