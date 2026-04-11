@@ -384,7 +384,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         )
 
     def paras_configure_helper(self):
-        torch.cuda.synchronize()
+        pass
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
