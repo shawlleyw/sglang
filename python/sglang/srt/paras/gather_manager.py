@@ -195,9 +195,13 @@ class ParaSReqGatherManager:
         
         num_heads = kv_cache.head_num
         head_dim = kv_cache.head_dim
-        sharded_num_heads = num_heads // self.group_size
+        sharded_num_heads = max(1, num_heads // self.group_size)
         size_per_token = kv_cache.head_num * kv_cache.head_dim
-        splited_size_per_token = size_per_token // self.group_size
+        splited_size_per_token = sharded_num_heads * head_dim
+        
+        # NOTE: when num_heads < group_size, heads are replicated (sharded_num_heads=1 per rank).
+        # The all_to_all still sends head_dim bytes per K+V, matching get_num_kv_heads(tp_size) = max(1,...).
+        # For full replication support (1-to-many), peer_access path is preferred.
         
         input_split_sizes = [2 * splited_size_per_token * self.num_local_tokens] * self.group_size
         output_split_sizes = [2 * (splited_size_per_token * num_tokens_of_rank) for num_tokens_of_rank in self.global_num_tokens]

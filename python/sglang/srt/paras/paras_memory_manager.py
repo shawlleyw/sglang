@@ -123,6 +123,7 @@ class ParaSMemoryManager:
         self.ep_max_kv_tokens: int = 0
         self.tp_max_kv_tokens: int = 0
         self._kv_reserved: bool = False
+        self._kv_n_plus_1: bool = False
 
     # ----- reservation ----------------------------------------------------
 
@@ -201,13 +202,22 @@ class ParaSMemoryManager:
         self.ep_max_kv_tokens = ep_max_tokens
         self.tp_max_kv_tokens = tp_max_tokens
 
+        # Reserve N+1 physical KV slots (slot 0 is the extra "TP landing" slot,
+        # matching the MoE N+1 pattern in plan_qwen_moe_layout).
+        kv_shape = (ep_max_tokens + page_size, num_kv_heads, head_dim)
+        for j in range(num_layers + 1):
+            self.reserve(f"paras.kv_slot.{j}.k", kv_shape, kv_dtype)
+            self.reserve(f"paras.kv_slot.{j}.v", kv_shape, kv_dtype)
+
+        # Weight-loading aliases: model.layers.{i}.kv.k/v → slot[i+1].
+        # Dict assignment (NOT alias()) — pre-materialize, same LayoutEntry object.
         for i in range(num_layers):
             lp = f"{prefix}.layers.{i}"
-            kv_shape = (ep_max_tokens + page_size, num_kv_heads, head_dim)
-            self.reserve(f"{lp}.kv.k", kv_shape, kv_dtype)
-            self.reserve(f"{lp}.kv.v", kv_shape, kv_dtype)
+            self._entries[f"{lp}.kv.k"] = self._entries[f"paras.kv_slot.{i+1}.k"]
+            self._entries[f"{lp}.kv.v"] = self._entries[f"paras.kv_slot.{i+1}.v"]
 
         self._kv_reserved = True
+        self._kv_n_plus_1 = True
 
     # ----- materialization ------------------------------------------------
 
@@ -324,16 +334,24 @@ class ParaSMemoryManager:
                 k_bufs.append(self.get_view(k_name))
                 v_bufs.append(self.get_view(v_name))
             elif mode == "tp":
-                k_entry = self._entries[k_name]
-                ep_heads = k_entry.shape[1]
-                tp_heads = ep_heads // tp_size
-                tp_shape = (
-                    self.tp_max_kv_tokens + page_size,
-                    tp_heads,
-                    k_entry.shape[2],
-                )
-                k_bufs.append(self.get_view_as(k_name, tp_shape))
-                v_bufs.append(self.get_view_as(v_name, tp_shape))
+                # Prefer dedicated TP aliases (N+1 slot design) when available.
+                tp_k_name = f"{lp}.kv.tp.k"
+                tp_v_name = f"{lp}.kv.tp.v"
+                if tp_k_name in self._entries:
+                    k_bufs.append(self.get_view(tp_k_name))
+                    v_bufs.append(self.get_view(tp_v_name))
+                else:
+                    # Fallback: reinterpret EP bytes as TP shape.
+                    k_entry = self._entries[k_name]
+                    ep_heads = k_entry.shape[1]
+                    tp_heads = ep_heads // tp_size
+                    tp_shape = (
+                        self.tp_max_kv_tokens + page_size,
+                        tp_heads,
+                        k_entry.shape[2],
+                    )
+                    k_bufs.append(self.get_view_as(k_name, tp_shape))
+                    v_bufs.append(self.get_view_as(v_name, tp_shape))
             else:
                 raise ValueError(f"mode must be 'ep' or 'tp', got '{mode}'")
 
@@ -409,7 +427,7 @@ class ParaSMemoryManager:
     @property
     def weights_only_bytes(self) -> int:
         """Total reserved bytes NOT including KV cache entries (for KV sizing)."""
-        kv_names = {n for n in self._reservation_order if ".kv." in n}
+        kv_names = {n for n in self._reservation_order if ".kv." in n or "kv_slot." in n}
         return sum(
             self._entries[n].size_bytes
             for n in self._reservation_order
@@ -601,3 +619,26 @@ def create_paras_moe_aliases(
         manager.alias(f"{prefix}.layers.{i}.mlp.ep_experts.w2_weight", f"paras.moe_slot.{i+1}.w2")
         manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w13_weight", f"paras.moe_slot.{i}.w13")
         manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w2_weight", f"paras.moe_slot.{i}.w2")
+
+
+# ---------------------------------------------------------------------------
+# KV cache alias creation (call after materialize)
+# ---------------------------------------------------------------------------
+
+def create_paras_kv_aliases(
+    manager: ParaSMemoryManager,
+    num_layers: int,
+    prefix: str = "model",
+) -> None:
+    """
+    Create EP and TP KV aliases for the N+1 slot layout.
+    Call after materialize().
+
+    ep layer i → slot i+1 (same physical buffer as EP KV data)
+    tp layer i → slot i   (one slot before EP, for fused transfer)
+    """
+    for i in range(num_layers):
+        manager.alias(f"{prefix}.layers.{i}.kv.ep.k", f"paras.kv_slot.{i+1}.k")
+        manager.alias(f"{prefix}.layers.{i}.kv.ep.v", f"paras.kv_slot.{i+1}.v")
+        manager.alias(f"{prefix}.layers.{i}.kv.tp.k", f"paras.kv_slot.{i}.k")
+        manager.alias(f"{prefix}.layers.{i}.kv.tp.v", f"paras.kv_slot.{i}.v")
