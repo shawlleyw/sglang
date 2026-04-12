@@ -1,4 +1,5 @@
 from typing import List, Optional, Tuple, Any
+import os
 import torch
 import pickle
 import numpy as np
@@ -108,12 +109,16 @@ class ParaSReqGatherManager:
         gather_group: GroupCoordinator,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        peer_ctx: Optional[Any] = None,
+        method: Optional[str] = None,
     ):
         self.local_reqs = local_reqs
         self.gather_group = gather_group
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.group_size = gather_group.world_size
+        self.peer_ctx = peer_ctx
+        self.method = method or os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl")
         
         self.local_no_reqs = len(local_reqs) == 0
         self.local_seqlens_list = [req.seqlen for req in local_reqs]
@@ -187,6 +192,12 @@ class ParaSReqGatherManager:
             self.global_token_indices = None
 
     def gather_cache(self) -> torch.Tensor:
+        if self.method == "peer_access" and self.peer_ctx is not None:
+            self._gather_cache_peer_access()
+        else:
+            self._gather_cache_nccl()
+
+    def _gather_cache_nccl(self):
         torch.cuda.empty_cache()
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         assert isinstance(kv_cache, MHATokenToKVPool), "Only MHATokenToKVPool is supported for now."
@@ -237,6 +248,72 @@ class ParaSReqGatherManager:
             gather_one_layer(layer_id)
             
         torch.cuda.synchronize()
+
+    def _gather_cache_peer_access(self):
+        from sglang.srt.paras.peer_access import peer_access_kv_transfer
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+
+        torch.cuda.empty_cache()
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        mgr = get_global_paras_memory_manager()
+
+        num_layers = kv_cache.layer_num
+        num_heads = kv_cache.head_num
+        head_dim = kv_cache.head_dim
+        sharded_num_heads = max(1, num_heads // self.group_size)
+
+        tp_rank = dist.get_rank(group=self.gather_group.device_group)
+        # Destination token start = sum of token counts for all ranks before this one
+        dst_token_start = sum(self.global_num_tokens[:tp_rank])
+
+        # Build peer addresses tensor on GPU
+        dst_base_ptrs = torch.tensor(
+            self.peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+        )
+
+        # Barrier tensor for per-layer sync
+        barrier_tensor = torch.zeros(1, device="cuda")
+
+        elem_size = kv_cache.store_dtype.itemsize if hasattr(kv_cache.store_dtype, 'itemsize') else 2
+        local_buffer_ptr = mgr._buffer.data_ptr()
+
+        # Token indices: local_token_indices are the EP slot positions
+        # If num_local_tokens == 0, we still participate in barriers
+        local_token_indices_gpu = self.local_token_indices  # already on GPU
+        # Kernel expects int32 — convert if needed
+        if local_token_indices_gpu is not None and local_token_indices_gpu.dtype != torch.int32:
+            local_token_indices_gpu = local_token_indices_gpu.to(torch.int32)
+
+        for layer_id in range(num_layers):
+            ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
+            ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
+            tp_k_name = f"model.layers.{layer_id}.kv.tp.k"
+            tp_v_name = f"model.layers.{layer_id}.kv.tp.v"
+
+            src_k_offset = mgr._entries[ep_k_name].offset_bytes
+            src_v_offset = mgr._entries[ep_v_name].offset_bytes
+            dst_k_offset = mgr._entries[tp_k_name].offset_bytes
+            dst_v_offset = mgr._entries[tp_v_name].offset_bytes
+
+            if self.num_local_tokens > 0:
+                peer_access_kv_transfer(
+                    local_buffer_ptr, dst_base_ptrs,
+                    local_token_indices_gpu,
+                    src_k_offset, src_v_offset,
+                    dst_k_offset, dst_v_offset,
+                    self.num_local_tokens, dst_token_start,
+                    num_heads, tp_rank, self.group_size, head_dim,
+                    elem_size,
+                )
+
+            # Per-layer barrier: ensures all ranks finish writing before next layer reads
+            dist.all_reduce(barrier_tensor, group=self.gather_group.device_group)
+
+        torch.cuda.synchronize()
+
+        # Now resize cache buffers to point to TP slots
+        for layer_id in range(num_layers):
+            kv_cache.paras_resize_cache(layer_id, self.new_cache_size, sharded_num_heads)
 
     def get_new_running_batch(
         self,

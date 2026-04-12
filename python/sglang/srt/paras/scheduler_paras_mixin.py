@@ -4,6 +4,7 @@ import torch
 import logging
 import torch
 import time
+import os
 
 from sglang.srt.managers.io_struct import ParaSConfigureReqInput, ParaSConfigureReqType, ParaSConfigureReqOutput
 from sglang.srt.managers.schedule_batch import (
@@ -142,7 +143,9 @@ class SchedulerParasMixin:
             local_reqs,
             self.paras_tp_group,
             self.req_to_token_pool, 
-            self.token_to_kv_pool_allocator
+            self.token_to_kv_pool_allocator,
+            peer_ctx=getattr(self.tp_worker, '_fused_peer_access_ctx', None),
+            method=os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl"),
         )
         
         start_time = time.time()

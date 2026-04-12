@@ -255,4 +255,42 @@ def peer_access_fused_transfer_w2_v2(
     )
 
 
+def peer_access_kv_transfer(
+    local_buffer_ptr: int,
+    dst_base_ptrs_tensor: torch.Tensor,
+    local_token_indices: torch.Tensor,
+    src_k_offset: int,
+    src_v_offset: int,
+    dst_k_offset: int,
+    dst_v_offset: int,
+    num_local_tokens: int,
+    dst_token_start: int,
+    num_kv_heads: int,
+    tp_rank: int,
+    tp_size: int,
+    head_dim: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    import paras_peer_access_cuda
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    paras_peer_access_cuda.launch_peer_access_kv_transfer(
+        local_buffer_ptr,
+        dst_base_ptrs_tensor,
+        local_token_indices,
+        src_k_offset,
+        src_v_offset,
+        dst_k_offset,
+        dst_v_offset,
+        num_local_tokens,
+        dst_token_start,
+        num_kv_heads,
+        tp_rank,
+        tp_size,
+        head_dim,
+        elem_size,
+        stream_ptr,
+    )
+
+
 
