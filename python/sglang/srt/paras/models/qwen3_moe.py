@@ -393,4 +393,6 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
 
     @paras_func
     def paras_configure_ep(self):
-        self.model.paras_configure_ep()
+        import os
+        method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
+        self.model.paras_configure_ep(method=method)

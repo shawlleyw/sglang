@@ -14,7 +14,9 @@ For a CausalLM class to support ParaS, define these methods:
 
     @paras_func
     def paras_configure_ep(self):
-        self.model.paras_configure_ep()
+        import os
+        method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
+        self.model.paras_configure_ep(method=method)
 
 Where ``self.model`` is the transformer body (inheriting ParaSModelMixin).
 After the switch completes, paras_configure_helper() is called by @paras_func to
@@ -111,8 +113,24 @@ class ParaSModelMixin:
         else:
             self.paras_configure_tp_naive(paras_tp_size, paras_tp_rank)
 
-    @paras_func
-    def paras_configure_ep(self):
-        """Configure all layers back to EP mode."""
+    def paras_configure_ep_naive(self):
+        """Sequential (non-overlapped) TP→EP conversion for all layers."""
         for layer in self.layers:
             layer.paras_configure_ep()
+
+    def paras_configure_ep_peer_access(self):
+        """TP→EP conversion with peer access barriers (reverse layer order)."""
+        paras_tp_group = get_paras_tp_group().device_group
+        barrier_tensor = torch.zeros(1, device="cuda")
+
+        for layer in reversed(self.layers):
+            layer.paras_configure_ep()
+            dist.all_reduce(barrier_tensor, group=paras_tp_group)
+
+    @paras_func
+    def paras_configure_ep(self, method: str = None):
+        """Configure all layers back to EP mode."""
+        if method == "peer_access":
+            self.paras_configure_ep_peer_access()
+        else:
+            self.paras_configure_ep_naive()

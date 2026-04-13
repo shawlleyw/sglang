@@ -587,6 +587,339 @@ def partition_requests_for_ep(
     return partitions
 
 
+class _EPCacheView:
+    """Lightweight proxy providing EP head_num over a TP-mode KV cache.
+
+    ``_scatter_cache_nccl`` expects separate ``tp_kv_cache`` and
+    ``ep_kv_cache`` objects with different ``head_num`` values.  When the
+    underlying storage is a single ``MHATokenToKVPool`` currently in TP
+    mode, this proxy reports the EP head count while delegating all buffer
+    access and resize operations to the real cache.
+    """
+
+    def __init__(self, tp_cache: 'MHATokenToKVPool', ep_head_num: int):
+        self.head_num = ep_head_num
+        self.head_dim = tp_cache.head_dim
+        self.layer_num = tp_cache.layer_num
+        self.store_dtype = tp_cache.store_dtype
+        self.device = tp_cache.device
+        self._tp_cache = tp_cache
+
+    def get_key_buffer(self, layer_id: int):
+        return self._tp_cache.get_key_buffer(layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        return self._tp_cache.get_value_buffer(layer_id)
+
+    def paras_resize_cache(self, layer_id: int, new_size: int, new_head_num: int):
+        self._tp_cache.paras_resize_cache(layer_id, new_size, new_head_num)
+
+
+# from TP to EP, requests are partitioned back to EP ranks
+class ParaSReqScatterManager:
+    """Orchestrates TP→EP request and KV cache redistribution.
+
+    Reverse of ``ParaSReqGatherManager``: partitions the global TP request
+    set back to EP ranks, shrinks memory pools to EP capacity, and scatters
+    KV cache data from TP layout to EP layout.
+    """
+
+    scatter_group: GroupCoordinator
+    req_to_token_pool: ReqToTokenPool
+    token_to_kv_pool_allocator: TokenToKVPoolAllocator
+
+    global_reqs: List[Req]
+    local_reqs: List[Req]
+
+    def __init__(
+        self,
+        global_reqs: List[Req],
+        scatter_group: GroupCoordinator,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        peer_ctx: Optional[Any] = None,
+        paras_tp_rank: int = 0,
+        paras_tp_size: int = 1,
+    ):
+        self.global_reqs = global_reqs
+        self.scatter_group = scatter_group
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.group_size = scatter_group.world_size
+        self.peer_ctx = peer_ctx
+        self.paras_tp_rank = paras_tp_rank
+        self.paras_tp_size = paras_tp_size
+        self.method = os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl")
+
+        self.local_reqs: List[Req] = []
+        self.local_seqlens_list: List[int] = []
+        self.num_local_tokens: int = 0
+        self.token_partition: Optional[List[List[int]]] = None
+        self.ep_dst_positions: Optional[torch.Tensor] = None
+        self.new_cache_size: Optional[int] = None
+
+        # In TP mode all ranks have identical req_to_token_pool entries.
+        self.global_seqlens_list = [req.seqlen for req in global_reqs]
+        # Last output token is not stored in KV cache.
+        self.num_global_tokens = sum(s - 1 for s in self.global_seqlens_list)
+
+        # Flatten TP pool positions for all global requests (identical on every rank).
+        if self.num_global_tokens > 0:
+            parts: List[torch.Tensor] = []
+            for req in global_reqs:
+                indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx
+                ][: req.seqlen - 1]
+                parts.append(indices)
+            self.global_token_indices: Optional[torch.Tensor] = torch.cat(parts, dim=0)
+            assert self.global_token_indices.shape[0] == self.num_global_tokens, (
+                f"global tokens {self.num_global_tokens}, "
+                f"global token indices {self.global_token_indices.shape}"
+            )
+        else:
+            self.global_token_indices = None
+
+    # ------------------------------------------------------------------
+    # Step 1: partition global requests to EP ranks
+    # ------------------------------------------------------------------
+
+    def partition_requests(self):
+        """Partition global TP requests to EP ranks and build token routing."""
+        partitions = partition_requests_for_ep(
+            self.global_reqs, self.paras_tp_size
+        )
+        self.local_reqs = partitions[self.paras_tp_rank]
+        self.local_seqlens_list = [req.seqlen for req in self.local_reqs]
+        self.num_local_tokens = sum(s - 1 for s in self.local_seqlens_list)
+
+        # Map each request to its global-token-index range.
+        req_to_offset: dict = {}
+        offset = 0
+        for req in self.global_reqs:
+            num_tokens = req.seqlen - 1
+            req_to_offset[req.rid] = (offset, offset + num_tokens)
+            offset += num_tokens
+
+        # token_partition[e] = list of global token indices for EP rank e.
+        self.token_partition = []
+        for rank_reqs in partitions:
+            rank_indices: List[int] = []
+            for req in rank_reqs:
+                start, end = req_to_offset[req.rid]
+                rank_indices.extend(range(start, end))
+            self.token_partition.append(rank_indices)
+
+    # ------------------------------------------------------------------
+    # Step 2: shrink pools to EP capacity
+    # ------------------------------------------------------------------
+
+    def reorchestrate_cache_reverse(
+        self,
+        new_ep_cache_size: Optional[int] = None,
+        new_req_pool_size: Optional[int] = None,
+    ):
+        """Shrink pools to EP capacity and allocate new EP token indices."""
+        if new_req_pool_size is None:
+            new_req_pool_size = self.req_to_token_pool.size // self.group_size
+        if new_ep_cache_size is None:
+            new_ep_cache_size = self.token_to_kv_pool_allocator.size // self.group_size
+        self.new_cache_size = new_ep_cache_size
+
+        num_local_reqs = len(self.local_reqs)
+        assert self.num_local_tokens <= new_ep_cache_size, (
+            f"Local tokens {self.num_local_tokens} exceed EP cache {new_ep_cache_size}"
+        )
+        assert num_local_reqs <= new_req_pool_size, (
+            f"Local reqs {num_local_reqs} exceed EP req pool {new_req_pool_size}"
+        )
+
+        # Resize and clear allocators.
+        self.req_to_token_pool.paras_resize_and_clear(new_req_pool_size)
+        self.token_to_kv_pool_allocator.paras_resize_and_clear(new_ep_cache_size)
+
+        # Allocate new EP pool indices for local requests.
+        if num_local_reqs > 0:
+            req_pool_indices = self.req_to_token_pool.alloc(num_local_reqs)
+
+            if self.num_local_tokens > 0:
+                ep_token_indices: torch.Tensor = (
+                    self.token_to_kv_pool_allocator.alloc(self.num_local_tokens)
+                )
+                start_index = 0
+                for req, rpi in zip(self.local_reqs, req_pool_indices):
+                    end_index = start_index + req.seqlen - 1
+                    req.req_pool_idx = rpi
+                    self.req_to_token_pool.write(
+                        (rpi, slice(0, req.seqlen - 1)),
+                        ep_token_indices[start_index:end_index],
+                    )
+                    start_index = end_index
+
+                self.ep_dst_positions = ep_token_indices
+            else:
+                for req, rpi in zip(self.local_reqs, req_pool_indices):
+                    req.req_pool_idx = rpi
+                self.ep_dst_positions = None
+        else:
+            self.ep_dst_positions = None
+
+    # ------------------------------------------------------------------
+    # Step 3: scatter KV cache TP → EP
+    # ------------------------------------------------------------------
+
+    def scatter_cache(
+        self,
+        tp_kv_cache: Optional['MHATokenToKVPool'] = None,
+        ep_head_num: Optional[int] = None,
+    ):
+        """Transfer KV cache from TP layout to EP layout.
+
+        Args:
+            tp_kv_cache: Source TP KV cache.  If *None*, obtained from
+                ``self.token_to_kv_pool_allocator.get_kvcache()``.
+            ep_head_num: Full EP head count.  If *None*, read from
+                ``tp_kv_cache._paras_original_head_num``.
+        """
+        if tp_kv_cache is None:
+            tp_kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        assert isinstance(tp_kv_cache, MHATokenToKVPool), (
+            "Only MHATokenToKVPool is supported for now."
+        )
+        if ep_head_num is None:
+            ep_head_num = tp_kv_cache._paras_original_head_num
+
+        if self.method == "peer_access" and self.peer_ctx is not None:
+            self._scatter_cache_peer_access(tp_kv_cache, ep_head_num)
+        else:
+            self._scatter_cache_nccl_impl(tp_kv_cache, ep_head_num)
+
+    def _scatter_cache_nccl_impl(
+        self,
+        kv_cache: 'MHATokenToKVPool',
+        ep_head_num: int,
+    ):
+        torch.cuda.empty_cache()
+
+        # _scatter_cache_nccl expects separate TP/EP cache objects with
+        # different head_num.  Create a lightweight EP view.
+        ep_view = _EPCacheView(kv_cache, ep_head_num)
+
+        _scatter_cache_nccl(
+            tp_kv_cache=kv_cache,
+            ep_kv_cache=ep_view,
+            token_partition=self.token_partition,
+            global_token_indices=self.global_token_indices,
+            ep_dst_positions=self.ep_dst_positions,
+            gather_group=self.scatter_group,
+            new_ep_cache_size=self.new_cache_size,
+        )
+
+        # Restore EP head_num (per-layer buffers already EP-shaped after resize).
+        kv_cache.paras_configure_ep()
+
+    def _scatter_cache_peer_access(
+        self,
+        kv_cache: 'MHATokenToKVPool',
+        ep_head_num: int,
+    ):
+        from sglang.srt.paras.peer_access import peer_access_kv_scatter
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+
+        torch.cuda.empty_cache()
+        mgr = get_global_paras_memory_manager()
+
+        num_layers = kv_cache.layer_num
+        heads_per_rank = kv_cache.head_num          # TP sharded heads
+        head_dim = kv_cache.head_dim
+        elem_size = (
+            kv_cache.store_dtype.itemsize
+            if hasattr(kv_cache.store_dtype, "itemsize")
+            else 2
+        )
+
+        local_buffer_ptr = mgr._buffer.data_ptr()
+        peer_buffer_ptrs = torch.tensor(
+            self.peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+        )
+
+        # TP pool positions for all global tokens.
+        tp_token_positions = self.global_token_indices
+        if tp_token_positions is not None and tp_token_positions.dtype != torch.int32:
+            tp_token_positions = tp_token_positions.to(torch.int32)
+
+        # Build per-token routing tensors.
+        token_to_rank = torch.empty(
+            self.num_global_tokens, dtype=torch.int32, device="cuda"
+        )
+        ep_dst_pos_all = torch.empty(
+            self.num_global_tokens, dtype=torch.int32, device="cuda"
+        )
+        for e in range(self.group_size):
+            rank_tokens = self.token_partition[e]
+            if rank_tokens:
+                idx_tensor = torch.tensor(
+                    rank_tokens, dtype=torch.long, device="cuda"
+                )
+                token_to_rank[idx_tensor] = e
+                # After paras_resize_and_clear, alloc returns [1, 2, ..., n]
+                # deterministically on every rank.
+                ep_dst_pos_all[idx_tensor] = torch.arange(
+                    1, len(rank_tokens) + 1, dtype=torch.int32, device="cuda"
+                )
+
+        # Build per-layer byte offsets (source=TP, dest=EP).
+        src_k_offsets: List[int] = []
+        src_v_offsets: List[int] = []
+        dst_k_offsets: List[int] = []
+        dst_v_offsets: List[int] = []
+        for layer_id in range(num_layers):
+            tp_k = f"model.layers.{layer_id}.kv.tp.k"
+            tp_v = f"model.layers.{layer_id}.kv.tp.v"
+            ep_k = f"model.layers.{layer_id}.kv.ep.k"
+            ep_v = f"model.layers.{layer_id}.kv.ep.v"
+            src_k_offsets.append(mgr._entries[tp_k].offset_bytes)
+            src_v_offsets.append(mgr._entries[tp_v].offset_bytes)
+            dst_k_offsets.append(mgr._entries[ep_k].offset_bytes)
+            dst_v_offsets.append(mgr._entries[ep_v].offset_bytes)
+
+        if self.num_global_tokens > 0:
+            peer_access_kv_scatter(
+                local_buffer_ptr,
+                peer_buffer_ptrs,
+                tp_token_positions,
+                token_to_rank,
+                ep_dst_pos_all,
+                src_k_offsets,
+                src_v_offsets,
+                dst_k_offsets,
+                dst_v_offsets,
+                self.num_global_tokens,
+                heads_per_rank,
+                self.paras_tp_rank,
+                self.paras_tp_size,
+                head_dim,
+                self.scatter_group.device_group,
+                num_layers,
+                elem_size,
+            )
+
+        torch.cuda.synchronize()
+
+        # Point KV buffers to EP managed entries.
+        for layer_id in range(num_layers):
+            local_layer_idx = layer_id - kv_cache.start_layer
+            ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
+            ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
+            total_elements = mgr._entries[ep_k_name].numel
+            ep_slots = total_elements // (ep_head_num * head_dim)
+            ep_shape = (ep_slots, ep_head_num, head_dim)
+            kv_cache.k_buffer[local_layer_idx] = mgr.get_view_as(ep_k_name, ep_shape)
+            kv_cache.v_buffer[local_layer_idx] = mgr.get_view_as(ep_v_name, ep_shape)
+
+        # Restore EP head_num.
+        kv_cache.paras_configure_ep()
+
+
 def _scatter_cache_nccl(
     tp_kv_cache: 'MHATokenToKVPool',
     ep_kv_cache: 'MHATokenToKVPool',

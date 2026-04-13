@@ -2457,6 +2457,8 @@ class ModelRunner:
         if hasattr(self.attn_backend, 'paras_configure_ep'):
             self.attn_backend.paras_configure_ep(self.req_to_token_pool.req_to_token)
 
+        self.model.paras_configure_ep()
+
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
