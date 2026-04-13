@@ -172,8 +172,10 @@ def init_peer_access(manager, tp_group, tp_size: int) -> PeerAccessContext:
     """
     assert manager.materialized, "manager must be materialized before init_peer_access"
 
-    device_ids = list(range(tp_size))
-    enable_peer_access(device_ids)
+    # NOTE: We intentionally skip enable_peer_access() (cudaDeviceEnablePeerAccess).
+    # cudaIpcOpenMemHandle with cudaIpcMemLazyEnablePeerAccess already enables
+    # NVLink paths without creating full CUDA contexts on peer GPUs (~416 MiB each).
+    # DeepEP uses the same approach. See: deep_ep.cpp Buffer::sync().
 
     local_ptr = manager._buffer.data_ptr()
     rank = dist.get_rank(group=tp_group)
