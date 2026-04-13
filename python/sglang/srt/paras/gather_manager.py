@@ -56,6 +56,73 @@ def permute_and_scatter_kv(
     k_buffer[indices] = kv[0]
     v_buffer[indices] = kv[1]
 
+def gather_tp_kv_and_permute(
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    sorted_token_indices: torch.Tensor,
+    num_kv_heads: int,
+    heads_per_rank: int,
+    head_dim: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Gather K/V from TP cache and pack to [tokens, heads_per_rank, KV=2, dim].
+
+    This is the TP→EP counterpart of ``gather_kv_and_permute`` (which outputs
+    ``[heads, tokens, KV, dim]`` for EP→TP).
+
+    ``sorted_token_indices`` must be pre-sorted by destination EP rank so
+    that the flat output can be split by per-rank token counts for
+    ``all_to_all_single``.
+
+    Output layout per destination-rank chunk:
+        ``[tokens_for_rank, heads_per_rank, 2, head_dim]``
+    """
+    if sorted_token_indices.numel() == 0:
+        return torch.empty(0, dtype=k_buffer.dtype, device=k_buffer.device)
+
+    kcache = k_buffer[sorted_token_indices]   # [N, heads_per_rank, head_dim]
+    vcache = v_buffer[sorted_token_indices]   # [N, heads_per_rank, head_dim]
+    # Interleave K and V → [N, heads_per_rank, 2, head_dim]
+    kvcache = torch.stack([kcache, vcache], dim=2)
+    return kvcache.contiguous().flatten()
+
+
+def permute_and_scatter_kv_to_ep(
+    recv_buf: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    dst_positions: torch.Tensor,
+    num_local_tokens: int,
+    num_kv_heads: int,
+    heads_per_rank: int,
+    head_dim: int,
+    group_size: int,
+) -> None:
+    """Unpack all_to_all output and scatter into EP KV buffers.
+
+    This is the TP→EP counterpart of ``permute_and_scatter_kv`` (which handles
+    EP→TP).
+
+    Received layout after all_to_all: ``group_size`` contiguous chunks, each
+    ``[num_local_tokens, heads_per_rank, 2, head_dim]``.
+
+    Each chunk carries the ``heads_per_rank`` heads owned by a different TP
+    rank.  We interleave the head contributions from all ranks to reconstruct
+    the full ``num_kv_heads`` for each token, then scatter K and V separately
+    into the EP buffer at ``dst_positions``.
+    """
+    # [group_size, num_local_tokens, heads_per_rank, 2, head_dim]
+    kv = recv_buf.view(group_size, num_local_tokens, heads_per_rank, 2, head_dim)
+    # Interleave heads from different ranks →
+    #   [tokens, group_size, heads_per_rank, 2, dim]
+    kv = kv.permute(1, 0, 2, 3, 4).contiguous()
+    # Merge rank and per-rank head dims → [tokens, num_kv_heads, 2, dim]
+    kv = kv.reshape(num_local_tokens, num_kv_heads, 2, head_dim)
+    # Scatter K and V into EP buffers
+    k_buffer[dst_positions] = kv[:, :, 0, :]
+    v_buffer[dst_positions] = kv[:, :, 1, :]
+
+
 def prune_request(req: Req):
     req.last_host_node = None
     req.last_node = None
@@ -480,3 +547,175 @@ class ParaSReqGatherManager:
             running_batch,
             model_config.vocab_size,
         )
+
+
+def partition_requests_for_ep(
+    global_reqs: List[Req], num_ranks: int
+) -> List[List[Req]]:
+    """Deterministic, balanced partition of requests across EP ranks.
+
+    Sorts requests by (-seqlen, rid) then greedily assigns each to the rank
+    with (1) fewest requests, (2) least total tokens, (3) lowest rank index.
+
+    Pure function: identical output on every rank given the same inputs.
+
+    Args:
+        global_reqs: All requests gathered from all ranks (identical on each).
+        num_ranks: Number of EP ranks to partition across.
+
+    Returns:
+        List of ``num_ranks`` lists, where partition[i] holds rank *i*'s
+        assigned requests.
+    """
+    if num_ranks <= 0:
+        return []
+
+    partitions: List[List[Req]] = [[] for _ in range(num_ranks)]
+    token_counts: List[int] = [0] * num_ranks
+
+    sorted_reqs = sorted(global_reqs, key=lambda r: (-r.seqlen, r.rid))
+
+    for req in sorted_reqs:
+        # Pick the rank with (fewest requests, least tokens, lowest index)
+        best_rank = min(
+            range(num_ranks),
+            key=lambda i: (len(partitions[i]), token_counts[i], i),
+        )
+        partitions[best_rank].append(req)
+        token_counts[best_rank] += req.seqlen
+
+    return partitions
+
+
+def _scatter_cache_nccl(
+    tp_kv_cache: 'MHATokenToKVPool',
+    ep_kv_cache: 'MHATokenToKVPool',
+    token_partition: List[List[int]],
+    global_token_indices: torch.Tensor,
+    ep_dst_positions: torch.Tensor,
+    gather_group: 'GroupCoordinator',
+    new_ep_cache_size: Optional[int] = None,
+) -> None:
+    """Scatter TP KV cache to EP KV cache via NCCL all_to_all.
+
+    Inverse of ``ParaSReqGatherManager._gather_cache_nccl``: moves from
+    TP layout (``heads_per_rank`` heads, all tokens) to EP layout (all
+    ``num_kv_heads`` heads, local tokens only).
+
+    Three-step flow per layer:
+      1. **Gather + permute**: read from TP K/V buffers, group tokens by
+         destination EP rank → flat send buffer with layout
+         ``[tokens_for_rank_e, heads_per_rank, KV=2, head_dim]`` per chunk.
+      2. **all_to_all_single**: redistribute.  Each rank sends variable-sized
+         chunks (different token counts per destination) and receives
+         uniform-sized chunks (every source sends the same number of tokens
+         — those assigned to this rank — but with different head data).
+      3. **Permute + scatter**: interleave the head contributions from all
+         source ranks to reconstruct full ``num_kv_heads`` per token, then
+         scatter K/V into EP buffers at ``ep_dst_positions``.
+
+    Args:
+        tp_kv_cache: Source TP KV pool (``head_num == heads_per_rank``).
+        ep_kv_cache: Destination EP KV pool (``head_num == num_kv_heads``).
+        token_partition: ``token_partition[e]`` is a list of global token
+            indices (into ``global_token_indices``) assigned to EP rank *e*.
+            Identical on every rank.
+        global_token_indices: TP pool slot positions for all global tokens.
+        ep_dst_positions: EP pool positions for tokens assigned to **this**
+            rank (i.e. ``token_partition[tp_rank]``).
+        gather_group: Communication group (all TP/EP ranks).
+        new_ep_cache_size: If provided, resize EP cache per layer before
+            writing.
+    """
+    torch.cuda.empty_cache()
+
+    group_size = gather_group.world_size
+    tp_rank = dist.get_rank(group=gather_group.device_group)
+
+    num_layers = tp_kv_cache.layer_num
+    num_kv_heads = ep_kv_cache.head_num      # EP has all heads
+    heads_per_rank = tp_kv_cache.head_num    # TP has subset
+    head_dim = tp_kv_cache.head_dim
+
+    assert num_kv_heads == heads_per_rank * group_size, (
+        f"Head count mismatch: EP {num_kv_heads} != "
+        f"TP {heads_per_rank} * {group_size}"
+    )
+
+    # -- Pre-compute token counts and split sizes (same for all layers) ------
+    send_token_counts = [len(token_partition[e]) for e in range(group_size)]
+    recv_token_count = send_token_counts[tp_rank]
+    total_send_tokens = sum(send_token_counts)
+
+    per_token_elems = heads_per_rank * 2 * head_dim
+    input_split_sizes = [cnt * per_token_elems for cnt in send_token_counts]
+    # Every source rank sends recv_token_count tokens (same tokens, different
+    # heads) so receive sizes are uniform.
+    output_split_sizes = [recv_token_count * per_token_elems] * group_size
+
+    # -- Build sorted TP pool indices: tokens ordered by dest rank -----------
+    sorted_parts: List[torch.Tensor] = []
+    for e in range(group_size):
+        if send_token_counts[e] > 0:
+            part_idx = torch.tensor(
+                token_partition[e],
+                dtype=torch.long,
+                device=global_token_indices.device,
+            )
+            sorted_parts.append(global_token_indices[part_idx])
+
+    if sorted_parts:
+        sorted_tp_indices = torch.cat(sorted_parts)
+    else:
+        sorted_tp_indices = torch.empty(
+            0, dtype=torch.long, device=global_token_indices.device
+        )
+
+    # -- Per-layer: gather → all_to_all → scatter ---------------------------
+    def scatter_one_layer(layer_id: int) -> None:
+        # Step 1: Gather from TP KV cache and permute
+        if total_send_tokens > 0:
+            k_buf = tp_kv_cache.get_key_buffer(layer_id)
+            v_buf = tp_kv_cache.get_value_buffer(layer_id)
+            send_buf = gather_tp_kv_and_permute(
+                k_buf, v_buf, sorted_tp_indices,
+                num_kv_heads, heads_per_rank, head_dim, group_size,
+            )
+        else:
+            send_buf = torch.empty(
+                0, dtype=tp_kv_cache.store_dtype, device=tp_kv_cache.device
+            )
+
+        # Resize EP cache for this layer before writing
+        if new_ep_cache_size is not None:
+            ep_kv_cache.paras_resize_cache(
+                layer_id, new_ep_cache_size, num_kv_heads
+            )
+
+        # Step 2: all_to_all — all ranks must participate
+        if total_send_tokens > 0:
+            recv_buf = torch.empty(
+                recv_token_count * group_size * per_token_elems,
+                dtype=send_buf.dtype,
+                device=send_buf.device,
+            )
+            dist.all_to_all_single(
+                recv_buf, send_buf,
+                output_split_sizes, input_split_sizes,
+                group=gather_group.device_group,
+            )
+
+            # Step 3: Permute received data and scatter into EP KV cache
+            if recv_token_count > 0:
+                ep_k = ep_kv_cache.get_key_buffer(layer_id)
+                ep_v = ep_kv_cache.get_value_buffer(layer_id)
+                permute_and_scatter_kv_to_ep(
+                    recv_buf, ep_k, ep_v, ep_dst_positions,
+                    recv_token_count, num_kv_heads, heads_per_rank,
+                    head_dim, group_size,
+                )
+
+    for layer_id in range(num_layers):
+        scatter_one_layer(layer_id)
+
+    torch.cuda.synchronize()

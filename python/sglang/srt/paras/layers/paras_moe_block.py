@@ -21,7 +21,12 @@ from sglang.srt.paras.paras_parallel_state import (
     get_paras_tp_size,
 )
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-from sglang.srt.paras.peer_access import peer_access_fused_transfer_w13_v2, peer_access_fused_transfer_w2_v2
+from sglang.srt.paras.peer_access import (
+    peer_access_fused_transfer_w13_ep,
+    peer_access_fused_transfer_w13_v2,
+    peer_access_fused_transfer_w2_ep,
+    peer_access_fused_transfer_w2_v2,
+)
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, set_weight_attrs
@@ -317,6 +322,125 @@ class ParaSMoeBlockMixin:
         )
 
     # ------------------------------------------------------------------
+    # TP→EP reverse weight redistribution helpers
+    # ------------------------------------------------------------------
+
+    def paras_configure_ep_mlp_naive(self):
+        """Naive TP→EP reverse weight transfer via NCCL all_to_all (inverse of EP→TP).
+
+        Reads from TP slot[i], all_to_all, inverse permute, writes to EP slot[i+1].
+        Currently only supports dp_size==1.
+        """
+        mgr = get_global_paras_memory_manager()
+        paras_tp_size = get_paras_tp_size()
+        paras_tp_group = get_paras_tp_group().device_group
+        paras_dp_size = get_paras_dp_size()
+        assert paras_dp_size == 1, (
+            "paras_configure_ep_mlp_naive only supports dp_size==1"
+        )
+
+        moe_inter_tp = self.moe_intermediate_size // paras_tp_size
+        layer_id = self._paras_layer_id
+        tp_w13_name = f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"
+        tp_w2_name = f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"
+
+        # --- w13: TP (E_total, 2*I', H) → all_to_all → inv_permute → EP (E_local, 2*I, H) ---
+        tp_w13 = mgr.get_view_as(
+            tp_w13_name,
+            (self.num_global_experts, 2 * moe_inter_tp, self.hidden_size),
+        )
+        tp_w13_for_a2a = tp_w13.view(
+            paras_tp_size, self.num_local_experts, 2,
+            moe_inter_tp * self.hidden_size,
+        )
+
+        staging_w13 = mgr.get_view("staging.w13_pre_permute").view(
+            paras_tp_size, self.num_local_experts, 2,
+            moe_inter_tp * self.hidden_size,
+        )
+        dist.all_to_all_single(
+            output=staging_w13.view(tp_w13.shape),
+            input=tp_w13_for_a2a.reshape(tp_w13.shape),
+            group=paras_tp_group,
+        )
+
+        ep_w13 = self.ep_experts.w13_weight.data.view(
+            self.num_local_experts, 2, paras_tp_size,
+            moe_inter_tp * self.hidden_size,
+        )
+        ep_w13.copy_(staging_w13.permute(1, 2, 0, 3))
+
+        # --- w2: TP (E_total, H, I') → all_to_all → inv_permute → EP (E_local, H, I) ---
+        tp_w2 = mgr.get_view_as(
+            tp_w2_name,
+            (self.num_global_experts, self.hidden_size, moe_inter_tp),
+        )
+        tp_w2_for_a2a = tp_w2.view(
+            paras_tp_size, self.num_local_experts, self.hidden_size,
+            moe_inter_tp,
+        )
+
+        staging_w2 = mgr.get_view("staging.w2_pre_permute").view(
+            paras_tp_size, self.num_local_experts, self.hidden_size,
+            moe_inter_tp,
+        )
+        dist.all_to_all_single(
+            output=staging_w2.view(tp_w2.shape),
+            input=tp_w2_for_a2a.reshape(tp_w2.shape),
+            group=paras_tp_group,
+        )
+
+        ep_w2 = self.ep_experts.w2_weight.data.view(
+            self.num_local_experts, self.hidden_size, paras_tp_size,
+            moe_inter_tp,
+        )
+        ep_w2.copy_(staging_w2.permute(1, 2, 0, 3))
+
+    def paras_configure_ep_fused_peer_access_kernel(
+        self,
+        peer_ctx,
+        dst_base_ptrs: torch.Tensor,
+        stream=None,
+    ):
+        """Launch TP→EP reverse NVLink peer access kernels for this layer.
+
+        NO barriers — caller manages per-layer synchronization.
+        Layer ordering must be REVERSE (N-1→0) at the model level.
+        """
+        mgr = get_global_paras_memory_manager()
+        paras_tp_size = get_paras_tp_size()
+        paras_tp_rank = get_paras_tp_rank()
+        layer_id = self._paras_layer_id
+        moe_intermediate_size_after_tp = self.moe_intermediate_size // paras_tp_size
+
+        tp_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"]
+        tp_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"]
+        ep_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.ep_experts.w13_weight"]
+        ep_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.ep_experts.w2_weight"]
+
+        local_buffer_ptr = mgr._buffer.data_ptr()
+        dtype_bytes = tp_w13_entry.dtype.itemsize
+
+        peer_access_fused_transfer_w13_ep(
+            local_buffer_ptr, dst_base_ptrs,
+            tp_w13_entry.offset_bytes, ep_w13_entry.offset_bytes,
+            paras_tp_rank, paras_tp_size,
+            self.num_local_experts,
+            moe_intermediate_size_after_tp * self.hidden_size,
+            num_gates=2, elem_size=dtype_bytes, stream=stream,
+        )
+        peer_access_fused_transfer_w2_ep(
+            local_buffer_ptr, dst_base_ptrs,
+            tp_w2_entry.offset_bytes, ep_w2_entry.offset_bytes,
+            paras_tp_rank, paras_tp_size,
+            self.num_local_experts,
+            hidden_size=self.hidden_size,
+            full_intermediate=self.moe_intermediate_size,
+            tp_intermediate=moe_intermediate_size_after_tp,
+            elem_size=dtype_bytes, stream=stream,
+        )
+
+    # ------------------------------------------------------------------
     # Parallelism mode switching
     # ------------------------------------------------------------------
 
@@ -330,10 +454,6 @@ class ParaSMoeBlockMixin:
     @paras_func
     def paras_configure_ep(self):
         """Configure the block back to EP mode."""
-        assert False, (
-            "ParaSMoeBlockMixin does not support configure back to EP "
-            "at this moment"
-        )
         self.parallelism_config = "ep"
         self.tp_size = 1
         self.experts = self.ep_experts
