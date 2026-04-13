@@ -17,7 +17,8 @@ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 
 from sglang.srt.paras.utils import paras_func, paras_profile_func
-from sglang.srt.paras.gather_manager import ParaSReqGatherManager
+from sglang.srt.paras.gather_manager import ParaSReqGatherManager, ParaSReqScatterManager, recover_request
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.managers.utils import SenderWrapper
@@ -203,10 +204,93 @@ class SchedulerParasMixin:
 
     @paras_func
     def paras_configure_ep(self):
+        # Entry guards
+        if self.paras_parallelism_config != "TP":
+            logger.warning("paras_configure_ep called but not in TP mode")
+            return
         if not self.paras_check():
             return
-        
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
+        assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
+        assert self.paras_dp_size == 1, "paras_configure_ep only supports dp_size==1"
+
+        self.paras_start_profile("/tmp/paras_configure_profile")
+
+        # Phase 1: Prepare — reset tree cache, merge batches, build global req list
+        self.tree_cache.reset()
+        self.merge_last_batch()
+        global_reqs = list(self.running_batch.reqs) if self.running_batch else []
+
+        # Phase 2: Scatter — partition reqs, shrink pools, scatter KV cache
+        paras_scatter_manager = ParaSReqScatterManager(
+            global_reqs=global_reqs,
+            scatter_group=self.paras_tp_group,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            peer_ctx=getattr(self.tp_worker, '_fused_peer_access_ctx', None),
+            paras_tp_rank=self.paras_tp_rank,
+            paras_tp_size=self.paras_tp_size,
+        )
+
+        start_time = time.time()
+
+        with TimeReporter("partition_requests"):
+            paras_scatter_manager.partition_requests()
+
+        with TimeReporter("reorchestrate_cache_reverse"):
+            paras_scatter_manager.reorchestrate_cache_reverse()
+
+        with TimeReporter("scatter_cache"):
+            paras_scatter_manager.scatter_cache()
+
+        # Rebuild running batch from local subset
+        local_reqs = paras_scatter_manager.local_reqs
+        if local_reqs:
+            for req in local_reqs:
+                recover_request(req, self.tree_cache, self.tokenizer)
+            self.running_batch = ScheduleBatch.init_new(
+                local_reqs,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+                self.spec_algorithm,
+                self.server_args.enable_custom_logit_processor,
+            )
+            device = self.req_to_token_pool.device
+            last_token_list = []
+            for req in local_reqs:
+                if len(req.output_ids) > 0:
+                    last_token_list.append(req.output_ids[-1])
+                else:
+                    last_token_list.append(req.origin_input_ids[-1])
+            req_pool_indices_list = [req.req_pool_idx for req in local_reqs]
+            seq_lens_list = [req.seqlen for req in local_reqs]
+            self.running_batch.output_ids = torch.tensor(last_token_list, dtype=torch.int64, device=device)
+            self.running_batch.req_pool_indices = torch.tensor(req_pool_indices_list, dtype=torch.int64, device=device)
+            self.running_batch.seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64, device=device)
+            self.running_batch.seq_lens_cpu = torch.tensor(seq_lens_list, dtype=torch.int64, device="cpu")
+            self.running_batch.orig_seq_lens = self.running_batch.seq_lens.clone()
+            self.running_batch.seq_lens_sum = sum(seq_lens_list)
+            self.running_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                self.running_batch,
+                self.model_config.vocab_size,
+            )
+        else:
+            self.running_batch = None
+
+        # Phase 3: Model switch (weights + attention)
+        with TimeReporter("transfer_weights"):
+            self.tp_worker.paras_configure_ep()
+
+        end_time = time.time()
+        cost_ms = (end_time - start_time) * 1000
+        logger.info(f"Time taken to configure EP: {cost_ms} ms")
+
+        self.paras_stop_profile()
+
+        # Phase 4: Update scheduler config and restore tokenizer
         # switch from TP to EP
         self.paras_parallelism_config = "EP"
         self.server_args.enable_dp_attention = True
@@ -215,8 +299,6 @@ class SchedulerParasMixin:
         self.server_args.dp_size = self.paras_ep_size
         self.server_args.ep_size = self.paras_ep_size
         moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.DEEPEP
-        
-        self.tp_worker.paras_configure_ep()
 
         # drop-in replacement for scheduler ep configs
         self.tp_size = self.paras_ep_size
