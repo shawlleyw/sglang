@@ -112,13 +112,9 @@ void launch_peer_access_fused_transfer_w13_v2(
     int num_sms;
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
 
-    // Grid divisible by tp_size for balanced warp-level peer assignment
-    // Env vars for tuning sweep (V2_GRID_MULT × tp_size blocks, V2_THREADS threads)
-    const char* grid_env = getenv("V2_GRID_MULT");
-    int grid_mult = grid_env ? atoi(grid_env) : num_sms;
-    int blocks = grid_mult * tp_size;
-    const char* thr_env = getenv("V2_THREADS");
-    int threads = thr_env ? atoi(thr_env) : 256;
+    // num_sms × tp_size blocks (one warp-group per SM per peer), 256 threads (8 warps)
+    const int blocks = num_sms * tp_size;
+    const int threads = 256;
 
     peer_access_fused_transfer_w13_v2<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const char*>(local_buffer_ptr),
@@ -223,11 +219,8 @@ void launch_peer_access_fused_transfer_w2_v2(
     int num_sms;
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
 
-    const char* grid_env = getenv("V2_GRID_MULT");
-    int grid_mult = grid_env ? atoi(grid_env) : num_sms;
-    int blocks = grid_mult * tp_size;
-    const char* thr_env = getenv("V2_THREADS");
-    int threads = thr_env ? atoi(thr_env) : 256;
+    const int blocks = num_sms * tp_size;
+    const int threads = 256;
 
     peer_access_fused_transfer_w2_v2<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const char*>(local_buffer_ptr),
@@ -361,12 +354,8 @@ void launch_peer_access_kv_transfer(
     int num_sms;
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
 
-    // Grid divisible by tp_size for balanced warp-level peer assignment
-    const char* grid_env = getenv("V2_GRID_MULT");
-    int grid_mult = grid_env ? atoi(grid_env) : num_sms;
-    int blocks = grid_mult * tp_size;
-    const char* thr_env = getenv("V2_THREADS");
-    int threads = thr_env ? atoi(thr_env) : 256;
+    const int blocks = num_sms * tp_size;
+    const int threads = 256;
 
     peer_access_kv_transfer<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const char*>(local_buffer_ptr),
