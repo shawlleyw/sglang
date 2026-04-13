@@ -360,6 +360,7 @@ def run_correctness_test(rank, world_size):
     tp_group = setup_paras_state(rank, world_size)
     mgr = build_kv_manager(rank, world_size)
 
+    # --- Test peer_access path ---
     fill_kv_data(mgr, rank)
     ref_k, ref_v = compute_reference(mgr, rank, world_size, tp_group)
 
@@ -367,8 +368,24 @@ def run_correctness_test(rank, world_size):
     run_peer_access_transfer(mgr, peer_ctx, rank, world_size, tp_group)
     tp_k, tp_v = read_tp_results(mgr, world_size)
 
+    if rank == 0:
+        print("\n--- peer_access correctness ---", flush=True)
     all_ok = compare_results(ref_k, ref_v, tp_k, tp_v, rank)
-    return all_ok, tp_group, mgr, peer_ctx
+
+    # --- Test NCCL all_to_all path ---
+    fill_kv_data(mgr, rank)
+    # Recompute reference (same data, same result)
+    ref_k2, ref_v2 = compute_reference(mgr, rank, world_size, tp_group)
+
+    dist.barrier(group=tp_group)
+    _bench_nccl(mgr, rank, world_size, tp_group)
+    tp_k2, tp_v2 = read_tp_results(mgr, world_size)
+
+    if rank == 0:
+        print("\n--- NCCL all_to_all correctness ---", flush=True)
+    nccl_ok = compare_results(ref_k2, ref_v2, tp_k2, tp_v2, rank)
+
+    return all_ok and nccl_ok, tp_group, mgr, peer_ctx
 
 
 # ---------------------------------------------------------------------------
@@ -386,36 +403,49 @@ def _bench_peer_access(mgr, peer_ctx, rank, world_size, tp_group):
 
 
 def _bench_nccl(mgr, rank, world_size, tp_group):
-    """Run NCCL all_gather-based KV transfer (for benchmarking)."""
+    """Run NCCL all_to_all-based KV transfer (mirrors production _gather_cache_nccl).
+
+    Uses the same repeat_interleave approach as the production code for the
+    replicated case (num_kv_heads < world_size).
+    """
+    from sglang.srt.paras.ops import gather_kv_and_permute
+
     heads_per_peer = max(1, NUM_KV_HEADS // world_size)
+    replication_factor = max(1, world_size // NUM_KV_HEADS) if NUM_KV_HEADS < world_size else 1
+    splited_size_per_token = heads_per_peer * HEAD_DIM
+    num_local = TOKENS_PER_RANK[rank]
+    total_tokens = sum(TOKENS_PER_RANK)
+
+    input_split_sizes = [2 * splited_size_per_token * num_local] * world_size
+    output_split_sizes = [2 * splited_size_per_token * TOKENS_PER_RANK[r] for r in range(world_size)]
+
+    # Build local_token_indices (contiguous: 0..num_local-1)
+    local_token_indices = torch.arange(num_local, dtype=torch.int64, device="cuda")
+    # Allocate global_token_indices (sequential: 0..total_tokens-1, offset by this rank)
+    global_token_indices = torch.arange(total_tokens, dtype=torch.int64, device="cuda")
+
     barrier_tensor = torch.zeros(1, device="cuda")
 
     for layer_id in range(NUM_LAYERS):
         ep_k = mgr.get_view(f"model.layers.{layer_id}.kv.ep.k")
         ep_v = mgr.get_view(f"model.layers.{layer_id}.kv.ep.v")
 
-        num_local = TOKENS_PER_RANK[rank]
-        head_start = rank * NUM_KV_HEADS // world_size
+        if num_local > 0:
+            # gather_kv_and_permute: → [num_heads, 2, N, head_dim] flattened
+            permuted = gather_kv_and_permute(ep_k, ep_v, local_token_indices)
 
-        # Extract this rank's head shard from local EP data
-        my_k_shard = ep_k[:num_local, head_start:head_start + heads_per_peer, :].contiguous()
-        my_v_shard = ep_v[:num_local, head_start:head_start + heads_per_peer, :].contiguous()
+            # Replicate heads for all_to_all when num_heads < world_size
+            if replication_factor > 1:
+                permuted = (
+                    permuted
+                    .view(NUM_KV_HEADS, 2 * num_local * HEAD_DIM)
+                    .repeat_interleave(replication_factor, dim=0)
+                    .flatten()
+                )
+        else:
+            permuted = torch.empty((0,), dtype=KV_DTYPE, device="cuda")
 
-        # Pad to max tokens for all_gather (all ranks must send same size)
-        max_tokens = max(TOKENS_PER_RANK)
-        padded_k = torch.zeros(
-            (max_tokens, heads_per_peer, HEAD_DIM), dtype=KV_DTYPE, device="cuda"
-        )
-        padded_v = torch.zeros_like(padded_k)
-        padded_k[:num_local] = my_k_shard
-        padded_v[:num_local] = my_v_shard
-
-        gathered_k = [torch.zeros_like(padded_k) for _ in range(world_size)]
-        gathered_v = [torch.zeros_like(padded_v) for _ in range(world_size)]
-        dist.all_gather(gathered_k, padded_k, group=tp_group)
-        dist.all_gather(gathered_v, padded_v, group=tp_group)
-
-        # Scatter into TP buffer
+        # Get TP view for scatter destination
         tp_k = mgr.get_view_as(
             f"model.layers.{layer_id}.kv.tp.k",
             (TP_VIEW_TOKENS, heads_per_peer, HEAD_DIM),
@@ -425,12 +455,30 @@ def _bench_nccl(mgr, rank, world_size, tp_group):
             (TP_VIEW_TOKENS, heads_per_peer, HEAD_DIM),
         )
 
-        token_offset = 0
-        for src_rank in range(world_size):
-            n_tok = TOKENS_PER_RANK[src_rank]
-            tp_k[token_offset:token_offset + n_tok] = gathered_k[src_rank][:n_tok]
-            tp_v[token_offset:token_offset + n_tok] = gathered_v[src_rank][:n_tok]
-            token_offset += n_tok
+        if total_tokens > 0:
+            gathered = torch.empty(
+                2 * total_tokens * splited_size_per_token,
+                dtype=KV_DTYPE, device="cuda",
+            )
+            dist.all_to_all_single(
+                gathered, permuted, output_split_sizes, input_split_sizes,
+                group=tp_group,
+            )
+
+            # Manual scatter: all_to_all output groups K and V by sender rank
+            # Layout: [K_r0(N0), V_r0(N0), K_r1(N1), V_r1(N1), ...]
+            # NOT token-interleaved, so permute_and_scatter_kv cannot be used directly.
+            offset = 0
+            tok_start = 0
+            for src_rank in range(world_size):
+                n_tok = TOKENS_PER_RANK[src_rank]
+                chunk_size = 2 * heads_per_peer * HEAD_DIM * n_tok
+                chunk = gathered[offset:offset + chunk_size]
+                k_v = chunk.view(2, n_tok, heads_per_peer, HEAD_DIM)
+                tp_k[tok_start:tok_start + n_tok] = k_v[0]
+                tp_v[tok_start:tok_start + n_tok] = k_v[1]
+                offset += chunk_size
+                tok_start += n_tok
 
         dist.all_reduce(barrier_tensor, op=dist.ReduceOp.SUM, group=tp_group)
 

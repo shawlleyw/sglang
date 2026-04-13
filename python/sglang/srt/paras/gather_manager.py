@@ -207,12 +207,14 @@ class ParaSReqGatherManager:
         num_heads = kv_cache.head_num
         head_dim = kv_cache.head_dim
         sharded_num_heads = max(1, num_heads // self.group_size)
-        size_per_token = kv_cache.head_num * kv_cache.head_dim
         splited_size_per_token = sharded_num_heads * head_dim
         
-        # NOTE: when num_heads < group_size, heads are replicated (sharded_num_heads=1 per rank).
-        # The all_to_all still sends head_dim bytes per K+V, matching get_num_kv_heads(tp_size) = max(1,...).
-        # For full replication support (1-to-many), peer_access path is preferred.
+        # When num_heads < group_size, heads must be replicated so that
+        # all_to_all has group_size chunks.  We chose Option A (repeat_interleave
+        # before all_to_all) over Option B (sub-head all_to_all + intra-group
+        # all_gather) for simplicity — see docs/paras/nvlink_peer_access_weight_transfer.md.
+        replication_factor = max(1, self.group_size // num_heads) if num_heads < self.group_size else 1
+        virtual_heads = num_heads * replication_factor  # == group_size when replicated
         
         input_split_sizes = [2 * splited_size_per_token * self.num_local_tokens] * self.group_size
         output_split_sizes = [2 * (splited_size_per_token * num_tokens_of_rank) for num_tokens_of_rank in self.global_num_tokens]
@@ -226,6 +228,18 @@ class ParaSReqGatherManager:
                 # Fused gather and permute using Triton kernel
                 # Output: [num_heads * 2 * num_tokens * head_dim] with layout [num_heads, 2, num_tokens, head_dim]
                 permuted_local_kvcache = gather_kv_and_permute(k_buffer, v_buffer, self.local_token_indices)
+                
+                # Replicate heads for all_to_all when num_heads < group_size.
+                # E.g. 4 heads / 8 GPUs: repeat_interleave(2) expands [4,2,N,128] → [8,2,N,128]
+                # so virtual heads 0,1 are copies of real head 0 → sent to ranks 0,1 (replication).
+                if replication_factor > 1:
+                    N = self.num_local_tokens
+                    permuted_local_kvcache = (
+                        permuted_local_kvcache
+                        .view(num_heads, 2 * N * head_dim)
+                        .repeat_interleave(replication_factor, dim=0)
+                        .flatten()
+                    )
             else:
                 permuted_local_kvcache = torch.empty((0, ), dtype=kv_cache.store_dtype, device=kv_cache.device)
                 
@@ -235,14 +249,25 @@ class ParaSReqGatherManager:
                 gathered_kvcache = torch.empty(2 * self.num_global_tokens * splited_size_per_token, dtype=permuted_local_kvcache.dtype, device=permuted_local_kvcache.device)
                 torch.distributed.all_to_all_single(gathered_kvcache, permuted_local_kvcache, output_split_sizes, input_split_sizes, group=self.gather_group.device_group)
                 
-                # Fused scatter using Triton kernel
-                # Input layout: [num_tokens, 2, num_heads, head_dim] (flat)
+                # Scatter all_to_all output into TP K/V buffers.
+                # The received layout is sender-grouped, NOT token-interleaved:
+                #   [K_r0(N0,hpp,D), V_r0(N0,hpp,D), K_r1(N1,hpp,D), V_r1(N1,hpp,D), ...]
+                # We unpack per-sender chunk and scatter by global_token_indices.
                 k_buffer = kv_cache.get_key_buffer(layer_id)
                 v_buffer = kv_cache.get_value_buffer(layer_id)
-                permute_and_scatter_kv(
-                    gathered_kvcache, k_buffer, v_buffer, self.global_token_indices,
-                    self.num_global_tokens, sharded_num_heads, head_dim
-                )
+                offset = 0
+                tok_start = 0
+                for src_rank in range(self.group_size):
+                    n_tok = self.global_num_tokens[src_rank]
+                    chunk_elems = 2 * sharded_num_heads * head_dim * n_tok
+                    chunk = gathered_kvcache[offset:offset + chunk_elems].view(
+                        2, n_tok, sharded_num_heads, head_dim
+                    )
+                    token_slice = self.global_token_indices[tok_start:tok_start + n_tok]
+                    k_buffer[token_slice] = chunk[0]
+                    v_buffer[token_slice] = chunk[1]
+                    offset += chunk_elems
+                    tok_start += n_tok
                 
         for layer_id in range(num_layers):
             gather_one_layer(layer_id)
