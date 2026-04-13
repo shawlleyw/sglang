@@ -10,7 +10,11 @@ def gather_kv_and_permute_torch(
     local_kcache = k_buffer[indices]
     local_vcache = v_buffer[indices]
     local_kvcache = torch.stack([local_kcache, local_vcache], dim=0).view(2, -1, k_buffer.shape[1], k_buffer.shape[2])
-    permuted_local_kvcache = local_kvcache.permute(2, 0, 1, 3).contiguous().flatten()
+    # Output layout: [heads, tokens, KV, dim] so that each head's chunk is
+    # token-interleaved (t0_K, t0_V, t1_K, t1_V, ...).  After all_to_all splits
+    # by head, concatenating received chunks gives [total_tokens, KV, heads, dim]
+    # which permute_and_scatter_kv expects.
+    permuted_local_kvcache = local_kvcache.permute(2, 1, 0, 3).contiguous().flatten()
     return permuted_local_kvcache
 
 def permute_and_scatter_kv_torch(
@@ -68,7 +72,7 @@ def test_gather_kv_and_permute():
     local_kcache = k_buffer[indices]
     local_vcache = v_buffer[indices]
     local_kvcache = torch.stack([local_kcache, local_vcache], dim=0).view(2, -1, num_heads, head_dim)
-    ref_output = local_kvcache.permute(2, 0, 1, 3).contiguous().flatten()
+    ref_output = local_kvcache.permute(2, 1, 0, 3).contiguous().flatten()
     
     # Triton kernel
     op_output = gather_kv_and_permute(k_buffer, v_buffer, indices)

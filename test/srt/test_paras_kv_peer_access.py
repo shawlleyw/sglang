@@ -450,7 +450,7 @@ def _bench_nccl(mgr, rank, world_size, tp_group):
     Uses the same repeat_interleave approach as the production code for the
     replicated case (num_kv_heads < world_size).
     """
-    from sglang.srt.paras.ops import gather_kv_and_permute
+    from sglang.srt.paras.ops import gather_kv_and_permute, permute_and_scatter_kv
 
     heads_per_peer = max(1, NUM_KV_HEADS // world_size)
     replication_factor = max(1, world_size // NUM_KV_HEADS) if NUM_KV_HEADS < world_size else 1
@@ -507,20 +507,12 @@ def _bench_nccl(mgr, rank, world_size, tp_group):
                 group=tp_group,
             )
 
-            # Manual scatter: all_to_all output groups K and V by sender rank
-            # Layout: [K_r0(N0), V_r0(N0), K_r1(N1), V_r1(N1), ...]
-            # NOT token-interleaved, so permute_and_scatter_kv cannot be used directly.
-            offset = 0
-            tok_start = 0
-            for src_rank in range(world_size):
-                n_tok = TOKENS_PER_RANK[src_rank]
-                chunk_size = 2 * heads_per_peer * HEAD_DIM * n_tok
-                chunk = gathered[offset:offset + chunk_size]
-                k_v = chunk.view(2, n_tok, heads_per_peer, HEAD_DIM)
-                tp_k[tok_start:tok_start + n_tok] = k_v[0]
-                tp_v[tok_start:tok_start + n_tok] = k_v[1]
-                offset += chunk_size
-                tok_start += n_tok
+            # gather_kv_and_permute outputs [heads, tokens, KV, dim], so after
+            # all_to_all the received data is [total_tokens, KV, heads_per_peer, dim].
+            permute_and_scatter_kv(
+                gathered, tp_k, tp_v, global_token_indices,
+                total_tokens, heads_per_peer, HEAD_DIM,
+            )
 
         dist.all_reduce(barrier_tensor, op=dist.ReduceOp.SUM, group=tp_group)
 

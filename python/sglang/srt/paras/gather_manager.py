@@ -226,17 +226,17 @@ class ParaSReqGatherManager:
                 v_buffer = kv_cache.get_value_buffer(layer_id)
                 
                 # Fused gather and permute using Triton kernel
-                # Output: [num_heads * 2 * num_tokens * head_dim] with layout [num_heads, 2, num_tokens, head_dim]
+                # Output layout: [num_heads, num_tokens, 2, head_dim] (token-interleaved per head)
                 permuted_local_kvcache = gather_kv_and_permute(k_buffer, v_buffer, self.local_token_indices)
                 
                 # Replicate heads for all_to_all when num_heads < group_size.
-                # E.g. 4 heads / 8 GPUs: repeat_interleave(2) expands [4,2,N,128] → [8,2,N,128]
+                # E.g. 4 heads / 8 GPUs: repeat_interleave(2) expands [4,N,2,128] → [8,N,2,128]
                 # so virtual heads 0,1 are copies of real head 0 → sent to ranks 0,1 (replication).
                 if replication_factor > 1:
                     N = self.num_local_tokens
                     permuted_local_kvcache = (
                         permuted_local_kvcache
-                        .view(num_heads, 2 * N * head_dim)
+                        .view(num_heads, N * 2 * head_dim)
                         .repeat_interleave(replication_factor, dim=0)
                         .flatten()
                     )
@@ -249,25 +249,16 @@ class ParaSReqGatherManager:
                 gathered_kvcache = torch.empty(2 * self.num_global_tokens * splited_size_per_token, dtype=permuted_local_kvcache.dtype, device=permuted_local_kvcache.device)
                 torch.distributed.all_to_all_single(gathered_kvcache, permuted_local_kvcache, output_split_sizes, input_split_sizes, group=self.gather_group.device_group)
                 
-                # Scatter all_to_all output into TP K/V buffers.
-                # The received layout is sender-grouped, NOT token-interleaved:
-                #   [K_r0(N0,hpp,D), V_r0(N0,hpp,D), K_r1(N1,hpp,D), V_r1(N1,hpp,D), ...]
-                # We unpack per-sender chunk and scatter by global_token_indices.
+                # Scatter into TP K/V buffers.
+                # gather_kv_and_permute outputs [heads, tokens, KV, dim], so after
+                # all_to_all the received data is [total_tokens, KV, sharded_heads, dim]
+                # which permute_and_scatter_kv handles directly.
                 k_buffer = kv_cache.get_key_buffer(layer_id)
                 v_buffer = kv_cache.get_value_buffer(layer_id)
-                offset = 0
-                tok_start = 0
-                for src_rank in range(self.group_size):
-                    n_tok = self.global_num_tokens[src_rank]
-                    chunk_elems = 2 * sharded_num_heads * head_dim * n_tok
-                    chunk = gathered_kvcache[offset:offset + chunk_elems].view(
-                        2, n_tok, sharded_num_heads, head_dim
-                    )
-                    token_slice = self.global_token_indices[tok_start:tok_start + n_tok]
-                    k_buffer[token_slice] = chunk[0]
-                    v_buffer[token_slice] = chunk[1]
-                    offset += chunk_elems
-                    tok_start += n_tok
+                permute_and_scatter_kv(
+                    gathered_kvcache, k_buffer, v_buffer, self.global_token_indices,
+                    self.num_global_tokens, sharded_num_heads, head_dim
+                )
                 
         for layer_id in range(num_layers):
             gather_one_layer(layer_id)

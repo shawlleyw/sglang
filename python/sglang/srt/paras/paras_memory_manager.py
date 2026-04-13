@@ -123,7 +123,7 @@ class ParaSMemoryManager:
         self.ep_max_kv_tokens: int = 0
         self.tp_max_kv_tokens: int = 0
         self._kv_reserved: bool = False
-        self._kv_n_plus_1: bool = False
+        
 
     # ----- reservation ----------------------------------------------------
 
@@ -217,7 +217,6 @@ class ParaSMemoryManager:
             self._entries[f"{lp}.kv.v"] = self._entries[f"paras.kv_slot.{i+1}.v"]
 
         self._kv_reserved = True
-        self._kv_n_plus_1 = True
 
     # ----- materialization ------------------------------------------------
 
