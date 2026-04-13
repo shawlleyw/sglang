@@ -1,8 +1,12 @@
-"""Peer access initialization and buffer address exchange for ParaS NVLink weight transfers.
+"""Peer access initialization and buffer address exchange for ParaS NVLink transfers.
 
-Enables CUDA peer access between TP-group GPUs and exchanges managed-buffer
-base addresses so that kernels on any rank can directly read peer memory
-via NVLink / NVSwitch (CUDA Unified Virtual Addressing).
+Exchanges managed-buffer base addresses via CUDA IPC so that kernels on any
+rank can directly write to peer GPU memory via NVLink stores.
+
+NOTE: We intentionally do NOT call cudaDeviceEnablePeerAccess(). The
+cudaIpcOpenMemHandle() with cudaIpcMemLazyEnablePeerAccess flag is sufficient
+for NVLink stores and avoids creating ~416 MiB CUDA contexts on peer GPUs.
+DeepEP uses the same IPC-only approach.
 """
 
 import ctypes
@@ -17,55 +21,6 @@ logger = logging.getLogger(__name__)
 
 # Load CUDA runtime via ctypes
 _cudart = ctypes.CDLL("libcudart.so")
-
-
-def check_peer_access_available(device_ids: List[int]) -> bool:
-    """Check if all GPU pairs in *device_ids* support peer access."""
-    can_access = ctypes.c_int(0)
-    for i in device_ids:
-        for j in device_ids:
-            if i != j:
-                _cudart.cudaDeviceCanAccessPeer(ctypes.byref(can_access), i, j)
-                if can_access.value == 0:
-                    return False
-    return True
-
-
-def enable_peer_access(device_ids: List[int]) -> None:
-    """Enable CUDA peer access between all GPU pairs.
-
-    Must be called from each rank for its own device.
-    Raises ``RuntimeError`` if peer access is not available.
-    """
-    if not check_peer_access_available(device_ids):
-        failed = []
-        can_access = ctypes.c_int(0)
-        for i in device_ids:
-            for j in device_ids:
-                if i != j:
-                    _cudart.cudaDeviceCanAccessPeer(ctypes.byref(can_access), i, j)
-                    if can_access.value == 0:
-                        failed.append((i, j))
-        raise RuntimeError(
-            f"CUDA peer access not available for GPU pairs: {failed}. "
-            "NVLink/NVSwitch connectivity required for paras_peer_access method."
-        )
-
-    # Enable peer access from this rank's device to every other device
-    current_device = torch.cuda.current_device()
-    for peer_device in device_ids:
-        if peer_device != current_device:
-            try:
-                _cudart.cudaDeviceEnablePeerAccess(peer_device, 0)
-                logger.debug(
-                    "Enabled peer access from GPU %d to GPU %d",
-                    current_device,
-                    peer_device,
-                )
-            except Exception:
-                # cudaErrorPeerAccessAlreadyEnabled (704) is OK
-                pass
-
 
 _IPC_HANDLE_SIZE = 64
 
@@ -171,11 +126,6 @@ def init_peer_access(manager, tp_group, tp_size: int) -> PeerAccessContext:
         :class:`PeerAccessContext` with exchanged buffer addresses.
     """
     assert manager.materialized, "manager must be materialized before init_peer_access"
-
-    # NOTE: We intentionally skip enable_peer_access() (cudaDeviceEnablePeerAccess).
-    # cudaIpcOpenMemHandle with cudaIpcMemLazyEnablePeerAccess already enables
-    # NVLink paths without creating full CUDA contexts on peer GPUs (~416 MiB each).
-    # DeepEP uses the same approach. See: deep_ep.cpp Buffer::sync().
 
     local_ptr = manager._buffer.data_ptr()
     rank = dist.get_rank(group=tp_group)

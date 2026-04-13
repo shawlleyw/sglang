@@ -450,7 +450,7 @@ def _bench_nccl(mgr, rank, world_size, tp_group):
     Uses the same repeat_interleave approach as the production code for the
     replicated case (num_kv_heads < world_size).
     """
-    from sglang.srt.paras.ops import gather_kv_and_permute, permute_and_scatter_kv
+    from sglang.srt.paras.gather_manager import gather_kv_and_permute, permute_and_scatter_kv
 
     heads_per_peer = max(1, NUM_KV_HEADS // world_size)
     replication_factor = max(1, world_size // NUM_KV_HEADS) if NUM_KV_HEADS < world_size else 1

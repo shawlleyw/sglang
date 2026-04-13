@@ -20,7 +20,41 @@ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.paras.utils import print_class_tensor_member, profile_object_members
-from sglang.srt.paras.ops import gather_kv_and_permute, permute_and_scatter_kv
+
+
+def gather_kv_and_permute(
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    """Gather K/V from cache buffers and permute to [heads, tokens, KV, dim].
+
+    Each head's chunk is token-interleaved (t0_K, t0_V, t1_K, t1_V, ...),
+    so that after all_to_all splits by head, concatenating received chunks
+    gives [total_tokens, KV, heads, dim] which permute_and_scatter_kv expects.
+    """
+    local_kcache = k_buffer[indices]
+    local_vcache = v_buffer[indices]
+    local_kvcache = torch.stack([local_kcache, local_vcache], dim=0).view(
+        2, -1, k_buffer.shape[1], k_buffer.shape[2]
+    )
+    return local_kvcache.permute(2, 1, 0, 3).contiguous().flatten()
+
+
+def permute_and_scatter_kv(
+    permuted_kvcache: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    indices: torch.Tensor,
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+) -> None:
+    """Scatter K/V from [total_tokens, KV, heads, dim] layout into cache buffers."""
+    kv = permuted_kvcache.view(num_tokens, 2, num_heads, head_dim)
+    kv = kv.permute(1, 0, 2, 3).contiguous()
+    k_buffer[indices] = kv[0]
+    v_buffer[indices] = kv[1]
 
 def prune_request(req: Req):
     req.last_host_node = None

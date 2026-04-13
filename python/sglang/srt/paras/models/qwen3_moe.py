@@ -248,8 +248,8 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         # Set global so create_weights() can find the manager
         set_global_paras_memory_manager(manager)
 
-        # Pre-initialize NVLink peer access during model init to avoid 6s overhead at switch time.
-        # cudaDeviceEnablePeerAccess() and cudaIpcOpenMemHandle() are slow on first call.
+        # Pre-initialize NVLink peer access during model init to avoid overhead at switch time.
+        # cudaIpcOpenMemHandle() is slow on first call (~6s for NVLink connection setup).
         try:
             from sglang.srt.paras.peer_access import init_peer_access
             self._fused_peer_access_ctx = init_peer_access(
