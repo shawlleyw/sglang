@@ -35,8 +35,10 @@ KV_DTYPE = torch.bfloat16
 ELEM_SIZE = 2           # bf16
 
 # Variable token counts per rank (8 entries to support up to 8 GPUs)
-TOKENS_PER_RANK_8 = [100, 80, 90, 70, 85, 75, 95, 65]  # total: 660
-EP_MAX_TOKENS = 200     # max tokens any rank could hold
+# Override via env: BENCH_TOKENS_PER_RANK=30000 for uniform large-scale benchmark
+_bench_tpr = int(os.environ.get("BENCH_TOKENS_PER_RANK", "0"))
+TOKENS_PER_RANK_8 = ([_bench_tpr] * 8) if _bench_tpr > 0 else [100, 80, 90, 70, 85, 75, 95, 65]
+EP_MAX_TOKENS = max(TOKENS_PER_RANK_8) + 100  # headroom above max tokens
 PAGE_SIZE = 1
 SEED = 42
 BENCHMARK_WARMUP = 3
@@ -45,9 +47,14 @@ BENCHMARK_RUNS = 10
 
 def _init_test_params(world_size):
     """Set module-level test parameters from world_size. Called after dist init."""
-    global TOKENS_PER_RANK, TP_VIEW_TOKENS, TP_MAX_TOKENS
+    global TOKENS_PER_RANK, EP_MAX_TOKENS, TP_VIEW_TOKENS, TP_MAX_TOKENS
     TOKENS_PER_RANK = TOKENS_PER_RANK_8[:world_size]
     heads_per_peer = max(1, NUM_KV_HEADS // world_size)
+    total_tokens = sum(TOKENS_PER_RANK)
+    # EP_MAX must be large enough that the TP view (union layout) fits all tokens:
+    #   (EP_MAX + PAGE) * NUM_KV_HEADS / heads_per_peer >= total_tokens
+    min_ep_for_tp = (total_tokens * heads_per_peer + NUM_KV_HEADS - 1) // NUM_KV_HEADS
+    EP_MAX_TOKENS = max(EP_MAX_TOKENS, min_ep_for_tp)
     TP_VIEW_TOKENS = (EP_MAX_TOKENS + PAGE_SIZE) * NUM_KV_HEADS // heads_per_peer
     TP_MAX_TOKENS = TP_VIEW_TOKENS
 
@@ -385,7 +392,42 @@ def run_correctness_test(rank, world_size):
         print("\n--- NCCL all_to_all correctness ---", flush=True)
     nccl_ok = compare_results(ref_k2, ref_v2, tp_k2, tp_v2, rank)
 
-    return all_ok and nccl_ok, tp_group, mgr, peer_ctx
+    # --- Replication consistency check (8-GPU case) ---
+    # Ranks mapped to the same head must have identical TP buffers.
+    replication_factor = max(1, world_size // NUM_KV_HEADS) if NUM_KV_HEADS < world_size else 1
+    repl_ok = True
+    if replication_factor > 1:
+        if rank == 0:
+            print("\n--- replication consistency ---", flush=True)
+        # Use peer_access results (tp_k, tp_v) for this check.
+        # Refill + retransfer to get clean state.
+        fill_kv_data(mgr, rank)
+        run_peer_access_transfer(mgr, peer_ctx, rank, world_size, tp_group)
+        tp_k3, tp_v3 = read_tp_results(mgr, world_size)
+        total_tokens = sum(TOKENS_PER_RANK)
+
+        # Within each replication group, all_gather the TP K for layer 0
+        # and verify all members are identical.
+        my_k = tp_k3[0][:total_tokens].contiguous()  # layer 0, shape (total, hpp, D)
+        group_k_list = [torch.zeros_like(my_k) for _ in range(world_size)]
+        dist.all_gather(group_k_list, my_k, group=tp_group)
+
+        my_group_id = rank * NUM_KV_HEADS // world_size  # which head
+        for other_rank in range(world_size):
+            other_group_id = other_rank * NUM_KV_HEADS // world_size
+            if other_group_id == my_group_id and other_rank != rank:
+                if not torch.equal(group_k_list[rank], group_k_list[other_rank]):
+                    diff = (group_k_list[rank] != group_k_list[other_rank]).sum().item()
+                    print(
+                        f"[Rank {rank}] REPL FAIL: rank {rank} vs rank {other_rank} "
+                        f"differ in {diff}/{my_k.numel()} elements",
+                        flush=True,
+                    )
+                    repl_ok = False
+        if repl_ok and rank == 0:
+            print(f"  [OK] replicated ranks have identical TP buffers", flush=True)
+
+    return all_ok and nccl_ok and repl_ok, tp_group, mgr, peer_ctx
 
 
 # ---------------------------------------------------------------------------
