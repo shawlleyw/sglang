@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-4-GPU correctness and benchmark test for ParaS KV cache peer access kernel.
+Multi-GPU correctness and benchmark test for ParaS KV cache peer access kernel.
 
 Tests that peer_access_kv_transfer produces bitwise-identical results to a
 PyTorch all_gather reference for the EP→TP KV redistribution.
 
+Supports both 4-GPU (no replication) and 8-GPU (head replication) cases.
+
 Usage:
-  torchrun --nproc_per_node=4 test_paras_kv_peer_access.py            # correctness
-  torchrun --nproc_per_node=4 test_paras_kv_peer_access.py --benchmark # + timing
+  torchrun --nproc_per_node=4 test_paras_kv_peer_access.py            # 4 GPU, no replication
+  torchrun --nproc_per_node=8 test_paras_kv_peer_access.py            # 8 GPU, replicated heads
+  torchrun --nproc_per_node=8 test_paras_kv_peer_access.py --benchmark # + timing
 """
 
 import argparse
@@ -24,30 +27,29 @@ _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.join(_TEST_DIR, "..", "..")
 sys.path.insert(0, os.path.join(_ROOT_DIR, "python"))
 
-# ---- test constants (Qwen3-30B-A3B, 4 GPUs, NO replication) ----
+# ---- test constants (Qwen3-30B-A3B) ----
 NUM_LAYERS = 3          # enough to test N+1 ordering
-NUM_KV_HEADS = 4        # total KV heads (4 heads / 4 GPUs = 1 head per rank)
+NUM_KV_HEADS = 4        # total KV heads
 HEAD_DIM = 128          # Qwen3-30B-A3B head dim
 KV_DTYPE = torch.bfloat16
 ELEM_SIZE = 2           # bf16
 
-# Variable token counts per rank (make them different for realistic test)
-TOKENS_PER_RANK = [100, 80, 90, 70]  # total: 340
+# Variable token counts per rank (8 entries to support up to 8 GPUs)
+TOKENS_PER_RANK_8 = [100, 80, 90, 70, 85, 75, 95, 65]  # total: 660
 EP_MAX_TOKENS = 200     # max tokens any rank could hold
 PAGE_SIZE = 1
-
-# TP view tokens: union layout means same bytes, so
-# (EP_MAX + PAGE) * total_heads / heads_per_peer = TP tokens in view
-# With 4 heads / 4 GPUs = 1 head per peer: (201) * 4 / 1 = 804
-# We store tp_max_tokens for the reserve_kv_cache API but actual TP view
-# size is derived from EP slot bytes.
-_HEADS_PER_PEER = max(1, NUM_KV_HEADS // 4)  # 1 for 4-GPU case
-TP_VIEW_TOKENS = (EP_MAX_TOKENS + PAGE_SIZE) * NUM_KV_HEADS // _HEADS_PER_PEER
-# tp_max_tokens for reserve_kv_cache (just metadata, doesn't affect alloc)
-TP_MAX_TOKENS = TP_VIEW_TOKENS
 SEED = 42
 BENCHMARK_WARMUP = 3
 BENCHMARK_RUNS = 10
+
+
+def _init_test_params(world_size):
+    """Set module-level test parameters from world_size. Called after dist init."""
+    global TOKENS_PER_RANK, TP_VIEW_TOKENS, TP_MAX_TOKENS
+    TOKENS_PER_RANK = TOKENS_PER_RANK_8[:world_size]
+    heads_per_peer = max(1, NUM_KV_HEADS // world_size)
+    TP_VIEW_TOKENS = (EP_MAX_TOKENS + PAGE_SIZE) * NUM_KV_HEADS // heads_per_peer
+    TP_MAX_TOKENS = TP_VIEW_TOKENS
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +60,7 @@ def setup_distributed():
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    assert world_size == 4, f"This test requires exactly 4 GPUs, got {world_size}"
+    assert world_size in (4, 8), f"This test requires 4 or 8 GPUs, got {world_size}"
     torch.cuda.set_device(rank)
     return rank, world_size
 
@@ -201,7 +203,10 @@ def compute_reference(mgr, rank, world_size, tp_group):
         expected_v = torch.zeros_like(expected_k)
 
         # Head shard for this rank in the EP buffer
-        head_start = rank * heads_per_peer
+        # Use the same replication formula as the kernel:
+        # ep_head = peer * num_kv_heads // tp_size
+        # This maps rank→head correctly even when heads < world_size (replication)
+        head_start = rank * NUM_KV_HEADS // world_size
 
         token_offset = 0
         for src_rank in range(world_size):
@@ -390,7 +395,7 @@ def _bench_nccl(mgr, rank, world_size, tp_group):
         ep_v = mgr.get_view(f"model.layers.{layer_id}.kv.ep.v")
 
         num_local = TOKENS_PER_RANK[rank]
-        head_start = rank * heads_per_peer
+        head_start = rank * NUM_KV_HEADS // world_size
 
         # Extract this rank's head shard from local EP data
         my_k_shard = ep_k[:num_local, head_start:head_start + heads_per_peer, :].contiguous()
@@ -518,9 +523,11 @@ def main():
         used = [int(x) for x in result.stdout.strip().split("\n")]
         empty = sum(1 for x in used if x < 100)
         print(f"[rank0] GPU memory check: {used} MiB used, {empty} empty GPUs")
-        assert empty >= 4, f"Need 4 empty GPUs, only {empty} available (used: {used})"
+        nproc = int(os.environ.get("WORLD_SIZE", "4"))
+        assert empty >= nproc, f"Need {nproc} empty GPUs, only {empty} available (used: {used})"
 
     rank, world_size = setup_distributed()
+    _init_test_params(world_size)
 
     try:
         ok, tp_group, mgr, peer_ctx = run_correctness_test(rank, world_size)
