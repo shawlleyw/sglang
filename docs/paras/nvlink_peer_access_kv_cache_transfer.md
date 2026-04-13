@@ -6,14 +6,16 @@ This document describes the NVLink peer access KV cache transfer optimization fo
 
 The peer access approach uses a custom CUDA kernel that reads from the local EP KV buffer and writes directly to peer GPUs' TP KV buffers via NVLink, eliminating the intermediate permutation buffers and NCCL collectives used by the fallback path.
 
-### Performance Summary (Qwen3-30B-A3B dimensions, 3 layers, bf16)
+### Performance Summary (Qwen3-30B-A3B dimensions, 3 layers, 4 KV heads, head_dim=128, bf16)
 
 | Config | Method | Latency (ms) | Speedup |
 |--------|--------|-------------|---------|
-| 4×A100, 30k tokens/rank | NCCL all_to_all | 2.54 | baseline |
+| 4×A100, 30k tokens/rank (120k total) | NCCL all_to_all | 2.54 | baseline |
 | 4×A100, 30k tokens/rank | **peer_access** | **1.42** | **1.79×** |
-| 8×A100, 30k tokens/rank (replicated heads) | NCCL all_to_all | 4.83 | baseline |
-| 8×A100, 30k tokens/rank (replicated heads) | **peer_access** | **2.96** | **1.64×** |
+| 4×A100, 262k tokens/rank (0.5 GB/layer) | NCCL all_to_all | 26.3 | baseline |
+| 4×A100, 262k tokens/rank | **peer_access** | **9.6** | **2.74×** |
+| 8×A100, 262k tokens/rank (0.5 GB/layer, replicated) | NCCL all_to_all | 53.5 | baseline |
+| 8×A100, 262k tokens/rank | **peer_access** | **19.1** | **2.80×** |
 
 ## Background
 
@@ -83,11 +85,33 @@ A single kernel (`peer_access_kv_transfer`) handles both K and V buffers in one 
 - `__ldg()` read-only cache for source reads
 - Fast uint32 integer division
 
-### 3. Synchronization
+### 3. Shared Memory vs L1 Cache for Replicated Reads
+
+When heads are replicated (e.g., 4 heads / 8 GPUs), multiple warps in the same block read identical source data (same `ep_head`, same `warp_index`). We considered using shared memory to eliminate the duplicate HBM reads:
+
+**Shared memory approach (tested, rejected)**:
+- Only one warp per replication group loads from HBM into shared memory
+- Other warps in the group read from shared memory
+- Requires `__syncthreads()` twice per stride iteration (load barrier + read barrier)
+
+**L1 cache approach (chosen)**:
+- All warps read independently via `__ldg()` (read-only texture cache path)
+- L1 cache (192 KB per SM on A100) naturally serves duplicate reads since replicated warps are in the same block → same SM → same L1
+
+**Benchmark results (8×A100, 4 heads, replication_factor=2)**:
+
+| Tokens/rank | Data/rank/layer | smem (ms) | direct/L1 (ms) | smem overhead |
+|-------------|----------------|-----------|-----------------|---------------|
+| 262k | 0.5 GB | 17.5 | **15.2** | +15% slower |
+| 524k | 1.0 GB | 30.2 | **29.8** | +1.3% slower |
+
+The `__syncthreads()` overhead (2 per stride × hundreds of iterations) dominates over HBM savings. NVLink write latency (~1-2 µs per transaction) is the true bottleneck, not HBM read bandwidth — so halving HBM reads yields minimal benefit while the sync stalls hurt throughput.
+
+### 4. Synchronization
 
 Per-layer `dist.all_reduce(barrier_tensor)` ensures all ranks finish writing to slot `i` before the next layer reads from slot `i+1`. Sequential kernel launches on the same CUDA stream enforce intra-layer ordering.
 
-### 4. CUDA IPC Without cudaDeviceEnablePeerAccess
+### 5. CUDA IPC Without cudaDeviceEnablePeerAccess
 
 The peer access infrastructure uses `cudaIpcOpenMemHandle` with `cudaIpcMemLazyEnablePeerAccess` to map peer buffers into the local address space. We intentionally do NOT call `cudaDeviceEnablePeerAccess()`, which would create full CUDA contexts (~416 MiB each) on every peer GPU.
 
