@@ -147,6 +147,72 @@ Expected speedups:
 - Small tokens (~100/rank): 3-5× (NCCL launch overhead dominates)
 - Large tokens (30k/rank): 1.5-2× (NVLink bandwidth dominates)
 
+## E2E Coherence Test (KV Cache Transfer in Live System)
+
+Tests that KV cache transfer works correctly during an actual EP→TP switch with in-flight requests. Uses the sglang server with Qwen3-30B-A3B.
+
+### Prerequisites
+
+- Model at `/data/shaoyuw/models/Qwen3-30B-A3B`
+- Kill any existing sglang: `pkill -9 -f "sglang" 2>/dev/null; sleep 3`
+
+### 4-GPU Test (no head replication)
+
+**Launch server** (in tmux or background):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+PARAS_KV_TRANSFER_METHOD=peer_access \
+SGLANG_ATTN_MAX_BS=256 \
+SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256 \
+SGLANG_DEEPEP_BF16_DISPATCH=true \
+python -m sglang.launch_server \
+    --model /data/shaoyuw/models/Qwen3-30B-A3B --trust-remote-code \
+    --chunked-prefill-size -1 --max-prefill-tokens 32000 \
+    --mem-fraction-static 0.6 \
+    --tp-size 4 --dp-size 4 --ep-size 4 \
+    --enable-dp-attention --enable-dp-lm-head \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --max-running-requests 1024 \
+    --disable-cuda-graph --disable-overlap-schedule \
+    --log-level info \
+    --enable-paras-moe --paras-tp-size 4 \
+    2>&1 | tee /tmp/kv_coherence_4gpu.log
+```
+
+Wait for `Application startup complete`, verify model type is `Qwen3MoeForCausalLMParaS`.
+
+**Test procedure:**
+
+1. Send 3 long requests in EP mode (builds KV cache, verifies EP works)
+2. Send 4 long requests in background (in-flight, building KV cache)
+3. While in-flight requests are processing, trigger switch: `curl http://localhost:30000/paras_configure_tp`
+4. Wait for all in-flight requests to complete
+5. Send 3 fresh requests in TP mode
+6. Check all outputs are coherent (no garbage, no `\xa0`, no repetition)
+
+**Key verification points:**
+- In-flight requests (sent in EP, completed after switch) must produce coherent output — this proves KV cache was transferred correctly
+- TP requests must produce coherent output — this proves weights + KV pool are correct after switch
+- `grep "gather_cache" /tmp/kv_coherence_4gpu.log` should show ~30-40ms
+
+### 8-GPU Test (head replication)
+
+Same as 4-GPU but with `--tp-size 8 --dp-size 8 --ep-size 8 --paras-tp-size 8` and `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`.
+
+**Known limitation**: As of 2026-04-13, the 8-GPU e2e test is BLOCKED by a pre-existing assertion in `linear.py:1209`:
+```
+assert paras_tp_size <= self.num_kv_heads
+```
+The attention layer's `paras_configure_tp()` doesn't support TP > num_kv_heads (head replication). The KV transfer kernel itself is correct (verified by unit test with bitwise match on 8 GPUs). The attention reconfiguration needs to be extended separately.
+
+### Evidence location
+
+Test logs saved to `.sisyphus/evidence/kv-coherence/`:
+- `4gpu_test.log`, `8gpu_test.log` — full test output
+- `*_inflight_*.json` — raw responses from in-flight requests
+- `summary.md` — pass/fail overview
+
 ## Troubleshooting
 
 | Issue | Cause | Fix |
@@ -156,3 +222,4 @@ Expected speedups:
 | `NCCL timeout` | Leftover NCCL state from crashed run | `pkill -f torchrun` and retry |
 | `Import error: paras_peer_access_cuda` | CUDA extension not compiled | `cd python/sglang/srt/paras/csrc && pip install -e .` |
 | OOM on 8-GPU benchmark with large tokens | EP_MAX_TOKENS too small for TP view | Auto-handled by `_init_test_params`, but reduce `BENCH_TOKENS_PER_RANK` if needed |
+| `assert paras_tp_size <= self.num_kv_heads` | Attention layer doesn't support TP > kv_heads | Pre-existing limitation — 8-GPU e2e blocked until attention reconfiguration supports head replication |
