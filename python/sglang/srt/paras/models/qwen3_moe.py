@@ -29,6 +29,7 @@ from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 from sglang.srt.paras.paras_memory_manager import (
     ParaSMemoryManager,
     create_paras_moe_aliases,
+    create_paras_kv_aliases,
     plan_qwen_moe_layout,
     set_global_paras_memory_manager,
 )
@@ -240,14 +241,15 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
 
         total_bytes = manager.materialize()
         create_paras_moe_aliases(manager, config.num_hidden_layers, prefix="model")
+        create_paras_kv_aliases(manager, config.num_hidden_layers)
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
 
         # Set global so create_weights() can find the manager
         set_global_paras_memory_manager(manager)
 
-        # Pre-initialize NVLink peer access during model init to avoid 6s overhead at switch time.
-        # cudaDeviceEnablePeerAccess() and cudaIpcOpenMemHandle() are slow on first call.
+        # Pre-initialize NVLink peer access during model init to avoid overhead at switch time.
+        # cudaIpcOpenMemHandle() is slow on first call (~6s for NVLink connection setup).
         try:
             from sglang.srt.paras.peer_access import init_peer_access
             self._fused_peer_access_ctx = init_peer_access(

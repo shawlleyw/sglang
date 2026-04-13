@@ -112,13 +112,9 @@ void launch_peer_access_fused_transfer_w13_v2(
     int num_sms;
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
 
-    // Grid divisible by tp_size for balanced warp-level peer assignment
-    // Env vars for tuning sweep (V2_GRID_MULT × tp_size blocks, V2_THREADS threads)
-    const char* grid_env = getenv("V2_GRID_MULT");
-    int grid_mult = grid_env ? atoi(grid_env) : num_sms;
-    int blocks = grid_mult * tp_size;
-    const char* thr_env = getenv("V2_THREADS");
-    int threads = thr_env ? atoi(thr_env) : 256;
+    // num_sms × tp_size blocks (one warp-group per SM per peer), 256 threads (8 warps)
+    const int blocks = num_sms * tp_size;
+    const int threads = 256;
 
     peer_access_fused_transfer_w13_v2<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const char*>(local_buffer_ptr),
@@ -223,11 +219,8 @@ void launch_peer_access_fused_transfer_w2_v2(
     int num_sms;
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
 
-    const char* grid_env = getenv("V2_GRID_MULT");
-    int grid_mult = grid_env ? atoi(grid_env) : num_sms;
-    int blocks = grid_mult * tp_size;
-    const char* thr_env = getenv("V2_THREADS");
-    int threads = thr_env ? atoi(thr_env) : 256;
+    const int blocks = num_sms * tp_size;
+    const int threads = 256;
 
     peer_access_fused_transfer_w2_v2<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const char*>(local_buffer_ptr),
@@ -239,6 +232,144 @@ void launch_peer_access_fused_transfer_w2_v2(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("CUDA w2_v2 kernel error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+// =============================================================================
+// KV cache transfer kernel: reads scattered EP token positions, writes directly
+// to peer GPU TP buffers via NVLink — fused for both K and V in a single pass.
+// EP layout: token at local_token_indices[i], num_kv_heads heads, head_dim elems
+// TP layout: contiguous tokens starting at dst_token_start, heads_per_peer heads
+//
+// For replicated heads (num_kv_heads < tp_size), multiple warps in the same
+// block read identical source data.  We rely on the L1 read-only cache (__ldg)
+// to serve these duplicate reads — benchmarking showed explicit shared memory
+// adds __syncthreads overhead that outweighs the HBM savings (~15% slower).
+// =============================================================================
+__global__ void peer_access_kv_transfer(
+    const char* __restrict__ local_buffer,
+    char* const* __restrict__ peer_buffers,
+    const int* __restrict__ local_token_indices,
+    int64_t src_k_offset,
+    int64_t src_v_offset,
+    int64_t dst_k_offset,
+    int64_t dst_v_offset,
+    int num_local_tokens,
+    int dst_token_start,
+    int num_kv_heads,
+    int tp_rank,
+    int tp_size,
+    int head_dim,
+    int elem_size
+) {
+    const int warps_in_block = blockDim.x >> 5;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int global_warp = blockIdx.x * warps_in_block + warp_in_block;
+    const int total_warps = gridDim.x * warps_in_block;
+
+    // Warp-level peer assignment (NVLink guideline)
+    const int peer = global_warp % tp_size;
+    const int warp_index = global_warp / tp_size;
+    const int warps_per_peer = total_warps / tp_size;
+
+    // Self-write bypass: avoid IPC pointer for local rank (no UVA overhead)
+    char* const dst_buf = (peer == tp_rank) ? const_cast<char*>(local_buffer) : peer_buffers[peer];
+
+    // Work decomposition: fused K and V (kv_idx 0=K, 1=V)
+    const int heads_per_peer = (num_kv_heads / tp_size) > 0 ? (num_kv_heads / tp_size) : 1;
+    const int int4_per_head = (head_dim * elem_size) >> 4;  // / 16
+    const int64_t total_int4 = (int64_t)num_local_tokens * 2 * heads_per_peer * int4_per_head;
+
+    // Head offset for this peer's shard (handles replication via integer division:
+    // e.g. 4 heads / 8 GPUs: peers 0,1 both get ep_head=0, peers 2,3 get ep_head=1)
+    const int ep_head = peer * num_kv_heads / tp_size;
+
+    // 8 unrolled × 32 lanes = 256 int4 per warp per iteration = 4KB
+    int64_t pos = (int64_t)warp_index * 256 + lane;
+    const int64_t stride = (int64_t)warps_per_peer * 256;
+
+    // Use uint32 for decomposition math — avoids expensive int64 software division
+    const unsigned int per_token_u = (unsigned int)(2 * heads_per_peer * int4_per_head);
+    const unsigned int per_kv_u = (unsigned int)(heads_per_peer * int4_per_head);
+    const unsigned int int4_per_head_u = (unsigned int)int4_per_head;
+
+    while (pos < total_int4) {
+        #pragma unroll 8
+        for (int u = 0; u < 8; u++) {
+            const int64_t idx = pos + (int64_t)u * 32;
+            if (idx < total_int4) {
+                // Fast uint32 decomposition (hardware divider, ~20 cycles vs ~100 for int64)
+                const unsigned int idx_u = (unsigned int)idx;
+                const unsigned int token_idx = idx_u / per_token_u;
+                const unsigned int rem = idx_u - token_idx * per_token_u;
+                const unsigned int kv_idx = rem / per_kv_u;
+                const unsigned int rem2 = rem - kv_idx * per_kv_u;
+                const unsigned int head_local = rem2 / int4_per_head_u;
+                const unsigned int in_head = rem2 - head_local * int4_per_head_u;
+
+                // Source: scattered read via index array
+                const int src_token = local_token_indices[token_idx];
+                const int64_t src_base = (kv_idx == 0) ? src_k_offset : src_v_offset;
+                const int64_t src_off = src_base
+                    + (int64_t)src_token * num_kv_heads * head_dim * elem_size
+                    + (int64_t)(ep_head + head_local) * head_dim * elem_size
+                    + (int64_t)in_head * 16;
+
+                // Destination: contiguous write via NVLink
+                const int dst_token = dst_token_start + token_idx;
+                const int64_t dst_base = (kv_idx == 0) ? dst_k_offset : dst_v_offset;
+                const int64_t dst_off = dst_base
+                    + (int64_t)dst_token * heads_per_peer * head_dim * elem_size
+                    + (int64_t)head_local * head_dim * elem_size
+                    + (int64_t)in_head * 16;
+
+                *reinterpret_cast<int4*>(dst_buf + dst_off) =
+                    __ldg(reinterpret_cast<const int4*>(local_buffer + src_off));
+            }
+        }
+        pos += stride;
+    }
+}
+
+void launch_peer_access_kv_transfer(
+    int64_t local_buffer_ptr,
+    int64_t* peer_buffer_ptrs,
+    int* local_token_indices,
+    int64_t src_k_offset,
+    int64_t src_v_offset,
+    int64_t dst_k_offset,
+    int64_t dst_v_offset,
+    int num_local_tokens,
+    int dst_token_start,
+    int num_kv_heads,
+    int tp_rank,
+    int tp_size,
+    int head_dim,
+    int elem_size,
+    cudaStream_t stream
+) {
+    int device;
+    cudaGetDevice(&device);
+    int num_sms;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
+
+    const int blocks = num_sms * tp_size;
+    const int threads = 256;
+
+    peer_access_kv_transfer<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const char*>(local_buffer_ptr),
+        reinterpret_cast<char* const*>(peer_buffer_ptrs),
+        local_token_indices,
+        src_k_offset, src_v_offset,
+        dst_k_offset, dst_v_offset,
+        num_local_tokens, dst_token_start,
+        num_kv_heads, tp_rank, tp_size, head_dim, elem_size
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA kv_transfer kernel error: %s\n", cudaGetErrorString(err));
     }
 }
 

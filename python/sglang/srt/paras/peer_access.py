@@ -1,8 +1,12 @@
-"""Peer access initialization and buffer address exchange for ParaS NVLink weight transfers.
+"""Peer access initialization and buffer address exchange for ParaS NVLink transfers.
 
-Enables CUDA peer access between TP-group GPUs and exchanges managed-buffer
-base addresses so that kernels on any rank can directly read peer memory
-via NVLink / NVSwitch (CUDA Unified Virtual Addressing).
+Exchanges managed-buffer base addresses via CUDA IPC so that kernels on any
+rank can directly write to peer GPU memory via NVLink stores.
+
+NOTE: We intentionally do NOT call cudaDeviceEnablePeerAccess(). The
+cudaIpcOpenMemHandle() with cudaIpcMemLazyEnablePeerAccess flag is sufficient
+for NVLink stores and avoids creating ~416 MiB CUDA contexts on peer GPUs.
+DeepEP uses the same IPC-only approach.
 """
 
 import ctypes
@@ -17,55 +21,6 @@ logger = logging.getLogger(__name__)
 
 # Load CUDA runtime via ctypes
 _cudart = ctypes.CDLL("libcudart.so")
-
-
-def check_peer_access_available(device_ids: List[int]) -> bool:
-    """Check if all GPU pairs in *device_ids* support peer access."""
-    can_access = ctypes.c_int(0)
-    for i in device_ids:
-        for j in device_ids:
-            if i != j:
-                _cudart.cudaDeviceCanAccessPeer(ctypes.byref(can_access), i, j)
-                if can_access.value == 0:
-                    return False
-    return True
-
-
-def enable_peer_access(device_ids: List[int]) -> None:
-    """Enable CUDA peer access between all GPU pairs.
-
-    Must be called from each rank for its own device.
-    Raises ``RuntimeError`` if peer access is not available.
-    """
-    if not check_peer_access_available(device_ids):
-        failed = []
-        can_access = ctypes.c_int(0)
-        for i in device_ids:
-            for j in device_ids:
-                if i != j:
-                    _cudart.cudaDeviceCanAccessPeer(ctypes.byref(can_access), i, j)
-                    if can_access.value == 0:
-                        failed.append((i, j))
-        raise RuntimeError(
-            f"CUDA peer access not available for GPU pairs: {failed}. "
-            "NVLink/NVSwitch connectivity required for paras_peer_access method."
-        )
-
-    # Enable peer access from this rank's device to every other device
-    current_device = torch.cuda.current_device()
-    for peer_device in device_ids:
-        if peer_device != current_device:
-            try:
-                _cudart.cudaDeviceEnablePeerAccess(peer_device, 0)
-                logger.debug(
-                    "Enabled peer access from GPU %d to GPU %d",
-                    current_device,
-                    peer_device,
-                )
-            except Exception:
-                # cudaErrorPeerAccessAlreadyEnabled (704) is OK
-                pass
-
 
 _IPC_HANDLE_SIZE = 64
 
@@ -172,9 +127,6 @@ def init_peer_access(manager, tp_group, tp_size: int) -> PeerAccessContext:
     """
     assert manager.materialized, "manager must be materialized before init_peer_access"
 
-    device_ids = list(range(tp_size))
-    enable_peer_access(device_ids)
-
     local_ptr = manager._buffer.data_ptr()
     rank = dist.get_rank(group=tp_group)
     peer_addresses = exchange_buffer_addresses_ipc(
@@ -251,6 +203,44 @@ def peer_access_fused_transfer_w2_v2(
         hidden_size,
         full_intermediate * elem_size,
         tp_intermediate * elem_size,
+        stream_ptr,
+    )
+
+
+def peer_access_kv_transfer(
+    local_buffer_ptr: int,
+    dst_base_ptrs_tensor: torch.Tensor,
+    local_token_indices: torch.Tensor,
+    src_k_offset: int,
+    src_v_offset: int,
+    dst_k_offset: int,
+    dst_v_offset: int,
+    num_local_tokens: int,
+    dst_token_start: int,
+    num_kv_heads: int,
+    tp_rank: int,
+    tp_size: int,
+    head_dim: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    import paras_peer_access_cuda
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    paras_peer_access_cuda.launch_peer_access_kv_transfer(
+        local_buffer_ptr,
+        dst_base_ptrs_tensor,
+        local_token_indices,
+        src_k_offset,
+        src_v_offset,
+        dst_k_offset,
+        dst_v_offset,
+        num_local_tokens,
+        dst_token_start,
+        num_kv_heads,
+        tp_rank,
+        tp_size,
+        head_dim,
+        elem_size,
         stream_ptr,
     )
 

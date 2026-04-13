@@ -958,7 +958,20 @@ class MHATokenToKVPool(KVCache):
         local_layer_idx = layer_id - self.start_layer
         
         if mgr is not None and mgr.materialized and mgr._kv_reserved:
-            # Use the pre-allocated managed TP view
+            # Check for N+1 TP alias (preferred — direct view, no shape reinterpretation needed)
+            tp_k_name = f"model.layers.{layer_id}.kv.tp.k"
+            tp_v_name = f"model.layers.{layer_id}.kv.tp.v"
+            if tp_k_name in mgr._entries:
+                # N+1 slot design: TP alias already has the right shape from slot[i]
+                # Reinterpret as TP shape using same get_view_as logic
+                total_elements = mgr._entries[tp_k_name].numel
+                tp_slots = total_elements // (new_head_num * self.head_dim)
+                tp_shape = (tp_slots, new_head_num, self.head_dim)
+                self.k_buffer[local_layer_idx] = mgr.get_view_as(tp_k_name, tp_shape)
+                self.v_buffer[local_layer_idx] = mgr.get_view_as(tp_v_name, tp_shape)
+                return
+
+            # Use the pre-allocated managed TP view (legacy EP-only path)
             # The manager's TP view shape: (tp_max_tokens + page_size, tp_heads, head_dim)
             # where tp_heads = new_head_num and tp_max_tokens = new_size
             k_name = f"model.layers.{layer_id}.kv.k"

@@ -337,9 +337,7 @@ def setup_peer_ctx(mgr, rank, world_size, tp_group):
     """
     import ctypes
 
-    from sglang.srt.paras.peer_access import PeerAccessContext, enable_peer_access
-
-    enable_peer_access(list(range(world_size)))
+    from sglang.srt.paras.peer_access import PeerAccessContext
 
     _cudart = ctypes.CDLL("libcudart.so")
 
