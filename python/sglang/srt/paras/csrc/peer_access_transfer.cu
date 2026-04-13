@@ -247,6 +247,11 @@ void launch_peer_access_fused_transfer_w2_v2(
 // to peer GPU TP buffers via NVLink — fused for both K and V in a single pass.
 // EP layout: token at local_token_indices[i], num_kv_heads heads, head_dim elems
 // TP layout: contiguous tokens starting at dst_token_start, heads_per_peer heads
+//
+// For replicated heads (num_kv_heads < tp_size), multiple warps in the same
+// block read identical source data.  We rely on the L1 read-only cache (__ldg)
+// to serve these duplicate reads — benchmarking showed explicit shared memory
+// adds __syncthreads overhead that outweighs the HBM savings (~15% slower).
 // =============================================================================
 __global__ void peer_access_kv_transfer(
     const char* __restrict__ local_buffer,
@@ -283,7 +288,8 @@ __global__ void peer_access_kv_transfer(
     const int int4_per_head = (head_dim * elem_size) >> 4;  // / 16
     const int64_t total_int4 = (int64_t)num_local_tokens * 2 * heads_per_peer * int4_per_head;
 
-    // Head offset for this peer's shard
+    // Head offset for this peer's shard (handles replication via integer division:
+    // e.g. 4 heads / 8 GPUs: peers 0,1 both get ep_head=0, peers 2,3 get ep_head=1)
     const int ep_head = peer * num_kv_heads / tp_size;
 
     // 8 unrolled × 32 lanes = 256 int4 per warp per iteration = 4KB
@@ -356,7 +362,6 @@ void launch_peer_access_kv_transfer(
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
 
     // Grid divisible by tp_size for balanced warp-level peer assignment
-    // Env vars for tuning sweep (V2_GRID_MULT × tp_size blocks, V2_THREADS threads)
     const char* grid_env = getenv("V2_GRID_MULT");
     int grid_mult = grid_env ? atoi(grid_env) : num_sms;
     int blocks = grid_mult * tp_size;
