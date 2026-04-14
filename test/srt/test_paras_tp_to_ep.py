@@ -66,7 +66,7 @@ class TestPartitionRequestsForEP:
 
     @staticmethod
     def _partition(reqs, num_ranks):
-        from sglang.srt.paras.gather_manager import partition_requests_for_ep
+        from sglang.srt.paras.scatter_manager import partition_requests_for_ep
         return partition_requests_for_ep(reqs, num_ranks)
 
     def test_partition_balanced(self):
@@ -257,6 +257,8 @@ class TestKVScatterNCCLRoundtrip:
         from sglang.srt.paras.gather_manager import (
             gather_kv_and_permute,
             permute_and_scatter_kv,
+        )
+        from sglang.srt.paras.scatter_manager import (
             gather_tp_kv_and_permute,
             permute_and_scatter_kv_to_ep,
         )

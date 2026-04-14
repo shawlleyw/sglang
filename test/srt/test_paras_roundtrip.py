@@ -443,6 +443,8 @@ class TestFullRoundTrip:
         from sglang.srt.paras.gather_manager import (
             gather_kv_and_permute,
             permute_and_scatter_kv,
+        )
+        from sglang.srt.paras.scatter_manager import (
             gather_tp_kv_and_permute,
             permute_and_scatter_kv_to_ep,
         )
@@ -534,7 +536,7 @@ class TestFullRoundTrip:
 
         # ---- Phase 2: TP→EP KV scatter (NCCL) ----
         # Use partition_requests_for_ep to compute routing
-        from sglang.srt.paras.gather_manager import partition_requests_for_ep
+        from sglang.srt.paras.scatter_manager import partition_requests_for_ep
 
         # Build global request list (all ranks' reqs) — simulate what
         # gather_global_reqs would produce. In the real flow reqs are
@@ -767,7 +769,7 @@ class TestPartitionConsistency:
         Verify: union of all partitions == original global request set.
         Verify: no request duplicated or lost.
         """
-        from sglang.srt.paras.gather_manager import partition_requests_for_ep
+        from sglang.srt.paras.scatter_manager import partition_requests_for_ep
 
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
@@ -858,6 +860,8 @@ class TestSingleRequestRoundTrip:
         from sglang.srt.paras.gather_manager import (
             gather_kv_and_permute,
             permute_and_scatter_kv,
+        )
+        from sglang.srt.paras.scatter_manager import (
             gather_tp_kv_and_permute,
             permute_and_scatter_kv_to_ep,
             partition_requests_for_ep,
@@ -1095,7 +1099,7 @@ class TestEmptyBatchRoundTrip:
         EP→TP→EP with 0 active requests.
         Verify: no crash, clean state after round-trip.
         """
-        from sglang.srt.paras.gather_manager import partition_requests_for_ep
+        from sglang.srt.paras.scatter_manager import partition_requests_for_ep
 
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])

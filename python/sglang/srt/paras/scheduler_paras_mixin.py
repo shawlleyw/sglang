@@ -17,7 +17,8 @@ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 
 from sglang.srt.paras.utils import paras_func, paras_profile_func
-from sglang.srt.paras.gather_manager import ParaSReqGatherManager, ParaSReqScatterManager, recover_request
+from sglang.srt.paras.gather_manager import ParaSReqGatherManager, recover_request
+from sglang.srt.paras.scatter_manager import ParaSReqScatterManager
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import MoeA2ABackend
