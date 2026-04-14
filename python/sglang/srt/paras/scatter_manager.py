@@ -585,195 +585,104 @@ def _scatter_cache_nccl(
         )
 
     per_token_elems = heads_per_rank * 2 * head_dim
+    intra_rank = tp_rank % replication_factor  # 0 when R=1
 
     # Total global tokens — identical on every rank, safe as all_to_all guard
     total_global_tokens = sum(len(token_partition[e]) for e in range(group_size))
 
-    if replication_factor == 1:
-        # ================================================================
-        # Standard path (no head duplication)
-        # ================================================================
-        send_token_counts = [len(token_partition[e]) for e in range(group_size)]
-        recv_token_count = send_token_counts[tp_rank]
-        total_send_tokens = sum(send_token_counts)
-
-        input_split_sizes = [cnt * per_token_elems for cnt in send_token_counts]
-        # Every source rank sends recv_token_count tokens (same tokens,
-        # different heads) so receive sizes are uniform.
-        output_split_sizes = [recv_token_count * per_token_elems] * group_size
-
-        # -- Build sorted TP pool indices: tokens ordered by dest rank ---
-        sorted_parts: List[torch.Tensor] = []
-        for e in range(group_size):
-            if send_token_counts[e] > 0:
-                part_idx = torch.tensor(
-                    token_partition[e],
-                    dtype=torch.long,
-                    device=global_token_indices.device,
-                )
-                sorted_parts.append(global_token_indices[part_idx])
-
-        if sorted_parts:
-            sorted_tp_indices = torch.cat(sorted_parts)
-        else:
-            sorted_tp_indices = torch.empty(
-                0, dtype=torch.long, device=global_token_indices.device
+    # -- Send side: each rank sends its 1/R token slice per destination --
+    # When R=1 (intra_rank=0): my_start=0, my_end=full → sends all tokens.
+    # When R>1: sends a disjoint slice, cutting NVLink traffic by R.
+    send_token_counts: List[int] = []
+    sorted_parts: List[torch.Tensor] = []
+    for e in range(group_size):
+        full = len(token_partition[e])
+        my_start = full * intra_rank // replication_factor
+        my_end = full * (intra_rank + 1) // replication_factor
+        my_count = my_end - my_start
+        send_token_counts.append(my_count)
+        if my_count > 0:
+            my_indices = token_partition[e][my_start:my_end]
+            part_idx = torch.tensor(
+                my_indices, dtype=torch.long,
+                device=global_token_indices.device,
             )
+            sorted_parts.append(global_token_indices[part_idx])
 
-        # -- Per-layer: gather → all_to_all → scatter -------------------
-        def scatter_one_layer(layer_id: int) -> None:
-            # Step 1: Gather from TP KV cache and permute
-            if total_send_tokens > 0:
-                k_buf = tp_kv_cache.get_key_buffer(layer_id)
-                v_buf = tp_kv_cache.get_value_buffer(layer_id)
-                send_buf = gather_tp_kv_and_permute(
-                    k_buf, v_buf, sorted_tp_indices,
-                    num_kv_heads, heads_per_rank, head_dim, group_size,
-                )
-            else:
-                send_buf = torch.empty(
-                    0, dtype=tp_kv_cache.store_dtype, device=tp_kv_cache.device
-                )
+    total_send_tokens = sum(send_token_counts)
+    input_split_sizes = [cnt * per_token_elems for cnt in send_token_counts]
 
-            # Resize EP cache for this layer before writing
-            if new_ep_cache_size is not None:
-                ep_kv_cache.paras_resize_cache(
-                    layer_id, new_ep_cache_size, num_kv_heads
-                )
-
-            # Step 2: all_to_all — all ranks must participate
-            if total_send_tokens > 0:
-                recv_buf = torch.empty(
-                    recv_token_count * group_size * per_token_elems,
-                    dtype=send_buf.dtype,
-                    device=send_buf.device,
-                )
-                dist.all_to_all_single(
-                    recv_buf, send_buf,
-                    output_split_sizes, input_split_sizes,
-                    group=gather_group.device_group,
-                )
-
-                # Step 3: Permute received data and scatter into EP KV cache
-                if recv_token_count > 0:
-                    ep_k = ep_kv_cache.get_key_buffer(layer_id)
-                    ep_v = ep_kv_cache.get_value_buffer(layer_id)
-                    permute_and_scatter_kv_to_ep(
-                        recv_buf, ep_k, ep_v, ep_dst_positions,
-                        recv_token_count, num_kv_heads, heads_per_rank,
-                        head_dim, group_size,
-                    )
-
-        for layer_id in range(num_layers):
-            scatter_one_layer(layer_id)
-
+    if sorted_parts:
+        sorted_tp_indices = torch.cat(sorted_parts)
     else:
-        # ================================================================
-        # Duplication path (num_kv_heads < group_size)
-        #
-        # Multiple TP ranks share the same KV head.  Each subgroup of
-        # ``replication_factor`` contiguous ranks holds identical data for
-        # one head.  Each subgroup member sends a disjoint 1/R slice of
-        # tokens to each destination, cutting NVLink traffic by R.
-        #
-        # On the receive side, contiguous subgroup members' contributions
-        # sum to exactly ``recv_full_count`` tokens per head (a property
-        # of integer-division slicing).  Since subgroups are contiguous in
-        # the recv_buf, a simple reshape to
-        #   [num_kv_heads, recv_full_count, heads_per_rank, 2, head_dim]
-        # correctly groups token slices by head — no per-chunk parsing
-        # needed.  The existing ``permute_and_scatter_kv_to_ep`` handles
-        # the rest with ``group_size=num_kv_heads``.
-        # ================================================================
-        intra_rank = tp_rank % replication_factor
+        sorted_tp_indices = torch.empty(
+            0, dtype=torch.long, device=global_token_indices.device
+        )
 
-        # -- Send side: each rank sends only its 1/R token slice ---------
-        send_token_counts: List[int] = []
-        sorted_parts: List[torch.Tensor] = []
-        for e in range(group_size):
-            full = len(token_partition[e])
-            my_start = full * intra_rank // replication_factor
-            my_end = full * (intra_rank + 1) // replication_factor
-            my_count = my_end - my_start
-            send_token_counts.append(my_count)
+    # -- Recv side: when R=1 all sources send recv_full_count (uniform);
+    #    when R>1 subgroup members send variable slices, but each
+    #    subgroup's total is exactly recv_full_count (integer-division
+    #    identity).  Since subgroups are contiguous in recv_buf, a reshape
+    #    to [num_kv_heads, recv_full_count, ...] naturally groups them.
+    recv_full_count = len(token_partition[tp_rank])
+    recv_token_counts: List[int] = []
+    for src in range(group_size):
+        src_intra = src % replication_factor
+        s = recv_full_count * src_intra // replication_factor
+        e_idx = recv_full_count * (src_intra + 1) // replication_factor
+        recv_token_counts.append(e_idx - s)
 
-            if my_count > 0:
-                my_indices = token_partition[e][my_start:my_end]
-                part_idx = torch.tensor(
-                    my_indices,
-                    dtype=torch.long,
-                    device=global_token_indices.device,
-                )
-                sorted_parts.append(global_token_indices[part_idx])
+    output_split_sizes = [cnt * per_token_elems for cnt in recv_token_counts]
+    total_recv_elems = sum(output_split_sizes)
 
-        total_send_tokens = sum(send_token_counts)
-        input_split_sizes = [cnt * per_token_elems for cnt in send_token_counts]
+    # Reassembly groups: when heads_per_rank > 1, each source contributes
+    # multiple unique heads → view by source rank.  When heads_per_rank == 1
+    # (including the R>1 duplication case), contiguous R sources carry the
+    # same head → view by head (num_kv_heads).  When R=1 and hpr=1,
+    # num_kv_heads == group_size so both views are identical.
+    reassembly_groups = group_size if heads_per_rank > 1 else num_kv_heads
 
-        if sorted_parts:
-            sorted_tp_indices = torch.cat(sorted_parts)
+    # -- Per-layer: gather → all_to_all → scatter ------------------------
+    def scatter_one_layer(layer_id: int) -> None:
+        if total_send_tokens > 0:
+            k_buf = tp_kv_cache.get_key_buffer(layer_id)
+            v_buf = tp_kv_cache.get_value_buffer(layer_id)
+            send_buf = gather_tp_kv_and_permute(
+                k_buf, v_buf, sorted_tp_indices,
+                num_kv_heads, heads_per_rank, head_dim, group_size,
+            )
         else:
-            sorted_tp_indices = torch.empty(
-                0, dtype=torch.long, device=global_token_indices.device
+            send_buf = torch.empty(
+                0, dtype=tp_kv_cache.store_dtype, device=tp_kv_cache.device
             )
 
-        # -- Recv side: variable sizes per source, but each subgroup's
-        #    total is exactly recv_full_count tokens -----------------------
-        recv_full_count = len(token_partition[tp_rank])
-        recv_token_counts: List[int] = []
-        for src in range(group_size):
-            src_intra = src % replication_factor
-            s = recv_full_count * src_intra // replication_factor
-            e_idx = recv_full_count * (src_intra + 1) // replication_factor
-            recv_token_counts.append(e_idx - s)
+        if new_ep_cache_size is not None:
+            ep_kv_cache.paras_resize_cache(
+                layer_id, new_ep_cache_size, num_kv_heads
+            )
 
-        output_split_sizes = [cnt * per_token_elems for cnt in recv_token_counts]
-        # Total recv = num_kv_heads * recv_full_count * per_token_elems
-        total_recv_elems = sum(output_split_sizes)
+        if total_global_tokens > 0:
+            recv_buf = torch.empty(
+                total_recv_elems,
+                dtype=tp_kv_cache.store_dtype,
+                device=tp_kv_cache.device,
+            )
+            dist.all_to_all_single(
+                recv_buf, send_buf,
+                output_split_sizes, input_split_sizes,
+                group=gather_group.device_group,
+            )
 
-        # -- Per-layer: gather → all_to_all → reshape → scatter ----------
-        def scatter_one_layer_dup(layer_id: int) -> None:
-            if total_send_tokens > 0:
-                k_buf = tp_kv_cache.get_key_buffer(layer_id)
-                v_buf = tp_kv_cache.get_value_buffer(layer_id)
-                send_buf = gather_tp_kv_and_permute(
-                    k_buf, v_buf, sorted_tp_indices,
-                    num_kv_heads, heads_per_rank, head_dim, group_size,
-                )
-            else:
-                send_buf = torch.empty(
-                    0, dtype=tp_kv_cache.store_dtype, device=tp_kv_cache.device
+            if recv_full_count > 0:
+                ep_k = ep_kv_cache.get_key_buffer(layer_id)
+                ep_v = ep_kv_cache.get_value_buffer(layer_id)
+                permute_and_scatter_kv_to_ep(
+                    recv_buf, ep_k, ep_v, ep_dst_positions,
+                    recv_full_count, num_kv_heads, heads_per_rank,
+                    head_dim, reassembly_groups,
                 )
 
-            if new_ep_cache_size is not None:
-                ep_kv_cache.paras_resize_cache(
-                    layer_id, new_ep_cache_size, num_kv_heads
-                )
-
-            if total_global_tokens > 0:
-                recv_buf = torch.empty(
-                    total_recv_elems,
-                    dtype=tp_kv_cache.store_dtype,
-                    device=tp_kv_cache.device,
-                )
-                dist.all_to_all_single(
-                    recv_buf, send_buf,
-                    output_split_sizes, input_split_sizes,
-                    group=gather_group.device_group,
-                )
-
-                # Contiguous subgroup chunks naturally concatenate to
-                # recv_full_count tokens per head — just reshape and
-                # reuse permute_and_scatter_kv_to_ep.
-                if recv_full_count > 0:
-                    ep_k = ep_kv_cache.get_key_buffer(layer_id)
-                    ep_v = ep_kv_cache.get_value_buffer(layer_id)
-                    permute_and_scatter_kv_to_ep(
-                        recv_buf, ep_k, ep_v, ep_dst_positions,
-                        recv_full_count, num_kv_heads, heads_per_rank,
-                        head_dim, num_kv_heads,  # group_size=num_kv_heads
-                    )
-
-        for layer_id in range(num_layers):
-            scatter_one_layer_dup(layer_id)
+    for layer_id in range(num_layers):
+        scatter_one_layer(layer_id)
 
     torch.cuda.synchronize()
