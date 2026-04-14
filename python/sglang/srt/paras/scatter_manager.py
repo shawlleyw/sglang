@@ -669,16 +669,25 @@ def _scatter_cache_nccl(
 
     else:
         # ================================================================
-        # R3: Duplication path (num_kv_heads < group_size)
+        # Duplication path (num_kv_heads < group_size)
         #
         # Multiple TP ranks share the same KV head.  Each subgroup of
-        # ``replication_factor`` ranks holds identical data for one head.
-        # To avoid redundant traffic, each subgroup member sends a
-        # disjoint slice of tokens to each destination.
+        # ``replication_factor`` contiguous ranks holds identical data for
+        # one head.  Each subgroup member sends a disjoint 1/R slice of
+        # tokens to each destination, cutting NVLink traffic by R.
+        #
+        # On the receive side, contiguous subgroup members' contributions
+        # sum to exactly ``recv_full_count`` tokens per head (a property
+        # of integer-division slicing).  Since subgroups are contiguous in
+        # the recv_buf, a simple reshape to
+        #   [num_kv_heads, recv_full_count, heads_per_rank, 2, head_dim]
+        # correctly groups token slices by head — no per-chunk parsing
+        # needed.  The existing ``permute_and_scatter_kv_to_ep`` handles
+        # the rest with ``group_size=num_kv_heads``.
         # ================================================================
         intra_rank = tp_rank % replication_factor
 
-        # -- Send side: each rank sends only its token slice per dest ----
+        # -- Send side: each rank sends only its 1/R token slice ---------
         send_token_counts: List[int] = []
         sorted_parts: List[torch.Tensor] = []
         for e in range(group_size):
@@ -707,7 +716,8 @@ def _scatter_cache_nccl(
                 0, dtype=torch.long, device=global_token_indices.device
             )
 
-        # -- Recv side: variable sizes per source -----------------------
+        # -- Recv side: variable sizes per source, but each subgroup's
+        #    total is exactly recv_full_count tokens -----------------------
         recv_full_count = len(token_partition[tp_rank])
         recv_token_counts: List[int] = []
         for src in range(group_size):
@@ -717,11 +727,11 @@ def _scatter_cache_nccl(
             recv_token_counts.append(e_idx - s)
 
         output_split_sizes = [cnt * per_token_elems for cnt in recv_token_counts]
+        # Total recv = num_kv_heads * recv_full_count * per_token_elems
         total_recv_elems = sum(output_split_sizes)
 
-        # -- Per-layer: gather → all_to_all → reassemble → scatter ------
+        # -- Per-layer: gather → all_to_all → reshape → scatter ----------
         def scatter_one_layer_dup(layer_id: int) -> None:
-            # Step 1: Gather from TP KV cache
             if total_send_tokens > 0:
                 k_buf = tp_kv_cache.get_key_buffer(layer_id)
                 v_buf = tp_kv_cache.get_value_buffer(layer_id)
@@ -734,13 +744,11 @@ def _scatter_cache_nccl(
                     0, dtype=tp_kv_cache.store_dtype, device=tp_kv_cache.device
                 )
 
-            # Resize EP cache for this layer before writing
             if new_ep_cache_size is not None:
                 ep_kv_cache.paras_resize_cache(
                     layer_id, new_ep_cache_size, num_kv_heads
                 )
 
-            # Step 2: all_to_all — all ranks must participate
             if total_global_tokens > 0:
                 recv_buf = torch.empty(
                     total_recv_elems,
@@ -753,42 +761,17 @@ def _scatter_cache_nccl(
                     group=gather_group.device_group,
                 )
 
-                # Step 3: Reassemble — cat same-subgroup token slices,
-                # stack across heads, scatter into EP buffers
+                # Contiguous subgroup chunks naturally concatenate to
+                # recv_full_count tokens per head — just reshape and
+                # reuse permute_and_scatter_kv_to_ep.
                 if recv_full_count > 0:
                     ep_k = ep_kv_cache.get_key_buffer(layer_id)
                     ep_v = ep_kv_cache.get_value_buffer(layer_id)
-
-                    # Parse recv_buf by source rank into per-subgroup chunks
-                    buf_offset = 0
-                    chunks_per_subgroup: List[List[torch.Tensor]] = [
-                        [] for _ in range(num_kv_heads)
-                    ]
-                    for src in range(group_size):
-                        sg = src // replication_factor
-                        cnt = recv_token_counts[src]
-                        size = cnt * per_token_elems
-                        if cnt > 0:
-                            chunk = recv_buf[buf_offset:buf_offset + size].view(
-                                cnt, heads_per_rank, 2, head_dim
-                            )
-                            chunks_per_subgroup[sg].append(chunk)
-                        buf_offset += size
-
-                    # Per subgroup: cat token slices → [full_count, 1, 2, hd]
-                    head_kv = [
-                        torch.cat(chunks, dim=0)
-                        for chunks in chunks_per_subgroup
-                    ]
-                    # Stack → [num_kv_heads, full_count, 1, 2, hd]
-                    stacked = torch.stack(head_kv, dim=0)
-                    # → [full_count, num_kv_heads, 1, 2, hd]
-                    stacked = stacked.permute(1, 0, 2, 3, 4).contiguous()
-                    # → [full_count, num_kv_heads, 2, hd]
-                    kv = stacked.reshape(recv_full_count, num_kv_heads, 2, head_dim)
-                    # Scatter K and V into EP buffers
-                    ep_k[ep_dst_positions] = kv[:, :, 0, :]
-                    ep_v[ep_dst_positions] = kv[:, :, 1, :]
+                    permute_and_scatter_kv_to_ep(
+                        recv_buf, ep_k, ep_v, ep_dst_positions,
+                        recv_full_count, num_kv_heads, heads_per_rank,
+                        head_dim, num_kv_heads,  # group_size=num_kv_heads
+                    )
 
         for layer_id in range(num_layers):
             scatter_one_layer_dup(layer_id)
