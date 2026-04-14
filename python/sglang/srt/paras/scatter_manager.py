@@ -507,25 +507,37 @@ class ParaSReqScatterManager:
             dst_k_offsets.append(mgr._entries[ep_k].offset_bytes)
             dst_v_offsets.append(mgr._entries[ep_v].offset_bytes)
 
-        if num_my_tokens > 0:
-            peer_access_kv_scatter(
-                local_buffer_ptr,
-                peer_buffer_ptrs,
-                tp_token_positions,
-                token_to_rank,
-                ep_dst_pos_all,
-                src_k_offsets,
-                src_v_offsets,
-                dst_k_offsets,
-                dst_v_offsets,
-                num_my_tokens,
-                heads_per_rank,
-                self.paras_tp_rank,
-                self.paras_tp_size,
-                head_dim,
-                self.scatter_group.device_group,
-                num_layers,
-                elem_size,
+        # Launch kernel per layer in REVERSE order with a per-layer
+        # all_reduce barrier, matching the EP→TP gather pattern.
+        # ALL ranks must participate in the barrier regardless of whether
+        # they have tokens — otherwise ranks with empty partitions skip
+        # the barrier and cause a deadlock.
+        import paras_peer_access_cuda
+
+        barrier_tensor = torch.zeros(1, device="cuda")
+        for layer_idx in range(num_layers - 1, -1, -1):
+            if num_my_tokens > 0:
+                paras_peer_access_cuda.launch_peer_access_kv_scatter(
+                    local_buffer_ptr,
+                    peer_buffer_ptrs,
+                    tp_token_positions,
+                    token_to_rank,
+                    ep_dst_pos_all,
+                    src_k_offsets[layer_idx],
+                    src_v_offsets[layer_idx],
+                    dst_k_offsets[layer_idx],
+                    dst_v_offsets[layer_idx],
+                    num_my_tokens,
+                    heads_per_rank,
+                    self.paras_tp_rank,
+                    self.paras_tp_size,
+                    head_dim,
+                    elem_size,
+                    0,  # default stream
+                )
+            # Per-layer barrier: ALL ranks participate
+            dist.all_reduce(
+                barrier_tensor, group=self.scatter_group.device_group
             )
 
         torch.cuda.synchronize()
