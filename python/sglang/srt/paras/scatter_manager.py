@@ -428,30 +428,57 @@ class ParaSReqScatterManager:
             self.peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
         )
 
-        # TP pool positions for all global tokens.
-        tp_token_positions = self.global_token_indices
-        if tp_token_positions is not None and tp_token_positions.dtype != torch.int32:
-            tp_token_positions = tp_token_positions.to(torch.int32)
+        # -- Replication-aware token selection ----------------------------
+        # When num_kv_heads < tp_size, multiple ranks share the same head
+        # and hold identical KV data.  Each subgroup member only needs to
+        # write its 1/R slice of tokens — same optimisation as the NCCL
+        # path.  We build routing tensors for only the sliced tokens so
+        # the kernel processes fewer items and NVLink traffic drops by R.
+        num_kv_heads = ep_head_num
+        replication_factor = (
+            self.group_size // num_kv_heads
+            if num_kv_heads < self.group_size
+            else 1
+        )
+        intra_rank = self.paras_tp_rank % replication_factor
 
-        # Build per-token routing tensors.
-        token_to_rank = torch.empty(
-            self.num_global_tokens, dtype=torch.int32, device="cuda"
-        )
-        ep_dst_pos_all = torch.empty(
-            self.num_global_tokens, dtype=torch.int32, device="cuda"
-        )
+        # Collect this rank's token slice per destination.
+        my_global_indices: List[int] = []   # indices into global_token_indices
+        my_dst_ranks: List[int] = []
+        my_ep_dst_pos: List[int] = []
         for e in range(self.group_size):
-            rank_tokens = self.token_partition[e]
-            if rank_tokens:
-                idx_tensor = torch.tensor(
-                    rank_tokens, dtype=torch.long, device="cuda"
-                )
-                token_to_rank[idx_tensor] = e
-                # After paras_resize_and_clear, alloc returns [1, 2, ..., n]
-                # deterministically on every rank.
-                ep_dst_pos_all[idx_tensor] = torch.arange(
-                    1, len(rank_tokens) + 1, dtype=torch.int32, device="cuda"
-                )
+            full_tokens = self.token_partition[e]
+            full = len(full_tokens)
+            my_start = full * intra_rank // replication_factor
+            my_end = full * (intra_rank + 1) // replication_factor
+            my_slice = full_tokens[my_start:my_end]
+            # ep_dst_positions on dest rank e are contiguous [1, 2, ...].
+            # This rank's slice maps to positions [my_start+1, my_end].
+            for local_idx, global_idx in enumerate(my_slice):
+                my_global_indices.append(global_idx)
+                my_dst_ranks.append(e)
+                my_ep_dst_pos.append(my_start + local_idx + 1)  # 1-indexed
+
+        num_my_tokens = len(my_global_indices)
+
+        if num_my_tokens > 0:
+            # TP pool positions for this rank's token slice only.
+            gi_tensor = torch.tensor(
+                my_global_indices, dtype=torch.long, device="cuda"
+            )
+            tp_token_positions = self.global_token_indices[gi_tensor].to(
+                torch.int32
+            )
+            token_to_rank = torch.tensor(
+                my_dst_ranks, dtype=torch.int32, device="cuda"
+            )
+            ep_dst_pos_all = torch.tensor(
+                my_ep_dst_pos, dtype=torch.int32, device="cuda"
+            )
+        else:
+            tp_token_positions = torch.empty(0, dtype=torch.int32, device="cuda")
+            token_to_rank = torch.empty(0, dtype=torch.int32, device="cuda")
+            ep_dst_pos_all = torch.empty(0, dtype=torch.int32, device="cuda")
 
         # Build per-layer byte offsets (source=TP, dest=EP).
         src_k_offsets: List[int] = []
@@ -468,7 +495,7 @@ class ParaSReqScatterManager:
             dst_k_offsets.append(mgr._entries[ep_k].offset_bytes)
             dst_v_offsets.append(mgr._entries[ep_v].offset_bytes)
 
-        if self.num_global_tokens > 0:
+        if num_my_tokens > 0:
             peer_access_kv_scatter(
                 local_buffer_ptr,
                 peer_buffer_ptrs,
@@ -479,7 +506,7 @@ class ParaSReqScatterManager:
                 src_v_offsets,
                 dst_k_offsets,
                 dst_v_offsets,
-                self.num_global_tokens,
+                num_my_tokens,
                 heads_per_rank,
                 self.paras_tp_rank,
                 self.paras_tp_size,

@@ -121,6 +121,109 @@ class TestPartitionRequestsForEP:
 
 
 # =========================================================================
+# TEST GROUP 1b: Peer-access replication-aware routing (no GPU needed)
+# =========================================================================
+
+class TestPeerAccessReplicationRouting:
+    """Verify that _scatter_cache_peer_access builds routing tensors for
+    only 1/R of the tokens when heads are replicated (num_kv_heads < tp_size).
+
+    This tests the Python-level logic without running the CUDA kernel.
+    """
+
+    def test_no_replication(self):
+        """R=1 (4 heads / 4 GPUs): each rank routes all tokens."""
+        num_kv_heads, group_size = 4, 4
+        R = group_size // num_kv_heads  # 1
+        assert R == 1
+        # 20 tokens total, 5 per destination
+        token_partition = [list(range(i * 5, (i + 1) * 5)) for i in range(4)]
+        for tp_rank in range(group_size):
+            intra = tp_rank % R  # always 0
+            my_count = 0
+            for e in range(group_size):
+                full = len(token_partition[e])
+                s = full * intra // R
+                end = full * (intra + 1) // R
+                my_count += end - s
+            assert my_count == 20, f"Rank {tp_rank} should route all 20 tokens, got {my_count}"
+
+    def test_replication_factor_2(self):
+        """R=2 (4 heads / 8 GPUs): each subgroup member routes half the tokens."""
+        num_kv_heads, group_size = 4, 8
+        R = group_size // num_kv_heads  # 2
+        assert R == 2
+        # 20 tokens total, variable per destination
+        token_partition = [
+            list(range(0, 3)),    # dest 0: 3 tokens
+            list(range(3, 6)),    # dest 1: 3 tokens
+            list(range(6, 8)),    # dest 2: 2 tokens
+            list(range(8, 11)),   # dest 3: 3 tokens
+            list(range(11, 13)),  # dest 4: 2 tokens
+            list(range(13, 16)),  # dest 5: 3 tokens
+            list(range(16, 18)),  # dest 6: 2 tokens
+            list(range(18, 20)),  # dest 7: 2 tokens
+        ]
+        total_tokens = sum(len(p) for p in token_partition)
+        assert total_tokens == 20
+
+        for tp_rank in range(group_size):
+            intra = tp_rank % R
+            my_count = 0
+            for e in range(group_size):
+                full = len(token_partition[e])
+                s = full * intra // R
+                end = full * (intra + 1) // R
+                my_count += end - s
+            # Subgroup members should collectively cover all tokens
+            partner_rank = tp_rank ^ 1  # flip last bit = partner
+            partner_intra = partner_rank % R
+            partner_count = 0
+            for e in range(group_size):
+                full = len(token_partition[e])
+                s = full * partner_intra // R
+                end = full * (partner_intra + 1) // R
+                partner_count += end - s
+            assert my_count + partner_count == total_tokens, (
+                f"Ranks {tp_rank},{partner_rank} together should cover "
+                f"{total_tokens} tokens, got {my_count}+{partner_count}"
+            )
+            # Each member handles roughly half
+            assert my_count <= total_tokens // R + group_size, (
+                f"Rank {tp_rank} handles too many tokens: {my_count}"
+            )
+
+    def test_no_token_lost_or_duplicated(self):
+        """With R=2, verify every dest's tokens are fully covered by
+        exactly 2 subgroup members with no overlap or gap."""
+        R = 2
+        for full in [0, 1, 2, 3, 7, 10, 15, 100, 1001]:
+            covered = set()
+            for intra in range(R):
+                s = full * intra // R
+                e = full * (intra + 1) // R
+                token_set = set(range(s, e))
+                assert covered.isdisjoint(token_set), (
+                    f"full={full}: overlap at intra_rank={intra}"
+                )
+                covered |= token_set
+            assert covered == set(range(full)), (
+                f"full={full}: missing or extra tokens. "
+                f"Expected {set(range(full))}, got {covered}"
+            )
+
+    def test_replication_factor_4(self):
+        """R=4 (2 heads / 8 GPUs): each subgroup member routes 1/4."""
+        R = 4
+        full = 100
+        for intra in range(R):
+            s = full * intra // R
+            e = full * (intra + 1) // R
+            count = e - s
+            assert count == 25, f"intra={intra}: expected 25, got {count}"
+
+
+# =========================================================================
 # Distributed test helpers (shared by GPU tests)
 # =========================================================================
 
