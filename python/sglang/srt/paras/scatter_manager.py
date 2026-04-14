@@ -170,13 +170,13 @@ def permute_and_scatter_kv_to_ep(
 # ============================================================
 
 class _EPCacheView:
-    """Lightweight proxy providing EP head_num over a TP-mode KV cache.
+    """Proxy providing EP-layout buffer access via the ParaS memory manager.
 
-    ``_scatter_cache_nccl`` expects separate ``tp_kv_cache`` and
-    ``ep_kv_cache`` objects with different ``head_num`` values.  When the
-    underlying storage is a single ``MHATokenToKVPool`` currently in TP
-    mode, this proxy reports the EP head count while delegating all buffer
-    access and resize operations to the real cache.
+    ``_scatter_cache_nccl`` needs an ``ep_kv_cache`` with EP-shaped buffers
+    for the write destination.  The N+1 slot design stores EP data in
+    slot[i+1] and TP data in slot[i] at *different* physical offsets.
+    This proxy reads the EP aliases from the global ``ParaSMemoryManager``
+    to return buffers at the correct physical location.
     """
 
     def __init__(self, tp_cache: 'MHATokenToKVPool', ep_head_num: int):
@@ -187,11 +187,23 @@ class _EPCacheView:
         self.device = tp_cache.device
         self._tp_cache = tp_cache
 
+    def _get_mgr(self):
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+        return get_global_paras_memory_manager()
+
     def get_key_buffer(self, layer_id: int):
-        return self._tp_cache.get_key_buffer(layer_id)
+        mgr = self._get_mgr()
+        ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
+        total_elems = mgr._entries[ep_k_name].numel
+        ep_tokens = total_elems // (self.head_num * self.head_dim)
+        return mgr.get_view_as(ep_k_name, (ep_tokens, self.head_num, self.head_dim))
 
     def get_value_buffer(self, layer_id: int):
-        return self._tp_cache.get_value_buffer(layer_id)
+        mgr = self._get_mgr()
+        ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
+        total_elems = mgr._entries[ep_v_name].numel
+        ep_tokens = total_elems // (self.head_num * self.head_dim)
+        return mgr.get_view_as(ep_v_name, (ep_tokens, self.head_num, self.head_dim))
 
     def paras_resize_cache(self, layer_id: int, new_size: int, new_head_num: int):
         self._tp_cache.paras_resize_cache(layer_id, new_size, new_head_num)
@@ -709,7 +721,11 @@ def _scatter_cache_nccl(
                     head_dim, reassembly_groups,
                 )
 
-    for layer_id in range(num_layers):
+    # Process layers in REVERSE order (N-1, ..., 0) to respect the N+1
+    # slot design.  Layer i reads TP slot[i] and writes EP slot[i+1].
+    # Slot[i+1] is also layer (i+1)'s TP read source, so we must finish
+    # reading layer i+1's TP data before writing layer i's EP data.
+    for layer_id in reversed(range(num_layers)):
         scatter_one_layer(layer_id)
 
     torch.cuda.synchronize()

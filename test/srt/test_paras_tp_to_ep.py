@@ -507,6 +507,251 @@ class TestKVScatterNCCLRoundtrip:
 
 
 # =========================================================================
+# TEST GROUP 2b: KV Scatter with head replication (num_kv_heads < tp_size)
+# =========================================================================
+
+# Replication test constants: 2 heads / 4 GPUs → replication_factor=2
+_REPL_NUM_KV_HEADS = 2
+_REPL_TOKENS_PER_RANK = [50, 40, 45, 35]
+
+
+def _build_kv_manager_repl(rank, world_size):
+    """Create ParaSMemoryManager with N+1 KV slots for replication test."""
+    from sglang.srt.paras.paras_memory_manager import (
+        ParaSMemoryManager,
+        create_paras_kv_aliases,
+        set_global_paras_memory_manager,
+    )
+
+    ep_max_tokens = max(_REPL_TOKENS_PER_RANK) + 100
+    # heads_per_rank = max(1, 2//4) = 1 (replicated)
+    heads_per_peer = max(1, _REPL_NUM_KV_HEADS // world_size)
+    total_tokens = sum(_REPL_TOKENS_PER_RANK)
+    min_ep_for_tp = (total_tokens * heads_per_peer + _REPL_NUM_KV_HEADS - 1) // _REPL_NUM_KV_HEADS
+    ep_max_tokens = max(ep_max_tokens, min_ep_for_tp)
+    tp_max_tokens = (ep_max_tokens + PAGE_SIZE) * _REPL_NUM_KV_HEADS // heads_per_peer
+
+    mgr = ParaSMemoryManager(device=f"cuda:{rank}")
+    mgr.reserve_kv_cache(
+        num_layers=NUM_LAYERS,
+        ep_max_tokens=ep_max_tokens,
+        tp_max_tokens=tp_max_tokens,
+        num_kv_heads=_REPL_NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        kv_dtype=KV_DTYPE,
+        page_size=PAGE_SIZE,
+    )
+    mgr.materialize()
+    create_paras_kv_aliases(mgr, NUM_LAYERS)
+    set_global_paras_memory_manager(mgr)
+    return mgr, ep_max_tokens, tp_max_tokens
+
+
+def _fill_kv_data_repl(mgr, rank):
+    """Fill EP KV buffers with rank-deterministic random data (repl test)."""
+    num_tokens = _REPL_TOKENS_PER_RANK[rank]
+    for layer_id in range(NUM_LAYERS):
+        ep_k = mgr.get_view(f"model.layers.{layer_id}.kv.ep.k")
+        ep_v = mgr.get_view(f"model.layers.{layer_id}.kv.ep.v")
+        ep_k.zero_()
+        ep_v.zero_()
+
+        gen_k = torch.Generator(device="cpu")
+        gen_k.manual_seed(SEED + layer_id * 1000 + rank + 7777)
+        data_k = torch.randn(
+            (num_tokens, _REPL_NUM_KV_HEADS, HEAD_DIM),
+            generator=gen_k, dtype=torch.float32,
+        ).to(dtype=KV_DTYPE, device=ep_k.device)
+        ep_k[:num_tokens].copy_(data_k)
+
+        gen_v = torch.Generator(device="cpu")
+        gen_v.manual_seed(SEED + layer_id * 1000 + rank + 8888)
+        data_v = torch.randn(
+            (num_tokens, _REPL_NUM_KV_HEADS, HEAD_DIM),
+            generator=gen_v, dtype=torch.float32,
+        ).to(dtype=KV_DTYPE, device=ep_v.device)
+        ep_v[:num_tokens].copy_(data_v)
+
+
+@pytest.mark.skipif(not _is_distributed(), reason="Requires torchrun with 4 GPUs")
+class TestKVScatterNCCLReplication:
+    """EP→TP gather → TP→EP scatter with num_kv_heads=2 < tp_size=4.
+
+    Replication factor = 2.  Ranks 0,1 share head 0; ranks 2,3 share head 1.
+    The scatter path should:
+    - Each subgroup member sends only 1/R of tokens per destination
+    - Receiver reshapes contiguous subgroup chunks into full heads
+    - Round-trip produces bitwise-identical EP data
+    """
+
+    def test_replication_roundtrip(self):
+        import torch.distributed as dist
+        from sglang.srt.paras.gather_manager import (
+            gather_kv_and_permute,
+            permute_and_scatter_kv,
+        )
+        from sglang.srt.paras.scatter_manager import (
+            _scatter_cache_nccl,
+            _EPCacheView,
+        )
+
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        tp_group = _setup_paras_state(rank, world_size)
+        mgr, ep_max_tokens, tp_max_tokens = _build_kv_manager_repl(rank, world_size)
+
+        _fill_kv_data_repl(mgr, rank)
+
+        num_kv_heads = _REPL_NUM_KV_HEADS  # 2
+        heads_per_peer = max(1, num_kv_heads // world_size)  # 1
+        replication_factor = world_size // num_kv_heads  # 2
+        total_tokens = sum(_REPL_TOKENS_PER_RANK)
+        num_local = _REPL_TOKENS_PER_RANK[rank]
+        splited_size = heads_per_peer * HEAD_DIM
+        tp_view_tokens = (ep_max_tokens + PAGE_SIZE) * num_kv_heads // heads_per_peer
+
+        if rank == 0:
+            print(f"\n  Replication test: {num_kv_heads} heads / {world_size} GPUs "
+                  f"→ R={replication_factor}, heads_per_rank={heads_per_peer}")
+
+        # --- Snapshot original EP data ---
+        orig_ep = {}
+        for lid in range(NUM_LAYERS):
+            ep_k = mgr.get_view(f"model.layers.{lid}.kv.ep.k")
+            ep_v = mgr.get_view(f"model.layers.{lid}.kv.ep.v")
+            orig_ep[lid] = (ep_k[:num_local].clone(), ep_v[:num_local].clone())
+
+        # --- Step 1: EP→TP gather (NCCL, with repeat_interleave for replication) ---
+        local_token_indices = torch.arange(num_local, dtype=torch.int64, device="cuda")
+        global_token_indices = torch.arange(total_tokens, dtype=torch.int64, device="cuda")
+
+        input_split_sizes = [2 * splited_size * num_local] * world_size
+        output_split_sizes = [2 * splited_size * _REPL_TOKENS_PER_RANK[r] for r in range(world_size)]
+
+        for lid in range(NUM_LAYERS):
+            ep_k = mgr.get_view(f"model.layers.{lid}.kv.ep.k")
+            ep_v = mgr.get_view(f"model.layers.{lid}.kv.ep.v")
+
+            permuted = gather_kv_and_permute(ep_k, ep_v, local_token_indices)
+
+            # Replicate heads for all_to_all (same as _gather_cache_nccl)
+            if replication_factor > 1:
+                permuted = (
+                    permuted
+                    .view(num_kv_heads, num_local * 2 * HEAD_DIM)
+                    .repeat_interleave(replication_factor, dim=0)
+                    .flatten()
+                )
+
+            tp_k = mgr.get_view_as(
+                f"model.layers.{lid}.kv.tp.k",
+                (tp_view_tokens, heads_per_peer, HEAD_DIM),
+            )
+            tp_v = mgr.get_view_as(
+                f"model.layers.{lid}.kv.tp.v",
+                (tp_view_tokens, heads_per_peer, HEAD_DIM),
+            )
+
+            gathered = torch.empty(
+                2 * total_tokens * splited_size,
+                dtype=KV_DTYPE, device="cuda",
+            )
+            dist.all_to_all_single(
+                gathered, permuted, output_split_sizes, input_split_sizes,
+                group=tp_group,
+            )
+            permute_and_scatter_kv(
+                gathered, tp_k, tp_v, global_token_indices,
+                total_tokens, heads_per_peer, HEAD_DIM,
+            )
+
+        torch.cuda.synchronize()
+        dist.barrier(group=tp_group)
+
+        if rank == 0:
+            print("  EP→TP gather done (with repeat_interleave)")
+
+        # --- Step 2: TP→EP scatter using unified _scatter_cache_nccl ---
+        # Build token partition (each rank gets its original tokens back)
+        token_partition: list = []
+        offset = 0
+        for r in range(world_size):
+            token_partition.append(list(range(offset, offset + _REPL_TOKENS_PER_RANK[r])))
+            offset += _REPL_TOKENS_PER_RANK[r]
+
+        ep_dst_positions = torch.arange(
+            _REPL_TOKENS_PER_RANK[rank], dtype=torch.int64, device="cuda"
+        )
+
+        # Build a mock TP cache view and EP cache view
+        class _MockKVCache:
+            def __init__(self, mgr, num_heads, hd, nlayers, dtype, dev, prefix):
+                self.head_num = num_heads
+                self.head_dim = hd
+                self.layer_num = nlayers
+                self.store_dtype = dtype
+                self.device = dev
+                self._mgr = mgr
+                self._prefix = prefix
+
+            def get_key_buffer(self, layer_id):
+                return self._mgr.get_view(f"model.layers.{layer_id}.kv.{self._prefix}.k")
+
+            def get_value_buffer(self, layer_id):
+                return self._mgr.get_view(f"model.layers.{layer_id}.kv.{self._prefix}.v")
+
+            def paras_resize_cache(self, layer_id, new_size, new_head_num):
+                pass  # Memory manager handles this
+
+        tp_cache = _MockKVCache(mgr, heads_per_peer, HEAD_DIM, NUM_LAYERS, KV_DTYPE, f"cuda:{rank}", "tp")
+        ep_cache = _EPCacheView(tp_cache, num_kv_heads)
+
+        group_coord = _SimpleGroupCoordinator(tp_group, world_size, f"cuda:{rank}", rank_in_group=rank)
+
+        # Zero EP buffers before scatter to detect any missed writes
+        for lid in range(NUM_LAYERS):
+            ep_k = mgr.get_view(f"model.layers.{lid}.kv.ep.k")
+            ep_v = mgr.get_view(f"model.layers.{lid}.kv.ep.v")
+            ep_k.zero_()
+            ep_v.zero_()
+
+        _scatter_cache_nccl(
+            tp_kv_cache=tp_cache,
+            ep_kv_cache=ep_cache,
+            token_partition=token_partition,
+            global_token_indices=global_token_indices,
+            ep_dst_positions=ep_dst_positions,
+            gather_group=group_coord,
+            new_ep_cache_size=None,
+        )
+
+        if rank == 0:
+            print("  TP→EP scatter done (unified path with R=2)")
+
+        # --- Verify round-trip ---
+        all_ok = True
+        for lid in range(NUM_LAYERS):
+            ep_k = mgr.get_view(f"model.layers.{lid}.kv.ep.k")
+            ep_v = mgr.get_view(f"model.layers.{lid}.kv.ep.v")
+            k_match = torch.equal(orig_ep[lid][0], ep_k[:num_local])
+            v_match = torch.equal(orig_ep[lid][1], ep_v[:num_local])
+            if not k_match or not v_match:
+                all_ok = False
+                if rank == 0:
+                    print(f"  Layer {lid}: K match={k_match}, V match={v_match}")
+
+        dist.barrier(group=tp_group)
+        if rank == 0:
+            status = "PASS" if all_ok else "FAIL"
+            print(f"  Replication round-trip: {status}")
+
+        assert all_ok, (
+            f"Replication KV scatter round-trip failed on rank {rank}: "
+            f"data mismatch after EP→TP(R={replication_factor})→EP"
+        )
+
+
+# =========================================================================
 # TEST GROUP 3: Weight restoration pointer swap (4 GPU)
 # =========================================================================
 
