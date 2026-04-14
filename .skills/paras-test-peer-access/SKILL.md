@@ -1,18 +1,19 @@
 ---
 name: paras-test-peer-access
-description: Run ParaS NVLink peer access correctness and benchmark tests for weight transfer and KV cache transfer. Knows GPU requirements, conda env, torchrun commands, env vars, and how to interpret results.
+description: Run ParaS correctness and benchmark tests for KV cache transfer (EP→TP and TP→EP, with/without head replication), weight transfer, request partition, memory invariants, and full round-trip. Knows GPU requirements, conda env, torchrun commands, and how to interpret results.
 metadata:
-  short-description: Test ParaS peer access weight + KV cache transfer
+  short-description: Test ParaS KV cache + weight transfer + partition + round-trip
 ---
 
-# ParaS Peer Access Tests
+# ParaS Transfer Tests
 
-Run correctness and benchmark tests for NVLink peer access transfers (weights and KV cache) during EP→TP switching.
+Correctness and benchmark tests for ParaS parallelism switching: KV cache transfer (both directions), weight transfer, request partition, memory invariants, and full EP↔TP round-trip.
 
 ## Prerequisites
 
 - Conda env: `sgl_paras`
-- Activate: `source /home/shaoyuw/miniconda3/etc/profile.d/conda.sh && conda activate sgl_paras`
+- Python path: `/home/shaoyuw/miniconda3/envs/sgl_paras/bin/python`
+- Torchrun: `/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun`
 - CUDA extension compiled: `cd python/sglang/srt/paras/csrc && pip install -e .`
 - Empty GPUs required (check before running)
 
@@ -23,203 +24,189 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits
 # All values should be < 100 MiB
 ```
 
-## Test Files
+## Test Suite Overview
 
-| File | Tests | GPU Requirement |
-|------|-------|----------------|
-| `test/srt/test_paras_peer_access.py` | Weight transfer (w13, w2): naive vs overlap vs peer_access | Exactly 4 GPUs |
-| `test/srt/test_paras_kv_peer_access.py` | KV cache transfer: peer_access vs NCCL all_to_all vs reference | 4 or 8 GPUs |
+All tests live in `test/srt/paras/`:
 
-## Weight Transfer Test
+| File | Tests | GPU Req | What It Verifies |
+|------|-------|---------|------------------|
+| `test_request_partition.py` | 11 | **None (CPU)** | Partition algorithm, replication routing, strategy extensibility |
+| `test_kv_cache_transfer.py` | 6 | 4 or 8 GPUs | KV cache EP→TP, TP→EP, round-trip (R=1 and R=2) — standalone ground truth |
+| `test_weight_transfer.py` | 4 | 4 GPUs | Weight EP→TP peer_access vs NCCL, MoE pointer swap, weight round-trip |
+| `test_memory.py` | 2 | 4 GPUs | head_num save/restore, GPU memory leak detection |
+| `test_roundtrip.py` | 4 | 4 GPUs | Full batch-level EP→TP→EP with model components |
 
-Tests that peer access v2 kernels produce bitwise-identical results to NCCL all-to-all for MoE weight redistribution.
+**Total: 27 tests**
 
-### Correctness
+---
 
-```bash
-conda run -n sgl_paras torchrun --nproc_per_node=4 test/srt/test_paras_peer_access.py
-```
+## 1. Request Partition Tests (CPU only — no GPU)
 
-### Benchmark
-
-```bash
-conda run -n sgl_paras torchrun --nproc_per_node=4 test/srt/test_paras_peer_access.py --benchmark
-```
-
-**Expected output**: All layers × {w13, w2} bitwise match for naive, overlap, and peer_access paths. Benchmark shows peer_access ~1.5× faster than naive.
-
-### Test Dimensions (Qwen3-30B-A3B)
-
-- 8 layers, 64 experts, hidden=2048, intermediate=1536, bf16
-- 4 GPUs: 16 local experts per rank
-
-## KV Cache Transfer Test
-
-Tests that peer_access_kv_transfer produces bitwise-identical results to a PyTorch all_gather reference for EP→TP KV redistribution. Also tests the NCCL all_to_all path and replication consistency.
-
-### Correctness (4 GPUs, no head replication)
+Tests the deterministic request partition algorithm and replication-aware routing.
 
 ```bash
-conda run -n sgl_paras torchrun --nproc_per_node=4 test/srt/test_paras_kv_peer_access.py
+/home/shaoyuw/miniconda3/envs/sgl_paras/bin/python -m pytest test/srt/paras/test_request_partition.py -v
 ```
 
-### Correctness (8 GPUs, head replication)
+**11 tests:**
+- `TestPartitionRequestsForEP` (5): balanced, fewer_than_ranks, zero, equal_seqlens_deterministic, imbalanced
+- `TestPeerAccessReplicationRouting` (4): R=1, R=2, no_token_lost_or_duplicated, R=4
+- `TestPartitionStrategy` (2): greedy_strategy works, unknown_strategy raises ValueError
 
-```bash
-conda run -n sgl_paras torchrun --nproc_per_node=8 test/srt/test_paras_kv_peer_access.py
-```
+---
 
-With 4 KV heads and 8 GPUs, heads are replicated (ranks 0,1 share head 0; ranks 2,3 share head 1; etc.). The test verifies:
-1. Peer access output matches reference
-2. NCCL all_to_all output matches reference
-3. Replicated ranks have identical TP buffers
+## 2. KV Cache Transfer Tests (4 or 8 GPUs)
 
-### Benchmark
+Standalone correctness tests for KV cache transfer in BOTH directions. Each direction is verified independently against pattern-based ground truth (not round-trip symmetry).
 
-```bash
-# Small tokens (default: variable 65-100 per rank)
-conda run -n sgl_paras torchrun --nproc_per_node=4 test/srt/test_paras_kv_peer_access.py --benchmark
+### Pattern-based verification
+Data is filled with `make_pattern(rank, layer, head, num_tokens)` which encodes source identity into values. After transfer, expected values at any destination are computed from first principles — no reliance on symmetry.
 
-# Large tokens (30k per rank, uniform)
-BENCH_TOKENS_PER_RANK=30000 conda run -n sgl_paras torchrun --nproc_per_node=4 test/srt/test_paras_kv_peer_access.py --benchmark
-
-# 8 GPUs with replication + large tokens
-BENCH_TOKENS_PER_RANK=30000 conda run -n sgl_paras torchrun --nproc_per_node=8 test/srt/test_paras_kv_peer_access.py --benchmark
-```
-
-### Test Dimensions (Qwen3-30B-A3B)
-
-- 3 layers, 4 KV heads, head_dim=128, bf16
-- Default token counts: variable per rank (100, 80, 90, 70, 85, 75, 95, 65)
-- `BENCH_TOKENS_PER_RANK`: override with uniform count for benchmarking
-
-## Environment Variables
-
-| Variable | Purpose | Default | Notes |
-|---|---|---|---|
-| `BENCH_TOKENS_PER_RANK` | Uniform token count per rank for KV benchmark | 0 (use variable defaults) | Set to 30000 for realistic benchmark |
-| `PARAS_KV_TRANSFER_METHOD` | KV transfer method in production | `nccl` | Set to `peer_access` for NVLink path |
-
-## Correctness Checks Performed
-
-### Weight Transfer (`test_paras_peer_access.py`)
-- naive (NCCL sequential) vs peer_access: bitwise match on w13 and w2 per layer
-- naive vs overlap (NCCL pipelined): bitwise match
-
-### KV Cache Transfer (`test_paras_kv_peer_access.py`)
-- **Reference**: all_gather raw EP data from all ranks, then slice the correct head shard per rank. No permutation, no all_to_all — pure indexing. This is the ground truth.
-- **peer_access vs reference**: bitwise match per layer per K/V
-- **NCCL all_to_all vs reference**: bitwise match per layer per K/V (uses gather_kv_and_permute + repeat_interleave + all_to_all + permute_and_scatter_kv)
-- **Replication consistency** (8-GPU only): ranks sharing the same head have identical TP buffers
-
-## Interpreting Results
-
-### Correctness Output
-```
---- peer_access correctness ---
-  [OK] layer=0 K bitwise match     ← each layer, K and V separately
-  [OK] layer=0 V bitwise match
---- NCCL all_to_all correctness ---
-  [OK] layer=0 K bitwise match
-  [OK] layer=0 V bitwise match
---- replication consistency ---
-  [OK] replicated ranks have identical TP buffers   ← 8-GPU only
-SUCCESS: All 3 layers × K/V × 8 ranks bitwise match
-```
-
-Any `FAIL` line means data corruption. Common causes:
-- CUDA extension not recompiled after kernel changes
-- GPU memory contention from other processes
-- Wrong `CUDA_VISIBLE_DEVICES`
-
-### Benchmark Output
-```
-================================================================================
-KV BENCHMARK (3 layers, 4 heads, head_dim=128, tokens=240000, TP=8, runs=10)
-================================================================================
-  Method          avg(ms)      min(ms)      max(ms)       vs nccl
-  nccl              4.831        4.756        4.944        1.00x
-  peer_access       2.961        2.912        3.040        1.63x
-================================================================================
-```
-
-Expected speedups:
-- Small tokens (~100/rank): 3-5× (NCCL launch overhead dominates)
-- Large tokens (30k/rank): 1.5-2× (NVLink bandwidth dominates)
-
-## E2E Coherence Test (KV Cache Transfer in Live System)
-
-Tests that KV cache transfer works correctly during an actual EP→TP switch with in-flight requests. Uses the sglang server with Qwen3-30B-A3B.
-
-### Prerequisites
-
-- Model at `/data/shaoyuw/models/Qwen3-30B-A3B`
-- Kill any existing sglang: `pkill -9 -f "sglang" 2>/dev/null; sleep 3`
-
-### 4-GPU Test (no head replication)
-
-**Launch server** (in tmux or background):
+### Run on 4 GPUs (R=1 and R=2)
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-PARAS_KV_TRANSFER_METHOD=peer_access \
-SGLANG_ATTN_MAX_BS=256 \
-SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256 \
-SGLANG_DEEPEP_BF16_DISPATCH=true \
-python -m sglang.launch_server \
-    --model /data/shaoyuw/models/Qwen3-30B-A3B --trust-remote-code \
-    --chunked-prefill-size -1 --max-prefill-tokens 32000 \
-    --mem-fraction-static 0.6 \
-    --tp-size 4 --dp-size 4 --ep-size 4 \
-    --enable-dp-attention --enable-dp-lm-head \
-    --moe-a2a-backend deepep --deepep-mode auto \
-    --max-running-requests 1024 \
-    --disable-cuda-graph --disable-overlap-schedule \
-    --log-level info \
-    --enable-paras-moe --paras-tp-size 4 \
-    2>&1 | tee /tmp/kv_coherence_4gpu.log
+/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=4 \
+  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_kv_cache_transfer.py -v
 ```
 
-Wait for `Application startup complete`, verify model type is `Qwen3MoeForCausalLMParaS`.
+### Run on 8 GPUs (R=1 with 8 heads, R=2 with 4 heads)
 
-**Test procedure:**
-
-1. Send 3 long requests in EP mode (builds KV cache, verifies EP works)
-2. Send 4 long requests in background (in-flight, building KV cache)
-3. While in-flight requests are processing, trigger switch: `curl http://localhost:30000/paras_configure_tp`
-4. Wait for all in-flight requests to complete
-5. Send 3 fresh requests in TP mode
-6. Check all outputs are coherent (no garbage, no `\xa0`, no repetition)
-
-**Key verification points:**
-- In-flight requests (sent in EP, completed after switch) must produce coherent output — this proves KV cache was transferred correctly
-- TP requests must produce coherent output — this proves weights + KV pool are correct after switch
-- `grep "gather_cache" /tmp/kv_coherence_4gpu.log` should show ~30-40ms
-
-### 8-GPU Test (head replication)
-
-Same as 4-GPU but with `--tp-size 8 --dp-size 8 --ep-size 8 --paras-tp-size 8` and `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`.
-
-**Known limitation**: As of 2026-04-13, the 8-GPU e2e test is BLOCKED by a pre-existing assertion in `linear.py:1209`:
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=8 \
+  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_kv_cache_transfer.py -v
 ```
-assert paras_tp_size <= self.num_kv_heads
+
+**6 tests (adaptive to world_size):**
+
+| Test | Direction | Replication | Verification Method |
+|------|-----------|-------------|---------------------|
+| `test_ep_to_tp_no_replication` | EP→TP | R=1 (heads=world_size) | Pattern ground truth |
+| `test_ep_to_tp_with_replication` | EP→TP | R=2 (heads=world_size//2) | Pattern ground truth |
+| `test_tp_to_ep_no_replication` | TP→EP | R=1 | Pattern ground truth |
+| `test_tp_to_ep_with_replication` | TP→EP | R=2 | Pattern ground truth |
+| `test_roundtrip_no_replication` | EP→TP→EP | R=1 | Bitwise snapshot match |
+| `test_roundtrip_with_replication` | EP→TP→EP | R=2 | Bitwise snapshot match |
+
+### Key implementation details
+- EP→TP gather uses `gather_kv_and_permute` + `repeat_interleave` (if R>1) + `all_to_all` + `permute_and_scatter_kv` — matches production `_gather_cache_nccl`
+- TP→EP scatter uses `_scatter_cache_nccl` directly with `_EPCacheView` — the production code path
+- Layer order: reverse (N-1→0) for TP→EP to respect N+1 slot aliasing
+- EP buffers are NEVER zeroed before scatter (EP slot[i+1] shares memory with TP slot[i+1])
+- Tests adapt to world_size: `num_kv_heads = world_size` (R=1) or `world_size // 2` (R=2)
+
+---
+
+## 3. Weight Transfer Tests (4 GPUs)
+
+Tests MoE weight transfer between EP and TP layouts.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=4 \
+  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_weight_transfer.py -v
 ```
-The attention layer's `paras_configure_tp()` doesn't support TP > num_kv_heads (head replication). The KV transfer kernel itself is correct (verified by unit test with bitwise match on 8 GPUs). The attention reconfiguration needs to be extended separately.
 
-### Evidence location
+**4 tests:**
 
-Test logs saved to `.sisyphus/evidence/kv-coherence/`:
-- `4gpu_test.log`, `8gpu_test.log` — full test output
-- `*_inflight_*.json` — raw responses from in-flight requests
-- `summary.md` — pass/fail overview
+| Test | What It Verifies |
+|------|------------------|
+| `test_w13_peer_access_vs_nccl` | EP→TP w13 weights: peer_access kernel bitwise matches NCCL naive |
+| `test_w2_peer_access_vs_nccl` | EP→TP w2 weights: peer_access kernel bitwise matches NCCL naive |
+| `test_moe_pointer_swap` | TP→EP: `experts` pointer toggles between ep_experts and tp_experts |
+| `test_weight_roundtrip` | EP→TP→EP: weight data bitwise match after full cycle |
+
+### Benchmark (optional)
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=4 \
+  test/srt/paras/test_weight_transfer.py --benchmark
+```
+
+---
+
+## 4. Memory Invariant Tests (4 GPUs)
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=4 \
+  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_memory.py -v
+```
+
+**2 tests:**
+- `test_head_num_restored_after_ep` — `MHATokenToKVPool.head_num` correctly shards on TP (÷tp_size) and restores on EP (original)
+- `test_no_memory_leak` — 5 TP↔EP cycles, asserts <1% GPU memory growth
+
+---
+
+## 5. Full Round-Trip Integration Tests (4 GPUs)
+
+Batch-level integration with model components (memory manager, req pools, scatter/gather managers).
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=4 \
+  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_roundtrip.py -v
+```
+
+**4 tests:**
+- `test_roundtrip_ep_tp_ep` — Full EP→TP→EP with KV, weights, batch reconstruction
+- `test_partition_consistency` — All ranks compute identical partitions (cross-rank assertion)
+- `test_single_request_roundtrip` — Edge case: 1 request lands on exactly 1 EP rank
+- `test_empty_batch_roundtrip` — Edge case: 0 requests, no crash
+
+---
+
+## Quick Reference: Run Everything
+
+```bash
+# CPU tests (no GPU needed)
+/home/shaoyuw/miniconda3/envs/sgl_paras/bin/python -m pytest test/srt/paras/test_request_partition.py -v
+
+# All GPU tests on 4 GPUs
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=4 \
+  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/ -v --ignore=test/srt/paras/test_request_partition.py
+
+# KV cache tests on 8 GPUs (tests replication with R=2)
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=8 \
+  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_kv_cache_transfer.py -v
+```
+
+## Environment Variables
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `PARAS_KV_TRANSFER_METHOD` | KV transfer method in production | `nccl` |
+| `PARAS_CONFIGURE_METHOD` | Weight transfer method | `naive` |
+| `CUDA_VISIBLE_DEVICES` | GPU selection | all |
+
+## Interpreting Results
+
+### Correctness
+```
+PASSED test_ep_to_tp_no_replication        ← EP→TP, 8h/8g, pattern verified
+PASSED test_ep_to_tp_with_replication      ← EP→TP, 4h/8g R=2, pattern verified
+PASSED test_tp_to_ep_no_replication        ← TP→EP, 8h/8g, pattern verified
+PASSED test_tp_to_ep_with_replication      ← TP→EP, 4h/8g R=2, pattern verified
+PASSED test_roundtrip_no_replication       ← EP→TP→EP bitwise match
+PASSED test_roundtrip_with_replication     ← EP→TP→EP bitwise match, R=2
+```
+
+Any `FAILED` means data corruption. Common causes:
+- CUDA extension not recompiled after kernel changes
+- GPU memory contention from other processes
+- Wrong `CUDA_VISIBLE_DEVICES`
 
 ## Troubleshooting
 
 | Issue | Cause | Fix |
 |---|---|---|
 | `Need N empty GPUs, only M available` | Other processes using GPUs | Kill them or wait |
-| `cudaIpcOpenMemHandle failed` | GPU memory fragmentation | Restart and clear GPU memory |
-| `NCCL timeout` | Leftover NCCL state from crashed run | `pkill -f torchrun` and retry |
+| `NCCL timeout` | Leftover state from crashed run | `pkill -f torchrun` and retry |
 | `Import error: paras_peer_access_cuda` | CUDA extension not compiled | `cd python/sglang/srt/paras/csrc && pip install -e .` |
-| OOM on 8-GPU benchmark with large tokens | EP_MAX_TOKENS too small for TP view | Auto-handled by `_init_test_params`, but reduce `BENCH_TOKENS_PER_RANK` if needed |
-| `assert paras_tp_size <= self.num_kv_heads` | Attention layer doesn't support TP > kv_heads | Pre-existing limitation — 8-GPU e2e blocked until attention reconfiguration supports head replication |
+| `assert world_size in (4, 8)` | Wrong number of GPUs | Set `CUDA_VISIBLE_DEVICES` correctly |
+| `assert False` in paras_moe_block | Old code before bug fix | Pull latest changes |
