@@ -26,7 +26,14 @@ NUM_LAYERS = 3
 HEAD_DIM = 128
 DTYPE = torch.bfloat16
 TOKENS_PER_RANK_4GPU = [50, 40, 45, 35]
+TOKENS_PER_RANK_8GPU = [50, 40, 45, 35, 55, 30, 60, 25]
 PAGE_SIZE = 1
+
+
+def _tokens_for_world(world_size):
+    if world_size <= 4:
+        return TOKENS_PER_RANK_4GPU[:world_size]
+    return TOKENS_PER_RANK_8GPU[:world_size]
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +77,7 @@ def _ensure_distributed():
         dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    assert world_size == 4, f"Requires exactly 4 GPUs, got {world_size}"
+    assert world_size in (4, 8), f"Requires 4 or 8 GPUs, got {world_size}"
     torch.cuda.set_device(rank)
     return rank, world_size
 
@@ -397,10 +404,10 @@ class TestEPtoTPStandalone:
     """EP→TP gather verified against first-principles pattern computation."""
 
     def test_ep_to_tp_no_replication(self):
-        """4 KV heads / 4 GPUs: each TP rank gets 1 unique head."""
+        """num_kv_heads == world_size: each TP rank gets 1 unique head."""
         rank, world_size = _ensure_distributed()
-        num_kv_heads = 4
-        tokens_per_rank = TOKENS_PER_RANK_4GPU
+        num_kv_heads = world_size
+        tokens_per_rank = _tokens_for_world(world_size)
 
         tp_group = _setup_paras_state(rank, world_size)
         mgr, ep_max, _ = setup_memory_manager(
@@ -452,10 +459,10 @@ class TestEPtoTPStandalone:
         assert all_ok, f"EP→TP (no replication) failed on rank {rank}"
 
     def test_ep_to_tp_with_replication(self):
-        """2 KV heads / 4 GPUs (R=2): ranks 0,1 share head 0; 2,3 share head 1."""
+        """num_kv_heads = world_size//2 (R=2): adjacent ranks share same head."""
         rank, world_size = _ensure_distributed()
-        num_kv_heads = 2
-        tokens_per_rank = TOKENS_PER_RANK_4GPU
+        num_kv_heads = world_size // 2
+        tokens_per_rank = _tokens_for_world(world_size)
 
         tp_group = _setup_paras_state(rank, world_size)
         mgr, ep_max, _ = setup_memory_manager(
@@ -515,10 +522,10 @@ class TestTPtoEPStandalone:
     """TP→EP scatter verified against first-principles pattern computation."""
 
     def test_tp_to_ep_no_replication(self):
-        """4 KV heads / 4 GPUs: standard scatter, no replication."""
+        """num_kv_heads == world_size: standard scatter, no replication."""
         rank, world_size = _ensure_distributed()
-        num_kv_heads = 4
-        tokens_per_rank = TOKENS_PER_RANK_4GPU
+        num_kv_heads = world_size
+        tokens_per_rank = _tokens_for_world(world_size)
         total_tokens = sum(tokens_per_rank)
 
         tp_group = _setup_paras_state(rank, world_size)
@@ -579,10 +586,10 @@ class TestTPtoEPStandalone:
         assert all_ok, f"TP→EP (no replication) failed on rank {rank}"
 
     def test_tp_to_ep_with_replication(self):
-        """2 KV heads / 4 GPUs (R=2): scatter with replication-aware slicing."""
+        """num_kv_heads = world_size//2 (R=2): scatter with replication-aware slicing."""
         rank, world_size = _ensure_distributed()
-        num_kv_heads = 2
-        tokens_per_rank = TOKENS_PER_RANK_4GPU
+        num_kv_heads = world_size // 2
+        tokens_per_rank = _tokens_for_world(world_size)
         total_tokens = sum(tokens_per_rank)
 
         tp_group = _setup_paras_state(rank, world_size)
@@ -671,7 +678,7 @@ class TestKVRoundTrip:
     def _run_roundtrip(self, num_kv_heads, test_name):
         """Shared round-trip logic for both replication modes."""
         rank, world_size = _ensure_distributed()
-        tokens_per_rank = TOKENS_PER_RANK_4GPU
+        tokens_per_rank = _tokens_for_world(world_size)
         num_local = tokens_per_rank[rank]
 
         tp_group = _setup_paras_state(rank, world_size)
@@ -733,15 +740,17 @@ class TestKVRoundTrip:
         return all_ok
 
     def test_roundtrip_no_replication(self):
-        """EP→TP→EP with 4 heads / 4 GPUs (R=1)."""
+        """EP→TP→EP with num_kv_heads == world_size (R=1)."""
         rank = int(os.environ["RANK"])
-        ok = self._run_roundtrip(num_kv_heads=4, test_name="roundtrip_no_replication")
+        world_size = int(os.environ["WORLD_SIZE"])
+        ok = self._run_roundtrip(num_kv_heads=world_size, test_name="roundtrip_no_replication")
         assert ok, f"Round-trip (no replication) failed on rank {rank}"
 
     def test_roundtrip_with_replication(self):
-        """EP→TP→EP with 2 heads / 4 GPUs (R=2)."""
+        """EP→TP→EP with num_kv_heads == world_size//2 (R=2)."""
         rank = int(os.environ["RANK"])
-        ok = self._run_roundtrip(num_kv_heads=2, test_name="roundtrip_with_replication")
+        world_size = int(os.environ["WORLD_SIZE"])
+        ok = self._run_roundtrip(num_kv_heads=world_size // 2, test_name="roundtrip_with_replication")
         assert ok, f"Round-trip (R=2) failed on rank {rank}"
 
 
