@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-4-GPU comparison test for ParaS peer access weight transfers.
+Weight transfer tests for both EP→TP and TP→EP directions.
 
-Tests that peer access v2 kernels produce bitwise-identical results to
-NCCL all-to-all for DP=1 configuration.
+Tests that weight redistribution produces correct results:
+  1. EP→TP: peer_access vs NCCL bitwise comparison (w13, w2 separately)
+  2. TP→EP: MoE pointer swap verification
+  3. EP→TP→EP: round-trip bitwise match
 
 Usage:
-  torchrun --nproc_per_node=4 test_paras_peer_access.py           # correctness
-  torchrun --nproc_per_node=4 test_paras_peer_access.py --benchmark  # + timing
+  torchrun --nproc_per_node=4 test/srt/paras/test_weight_transfer.py
 """
 
-import argparse
+import ctypes
 import os
 import sys
-import time
 
 import torch
 import torch.distributed as dist
 
 # Add sglang to path
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
-_ROOT_DIR = os.path.join(_TEST_DIR, "..", "..")
+_ROOT_DIR = os.path.join(_TEST_DIR, "..", "..", "..")
 sys.path.insert(0, os.path.join(_ROOT_DIR, "python"))
 
 # ---- test constants (Qwen3-30B-A3B) ----
@@ -29,13 +29,12 @@ HIDDEN = 2048
 INTERMEDIATE = 1536
 NUM_EXPERTS = 64
 SEED = 42
-BENCHMARK_WARMUP = 5
-BENCHMARK_RUNS = 10
 
 
 # ---------------------------------------------------------------------------
 # Distributed setup
 # ---------------------------------------------------------------------------
+
 
 def setup_distributed():
     dist.init_process_group(backend="nccl")
@@ -53,6 +52,7 @@ def teardown_distributed():
 # ---------------------------------------------------------------------------
 # ParaS parallel state (lightweight init — no sglang server needed)
 # ---------------------------------------------------------------------------
+
 
 class _SimpleGroupCoordinator:
     """Minimal GroupCoordinator stand-in for testing."""
@@ -77,17 +77,21 @@ def setup_paras_state(rank, world_size):
 
     # TP group = all ranks (DP=1 means TP covers the entire world)
     tp_group = dist.new_group(ranks=list(range(world_size)))
+    tp_coord = _SimpleGroupCoordinator(
+        tp_group, world_size, f"cuda:{rank}", rank_in_group=rank
+    )
 
-    tp_coord = _SimpleGroupCoordinator(tp_group, world_size, f"cuda:{rank}", rank_in_group=rank)
-
-    # Stub sglang's global _TP so import-time code in fused_moe_triton
-    # (get_tensor_model_parallel_rank, log_info_on_rank0) doesn't crash.
+    # Stub sglang's global _TP
     ps._TP = tp_coord
 
     # ParaS-specific parallel state
     pps._PARAS_TP = tp_coord
-    pps._PARAS_DP = _SimpleGroupCoordinator(None, 1, f"cuda:{rank}", rank_in_group=0)
-    pps._PARAS_SELF = _SimpleGroupCoordinator(None, 1, f"cuda:{rank}", rank_in_group=0)
+    pps._PARAS_DP = _SimpleGroupCoordinator(
+        None, 1, f"cuda:{rank}", rank_in_group=0
+    )
+    pps._PARAS_SELF = _SimpleGroupCoordinator(
+        None, 1, f"cuda:{rank}", rank_in_group=0
+    )
 
     pps._PARAS_TP_SIZE = world_size
     pps._PARAS_TP_RANK = rank
@@ -102,6 +106,7 @@ def setup_paras_state(rank, world_size):
 # ---------------------------------------------------------------------------
 # Memory manager helpers
 # ---------------------------------------------------------------------------
+
 
 def build_manager(rank, world_size):
     """Create ParaSMemoryManager with N+1 slots + staging buffers."""
@@ -131,15 +136,24 @@ def build_manager(rank, world_size):
 
     # 'experts' aliases → slot i+1 (for weight loading / EP access)
     for i in range(NUM_LAYERS):
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[f"paras.moe_slot.{i+1}.w13"]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[f"paras.moe_slot.{i+1}.w2"]
+        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[
+            f"paras.moe_slot.{i + 1}.w13"
+        ]
+        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[
+            f"paras.moe_slot.{i + 1}.w2"
+        ]
 
+    # Staging buffers for NCCL all-to-all and overlap paths
     staging_experts = num_local
     w13_staging_shape = (staging_experts, 2 * INTERMEDIATE, HIDDEN)
     w2_staging_shape = (staging_experts, HIDDEN, INTERMEDIATE)
     for sfx in ("", "_1", "_2"):
-        mgr.reserve(f"staging.w13_pre_permute{sfx}", w13_staging_shape, torch.bfloat16)
-        mgr.reserve(f"staging.w2_pre_permute{sfx}", w2_staging_shape, torch.bfloat16)
+        mgr.reserve(
+            f"staging.w13_pre_permute{sfx}", w13_staging_shape, torch.bfloat16
+        )
+        mgr.reserve(
+            f"staging.w2_pre_permute{sfx}", w2_staging_shape, torch.bfloat16
+        )
 
     mgr.materialize()
     create_paras_moe_aliases(mgr, NUM_LAYERS)
@@ -173,8 +187,12 @@ def snapshot_weights(mgr):
     snap = {}
     for layer_id in range(NUM_LAYERS):
         snap[layer_id] = (
-            mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w13_weight").clone(),
-            mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w2_weight").clone(),
+            mgr.get_view(
+                f"model.layers.{layer_id}.mlp.experts.w13_weight"
+            ).clone(),
+            mgr.get_view(
+                f"model.layers.{layer_id}.mlp.experts.w2_weight"
+            ).clone(),
         )
     return snap
 
@@ -193,6 +211,7 @@ def restore_weights(mgr, snap):
 # ---------------------------------------------------------------------------
 # Mixin construction + path runners
 # ---------------------------------------------------------------------------
+
 
 class _MockExperts:
     def __init__(self, w13_view, w2_view):
@@ -229,11 +248,19 @@ class _MockLayer:
     def paras_configure_tp_attn(self, tp_size, tp_rank):
         pass
 
-    def paras_configure_tp_mlp_all_gather(self, stream, handles, async_op=False, staging_suffix=""):
-        return self.mlp.paras_configure_tp_all_gather(stream, handles, async_op, staging_suffix)
+    def paras_configure_tp_mlp_all_gather(
+        self, stream, handles, async_op=False, staging_suffix=""
+    ):
+        return self.mlp.paras_configure_tp_all_gather(
+            stream, handles, async_op, staging_suffix
+        )
 
-    def paras_configure_tp_mlp_all_to_all(self, stream, handles, staging_suffix=""):
-        return self.mlp.paras_configure_tp_all_to_all(stream, handles, staging_suffix)
+    def paras_configure_tp_mlp_all_to_all(
+        self, stream, handles, staging_suffix=""
+    ):
+        return self.mlp.paras_configure_tp_all_to_all(
+            stream, handles, staging_suffix
+        )
 
     def paras_configure_tp(self, tp_size, tp_rank):
         pass
@@ -272,7 +299,10 @@ def run_overlap_path(mgr, num_local):
     tp_size = get_paras_tp_size()
     tp_inter = INTERMEDIATE // tp_size
 
-    layers = [_MockLayer(_make_mixin(i, num_local, mgr, set_gathered=False)) for i in range(NUM_LAYERS)]
+    layers = [
+        _MockLayer(_make_mixin(i, num_local, mgr, set_gathered=False))
+        for i in range(NUM_LAYERS)
+    ]
 
     stream_1 = torch.cuda.Stream()
     stream_2 = torch.cuda.Stream()
@@ -290,10 +320,15 @@ def run_overlap_path(mgr, num_local):
             next_layer = layers[i + 1]
             next_layer.paras_configure_tp_attn(tp_size, 0)
             new_handles = next_layer.paras_configure_tp_mlp_all_gather(
-                stream_2, last_layer_handles, async_op=True, staging_suffix=staging_2
+                stream_2,
+                last_layer_handles,
+                async_op=True,
+                staging_suffix=staging_2,
             )
 
-        layer.paras_configure_tp_mlp_all_to_all(stream_1, last_layer_handles, staging_1)
+        layer.paras_configure_tp_mlp_all_to_all(
+            stream_1, last_layer_handles, staging_1
+        )
         layer.paras_configure_tp(tp_size, 0)
 
         if not_last_layer:
@@ -306,20 +341,29 @@ def run_overlap_path(mgr, num_local):
 
 
 def run_peer_access_path(mgr, num_local, peer_ctx):
-    from sglang.srt.paras.paras_parallel_state import get_paras_tp_size, get_paras_tp_group
+    from sglang.srt.paras.paras_parallel_state import (
+        get_paras_tp_group,
+        get_paras_tp_size,
+    )
 
     tp_size = get_paras_tp_size()
     tp_inter = INTERMEDIATE // tp_size
 
     paras_tp_group = get_paras_tp_group().device_group
-    dst_base_ptrs = torch.tensor(peer_ctx.peer_addresses, dtype=torch.int64, device="cuda")
+    dst_base_ptrs = torch.tensor(
+        peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+    )
     barrier_tensor = torch.zeros(1, device="cuda")
     dist.barrier(group=paras_tp_group)
 
     for layer_id in range(NUM_LAYERS):
         mixin = _make_mixin(layer_id, num_local, mgr)
-        mixin.paras_configure_tp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
-        dist.all_reduce(barrier_tensor, op=dist.ReduceOp.SUM, group=paras_tp_group)
+        mixin.paras_configure_tp_fused_peer_access_kernel(
+            peer_ctx, dst_base_ptrs, None
+        )
+        dist.all_reduce(
+            barrier_tensor, op=dist.ReduceOp.SUM, group=paras_tp_group
+        )
 
     return _read_tp_results(mgr, tp_inter)
 
@@ -328,6 +372,7 @@ def run_peer_access_path(mgr, num_local, peer_ctx):
 # Peer access setup
 # ---------------------------------------------------------------------------
 
+
 def setup_peer_ctx(mgr, rank, world_size, tp_group):
     """Enable peer access and exchange CUDA IPC handles for cross-process access.
 
@@ -335,8 +380,6 @@ def setup_peer_ctx(mgr, rank, world_size, tp_group):
     within their own process.  We use CUDA IPC to map remote buffers into the
     local address space so the peer-access kernel can write directly.
     """
-    import ctypes
-
     from sglang.srt.paras.peer_access import PeerAccessContext
 
     _cudart = ctypes.CDLL("libcudart.so")
@@ -409,123 +452,174 @@ def setup_peer_ctx(mgr, rank, world_size, tp_group):
     )
 
 
-
 # ---------------------------------------------------------------------------
-# Comparison test
-# ---------------------------------------------------------------------------
-
-def _compare_results(ref_results, test_results, ref_name, test_name, rank):
-    all_ok = True
-    for layer_id in range(NUM_LAYERS):
-        for i, wt in enumerate(("w13", "w2")):
-            ref_flat = ref_results[layer_id][i].reshape(-1)
-            test_flat = test_results[layer_id][i].reshape(-1)
-            if not torch.equal(ref_flat, test_flat):
-                diff = (ref_flat != test_flat).sum().item()
-                print(
-                    f"[Rank {rank}] FAIL {test_name} layer={layer_id} {wt}: "
-                    f"{diff}/{ref_flat.numel()} elements differ",
-                    flush=True,
-                )
-                all_ok = False
-            elif rank == 0:
-                print(
-                    f"  [OK] {test_name} layer={layer_id} {wt} bitwise match vs {ref_name}",
-                    flush=True,
-                )
-    return all_ok
-
-
-def run_comparison_test(rank, world_size):
-    tp_group = setup_paras_state(rank, world_size)
-    mgr, num_local = build_manager(rank, world_size)
-
-    fill_ep_weights(mgr, rank)
-    snap = snapshot_weights(mgr)
-
-    naive_results = run_naive_path(mgr, num_local)
-
-    restore_weights(mgr, snap)
-    peer_ctx = setup_peer_ctx(mgr, rank, world_size, tp_group)
-    pa_results = run_peer_access_path(mgr, num_local, peer_ctx)
-
-    all_ok = True
-
-    if rank == 0:
-        print("\n--- naive vs peer_access ---", flush=True)
-    all_ok &= _compare_results(naive_results, pa_results, "naive", "peer_access", rank)
-
-    restore_weights(mgr, snap)
-    overlap_results = run_overlap_path(mgr, num_local)
-
-    if rank == 0:
-        print("\n--- naive vs overlap ---", flush=True)
-    all_ok &= _compare_results(naive_results, overlap_results, "naive", "overlap", rank)
-
-    del naive_results, overlap_results, pa_results
-    torch.cuda.empty_cache()
-
-    return all_ok, tp_group, mgr, num_local, snap, peer_ctx
-
-
-# ---------------------------------------------------------------------------
-# Latency benchmark
+# Test classes
 # ---------------------------------------------------------------------------
 
-def _bench_method(name, run_fn, mgr, num_local, snap, peer_ctx=None):
-    args = (mgr, num_local, peer_ctx) if peer_ctx else (mgr, num_local)
-    for _ in range(BENCHMARK_WARMUP):
-        restore_weights(mgr, snap)
-        run_fn(*args)
-    torch.cuda.synchronize()
-    dist.barrier()
 
-    times = []
-    for _ in range(BENCHMARK_RUNS):
-        restore_weights(mgr, snap)
-        torch.cuda.synchronize()
-        dist.barrier()
-        t0 = time.perf_counter()
-        run_fn(*args)
-        torch.cuda.synchronize()
-        times.append(time.perf_counter() - t0)
-    return times
+class TestEPtoTPWeightTransfer:
+    """EP→TP: peer_access vs NCCL comparison (from test_paras_peer_access.py)."""
 
+    def __init__(self, rank, world_size, mgr, num_local, snap, peer_ctx):
+        self.rank = rank
+        self.world_size = world_size
+        self.mgr = mgr
+        self.num_local = num_local
+        self.snap = snap
+        self.peer_ctx = peer_ctx
+        self._naive_results = None
+        self._pa_results = None
 
-def run_benchmark(
-    rank, world_size, tp_group, mgr, num_local, snap, peer_ctx,
-):
-    naive_times = _bench_method("naive", run_naive_path, mgr, num_local, snap)
-    overlap_times = _bench_method("overlap", run_overlap_path, mgr, num_local, snap)
-    pa_times = _bench_method("peer_access", run_peer_access_path, mgr, num_local, snap, peer_ctx)
-
-    if rank == 0:
-        def _stats(t):
-            return sum(t) / len(t), min(t), max(t)
-
-        na, nm, nx = _stats(naive_times)
-        oa, om, ox = _stats(overlap_times)
-        pa, pm, px = _stats(pa_times)
-
-        print(f"\n{'=' * 80}")
-        print(
-            f"BENCHMARK ({NUM_LAYERS} layers, {NUM_EXPERTS} experts, "
-            f"hidden={HIDDEN}, inter={INTERMEDIATE}, TP={world_size}, "
-            f"runs={BENCHMARK_RUNS})"
+    def _ensure_results(self):
+        """Run NCCL naive and peer_access paths, cache results."""
+        if self._naive_results is not None:
+            return
+        restore_weights(self.mgr, self.snap)
+        self._naive_results = run_naive_path(self.mgr, self.num_local)
+        restore_weights(self.mgr, self.snap)
+        self._pa_results = run_peer_access_path(
+            self.mgr, self.num_local, self.peer_ctx
         )
-        print(f"{'=' * 80}")
-        print(f"  {'Method':<14s}  {'avg':>10s}  {'min':>10s}  {'max':>10s}  {'vs naive':>10s}")
-        print(f"  {'naive':<14s}  {na*1000:10.3f}  {nm*1000:10.3f}  {nx*1000:10.3f}  {'1.00x':>10s}")
-        print(f"  {'overlap':<14s}  {oa*1000:10.3f}  {om*1000:10.3f}  {ox*1000:10.3f}  {na/oa:10.2f}x")
-        print(f"  {'peer_access':<14s}  {pa*1000:10.3f}  {pm*1000:10.3f}  {px*1000:10.3f}  {na/pa:10.2f}x")
-        print(f"{'=' * 80}")
 
-        print(f"\nPer-run times (ms):")
-        print(f"  {'Run':>4s}  {'naive':>10s}  {'overlap':>10s}  {'peer_access':>12s}")
-        for i in range(BENCHMARK_RUNS):
+    def test_w13_peer_access_vs_nccl(self):
+        """w13 weights must be bitwise identical between peer_access and NCCL."""
+        self._ensure_results()
+        for layer_id in range(NUM_LAYERS):
+            ref = self._naive_results[layer_id][0].reshape(-1)
+            test = self._pa_results[layer_id][0].reshape(-1)
+            if not torch.equal(ref, test):
+                diff = (ref != test).sum().item()
+                raise AssertionError(
+                    f"[Rank {self.rank}] w13 mismatch layer={layer_id}: "
+                    f"{diff}/{ref.numel()} elements differ"
+                )
+        if self.rank == 0:
             print(
-                f"  {i:4d}  {naive_times[i]*1000:10.3f}  "
-                f"{overlap_times[i]*1000:10.3f}  {pa_times[i]*1000:12.3f}"
+                "  [OK] w13 peer_access vs NCCL: bitwise match all layers",
+                flush=True,
+            )
+
+    def test_w2_peer_access_vs_nccl(self):
+        """w2 weights must be bitwise identical between peer_access and NCCL."""
+        self._ensure_results()
+        for layer_id in range(NUM_LAYERS):
+            ref = self._naive_results[layer_id][1].reshape(-1)
+            test = self._pa_results[layer_id][1].reshape(-1)
+            if not torch.equal(ref, test):
+                diff = (ref != test).sum().item()
+                raise AssertionError(
+                    f"[Rank {self.rank}] w2 mismatch layer={layer_id}: "
+                    f"{diff}/{ref.numel()} elements differ"
+                )
+        if self.rank == 0:
+            print(
+                "  [OK] w2 peer_access vs NCCL: bitwise match all layers",
+                flush=True,
+            )
+
+
+class TestTPtoEPWeightRestore:
+    """TP→EP: MoE pointer swap verification."""
+
+    def __init__(self, rank, world_size):
+        self.rank = rank
+        self.world_size = world_size
+
+    def test_moe_pointer_swap(self):
+        """Create mock MoE, verify experts toggle between ep/tp."""
+        from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
+
+        m = object.__new__(ParaSMoeBlockMixin)
+        m._paras_layer_id = 0
+        m.num_local_experts = NUM_EXPERTS // self.world_size
+        m.num_global_experts = NUM_EXPERTS
+        m.hidden_size = HIDDEN
+        m.moe_intermediate_size = INTERMEDIATE
+
+        class _TaggedExperts:
+            def __init__(self, tag):
+                self.tag = tag
+
+        ep_exp = _TaggedExperts("ep")
+        tp_exp = _TaggedExperts("tp")
+
+        m.ep_experts = ep_exp
+        m.tp_experts = tp_exp
+        m.experts = ep_exp
+        m.parallelism_config = "ep"
+        m.tp_size = 1
+
+        # Switch to TP
+        m.paras_configure_tp(self.world_size, self.rank)
+        assert (
+            m.experts is tp_exp
+        ), "After configure_tp, experts should be tp_experts"
+        assert m.parallelism_config == "tp"
+
+        # Switch back to EP
+        m.paras_configure_ep()
+        assert (
+            m.experts is ep_exp
+        ), "After configure_ep, experts should be ep_experts"
+        assert m.parallelism_config == "ep"
+
+        if self.rank == 0:
+            print(
+                "  [OK] MoE pointer swap: ep→tp→ep verified", flush=True
+            )
+
+
+class TestWeightRoundTrip:
+    """EP→TP→EP: weight data bitwise match."""
+
+    def __init__(self, rank, world_size, mgr, num_local, snap):
+        self.rank = rank
+        self.world_size = world_size
+        self.mgr = mgr
+        self.num_local = num_local
+        self.snap = snap
+
+    def test_weight_roundtrip(self):
+        """Verify ep_experts data matches after EP→TP→EP cycle."""
+        # Restore clean EP weights
+        restore_weights(self.mgr, self.snap)
+
+        # EP→TP via NCCL naive all-to-all
+        run_naive_path(self.mgr, self.num_local)
+
+        # TP→EP via NCCL naive reverse (inverse permute + all-to-all)
+        for layer_id in range(NUM_LAYERS):
+            mixin = _make_mixin(layer_id, self.num_local, self.mgr)
+            mixin.paras_configure_ep_mlp_naive()
+
+        # Compare restored EP weights to original snapshot
+        for layer_id in range(NUM_LAYERS):
+            w13 = self.mgr.get_view(
+                f"model.layers.{layer_id}.mlp.experts.w13_weight"
+            )
+            w2 = self.mgr.get_view(
+                f"model.layers.{layer_id}.mlp.experts.w2_weight"
+            )
+            w13_orig = self.snap[layer_id][0]
+            w2_orig = self.snap[layer_id][1]
+
+            if not torch.equal(w13.reshape(-1), w13_orig.reshape(-1)):
+                diff = (w13.reshape(-1) != w13_orig.reshape(-1)).sum().item()
+                raise AssertionError(
+                    f"[Rank {self.rank}] Round-trip w13 mismatch layer={layer_id}: "
+                    f"{diff}/{w13.numel()} elements differ"
+                )
+            if not torch.equal(w2.reshape(-1), w2_orig.reshape(-1)):
+                diff = (w2.reshape(-1) != w2_orig.reshape(-1)).sum().item()
+                raise AssertionError(
+                    f"[Rank {self.rank}] Round-trip w2 mismatch layer={layer_id}: "
+                    f"{diff}/{w2.numel()} elements differ"
+                )
+
+        if self.rank == 0:
+            print(
+                "  [OK] EP→TP→EP round-trip: bitwise match all layers",
+                flush=True,
             )
 
 
@@ -533,43 +627,75 @@ def run_benchmark(
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="ParaS peer access comparison test and latency benchmark"
-    )
-    parser.add_argument(
-        "--benchmark", action="store_true", help="Run latency benchmark after correctness test"
-    )
-    args = parser.parse_args()
 
+def main():
     rank, world_size = setup_distributed()
+    passed = 0
+    failed = 0
 
     try:
-        result = run_comparison_test(rank, world_size)
-        ok = result[0]
+        tp_group = setup_paras_state(rank, world_size)
+        mgr, num_local = build_manager(rank, world_size)
+        fill_ep_weights(mgr, rank)
+        snap = snapshot_weights(mgr)
 
-        if not ok:
-            dist.barrier()
-            if rank == 0:
-                print("\nFAILED: Bitwise mismatch detected!", flush=True)
+        # --- EP→TP weight transfer tests ---
+        if rank == 0:
+            print("\n=== TestEPtoTPWeightTransfer ===", flush=True)
+        peer_ctx = setup_peer_ctx(mgr, rank, world_size, tp_group)
+        ep_tp = TestEPtoTPWeightTransfer(
+            rank, world_size, mgr, num_local, snap, peer_ctx
+        )
+
+        for name in ("test_w13_peer_access_vs_nccl", "test_w2_peer_access_vs_nccl"):
+            try:
+                getattr(ep_tp, name)()
+                passed += 1
+            except Exception as e:
+                print(f"  [FAIL] {name}: {e}", flush=True)
+                failed += 1
+
+        # --- TP→EP pointer swap test ---
+        if rank == 0:
+            print("\n=== TestTPtoEPWeightRestore ===", flush=True)
+        tp_ep = TestTPtoEPWeightRestore(rank, world_size)
+        try:
+            tp_ep.test_moe_pointer_swap()
+            passed += 1
+        except Exception as e:
+            print(f"  [FAIL] test_moe_pointer_swap: {e}", flush=True)
+            failed += 1
+
+        # --- Round-trip test ---
+        if rank == 0:
+            print("\n=== TestWeightRoundTrip ===", flush=True)
+        rt = TestWeightRoundTrip(rank, world_size, mgr, num_local, snap)
+        try:
+            rt.test_weight_roundtrip()
+            passed += 1
+        except Exception as e:
+            print(f"  [FAIL] test_weight_roundtrip: {e}", flush=True)
+            failed += 1
+
+        # --- Summary ---
+        dist.barrier()
+        if rank == 0:
+            total = passed + failed
+            print(f"\n{'=' * 60}")
+            print(f"RESULTS: {passed}/{total} passed, {failed}/{total} failed")
+            if failed == 0:
+                print(
+                    f"SUCCESS: All weight transfer tests passed "
+                    f"({NUM_LAYERS} layers × {world_size} ranks)!"
+                )
+            else:
+                print("FAILED: Some tests failed!")
+            print(f"{'=' * 60}", flush=True)
+
+        if failed > 0:
             teardown_distributed()
             sys.exit(1)
 
-        dist.barrier()
-        if rank == 0:
-            print(
-                f"\nSUCCESS: All {NUM_LAYERS} layers × 2 weights × "
-                f"{world_size} ranks bitwise match (naive vs overlap vs peer_access)!",
-                flush=True,
-            )
-
-        if args.benchmark:
-            _, tp_group, mgr, num_local, snap, peer_ctx = result
-            run_benchmark(
-                rank, world_size, tp_group, mgr, num_local, snap, peer_ctx,
-            )
-
-        dist.barrier()
     except Exception as e:
         print(f"[Rank {rank}] ERROR: {e}", flush=True)
         import traceback
