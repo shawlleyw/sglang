@@ -164,49 +164,72 @@ curl -s --max-time 60 http://localhost:30000/v1/completions \
 
 **Expected**: Coherent output, same quality as original EP mode. May have minor wording differences due to BF16 precision.
 
-### 11. Test KV cache coherence (in-flight requests during switch)
+### 11. Test KV cache coherence: in-flight EP→TP switch
 
-This tests that requests with accumulated KV cache survive the TP→EP switch.
+Server is in EP mode after step 10. Requests started in EP must survive the switch to TP.
 
 ```bash
-# Switch back to TP first
-curl -s --max-time 30 http://localhost:30000/paras_configure_tp
-
-# Start long requests in TP mode (background)
+# Start requests in EP mode (background)
 curl -s --max-time 120 http://localhost:30000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"List the first 10 prime numbers and explain why each is prime.","max_tokens":200,"temperature":0}' > /tmp/r1.json &
+    -d '{"model":"Qwen3-30B-A3B","prompt":"Explain how a hash table works, including collision resolution strategies like chaining and open addressing.","max_tokens":500,"temperature":0}' > /tmp/r1.json &
 PID1=$!
 
 curl -s --max-time 120 http://localhost:30000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"Write a recursive Fibonacci function in Python with memoization.","max_tokens":200,"temperature":0}' > /tmp/r2.json &
+    -d '{"model":"Qwen3-30B-A3B","prompt":"Describe the process of photosynthesis in plants, including the light-dependent and light-independent reactions.","max_tokens":500,"temperature":0}' > /tmp/r2.json &
 PID2=$!
 
-# Wait for KV cache to build up
+sleep 4
+
+# Switch EP→TP mid-generation
+curl -s --max-time 60 http://localhost:30000/paras_configure_tp
+
+wait $PID1 $PID2
+
+python3 -c "import json; d=json.load(open('/tmp/r1.json')); print('[EP→TP R1]', d['choices'][0]['text'][:300])"
+python3 -c "import json; d=json.load(open('/tmp/r2.json')); print('[EP→TP R2]', d['choices'][0]['text'][:300])"
+```
+
+**Expected**: Both outputs are coherent. R1 should discuss hash functions, collision resolution. R2 should discuss light reactions, Calvin cycle, chloroplasts.
+
+### 12. Test KV cache coherence: in-flight TP→EP switch
+
+Server is in TP mode after step 11. Requests started in TP must survive the switch to EP.
+
+```bash
+# Start requests in TP mode (background)
+curl -s --max-time 120 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen3-30B-A3B","prompt":"List the first 10 prime numbers and explain why each is prime.","max_tokens":500,"temperature":0}' > /tmp/r3.json &
+PID3=$!
+
+curl -s --max-time 120 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen3-30B-A3B","prompt":"Write a recursive Fibonacci function in Python with memoization.","max_tokens":500,"temperature":0}' > /tmp/r4.json &
+PID4=$!
+
 sleep 4
 
 # Switch TP→EP mid-generation
 curl -s --max-time 60 http://localhost:30000/paras_configure_ep
 
-# Wait for requests to complete
-wait $PID1 $PID2
+wait $PID3 $PID4
 
-# Verify outputs are coherent
-python3 -c "import json; d=json.load(open('/tmp/r1.json')); print('[R1]', d['choices'][0]['text'][:300])"
-python3 -c "import json; d=json.load(open('/tmp/r2.json')); print('[R2]', d['choices'][0]['text'][:300])"
+python3 -c "import json; d=json.load(open('/tmp/r3.json')); print('[TP→EP R3]', d['choices'][0]['text'][:300])"
+python3 -c "import json; d=json.load(open('/tmp/r4.json')); print('[TP→EP R4]', d['choices'][0]['text'][:300])"
 ```
 
-**Expected**: Both outputs are coherent multi-sentence text. No degeneration, no garbage, no repeated tokens. The switch is transparent — requests continue generating after the switch with correctly transferred KV cache.
+**Expected**: Both outputs are coherent multi-sentence text. No degeneration, no garbage, no repeated tokens.
 
-### 12. Verify no errors
+### 13. Verify no errors
 
 ```bash
 grep -i "error\|exception" /tmp/sglang_paras_test.log | grep -v "import error\|Config file\|opentelemetry\|WARNING"
 # Expected: empty
 ```
 
-### 12. Cleanup
+### 14. Cleanup
 
 ```bash
 pkill -9 -f "sglang" 2>/dev/null
@@ -223,7 +246,8 @@ rm -f /tmp/sglang_paras_test.log
 | TP requests (3 prompts) | Coherent, same quality as EP | Garbage, `\xa0`, or repetition |
 | TP→EP switch | Returns in < 300ms | Timeout or error |
 | EP requests after round-trip | **Identical** to original EP output | Different output or garbage |
-| In-flight KV coherence | Both requests coherent after switch | Degeneration or crash |
+| In-flight EP→TP coherence | Both requests coherent after switch | Degeneration or crash |
+| In-flight TP→EP coherence | Both requests coherent after switch | Degeneration or crash |
 | Server errors | None | Any scheduler/runtime exception |
 
 ## Important Notes
