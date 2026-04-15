@@ -146,14 +146,32 @@ curl -s --max-time 60 http://localhost:30000/v1/completions \
 
 **Critical check**: All responses must be coherent multi-token text with no degeneration (e.g., repeated `\xa0`, blank spaces, or topic drift). Degeneration after the first token = stale FlashInfer attention backend state.
 
-### 9. Verify no errors
+### 9. Trigger ParaS TP→EP switch (round-trip)
+
+```bash
+curl -s --max-time 60 http://localhost:30000/paras_configure_ep
+# Expected: "ParaS EP parallelism configured."
+```
+
+### 10. Send requests in EP mode (after round-trip)
+
+```bash
+curl -s --max-time 60 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen3-30B-A3B","prompt":"Write a Python function that implements binary search on a sorted list, with docstring and edge case handling.","max_tokens":200,"temperature":0}' \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP-RT P1]', d['choices'][0]['text'][:300])"
+```
+
+**Expected**: Coherent output, same quality as original EP mode. May have minor wording differences due to BF16 precision.
+
+### 11. Verify no errors
 
 ```bash
 grep -i "error\|exception" /tmp/sglang_paras_test.log | grep -v "import error\|Config file\|opentelemetry\|WARNING"
 # Expected: empty
 ```
 
-### 10. Cleanup
+### 12. Cleanup
 
 ```bash
 pkill -9 -f "sglang" 2>/dev/null
@@ -176,7 +194,7 @@ rm -f /tmp/sglang_paras_test.log
 ## Important Notes
 
 - **mem-fraction-static=0.75 will OOM** during weight redistribution on A100-80GB. Use 0.6.
-- **ParaS configure is one-way** (EP→TP only). Once configured, you cannot call `/paras_configure_tp` again. Restart the server for a new test.
+- **ParaS configure supports round-trip** (EP→TP→EP→TP...). Use `/paras_configure_tp` and `/paras_configure_ep` endpoints. For the naive weight transfer method, set `PARAS_CONFIGURE_METHOD=naive` (default is `peer_access`).
 - **Overlap mode**: To test overlapped conversion, modify `paras/models/qwen3_moe.py` to pass `overlap=True` to `self.model.paras_configure_tp(...)`.
 - **Slow timing (~3s instead of ~100ms)**: Likely GPU in bad state from prior OOM. Kill all processes, wait 5 seconds, retry on clean GPU.
 - **Profiler overhead**: If `transfer_weights` > 500ms, check that `paras_start_profile`/`paras_stop_profile` are not called in `scheduler_paras_mixin.py` and `paras_memory_check` is not called in `model_runner.py`.

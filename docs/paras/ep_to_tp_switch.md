@@ -160,12 +160,40 @@ The switch is transparent to clients — in-flight requests continue generating 
 | `nvlink_peer_access_guielines.md` | NVLink store optimization guidelines (grid config, vectorization, alignment) |
 | `exploration_notes_kv_cache_peer_access.md` | Development notes: bugs found, CUDA IPC analysis, design tradeoffs |
 
+## TP→EP Reverse Switch
+
+The reverse switch (TP→EP) is now implemented, enabling full round-trip switching (EP→TP→EP→TP...).
+
+### Key Design Decisions
+
+1. **Weight transfer is mandatory, not a pointer swap**: The N+1 slot design means EP→TP overwrites EP weight slots (slot[i+1] becomes layer i+1's TP destination). After EP→TP, the original EP weights are destroyed. TP→EP must perform an actual reverse weight transfer (NCCL all-to-all or peer_access kernels) in reverse layer order (N-1→0).
+
+2. **KV cache scatter**: The inverse of EP→TP gather. Each TP rank sends its head's token data to the EP ranks that will own those tokens. With head replication (`num_kv_heads < tp_size`), subgroup members split the token load — each sends a disjoint 1/R slice, cutting NVLink traffic by R.
+
+3. **Request distribution**: Requests are partitioned across EP ranks using a greedy algorithm (balanced by request count first, then total tokens). All ranks compute the identical partition deterministically.
+
+### Trigger
+
+```bash
+curl http://localhost:30000/paras_configure_ep
+```
+
+### Switch Timeline (Qwen3-30B-A3B, 4×A100)
+
+| Phase | Time (naive) | Time (peer_access) |
+|-------|-------------|-------------------|
+| Request partition + pool resize | ~5 ms | ~5 ms |
+| KV cache scatter | ~30 ms | TBD |
+| Weight transfer (reverse) | ~70 ms | ~500 ms |
+| Attention reconfiguration | ~5 ms | ~5 ms |
+| **Total** | **~103 ms** | **~545 ms** |
+
 ## Limitations and Future Work
 
-1. **One-way switch**: Currently EP→TP only. TP→EP reverse switch is architecturally supported by the N+1 slot design (process layers in reverse order) but not yet implemented.
+1. **Head replication e2e**: When `num_kv_heads < tp_size` (e.g., 4 heads / 8 GPUs), the KV transfer works correctly (verified by unit test), but the attention layer's `paras_configure_tp()` asserts `tp_size <= num_kv_heads`. Extending the attention reconfiguration to support replicated heads is a separate effort.
 
-2. **Head replication e2e**: When `num_kv_heads < tp_size` (e.g., 4 heads / 8 GPUs), the KV transfer kernel works correctly (verified by unit test), but the attention layer's `paras_configure_tp()` asserts `tp_size <= num_kv_heads`. Extending the attention reconfiguration to support replicated heads is a separate effort.
+2. **Dynamic switching**: The current switch is triggered manually via `/paras_configure_tp` and `/paras_configure_ep`. An automatic policy that monitors batch size and switches when the crossover point is reached would enable fully adaptive serving.
 
-3. **Dynamic switching**: The current switch is triggered manually via `/paras_configure_tp`. An automatic policy that monitors batch size and switches when the crossover point is reached would enable fully adaptive serving.
+3. **FP8 support**: The kernel and memory manager support FP8 weights but FP8 KV cache is not yet wired through.
 
-4. **FP8 support**: The kernel and memory manager support FP8 weights but FP8 KV cache is not yet wired through.
+4. **Peer access reverse kernel optimization**: The TP→EP peer_access weight kernels are ~5× slower than NCCL naive (545ms vs 103ms). The kernels need profiling and optimization to match the EP→TP direction's performance.

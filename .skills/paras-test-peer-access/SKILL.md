@@ -32,11 +32,11 @@ All tests live in `test/srt/paras/`:
 |------|-------|---------|------------------|
 | `test_request_partition.py` | 11 | **None (CPU)** | Partition algorithm, replication routing, strategy extensibility |
 | `test_kv_cache_transfer.py` | 6 | 4 or 8 GPUs | KV cache EP→TP, TP→EP, round-trip (R=1 and R=2) — standalone ground truth |
-| `test_weight_transfer.py` | 4 | 4 GPUs | Weight EP→TP peer_access vs NCCL, MoE pointer swap, weight round-trip |
+| `test_weight_transfer.py` | 7 | 4 GPUs | Weight EP→TP peer_access vs NCCL, ground truth, pointer swap, round-trip, reverse |
 | `test_memory.py` | 2 | 4 GPUs | head_num save/restore, GPU memory leak detection |
 | `test_roundtrip.py` | 4 | 4 GPUs | Full batch-level EP→TP→EP with model components |
 
-**Total: 27 tests**
+**Total: 30 tests**
 
 ---
 
@@ -95,6 +95,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 - Layer order: reverse (N-1→0) for TP→EP to respect N+1 slot aliasing
 - EP buffers are NEVER zeroed before scatter (EP slot[i+1] shares memory with TP slot[i+1])
 - Tests adapt to world_size: `num_kv_heads = world_size` (R=1) or `world_size // 2` (R=2)
+- **CRITICAL**: EP→TP DESTROYS EP weight slots (N+1 aliasing). TP→EP weight transfer must be actual reverse all-to-all, NOT pointer swap. Reverse must process layers in reverse order (N-1→0).
 
 ---
 
@@ -108,14 +109,17 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
   /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_weight_transfer.py -v
 ```
 
-**4 tests:**
+**7 tests:**
 
 | Test | What It Verifies |
 |------|------------------|
 | `test_w13_peer_access_vs_nccl` | EP→TP w13 weights: peer_access kernel bitwise matches NCCL naive |
 | `test_w2_peer_access_vs_nccl` | EP→TP w2 weights: peer_access kernel bitwise matches NCCL naive |
 | `test_moe_pointer_swap` | TP→EP: `experts` pointer toggles between ep_experts and tp_experts |
-| `test_weight_roundtrip` | EP→TP→EP: weight data bitwise match after full cycle |
+| `test_weight_roundtrip` | EP→TP→EP: weight data bitwise match (reverse layer order) |
+| `test_w13_ground_truth` | EP→TP w13: verified against independently computed expected values |
+| `test_w2_ground_truth` | EP→TP w2: verified against independently computed expected values |
+| `test_reverse_naive_vs_original` | TP→EP reverse: restored EP matches original snapshot |
 
 ### Benchmark (optional)
 
