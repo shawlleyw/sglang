@@ -1,216 +1,168 @@
 ---
 name: paras-test-peer-access
-description: Run ParaS correctness and benchmark tests for KV cache transfer (EP→TP and TP→EP, with/without head replication), weight transfer, request partition, memory invariants, and full round-trip. Knows GPU requirements, conda env, torchrun commands, and how to interpret results.
+description: Run ParaS correctness tests for KV cache transfer (EP→TP and TP→EP, with/without head replication), weight transfer, and request partition. Knows GPU requirements, conda env, torchrun commands, test structure, and how to interpret results.
 metadata:
-  short-description: Test ParaS KV cache + weight transfer + partition + round-trip
+  short-description: Test ParaS KV cache + weight transfer + partition
 ---
 
 # ParaS Transfer Tests
 
-Correctness and benchmark tests for ParaS parallelism switching: KV cache transfer (both directions), weight transfer, request partition, memory invariants, and full EP↔TP round-trip.
+Correctness tests for ParaS parallelism switching: KV cache transfer (both directions), weight transfer, and request partition. Every transfer method (NCCL naive, peer_access NVLink kernel) is verified independently against computed ground truth — never against each other.
+
+## Quick Run
+
+```bash
+bash run_paras_tests.sh      # 4 GPUs
+bash run_paras_tests.sh 8    # 8 GPUs
+```
 
 ## Prerequisites
 
 - Conda env: `sgl_paras`
-- Python path: `/home/shaoyuw/miniconda3/envs/sgl_paras/bin/python`
-- Torchrun: `/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun`
-- CUDA extension compiled: `cd python/sglang/srt/paras/csrc && python setup.py build_ext --inplace`
-- Empty GPUs required (check before running)
+- CUDA extension: `cd python/sglang/srt/paras/csrc && python setup.py build_ext --inplace`
+- Empty GPUs: `nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits` (all < 100 MiB)
 
-## GPU Check (ALWAYS run first)
+## Test Coverage
 
-```bash
-nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits
-# All values should be < 100 MiB
+### What is tested
+
+All tests verify against **independently computed ground truth**, not round-trip symmetry or method-vs-method comparison.
+
+| Component | Direction | Methods | Replication | Ground Truth |
+|-----------|-----------|---------|-------------|-------------|
+| KV cache | EP→TP | NCCL, peer_access | R=1, R=2 | `make_pattern(rank, layer, head, token)` encodes source identity. Expected TP value at any position computed from pattern. |
+| KV cache | TP→EP | NCCL, peer_access | R=1, R=2 | Same pattern. Expected EP value computed by tracing which TP rank sent which token slice to which head slot. |
+| KV cache | EP→TP→EP | NCCL | R=1, R=2 | Bitwise snapshot: save EP before, compare after round-trip. |
+| MoE weights | EP→TP | NCCL, peer_access | — | All-gather EP data from all ranks, compute expected TP shards: `gate_shard = full_w13[:, r*I_tp:(r+1)*I_tp, :]`, `up_shard = full_w13[:, I+r*I_tp:I+(r+1)*I_tp, :]`. |
+| MoE weights | TP→EP | NCCL reverse, peer_access reverse | — | Original EP snapshot (since EP→TP ground truth is verified, reverse must recover original). |
+| MoE weights | EP→TP→EP | NCCL | — | Bitwise snapshot match. |
+| Request partition | — | Greedy algorithm | — | Deterministic: `sort(-seqlen, rid)`, assign to rank with fewest requests then least tokens. Verified: count balance, token balance, no duplicates, no losses, cross-input determinism. |
+
+### How the ground truth is built
+
+**KV cache pattern**: `make_pattern(rank, layer, head, num_tokens)` returns a `(num_tokens, HEAD_DIM)` bf16 tensor where each value encodes the source:
+```python
+base = rank * 1000.0 + layer * 100.0 + head * 10.0
+value[t, d] = base + t + d * 0.001
+```
+After transfer, the expected value at any destination position is computed by knowing which source rank/head/token should end up there. A mismatch of ~1000 means wrong source rank; ~100 means wrong layer; ~10 means wrong head.
+
+**Weight ground truth**: All ranks' EP weights are all-gathered to build a global view `(NUM_EXPERTS, 2*I, H)`. The expected TP shard for rank `r` is extracted via column slicing. This is computed once and compared against both NCCL and peer_access results independently.
+
+**Replication (R>1)**: When `num_kv_heads < tp_size`, R contiguous ranks share the same head. Each subgroup member sends a disjoint 1/R token slice. The verification traces which intra_rank within the subgroup sent each token position and checks against that member's pattern.
+
+### What is NOT tested (out of scope)
+
+- Performance benchmarks (latency measurement) — planned, not yet implemented
+- FP8 KV cache
+- dp_size > 1
+- Automatic switching policy
+- FlashInfer attention backend integration (tested via E2E only)
+
+## Test Files
+
+```
+test/srt/paras/
+├── test_request_partition.py                  # 11 CPU tests
+├── test_kv_cache_transfer.py                  # 5 GPU tests (R=1 only)
+├── test_kv_cache_transfer_replication.py      # 5 GPU tests (R=2 only)
+├── test_weight_transfer.py                    # 6 GPU tests
+├── test_memory.py                             # 2 GPU tests
+└── test_roundtrip.py                          # 4 GPU tests
 ```
 
-## Test Suite Overview
+### Why KV replication is a separate file
 
-All tests live in `test/srt/paras/`:
-
-| File | Tests | GPU Req | What It Verifies |
-|------|-------|---------|------------------|
-| `test_request_partition.py` | 11 | **None (CPU)** | Partition algorithm, replication routing, strategy extensibility |
-| `test_kv_cache_transfer.py` | 6 | 4 or 8 GPUs | KV cache EP→TP, TP→EP, round-trip (R=1 and R=2) — standalone ground truth |
-| `test_weight_transfer.py` | 7 | 4 GPUs | Weight EP→TP peer_access vs NCCL, ground truth, pointer swap, round-trip, reverse |
-| `test_memory.py` | 2 | 4 GPUs | head_num save/restore, GPU memory leak detection |
-| `test_roundtrip.py` | 4 | 4 GPUs | Full batch-level EP→TP→EP with model components |
-
-**Total: 30 tests**
+Tests with different `num_kv_heads` allocate managed buffers of different sizes. CUDA IPC handles (`cudaIpcOpenMemHandle`) mapped to the old buffer become stale when the buffer is reallocated. Running R=1 and R=2 tests in the same process causes address space corruption. Separating into two files ensures each runs in a fresh process.
 
 ---
 
-## 1. Request Partition Tests (CPU only — no GPU)
-
-Tests the deterministic request partition algorithm and replication-aware routing.
+## 1. Request Partition Tests (11 CPU tests)
 
 ```bash
-/home/shaoyuw/miniconda3/envs/sgl_paras/bin/python -m pytest test/srt/paras/test_request_partition.py -v
+python -m pytest test/srt/paras/test_request_partition.py -v
 ```
 
-**11 tests:**
-- `TestPartitionRequestsForEP` (5): balanced, fewer_than_ranks, zero, equal_seqlens_deterministic, imbalanced
-- `TestPeerAccessReplicationRouting` (4): R=1, R=2, no_token_lost_or_duplicated, R=4
-- `TestPartitionStrategy` (2): greedy_strategy works, unknown_strategy raises ValueError
+| Class | Tests | What it verifies |
+|-------|-------|-----------------|
+| `TestPartitionRequestsForEP` | 5 | Balanced assignment, fewer-than-ranks, zero requests, determinism with equal seqlens, imbalanced (count-first priority) |
+| `TestPeerAccessReplicationRouting` | 4 | 1/R token slicing: R=1 routes all, R=2 subgroup partners cover 100%, exhaustive no-token-lost for many sizes, R=4 |
+| `TestPartitionStrategy` | 2 | Strategy registry works, unknown strategy raises ValueError |
 
 ---
 
-## 2. KV Cache Transfer Tests (4 or 8 GPUs)
-
-Standalone correctness tests for KV cache transfer in BOTH directions. Each direction is verified independently against pattern-based ground truth (not round-trip symmetry).
-
-### Pattern-based verification
-Data is filled with `make_pattern(rank, layer, head, num_tokens)` which encodes source identity into values. After transfer, expected values at any destination are computed from first principles — no reliance on symmetry.
-
-### Run on 4 GPUs (R=1 and R=2)
+## 2. KV Cache Transfer — No Replication (5 GPU tests)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=4 \
-  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_kv_cache_transfer.py -v
+torchrun --nproc_per_node=4 -m pytest test/srt/paras/test_kv_cache_transfer.py -v
 ```
 
-### Run on 8 GPUs (R=1 with 8 heads, R=2 with 4 heads)
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=8 \
-  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_kv_cache_transfer.py -v
-```
-
-**6 tests (adaptive to world_size):**
-
-| Test | Direction | Replication | Verification Method |
-|------|-----------|-------------|---------------------|
-| `test_ep_to_tp_no_replication` | EP→TP | R=1 (heads=world_size) | Pattern ground truth |
-| `test_ep_to_tp_with_replication` | EP→TP | R=2 (heads=world_size//2) | Pattern ground truth |
-| `test_tp_to_ep_no_replication` | TP→EP | R=1 | Pattern ground truth |
-| `test_tp_to_ep_with_replication` | TP→EP | R=2 | Pattern ground truth |
-| `test_roundtrip_no_replication` | EP→TP→EP | R=1 | Bitwise snapshot match |
-| `test_roundtrip_with_replication` | EP→TP→EP | R=2 | Bitwise snapshot match |
-
-### Key implementation details
-- EP→TP gather uses `gather_kv_and_permute` + `repeat_interleave` (if R>1) + `all_to_all` + `permute_and_scatter_kv` — matches production `_gather_cache_nccl`
-- TP→EP scatter uses `_scatter_cache_nccl` directly with `_EPCacheView` — the production code path
-- Layer order: reverse (N-1→0) for TP→EP to respect N+1 slot aliasing
-- EP buffers are NEVER zeroed before scatter (EP slot[i+1] shares memory with TP slot[i+1])
-- Tests adapt to world_size: `num_kv_heads = world_size` (R=1) or `world_size // 2` (R=2)
-- **CRITICAL**: EP→TP DESTROYS EP weight slots (N+1 aliasing). TP→EP weight transfer must be actual reverse all-to-all, NOT pointer swap. Reverse must process layers in reverse order (N-1→0).
+| Test | Direction | Method | Verification |
+|------|-----------|--------|-------------|
+| `test_ep_to_tp_no_replication` | EP→TP | NCCL | Pattern ground truth |
+| `test_ep_to_tp_peer_access_no_replication` | EP→TP | peer_access | Pattern ground truth |
+| `test_tp_to_ep_no_replication` | TP→EP | NCCL | Pattern ground truth |
+| `test_tp_to_ep_peer_access_no_replication` | TP→EP | peer_access | Pattern ground truth |
+| `test_roundtrip_no_replication` | EP→TP→EP | NCCL | Bitwise snapshot |
 
 ---
 
-## 3. Weight Transfer Tests (4 GPUs)
-
-Tests MoE weight transfer between EP and TP layouts.
+## 3. KV Cache Transfer — With Replication (5 GPU tests)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=4 \
-  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_weight_transfer.py -v
+torchrun --nproc_per_node=4 -m pytest test/srt/paras/test_kv_cache_transfer_replication.py -v
 ```
 
-**7 tests:**
-
-| Test | What It Verifies |
-|------|------------------|
-| `test_w13_peer_access_vs_nccl` | EP→TP w13 weights: peer_access kernel bitwise matches NCCL naive |
-| `test_w2_peer_access_vs_nccl` | EP→TP w2 weights: peer_access kernel bitwise matches NCCL naive |
-| `test_moe_pointer_swap` | TP→EP: `experts` pointer toggles between ep_experts and tp_experts |
-| `test_weight_roundtrip` | EP→TP→EP: weight data bitwise match (reverse layer order) |
-| `test_w13_ground_truth` | EP→TP w13: verified against independently computed expected values |
-| `test_w2_ground_truth` | EP→TP w2: verified against independently computed expected values |
-| `test_reverse_naive_vs_original` | TP→EP reverse: restored EP matches original snapshot |
-
-### Benchmark (optional)
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=4 \
-  test/srt/paras/test_weight_transfer.py --benchmark
-```
+| Test | Direction | Method | Verification |
+|------|-----------|--------|-------------|
+| `test_ep_to_tp_nccl` | EP→TP | NCCL | Pattern ground truth (R=2) |
+| `test_ep_to_tp_peer_access` | EP→TP | peer_access | Pattern ground truth (R=2) |
+| `test_tp_to_ep_nccl` | TP→EP | NCCL | Pattern ground truth (R=2) |
+| `test_tp_to_ep_peer_access` | TP→EP | peer_access | Pattern ground truth (R=2) |
+| `test_roundtrip` | EP→TP→EP | NCCL | Bitwise snapshot (R=2) |
 
 ---
 
-## 4. Memory Invariant Tests (4 GPUs)
+## 4. Weight Transfer (6 GPU tests)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=4 \
-  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_memory.py -v
+torchrun --nproc_per_node=4 test/srt/paras/test_weight_transfer.py
 ```
 
-**2 tests:**
-- `test_head_num_restored_after_ep` — `MHATokenToKVPool.head_num` correctly shards on TP (÷tp_size) and restores on EP (original)
-- `test_no_memory_leak` — 5 TP↔EP cycles, asserts <1% GPU memory growth
+| Test | Direction | Method | Verification |
+|------|-----------|--------|-------------|
+| `test_nccl_vs_ground_truth` | EP→TP | NCCL | Computed gate/up shards from all-gathered EP |
+| `test_peer_access_vs_ground_truth` | EP→TP | peer_access | Same ground truth |
+| `test_nccl_reverse_vs_original` | TP→EP | NCCL reverse | Original EP snapshot |
+| `test_peer_access_reverse_vs_original` | TP→EP | peer_access reverse | Same original EP snapshot |
+| `test_moe_pointer_swap` | TP→EP | Module attribute | `self.experts is self.ep_experts` after configure_ep |
+| `test_weight_roundtrip` | EP→TP→EP | NCCL | Bitwise snapshot (reversed layer order) |
 
 ---
 
-## 5. Full Round-Trip Integration Tests (4 GPUs)
+## Key Design Decisions
 
-Batch-level integration with model components (memory manager, req pools, scatter/gather managers).
+### N+1 slot aliasing
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=4 \
-  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_roundtrip.py -v
-```
+EP layer `i` uses slot[i+1], TP layer `i` uses slot[i]. Slot[i+1] = TP slot for layer i+1. This means:
+- **EP→TP forward order** (0→N-1): safe because layer i reads slot[i+1] before layer i+1 writes to slot[i+1]
+- **TP→EP reverse order** (N-1→0): safe because layer i+1 reads slot[i+1] before layer i writes to slot[i+1]
+- **EP→TP DESTROYS EP weight data** in slots 1..N-1. TP→EP must use actual reverse all-to-all transfer, NOT pointer swap.
 
-**4 tests:**
-- `test_roundtrip_ep_tp_ep` — Full EP→TP→EP with KV, weights, batch reconstruction
-- `test_partition_consistency` — All ranks compute identical partitions (cross-rank assertion)
-- `test_single_request_roundtrip` — Edge case: 1 request lands on exactly 1 EP rank
-- `test_empty_batch_roundtrip` — Edge case: 0 requests, no crash
+### KV cache scatter with replication
 
----
-
-## Quick Reference: Run Everything
-
-```bash
-# CPU tests (no GPU needed)
-/home/shaoyuw/miniconda3/envs/sgl_paras/bin/python -m pytest test/srt/paras/test_request_partition.py -v
-
-# All GPU tests on 4 GPUs
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=4 \
-  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/ -v --ignore=test/srt/paras/test_request_partition.py
-
-# KV cache tests on 8 GPUs (tests replication with R=2)
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun --nproc_per_node=8 \
-  /home/shaoyuw/miniconda3/envs/sgl_paras/bin/pytest test/srt/paras/test_kv_cache_transfer.py -v
-```
-
-## Environment Variables
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `PARAS_KV_TRANSFER_METHOD` | KV transfer method in production | `nccl` |
-| `PARAS_CONFIGURE_METHOD` | Weight transfer method | `naive` |
-| `CUDA_VISIBLE_DEVICES` | GPU selection | all |
-
-## Interpreting Results
-
-### Correctness
-```
-PASSED test_ep_to_tp_no_replication        ← EP→TP, 8h/8g, pattern verified
-PASSED test_ep_to_tp_with_replication      ← EP→TP, 4h/8g R=2, pattern verified
-PASSED test_tp_to_ep_no_replication        ← TP→EP, 8h/8g, pattern verified
-PASSED test_tp_to_ep_with_replication      ← TP→EP, 4h/8g R=2, pattern verified
-PASSED test_roundtrip_no_replication       ← EP→TP→EP bitwise match
-PASSED test_roundtrip_with_replication     ← EP→TP→EP bitwise match, R=2
-```
-
-Any `FAILED` means data corruption. Common causes:
-- CUDA extension not recompiled after kernel changes
-- GPU memory contention from other processes
-- Wrong `CUDA_VISIBLE_DEVICES`
+When `num_kv_heads < tp_size` (replication factor R>1):
+- Each subgroup of R contiguous ranks holds identical KV data
+- Each member sends a disjoint 1/R token slice, cutting NVLink traffic by R
+- The NCCL path is a single unified code path — the only conditional is `reassembly_groups = group_size if heads_per_rank > 1 else num_kv_heads`
+- The peer_access kernel uses `num_kv_heads` (not `heads_per_rank * tp_size`) for the EP destination stride
 
 ## Troubleshooting
 
 | Issue | Cause | Fix |
 |---|---|---|
-| `Need N empty GPUs, only M available` | Other processes using GPUs | Kill them or wait |
-| `NCCL timeout` | Leftover state from crashed run | `pkill -f torchrun` and retry |
-| `Import error: paras_peer_access_cuda` | CUDA extension not compiled | `cd python/sglang/srt/paras/csrc && pip install -e .` |
-| `assert world_size in (4, 8)` | Wrong number of GPUs | Set `CUDA_VISIBLE_DEVICES` correctly |
-| `assert False` in paras_moe_block | Old code before bug fix | Pull latest changes |
+| GPU memory not free | Other processes | `nvidia-smi` to check, kill or wait |
+| `NCCL timeout` | Leftover from crashed run | `pkill -f torchrun` and retry |
+| `Import error: paras_peer_access_cuda` | CUDA extension not compiled | `cd python/sglang/srt/paras/csrc && python setup.py build_ext --inplace` |
+| R=2 tests fail in full suite | CUDA IPC isolation | Run replication tests separately (already split into own file) |
+| `assert False` in paras_moe_block | Old code | Pull latest changes |

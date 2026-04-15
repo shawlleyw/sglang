@@ -205,7 +205,7 @@ The reverse direction (TP→EP) is now implemented in `scatter_manager.py`. Each
 - **Per-layer barrier**: `dist.all_reduce(barrier)` after each layer kernel, with ALL ranks participating (even those with 0 tokens)
 - **NCCL fallback**: A unified `_scatter_cache_nccl` path handles both R=1 and R>1 with a single code path. The only conditional is `reassembly_groups = group_size if heads_per_rank > 1 else num_kv_heads`.
 
-See `tp_to_ep_switch.md` for the full design and `scatter_manager.py` for the implementation.
+See `parallelism_switch.md` for the full design and `scatter_manager.py` for the implementation.
 
 ## Future Work
 

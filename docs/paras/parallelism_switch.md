@@ -24,92 +24,87 @@ Reference measurements (Qwen3-30B-A3B, 8×A100, CUDA graphs):
 | 1024 | ~1.0× (crossover) |
 | 2048 | **1.50×** (EP wins) |
 
-In a real serving system, batch sizes fluctuate. During off-peak hours, the batch is small and TP is faster. During peak traffic, the batch is large and EP is faster. **ParaS enables the system to start in EP mode (optimal for prefill and large batches) and switch to TP mode at runtime when the workload favors it** — without restarting the server, reloading weights, or dropping requests.
+ParaS enables the system to switch between EP and TP **at runtime** — without restarting the server, reloading weights, or dropping requests.
 
-## What Needs to Happen During the Switch
+| Scenario | Direction | Why |
+|----------|-----------|-----|
+| Peak traffic → off-peak | EP→TP | Small batch, TP's low-latency AllReduce wins |
+| Off-peak → peak traffic | TP→EP | Large batch, EP's per-rank data reduction wins |
+| Bursty workload | EP→TP→EP→... | Oscillate as batch size fluctuates |
 
-The EP→TP switch must transform the entire model's runtime state from EP layout to TP layout:
+## What Needs to Happen During a Switch
 
-### 1. MoE Weight Redistribution
+Both directions transform the model's runtime state between EP and TP layouts:
 
-In EP mode, each GPU holds `num_experts / ep_size` complete experts. In TP mode, each GPU holds ALL experts but only a shard of each expert's weight matrices (sliced along the intermediate dimension).
+| Component | EP Layout | TP Layout |
+|-----------|-----------|-----------|
+| MoE weights | `num_experts/ep_size` complete experts per GPU | ALL experts, sharded along intermediate dimension |
+| KV cache | All `num_kv_heads` heads, local tokens only | `num_kv_heads/tp_size` heads, ALL tokens |
+| Attention | Full QKV projection (DP attention) | Sharded QKV projection (TP attention) |
+| Requests | Each GPU owns a disjoint subset | All GPUs share the identical set |
 
-**Data movement**: Every GPU must send its local experts' weight slices to every other GPU, and receive slices from every other GPU. For Qwen3-30B-A3B with 48 layers: ~10.4 GB of NVLink traffic per GPU.
+### Asymmetry Between Directions
 
-### 2. KV Cache Redistribution
+| Aspect | EP→TP (gather) | TP→EP (scatter) |
+|--------|----------------|-----------------|
+| Requests | Gather local subsets into global set (simple concat) | **Partition** global set into disjoint subsets (load-balancing problem) |
+| KV cache | Head-split: all heads → subset heads | **Head-gather**: subset heads → all heads |
+| MoE weights | all-to-all redistribution | **Reverse all-to-all** (EP weights destroyed during EP→TP; see N+1 Slot section) |
+| Layer order | Forward (0, 1, ..., N-1) | **Reverse** (N-1, ..., 0) |
 
-In EP mode, each GPU stores KV cache for all `num_kv_heads` attention heads but only for its local tokens (the tokens it processed via DP attention). In TP mode, each GPU stores KV cache for `num_kv_heads / tp_size` heads but for ALL tokens across all GPUs.
+## The Unified Memory Manager
 
-**Data movement**: Each GPU splits its local KV heads across peers (head-splitting), while collecting other GPUs' head shards for their tokens. For in-flight requests, this is critical — the KV cache must be transferred correctly or the model produces garbage on the next decode step.
+The foundation of fast switching. Allocates ALL persistent GPU memory — expert weights, attention weights, KV cache — in a single contiguous buffer at model init time.
 
-### 3. Attention Reconfiguration
+**Key insight**: EP and TP layouts use the **same total bytes** per layer. An expert with shape `(E_local, 2I, H)` in EP becomes `(E_total, 2I/tp, H)` in TP — same bytes, different interpretation. The switch overwrites the same physical memory with the new layout, avoiding any allocation or deallocation.
 
-The attention layer must switch from DP attention (local QKV projection with full heads) to TP attention (sharded QKV projection with split heads). This involves:
-- Slicing the full QKV weight to the TP shard
-- Updating the attention backend's metadata (num_heads, req_to_token mapping)
-- Resizing the KV pool to the TP token capacity
+### N+1 Slot Design
 
-### 4. Request State Migration
-
-Active requests' metadata (sequence lengths, token indices, sampling state) must be globally coordinated. Each GPU's local request state becomes a global shared state.
-
-## How ParaS Achieves It
-
-### Architecture Overview
+Prevents read/write races during transfer. For N model layers, N+1 slots are allocated:
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   ParaS EP→TP Switch                     │
-│                                                         │
-│  1. Scheduler pauses, drains active batch                │
-│  2. Gather request metadata across all ranks             │
-│                                                         │
-│  ┌─────────────────────────────────────────────────────┐ │
-│  │           KV Cache Transfer (~34ms)                 │ │
-│  │  peer_access: fused K+V kernel → NVLink direct     │ │
-│  │  OR nccl: gather_kv_and_permute → all_to_all       │ │
-│  └─────────────────────────────────────────────────────┘ │
-│                                                         │
-│  ┌─────────────────────────────────────────────────────┐ │
-│  │          Weight Transfer (~61ms)                     │ │
-│  │  peer_access: fused w13/w2 kernels → NVLink direct  │ │
-│  │  OR nccl: naive/overlap all_to_all                  │ │
-│  └─────────────────────────────────────────────────────┘ │
-│                                                         │
-│  3. Attention reconfiguration (QKV slice, backend update)│
-│  4. Resume scheduling in TP mode                         │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
+Slots:  [ 0 | 1 | 2 | ... | N ]
+TP:       0   1   2         N-1      ← layer i TP in slot[i]
+EP:           0   1         N-2  N-1 ← layer i EP in slot[i+1]
 ```
 
-### The Unified Memory Manager
+**EP→TP** reads from slot[i+1] (EP), writes to slot[i] (TP). Forward order is safe.
 
-The foundation of fast switching is the Unified Memory Manager (`ParaSMemoryManager`). It allocates ALL persistent GPU memory — expert weights, attention weights, KV cache — in a single contiguous buffer at model init time.
+**TP→EP** reads from slot[i] (TP), writes to slot[i+1] (EP). **Reverse order is required** because slot[i+1] = layer (i+1)'s TP source.
 
-**Key insight**: EP and TP layouts use the **same total bytes** per layer. An expert with shape `(E_local, 2I, H)` in EP becomes `(E_total, 2I/tp, H)` in TP — same bytes, different interpretation. The switch overwrites the same physical memory with the TP layout, avoiding any allocation or deallocation.
-
-The **N+1 slot design** prevents read/write races during the transfer: layer `i`'s EP data lives in slot `i+1`, while TP data is written to slot `i`. Source and destination never overlap.
+**Critical implication**: EP→TP **destroys EP weight data** in slots 1..N-1 (each becomes the next layer's TP target). TP→EP cannot use a pointer swap — it must perform an actual reverse weight transfer to reconstruct EP data.
 
 See: `unified_memory_manager.md`
 
-### NVLink Peer Access Transfers
+## NVLink Peer Access Transfers
 
-Instead of NCCL collectives (which require staging buffers, permutations, and kernel launch overhead), ParaS uses custom CUDA kernels that write directly to peer GPU memory via NVLink:
+Custom CUDA kernels write directly to peer GPU memory via NVLink, avoiding NCCL's staging buffers and kernel launch overhead.
+
+### EP→TP Direction
 
 **Weight transfer** (`peer_access_fused_transfer_w13_v2`, `peer_access_fused_transfer_w2_v2`):
-- Reads EP weights from local buffer
-- Writes TP weight slices directly to each peer's TP slot via NVLink stores
+- Reads EP weights from local buffer, writes TP weight slices to each peer's TP slot via NVLink
 - Fused kernel — one launch per layer handles all peers
-- 1.57× faster than NCCL sequential for weights
+- 1.57× faster than NCCL sequential
 
 **KV cache transfer** (`peer_access_kv_transfer`):
-- Reads EP KV cache from scattered token positions (via index array)
-- Writes to each peer's TP KV slot at contiguous positions via NVLink
+- Reads EP KV cache from scattered token positions, writes to each peer's TP KV slot
 - Fused K+V in a single kernel
-- Handles head replication when `num_kv_heads < tp_size` via `ep_head = peer * num_kv_heads / tp_size`
-- 2.74× faster than NCCL all_to_all for KV cache at scale
+- Handles head replication via `ep_head = peer * num_kv_heads / tp_size`
+- 2.74× faster than NCCL at scale
 
-Both kernels follow the NVLink optimization guidelines:
+### TP→EP Direction
+
+**Weight transfer** (`peer_access_fused_transfer_w13_ep`, `peer_access_fused_transfer_w2_ep`):
+- Structural mirror of EP→TP v2 kernels with swapped src/dst
+- Reverse layer order (N-1→0) with per-layer barrier
+
+**KV cache scatter** (`peer_access_kv_scatter`):
+- Reads local TP KV, writes to peer EP buffers at correct head slot
+- Uses `num_kv_heads` (not `heads_per_rank * tp_size`) for EP destination stride — critical for head replication correctness
+- Replication-aware routing in Python wrapper: each subgroup member routes 1/R tokens
+
+All kernels follow the same NVLink optimization guidelines:
 - Warp-level peer assignment for balanced NVLink utilization
 - int4 vectorized stores (512 bytes per warp per store)
 - 8-store unrolling (4 KB contiguous per warp per iteration)
@@ -118,81 +113,125 @@ Both kernels follow the NVLink optimization guidelines:
 
 See: `nvlink_peer_access_weight_transfer.md`, `nvlink_peer_access_kv_cache_transfer.md`
 
-### CUDA IPC Without Context Overhead
+## CUDA IPC Without Context Overhead
 
-Cross-process NVLink stores require mapping peer GPU memory into the local process's address space. ParaS uses `cudaIpcOpenMemHandle` with the lazy peer access flag — this maps the memory without creating full CUDA contexts on peer GPUs.
+Cross-process NVLink stores require mapping peer GPU memory into the local address space. ParaS uses `cudaIpcOpenMemHandle` with the lazy peer access flag — no full CUDA contexts on peer GPUs.
 
-**Critical finding**: The commonly used `cudaDeviceEnablePeerAccess()` creates ~416 MiB CUDA contexts per peer GPU (~2.9 GB total on 8 GPUs). The lazy IPC flag alone is sufficient for NVLink stores. DeepEP uses the same approach. Removing `cudaDeviceEnablePeerAccess` saved ~2.9 GB per GPU with zero performance impact.
+**Critical finding**: `cudaDeviceEnablePeerAccess()` creates ~416 MiB contexts per peer GPU (~2.9 GB total on 8 GPUs). The lazy IPC flag alone is sufficient. Savings: ~2.9 GB per GPU.
 
 See: `exploration_notes_kv_cache_peer_access.md` §2
 
-### NCCL Fallback Path
+## NCCL Fallback Path
 
-The NCCL path provides a portable fallback when NVLink peer access is unavailable:
+### EP→TP
 
 **Weight transfer**: `all_to_all_single` with optional pipelining (overlap method).
 
 **KV cache transfer**: `gather_kv_and_permute` → `repeat_interleave` (for head replication) → `all_to_all_single` → `permute_and_scatter_kv`.
 
-The permutation outputs `[heads, tokens, KV, dim]` so that each head chunk is token-interleaved. After all_to_all splits by head and concatenates chunks from all senders, the result is `[total_tokens, KV, heads, dim]` — directly compatible with the scatter function.
+### TP→EP
 
-For head replication (`num_kv_heads < tp_size`), `repeat_interleave` expands heads to `tp_size` virtual heads before all_to_all. This was chosen over a sub-head split + intra-group all_gather approach for simplicity, since the NCCL path is a fallback and replication factors > 2 are rare in practice.
+**Weight transfer**: Reverse all-to-all (inverse permute + `all_to_all_single`), layers in reverse order.
 
-### Switch Timeline (Qwen3-30B-A3B, 4×A100)
+**KV cache scatter**: A single unified code path handles both R=1 and R>1. With head replication, each subgroup member sends a disjoint 1/R token slice. On the receive side, contiguous subgroup chunks naturally concatenate via reshape — the only conditional is:
+```python
+reassembly_groups = group_size if heads_per_rank > 1 else num_kv_heads
+```
 
-| Phase | Time | Method |
-|-------|------|--------|
-| Request gathering + metadata exchange | ~5 ms | NCCL all_gather |
-| KV cache transfer | ~34 ms | peer_access |
-| Weight transfer | ~61 ms | peer_access |
-| Attention reconfiguration | ~20 ms | Local (QKV slice, backend update) |
-| **Total** | **~120 ms** | |
+For head replication in EP→TP, `repeat_interleave` inflates before send. For TP→EP, 1/R slicing deflates before send. Both maintain uniform per-subgroup totals.
 
-The switch is transparent to clients — in-flight requests continue generating after the switch with correctly transferred KV cache. No requests are dropped.
+## Request Partitioning (TP→EP only)
+
+In TP mode, all ranks hold the identical request set. For EP mode, this must be partitioned into disjoint subsets — balanced so no GPU is overloaded:
+
+```python
+def partition_requests_for_ep(global_reqs, num_ranks, strategy="greedy"):
+    sorted_reqs = sorted(global_reqs, key=lambda r: (-r.seqlen, r.rid))
+    partitions = [[] for _ in range(num_ranks)]
+    counts = [0] * num_ranks
+    tokens = [0] * num_ranks
+    for req in sorted_reqs:
+        best = min(range(num_ranks), key=lambda i: (counts[i], tokens[i], i))
+        partitions[best].append(req)
+        counts[best] += 1
+        tokens[best] += req.seqlen
+    return partitions
+```
+
+Primary balance: equal request count. Secondary: equal token count. Tertiary: lowest rank index. Wrapped in a strategy registry for extensibility.
+
+## Control Plane
+
+Both switches are triggered via HTTP:
+
+```bash
+curl http://localhost:30000/paras_configure_tp   # EP→TP
+curl http://localhost:30000/paras_configure_ep   # TP→EP
+```
+
+The request propagates: HTTP → TokenizerManager (adjusts fan_out) → DataParallelController (switches worker list) → Scheduler rank 0 (broadcasts via `tp_cpu_group`) → ALL ranks execute the switch with NCCL collectives → responses sent back via restored sockets.
+
+No changes to tokenizer or detokenizer code are needed.
+
+## Round-Trip Support (EP→TP→EP→TP...)
+
+Unlimited round-trips are supported without explicit state caching:
+
+| Component | Why it works |
+|-----------|-------------|
+| **Weight aliases** | `ep_experts` → slot[i+1] and `tp_experts` → slot[i] are permanent. Each direction reconstructs its target slots from the source. |
+| **KV aliases** | Same principle: `kv.ep` → slot[i+1], `kv.tp` → slot[i]. |
+| **Communication groups** | Created at init (PARAS_TP, PARAS_DP, PARAS_EP), never destroyed. |
+| **Dual LayerCommunicator** | EP and TP communicator objects co-exist. The switch swaps which one is active. |
+| **QKV weights** | Full (EP) and sharded (TP) weight views are permanent. |
+
+## Verified Performance (Qwen3-30B-A3B, 4×A100)
+
+### Switch Timings
+
+| Phase | EP→TP | TP→EP |
+|-------|-------|-------|
+| Request gather/partition | 16ms | <1ms |
+| Cache reorchestrate | 2ms | 1ms |
+| KV cache transfer | 46ms | 3ms (empty batch) |
+| Weight transfer (peer_access) | 78ms | 70ms |
+| Attention + config | 20ms | 11ms |
+| **Total** | **163ms** | **88ms** |
+
+### E2E Coherence (Qwen3-30B-A3B)
+
+| Test | Result |
+|------|--------|
+| EP request → EP→TP → TP request (same prompt) | ✅ Identical output |
+| TP request → TP→EP → EP request (same prompt) | ✅ Identical output |
+| In-flight requests during TP→EP switch | ✅ Coherent completion |
+| Full round-trip EP→TP→EP | ✅ Identical to original EP |
+
+### Unit Tests (27 total, all pass)
+
+| Suite | Tests | Verified Against |
+|-------|-------|-----------------|
+| Request partition (CPU) | 11 | Deterministic algorithm properties |
+| KV cache R=1 (NCCL + peer_access) | 5 | Pattern ground truth |
+| KV cache R=2 (NCCL + peer_access) | 5 | Pattern ground truth |
+| Weight transfer (NCCL + peer_access) | 6 | Independent shard computation + original EP snapshot |
 
 ## Design Documents
 
 | Document | Contents |
 |----------|----------|
 | `unified_memory_manager.md` | Contiguous buffer allocation, N+1 slot design, alias system, KV cache integration |
-| `nvlink_peer_access_weight_transfer.md` | w13/w2 CUDA kernels (EP→TP + TP→EP reverse), data flow, theoretical analysis |
+| `nvlink_peer_access_weight_transfer.md` | w13/w2 CUDA kernels (EP→TP + TP→EP reverse), data flow, performance comparison |
 | `nvlink_peer_access_kv_cache_transfer.md` | Fused K+V kernel (EP→TP + TP→EP scatter), head replication, NCCL fallback |
 | `nvlink_peer_access_guielines.md` | NVLink store optimization guidelines (grid config, vectorization, alignment) |
 | `exploration_notes_kv_cache_peer_access.md` | Development notes: bugs found, CUDA IPC analysis, design tradeoffs |
-| `tp_to_ep_switch.md` | TP→EP reverse switch: request partition, KV scatter, weight restoration, control plane |
-
-## TP→EP Reverse Switch
-
-The reverse switch (TP→EP) is now implemented, enabling full round-trip switching (EP→TP→EP→TP...).
-
-### Key Design Decisions
-
-1. **Weight transfer is mandatory, not a pointer swap**: The N+1 slot design means EP→TP overwrites EP weight slots (slot[i+1] becomes layer i+1's TP destination). After EP→TP, the original EP weights are destroyed. TP→EP must perform an actual reverse weight transfer (NCCL all-to-all or peer_access kernels) in reverse layer order (N-1→0).
-
-2. **KV cache scatter**: The inverse of EP→TP gather. Each TP rank sends its head's token data to the EP ranks that will own those tokens. With head replication (`num_kv_heads < tp_size`), subgroup members split the token load — each sends a disjoint 1/R slice, cutting NVLink traffic by R.
-
-3. **Request distribution**: Requests are partitioned across EP ranks using a greedy algorithm (balanced by request count first, then total tokens). All ranks compute the identical partition deterministically.
-
-### Trigger
-
-```bash
-curl http://localhost:30000/paras_configure_ep
-```
-
-### Switch Timeline (Qwen3-30B-A3B, 4×A100, empty batch)
-
-| Phase | Time (peer_access) |
-|-------|--------------------|
-| Request partition + pool resize | ~1 ms |
-| KV cache scatter (0 tokens) | ~3 ms |
-| Weight transfer (reverse peer_access) | ~70 ms |
-| Attention reconfiguration | ~11 ms |
-| **Total** | **~88 ms** |
 
 ## Limitations and Future Work
 
-1. **Head replication e2e**: When `num_kv_heads < tp_size` (e.g., 4 heads / 8 GPUs), the KV transfer works correctly (verified by unit test), but the attention layer's `paras_configure_tp()` asserts `tp_size <= num_kv_heads`. Extending the attention reconfiguration to support replicated heads is a separate effort.
+1. **Head replication e2e**: When `num_kv_heads < tp_size`, the KV and weight transfers work correctly, but the attention layer's `paras_configure_tp()` asserts `tp_size <= num_kv_heads`. Extending attention reconfiguration to support replicated heads is a separate effort.
 
-2. **Dynamic switching**: The current switch is triggered manually via `/paras_configure_tp` and `/paras_configure_ep`. An automatic policy that monitors batch size and switches when the crossover point is reached would enable fully adaptive serving.
+2. **`dp_size > 1`**: Currently only `paras_dp_size == 1` is supported.
 
-3. **FP8 support**: The kernel and memory manager support FP8 weights but FP8 KV cache is not yet wired through.
+3. **Dynamic switching**: Both directions are triggered manually via HTTP. An automatic policy that monitors batch size and switches at the crossover point would enable fully adaptive serving.
+
+4. **FP8 support**: Kernels and memory manager support FP8 weights but FP8 KV cache is not yet wired through.
