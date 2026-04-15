@@ -537,6 +537,7 @@ class ParaSReqScatterManager:
                     dst_v_offsets[layer_idx],
                     num_my_tokens,
                     heads_per_rank,
+                    num_kv_heads,
                     self.paras_tp_rank,
                     self.paras_tp_size,
                     head_dim,

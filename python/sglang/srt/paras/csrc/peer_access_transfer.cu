@@ -636,6 +636,7 @@ __global__ void peer_access_kv_scatter(
     int64_t dst_v_offset,
     int num_local_tokens,
     int heads_per_rank,
+    int num_kv_heads,
     int tp_rank,
     int tp_size,
     int head_dim,
@@ -662,10 +663,11 @@ __global__ void peer_access_kv_scatter(
     // Source stride (TP layout: heads_per_rank heads per token)
     const int src_token_stride = heads_per_rank * head_dim * elem_size;
 
-    // Destination stride (EP layout: num_kv_heads = heads_per_rank * tp_size)
-    const int dst_token_stride = heads_per_rank * tp_size * head_dim * elem_size;
-    // This rank's TP heads map to EP head range [tp_rank*heads_per_rank, ...)
-    const int dst_head_base = tp_rank * heads_per_rank * head_dim * elem_size;
+    // Destination stride (EP layout: num_kv_heads heads per token)
+    const int dst_token_stride = num_kv_heads * head_dim * elem_size;
+    // This rank's TP heads map to EP head index tp_rank * num_kv_heads / tp_size
+    const int dst_head_idx = tp_rank * num_kv_heads / tp_size;
+    const int dst_head_base = dst_head_idx * head_dim * elem_size;
 
     const int head_stride = head_dim * elem_size;
 
@@ -733,6 +735,7 @@ void launch_peer_access_kv_scatter(
     int64_t dst_v_offset,
     int num_local_tokens,
     int heads_per_rank,
+    int num_kv_heads,
     int tp_rank,
     int tp_size,
     int head_dim,
@@ -755,7 +758,7 @@ void launch_peer_access_kv_scatter(
         ep_dst_positions,
         src_k_offset, src_v_offset,
         dst_k_offset, dst_v_offset,
-        num_local_tokens, heads_per_rank,
+        num_local_tokens, heads_per_rank, num_kv_heads,
         tp_rank, tp_size, head_dim, elem_size
     );
 
