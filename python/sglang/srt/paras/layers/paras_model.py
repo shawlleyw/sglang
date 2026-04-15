@@ -21,6 +21,8 @@ After the switch completes, paras_configure_helper() is called by @paras_func to
 synchronize CUDA.
 """
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -111,8 +113,45 @@ class ParaSModelMixin:
         else:
             self.paras_configure_tp_naive(paras_tp_size, paras_tp_rank)
 
-    @paras_func
-    def paras_configure_ep(self):
-        """Configure all layers back to EP mode."""
-        for layer in self.layers:
+    def paras_configure_ep_naive(self):
+        """Sequential TP→EP: reverse weight transfer + attn/communicator restore.
+
+        Single pass in reverse layer order, mirroring paras_configure_tp_naive.
+        """
+        for layer in reversed(self.layers):
+            layer.paras_configure_ep_attn()
+            layer.paras_configure_ep_mlp_naive()
             layer.paras_configure_ep()
+
+    def paras_configure_ep_peer_access(self):
+        """TP→EP via peer access kernels (reverse layer order) + attn/communicator restore."""
+        mgr = get_global_paras_memory_manager()
+
+        if not hasattr(self, '_peer_access_ctx') or self._peer_access_ctx is None:
+            tp_group_tmp = get_paras_tp_group().device_group
+            tp_size_tmp = get_paras_tp_size()
+            self._peer_access_ctx = init_peer_access(mgr, tp_group_tmp, tp_size_tmp)
+
+        peer_ctx = self._peer_access_ctx
+        dst_base_ptrs = torch.tensor(
+            peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+        )
+
+        paras_tp_group = get_paras_tp_group().device_group
+        barrier_tensor = torch.zeros(1, device="cuda")
+
+        for layer in reversed(self.layers):
+            layer.paras_configure_ep_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
+            dist.all_reduce(barrier_tensor, group=paras_tp_group)
+            layer.paras_configure_ep_attn()
+            layer.paras_configure_ep()
+
+    @paras_func
+    def paras_configure_ep(self, method: str = None):
+        """Configure all layers back to EP mode."""
+        if method is None:
+            method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
+        if method == "peer_access":
+            self.paras_configure_ep_peer_access()
+        else:
+            self.paras_configure_ep_naive()

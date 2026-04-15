@@ -360,3 +360,28 @@ The v2 kernel time (9 ms) is well below the NVLink-bound theoretical minimum (69
 4. **L2 cache prefetch**: Use `__prefetch_l2()` hints to pre-load the next chunk's source data while the current chunk's NVLink writes are in flight.
 
 5. **Adaptive grid sizing**: Instead of fixed `num_SMs × tp_size`, dynamically compute grid size based on total data volume and per-SM NVLink bandwidth target.
+
+## TP→EP Reverse Weight Transfer
+
+The reverse kernels (`peer_access_fused_transfer_w13_ep`, `peer_access_fused_transfer_w2_ep`) are structural mirrors of the EP→TP v2 kernels with swapped source/destination:
+
+| Aspect | EP→TP (v2) | TP→EP (ep) |
+|--------|-----------|-----------|
+| Source | Local EP slot[i+1], strided layout | Local TP slot[i], contiguous layout |
+| Destination | Peer TP slot[i], contiguous layout | Peer EP slot[i+1], strided layout |
+| Layer order | Forward (0→N-1) | **Reverse** (N-1→0) |
+
+### Why Reverse Weight Transfer is Mandatory
+
+The N+1 slot design means EP→TP **destroys EP weight slots**: when layer `i+1`'s EP→TP processes, it writes TP data to slot[i+1], which IS layer `i`'s EP slot. After EP→TP completes, slots 1..N-1 contain TP data, not the original EP weights. A pointer swap back to `ep_experts` would return stale/wrong data.
+
+Therefore, TP→EP must perform an actual reverse transfer: read from TP slots (which contain correct TP data written during EP→TP), reconstruct EP layout via inverse permute, and write to EP slots.
+
+### Performance
+
+The reverse kernels use identical NVLink optimizations (warp-level peer assignment, int4 stores, 8-unrolling, `__ldg`, self-write bypass, uint32 fast division) and achieve comparable performance:
+
+| Direction | Weight kernel time (48 layers, 4×A100) |
+|-----------|---------------------------------------|
+| EP→TP (v2) | ~78 ms |
+| TP→EP (ep) | ~70 ms |

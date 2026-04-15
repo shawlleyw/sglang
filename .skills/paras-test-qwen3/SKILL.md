@@ -146,14 +146,90 @@ curl -s --max-time 60 http://localhost:30000/v1/completions \
 
 **Critical check**: All responses must be coherent multi-token text with no degeneration (e.g., repeated `\xa0`, blank spaces, or topic drift). Degeneration after the first token = stale FlashInfer attention backend state.
 
-### 9. Verify no errors
+### 9. Trigger ParaS TP→EP switch (round-trip)
+
+```bash
+curl -s --max-time 60 http://localhost:30000/paras_configure_ep
+# Expected: "ParaS EP parallelism configured."
+```
+
+### 10. Send requests in EP mode (after round-trip)
+
+```bash
+curl -s --max-time 60 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen3-30B-A3B","prompt":"Write a Python function that implements binary search on a sorted list, with docstring and edge case handling.","max_tokens":200,"temperature":0}' \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP-RT P1]', d['choices'][0]['text'][:300])"
+```
+
+**Expected**: Coherent output, same quality as original EP mode. May have minor wording differences due to BF16 precision.
+
+### 11. Test KV cache coherence: in-flight EP→TP switch
+
+Server is in EP mode after step 10. Requests started in EP must survive the switch to TP.
+
+```bash
+# Start requests in EP mode (background)
+curl -s --max-time 120 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen3-30B-A3B","prompt":"Explain how a hash table works, including collision resolution strategies like chaining and open addressing.","max_tokens":500,"temperature":0}' > /tmp/r1.json &
+PID1=$!
+
+curl -s --max-time 120 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen3-30B-A3B","prompt":"Describe the process of photosynthesis in plants, including the light-dependent and light-independent reactions.","max_tokens":500,"temperature":0}' > /tmp/r2.json &
+PID2=$!
+
+sleep 4
+
+# Switch EP→TP mid-generation
+curl -s --max-time 60 http://localhost:30000/paras_configure_tp
+
+wait $PID1 $PID2
+
+python3 -c "import json; d=json.load(open('/tmp/r1.json')); print('[EP→TP R1]', d['choices'][0]['text'][:300])"
+python3 -c "import json; d=json.load(open('/tmp/r2.json')); print('[EP→TP R2]', d['choices'][0]['text'][:300])"
+```
+
+**Expected**: Both outputs are coherent. R1 should discuss hash functions, collision resolution. R2 should discuss light reactions, Calvin cycle, chloroplasts.
+
+### 12. Test KV cache coherence: in-flight TP→EP switch
+
+Server is in TP mode after step 11. Requests started in TP must survive the switch to EP.
+
+```bash
+# Start requests in TP mode (background)
+curl -s --max-time 120 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen3-30B-A3B","prompt":"List the first 10 prime numbers and explain why each is prime.","max_tokens":500,"temperature":0}' > /tmp/r3.json &
+PID3=$!
+
+curl -s --max-time 120 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen3-30B-A3B","prompt":"Write a recursive Fibonacci function in Python with memoization.","max_tokens":500,"temperature":0}' > /tmp/r4.json &
+PID4=$!
+
+sleep 4
+
+# Switch TP→EP mid-generation
+curl -s --max-time 60 http://localhost:30000/paras_configure_ep
+
+wait $PID3 $PID4
+
+python3 -c "import json; d=json.load(open('/tmp/r3.json')); print('[TP→EP R3]', d['choices'][0]['text'][:300])"
+python3 -c "import json; d=json.load(open('/tmp/r4.json')); print('[TP→EP R4]', d['choices'][0]['text'][:300])"
+```
+
+**Expected**: Both outputs are coherent multi-sentence text. No degeneration, no garbage, no repeated tokens.
+
+### 13. Verify no errors
 
 ```bash
 grep -i "error\|exception" /tmp/sglang_paras_test.log | grep -v "import error\|Config file\|opentelemetry\|WARNING"
 # Expected: empty
 ```
 
-### 10. Cleanup
+### 14. Cleanup
 
 ```bash
 pkill -9 -f "sglang" 2>/dev/null
@@ -166,17 +242,18 @@ rm -f /tmp/sglang_paras_test.log
 |-------|------|------|
 | Model type | `Qwen3MoeForCausalLMParaS` | `Qwen3MoeForCausalLM` |
 | EP requests (3 prompts) | All coherent, 150-200 tokens | Error, timeout, or garbage |
-| ParaS switch | Returns in < 1s | Timeout or OOM |
-| `transfer_weights` | < 300ms | > 1000ms (profiler may be on) |
-| TP P1 (binary search) | Coherent Python reasoning | Garbage, `\xa0`, or repetition |
-| TP P2 (train problem) | Correct approach (140mph combined) | Wrong math or degeneration |
-| TP P3 (TCP vs UDP) | Coherent, covers handshake + reliability | Degeneration after first sentence |
+| EP→TP switch | Returns in < 300ms | Timeout or OOM |
+| TP requests (3 prompts) | Coherent, same quality as EP | Garbage, `\xa0`, or repetition |
+| TP→EP switch | Returns in < 300ms | Timeout or error |
+| EP requests after round-trip | **Identical** to original EP output | Different output or garbage |
+| In-flight EP→TP coherence | Both requests coherent after switch | Degeneration or crash |
+| In-flight TP→EP coherence | Both requests coherent after switch | Degeneration or crash |
 | Server errors | None | Any scheduler/runtime exception |
 
 ## Important Notes
 
 - **mem-fraction-static=0.75 will OOM** during weight redistribution on A100-80GB. Use 0.6.
-- **ParaS configure is one-way** (EP→TP only). Once configured, you cannot call `/paras_configure_tp` again. Restart the server for a new test.
+- **ParaS configure supports round-trip** (EP→TP→EP→TP...). Use `/paras_configure_tp` and `/paras_configure_ep` endpoints. For the naive weight transfer method, set `PARAS_CONFIGURE_METHOD=naive` (default is `peer_access`).
 - **Overlap mode**: To test overlapped conversion, modify `paras/models/qwen3_moe.py` to pass `overlap=True` to `self.model.paras_configure_tp(...)`.
 - **Slow timing (~3s instead of ~100ms)**: Likely GPU in bad state from prior OOM. Kill all processes, wait 5 seconds, retry on clean GPU.
 - **Profiler overhead**: If `transfer_weights` > 500ms, check that `paras_start_profile`/`paras_stop_profile` are not called in `scheduler_paras_mixin.py` and `paras_memory_check` is not called in `model_runner.py`.

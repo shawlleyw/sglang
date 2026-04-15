@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
+
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -941,94 +942,53 @@ class MHATokenToKVPool(KVCache):
         )
         self.size = self.k_buffer[0].shape[0] - self.page_size
 
-    def paras_resize_cache(self, layer_id: int, new_size: int, new_head_num: int):
-        """
-        Resize KV cache for one layer during EP→TP switch.
-        
-        If a ParaS memory manager is active, uses the pre-allocated managed TP view
-        instead of torch.empty. This avoids an unmanaged allocation and keeps all
-        KV data within the contiguous managed buffer.
-        
-        The TP view has shape (tp_max_tokens + page_size, tp_heads, head_dim) which
-        is exactly what gather_cache writes TP data into.
+    @paras_func
+    def paras_configure_tp(self, paras_tp_size: int):
+        """Switch all KV cache buffers from EP to TP layout.
+
+        Points each layer's k/v_buffer at TP aliases (slot[i]) from the
+        memory manager and updates head_num.  Called once after gather_cache
+        finishes writing TP data.  ``@paras_func`` triggers
+        ``paras_configure_helper`` to rebuild derived state (data_ptrs, etc.).
         """
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+        self.full_head_num = self.head_num
+        sharded_head_num = self.head_num // paras_tp_size
+        self.head_num = sharded_head_num
+
         mgr = get_global_paras_memory_manager()
-        
-        local_layer_idx = layer_id - self.start_layer
-        
-        if mgr is not None and mgr.materialized and mgr._kv_reserved:
-            # Check for N+1 TP alias (preferred — direct view, no shape reinterpretation needed)
+        for i in range(self.layer_num):
+            layer_id = i + self.start_layer
             tp_k_name = f"model.layers.{layer_id}.kv.tp.k"
             tp_v_name = f"model.layers.{layer_id}.kv.tp.v"
-            if tp_k_name in mgr._entries:
-                # N+1 slot design: TP alias already has the right shape from slot[i]
-                # Reinterpret as TP shape using same get_view_as logic
-                total_elements = mgr._entries[tp_k_name].numel
-                tp_slots = total_elements // (new_head_num * self.head_dim)
-                tp_shape = (tp_slots, new_head_num, self.head_dim)
-                self.k_buffer[local_layer_idx] = mgr.get_view_as(tp_k_name, tp_shape)
-                self.v_buffer[local_layer_idx] = mgr.get_view_as(tp_v_name, tp_shape)
-                return
-
-            # Use the pre-allocated managed TP view (legacy EP-only path)
-            # The manager's TP view shape: (tp_max_tokens + page_size, tp_heads, head_dim)
-            # where tp_heads = new_head_num and tp_max_tokens = new_size
-            k_name = f"model.layers.{layer_id}.kv.k"
-            v_name = f"model.layers.{layer_id}.kv.v"
-            if k_name in mgr._entries and v_name in mgr._entries:
-                # The KV entry was reserved in EP shape. Reinterpret as TP shape.
-                # Compute TP slots from actual buffer element count to ensure byte alignment.
-                # EP reserved: (ep_tokens + page_size, ep_heads, head_dim)
-                # TP view:     (tp_slots, tp_heads, head_dim) where tp_slots fills the buffer
-                total_elements = mgr._entries[k_name].numel
-                tp_slots = total_elements // (new_head_num * self.head_dim)
-                tp_shape = (tp_slots, new_head_num, self.head_dim)
-                self.k_buffer[local_layer_idx] = mgr.get_view_as(k_name, tp_shape)
-                self.v_buffer[local_layer_idx] = mgr.get_view_as(v_name, tp_shape)
-                return
-        
-        # Fallback: allocate unmanaged buffer (non-ParaS or manager not ready)
-        self.k_buffer[local_layer_idx] = torch.empty(
-            new_size + self.page_size,
-            new_head_num,
-            self.head_dim,
-            dtype=self.store_dtype,
-            device=self.device,
-        )
-        self.v_buffer[local_layer_idx] = torch.empty(
-            new_size + self.page_size,
-            new_head_num,
-            self.head_dim,
-            dtype=self.store_dtype,
-            device=self.device,
-        )
-
-    @paras_func
-    def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
-        # ParaS: Reshape kv cache from EP to TP.
-        # TODO: change the size of kv cache pool
-        # It does not intrusively change the number of heads, just increases the number of slots by reshaping kv cache.
-        sharded_head_num = self.head_num // paras_tp_size
-        for i in range(self.layer_num):
-            self.k_buffer[i] = self.k_buffer[i].view(
-                (-1, sharded_head_num, self.head_dim)
-            )
-            self.v_buffer[i] = self.v_buffer[i].view(
-                (-1, sharded_head_num, self.head_dim)
-            )
-        self.head_num = sharded_head_num
+            total_elements = mgr._entries[tp_k_name].numel
+            tp_slots = total_elements // (sharded_head_num * self.head_dim)
+            tp_shape = (tp_slots, sharded_head_num, self.head_dim)
+            self.k_buffer[i] = mgr.get_view_as(tp_k_name, tp_shape)
+            self.v_buffer[i] = mgr.get_view_as(tp_v_name, tp_shape)
 
     @paras_func
     def paras_configure_ep(self):
-        # ParaS: Reshape kv cache from TP to EP.
+        """Switch all KV cache buffers from TP to EP layout.
+
+        Points each layer's k/v_buffer at EP aliases (slot[i+1]) from the
+        memory manager and restores head_num.  Called once after scatter_cache
+        finishes writing EP data.  ``@paras_func`` triggers
+        ``paras_configure_helper`` to rebuild derived state (data_ptrs, etc.).
+        """
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+        self.head_num = self.full_head_num
+
+        mgr = get_global_paras_memory_manager()
         for i in range(self.layer_num):
-            self.k_buffer[i] = self.k_buffer[i].view(
-                (-1, self.head_num, self.head_dim)
-            )
-            self.v_buffer[i] = self.v_buffer[i].view(
-                (-1, self.head_num, self.head_dim)
-            )
+            layer_id = i + self.start_layer
+            ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
+            ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
+            total_elements = mgr._entries[ep_k_name].numel
+            ep_slots = total_elements // (self.head_num * self.head_dim)
+            ep_shape = (ep_slots, self.head_num, self.head_dim)
+            self.k_buffer[i] = mgr.get_view_as(ep_k_name, ep_shape)
+            self.v_buffer[i] = mgr.get_view_as(ep_v_name, ep_shape)
 
     def paras_get_num_kv_slots(self):
         # ParaS: Get the number of kv slots in each layer.

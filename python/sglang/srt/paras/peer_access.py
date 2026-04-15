@@ -207,6 +207,67 @@ def peer_access_fused_transfer_w2_v2(
     )
 
 
+def peer_access_fused_transfer_w13_ep(
+    local_buffer_ptr: int,
+    peer_base_ptrs_tensor: torch.Tensor,
+    src_tp_offset: int,
+    dst_ep_offset: int,
+    tp_rank: int,
+    tp_size: int,
+    num_local_experts: int,
+    intermediate_per_tp_times_hidden: int,
+    num_gates: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    import paras_peer_access_cuda
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    paras_peer_access_cuda.launch_peer_access_fused_transfer_w13_ep(
+        local_buffer_ptr,
+        peer_base_ptrs_tensor,
+        src_tp_offset,
+        dst_ep_offset,
+        tp_rank,
+        tp_size,
+        num_local_experts,
+        intermediate_per_tp_times_hidden,
+        num_gates,
+        elem_size,
+        stream_ptr,
+    )
+
+
+def peer_access_fused_transfer_w2_ep(
+    local_buffer_ptr: int,
+    peer_base_ptrs_tensor: torch.Tensor,
+    src_tp_offset: int,
+    dst_ep_offset: int,
+    tp_rank: int,
+    tp_size: int,
+    num_local_experts: int,
+    hidden_size: int,
+    full_intermediate: int,
+    tp_intermediate: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    import paras_peer_access_cuda
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    paras_peer_access_cuda.launch_peer_access_fused_transfer_w2_ep(
+        local_buffer_ptr,
+        peer_base_ptrs_tensor,
+        src_tp_offset,
+        dst_ep_offset,
+        tp_rank,
+        tp_size,
+        num_local_experts,
+        hidden_size,
+        full_intermediate * elem_size,
+        tp_intermediate * elem_size,
+        stream_ptr,
+    )
+
+
 def peer_access_kv_transfer(
     local_buffer_ptr: int,
     dst_base_ptrs_tensor: torch.Tensor,
@@ -243,6 +304,91 @@ def peer_access_kv_transfer(
         elem_size,
         stream_ptr,
     )
+
+
+def peer_access_kv_scatter(
+    local_buffer_ptr: int,
+    peer_buffer_ptrs_tensor: torch.Tensor,
+    tp_token_positions: torch.Tensor,
+    token_to_rank: torch.Tensor,
+    ep_dst_positions: torch.Tensor,
+    src_k_offsets: List[int],
+    src_v_offsets: List[int],
+    dst_k_offsets: List[int],
+    dst_v_offsets: List[int],
+    num_local_tokens: int,
+    heads_per_rank: int,
+    tp_rank: int,
+    tp_size: int,
+    head_dim: int,
+    tp_group,
+    num_layers: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    """Scatter local TP KV cache to peer EP KV buffers via NVLink for all layers.
+
+    This is the reverse of peer_access_kv_transfer (EP→TP). Each local TP token
+    is sent to exactly one EP rank determined by token_to_rank[t].
+
+    Layers are processed in REVERSE order (N-1 to 0) with a dist.all_reduce
+    barrier after each layer. This ensures that layer i's read from TP slot[i]
+    completes before layer (i-1)'s write to EP slot[i] (N+1 slot design).
+
+    Data flow per token t:
+      Source:  local TP buffer at tp_token_positions[t], heads [0, heads_per_rank)
+      Dest:   rank token_to_rank[t]'s EP buffer at ep_dst_positions[t],
+              heads [tp_rank*heads_per_rank, (tp_rank+1)*heads_per_rank)
+
+    Args:
+        local_buffer_ptr: Base address of local managed buffer.
+        peer_buffer_ptrs_tensor: GPU tensor of int64 base addresses for each
+            rank's managed buffer (from IPC exchange).
+        tp_token_positions: GPU int32 tensor [num_local_tokens] — TP pool
+            indices for each local token (source positions).
+        token_to_rank: GPU int32 tensor [num_local_tokens] — destination EP
+            rank for each local token.
+        ep_dst_positions: GPU int32 tensor [num_local_tokens] — EP pool
+            position on the destination rank for each token.
+        src_k_offsets: Per-layer byte offsets to TP K within local buffer.
+        src_v_offsets: Per-layer byte offsets to TP V within local buffer.
+        dst_k_offsets: Per-layer byte offsets to EP K within peer buffers.
+        dst_v_offsets: Per-layer byte offsets to EP V within peer buffers.
+        num_local_tokens: Number of tokens on this rank.
+        heads_per_rank: Number of KV heads per TP rank (num_kv_heads // tp_size).
+        tp_rank: This rank's TP index.
+        tp_size: Total number of TP ranks.
+        head_dim: Dimension per KV head.
+        tp_group: TP process group for barrier synchronization.
+        num_layers: Number of model layers to scatter.
+        elem_size: Bytes per element (default 2 for bf16/fp16).
+        stream: Optional CUDA stream.
+    """
+    import paras_peer_access_cuda
+
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    barrier = torch.zeros(1, device="cuda")
+
+    for layer_idx in range(num_layers - 1, -1, -1):
+        paras_peer_access_cuda.launch_peer_access_kv_scatter(
+            local_buffer_ptr,
+            peer_buffer_ptrs_tensor,
+            tp_token_positions,
+            token_to_rank,
+            ep_dst_positions,
+            src_k_offsets[layer_idx],
+            src_v_offsets[layer_idx],
+            dst_k_offsets[layer_idx],
+            dst_v_offsets[layer_idx],
+            num_local_tokens,
+            heads_per_rank,
+            tp_rank,
+            tp_size,
+            head_dim,
+            elem_size,
+            stream_ptr,
+        )
+        dist.all_reduce(barrier, group=tp_group)
 
 
 

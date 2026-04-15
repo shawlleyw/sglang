@@ -232,15 +232,16 @@ class ParaSReqGatherManager:
             self._gather_cache_nccl()
 
     def _gather_cache_nccl(self):
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         torch.cuda.empty_cache()
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        assert isinstance(kv_cache, MHATokenToKVPool), "Only MHATokenToKVPool is supported for now."
+        mgr = get_global_paras_memory_manager()
         
         num_layers = kv_cache.layer_num
-        
         num_heads = kv_cache.head_num
         head_dim = kv_cache.head_dim
         sharded_num_heads = max(1, num_heads // self.group_size)
+        
         splited_size_per_token = sharded_num_heads * head_dim
         
         # When num_heads < group_size, heads must be replicated so that
@@ -256,16 +257,12 @@ class ParaSReqGatherManager:
         def gather_one_layer(layer_id: int) -> torch.Tensor:
 
             if self.num_local_tokens > 0:
+                # Read from EP buffers (current kv_cache state)
                 k_buffer = kv_cache.get_key_buffer(layer_id)
                 v_buffer = kv_cache.get_value_buffer(layer_id)
                 
-                # Fused gather and permute using Triton kernel
-                # Output layout: [num_heads, num_tokens, 2, head_dim] (token-interleaved per head)
                 permuted_local_kvcache = gather_kv_and_permute(k_buffer, v_buffer, self.local_token_indices)
                 
-                # Replicate heads for all_to_all when num_heads < group_size.
-                # E.g. 4 heads / 8 GPUs: repeat_interleave(2) expands [4,N,2,128] → [8,N,2,128]
-                # so virtual heads 0,1 are copies of real head 0 → sent to ranks 0,1 (replication).
                 if replication_factor > 1:
                     N = self.num_local_tokens
                     permuted_local_kvcache = (
@@ -277,20 +274,20 @@ class ParaSReqGatherManager:
             else:
                 permuted_local_kvcache = torch.empty((0, ), dtype=kv_cache.store_dtype, device=kv_cache.device)
                 
-            kv_cache.paras_resize_cache(layer_id, self.new_cache_size, sharded_num_heads)
-                
             if self.num_global_tokens > 0:
                 gathered_kvcache = torch.empty(2 * self.num_global_tokens * splited_size_per_token, dtype=permuted_local_kvcache.dtype, device=permuted_local_kvcache.device)
                 torch.distributed.all_to_all_single(gathered_kvcache, permuted_local_kvcache, output_split_sizes, input_split_sizes, group=self.gather_group.device_group)
                 
-                # Scatter into TP K/V buffers.
-                # gather_kv_and_permute outputs [heads, tokens, KV, dim], so after
-                # all_to_all the received data is [total_tokens, KV, sharded_heads, dim]
-                # which permute_and_scatter_kv handles directly.
-                k_buffer = kv_cache.get_key_buffer(layer_id)
-                v_buffer = kv_cache.get_value_buffer(layer_id)
+                # Write into TP buffers obtained directly from memory manager
+                tp_k_name = f"model.layers.{layer_id}.kv.tp.k"
+                tp_v_name = f"model.layers.{layer_id}.kv.tp.v"
+                total_elements = mgr._entries[tp_k_name].numel
+                tp_slots = total_elements // (sharded_num_heads * head_dim)
+                tp_shape = (tp_slots, sharded_num_heads, head_dim)
+                tp_k = mgr.get_view_as(tp_k_name, tp_shape)
+                tp_v = mgr.get_view_as(tp_v_name, tp_shape)
                 permute_and_scatter_kv(
-                    gathered_kvcache, k_buffer, v_buffer, self.global_token_indices,
+                    gathered_kvcache, tp_k, tp_v, self.global_token_indices,
                     self.num_global_tokens, sharded_num_heads, head_dim
                 )
                 
@@ -360,10 +357,6 @@ class ParaSReqGatherManager:
             dist.all_reduce(barrier_tensor, group=self.gather_group.device_group)
 
         torch.cuda.synchronize()
-
-        # Now resize cache buffers to point to TP slots
-        for layer_id in range(num_layers):
-            kv_cache.paras_resize_cache(layer_id, self.new_cache_size, sharded_num_heads)
 
     def get_new_running_batch(
         self,
@@ -480,3 +473,4 @@ class ParaSReqGatherManager:
             running_batch,
             model_config.vocab_size,
         )
+
