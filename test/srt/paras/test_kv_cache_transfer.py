@@ -8,12 +8,21 @@ Usage:
   torchrun --nproc_per_node=4 test/srt/paras/test_kv_cache_transfer.py --num-kv-heads 2  # replication
 """
 
+import ctypes
 import os
 import sys
+from typing import List
 
 import pytest
 import torch
 import torch.distributed as dist
+
+try:
+    import paras_peer_access_cuda
+
+    _HAS_PEER_ACCESS = True
+except ImportError:
+    _HAS_PEER_ACCESS = False
 
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.join(_TEST_DIR, "..", "..", "..")
@@ -82,12 +91,18 @@ def _ensure_distributed():
     return rank, world_size
 
 
+_CACHED_TP_GROUP = None
+
+
 def _setup_paras_state(rank, world_size):
     """Set ParaS parallel state globals without full sglang server init."""
     import sglang.srt.distributed.parallel_state as ps
     import sglang.srt.paras.paras_parallel_state as pps
 
-    tp_group = dist.new_group(ranks=list(range(world_size)))
+    global _CACHED_TP_GROUP
+    if _CACHED_TP_GROUP is None:
+        _CACHED_TP_GROUP = dist.new_group(ranks=list(range(world_size)))
+    tp_group = _CACHED_TP_GROUP
     tp_coord = _SimpleGroupCoordinator(
         tp_group, world_size, f"cuda:{rank}", rank_in_group=rank
     )
@@ -106,9 +121,105 @@ def _setup_paras_state(rank, world_size):
     return tp_group
 
 
+_OPEN_IPC_PTRS: list = []
+
+
+def _close_old_ipc_handles():
+    _cudart = ctypes.CDLL("libcudart.so")
+    _cudart.cudaIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
+    _cudart.cudaIpcCloseMemHandle.restype = ctypes.c_int
+    for ptr in _OPEN_IPC_PTRS:
+        _cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr))
+    _OPEN_IPC_PTRS.clear()
+
+
+def setup_peer_ctx(mgr, rank, world_size, tp_group):
+    """Enable peer access and exchange CUDA IPC handles."""
+    from sglang.srt.paras.peer_access import PeerAccessContext
+
+    _close_old_ipc_handles()
+
+    _cudart = ctypes.CDLL("libcudart.so")
+
+    # --- ctypes types for CUDA IPC ---
+    IPC_HANDLE_SIZE = 64
+
+    class CudaIpcMemHandle(ctypes.Structure):
+        _fields_ = [("reserved", ctypes.c_ubyte * IPC_HANDLE_SIZE)]
+
+    _cudart.cudaIpcGetMemHandle.argtypes = [
+        ctypes.POINTER(CudaIpcMemHandle),
+        ctypes.c_void_p,
+    ]
+    _cudart.cudaIpcGetMemHandle.restype = ctypes.c_int
+    _cudart.cudaIpcOpenMemHandle.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        CudaIpcMemHandle,
+        ctypes.c_uint,
+    ]
+    _cudart.cudaIpcOpenMemHandle.restype = ctypes.c_int
+
+    # 1. Get IPC handle for local buffer
+    local_handle = CudaIpcMemHandle()
+    ret = _cudart.cudaIpcGetMemHandle(
+        ctypes.byref(local_handle), ctypes.c_void_p(mgr._buffer.data_ptr())
+    )
+    assert ret == 0, f"cudaIpcGetMemHandle failed (cuda error {ret})"
+
+    # 2. Exchange handles via all_gather (64 bytes per rank)
+    handle_tensor = torch.tensor(
+        list(local_handle.reserved), dtype=torch.uint8, device=f"cuda:{rank}"
+    )
+    assert handle_tensor.numel() == IPC_HANDLE_SIZE
+    all_handles = torch.zeros(
+        world_size * IPC_HANDLE_SIZE, dtype=torch.uint8, device=f"cuda:{rank}"
+    )
+    dist.all_gather_into_tensor(all_handles, handle_tensor, group=tp_group)
+
+    # 3. Open remote handles to get local-address mappings
+    peer_addresses = []
+    for r in range(world_size):
+        if r == rank:
+            peer_addresses.append(mgr._buffer.data_ptr())
+        else:
+            raw_list = (
+                all_handles[r * IPC_HANDLE_SIZE : (r + 1) * IPC_HANDLE_SIZE]
+                .cpu()
+                .tolist()
+            )
+            remote_handle = CudaIpcMemHandle()
+            for idx, val in enumerate(raw_list):
+                remote_handle.reserved[idx] = val
+            remote_ptr = ctypes.c_void_p()
+            ret = _cudart.cudaIpcOpenMemHandle(
+                ctypes.byref(remote_ptr),
+                remote_handle,
+                1,  # cudaIpcMemLazyEnablePeerAccess
+            )
+            assert ret == 0, (
+                f"cudaIpcOpenMemHandle for rank {r} failed (cuda error {ret})"
+            )
+            peer_addresses.append(remote_ptr.value)
+            _OPEN_IPC_PTRS.append(remote_ptr.value)
+
+    return PeerAccessContext(
+        peer_addresses=peer_addresses,
+        peer_access_enabled=True,
+        tp_group=tp_group,
+        tp_size=world_size,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Memory manager setup
 # ---------------------------------------------------------------------------
+
+def cleanup_global_manager():
+    from sglang.srt.paras.paras_memory_manager import set_global_paras_memory_manager
+    set_global_paras_memory_manager(None)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
 
 def setup_memory_manager(rank, world_size, num_kv_heads, tokens_per_rank):
     """Create ParaSMemoryManager with N+1 KV slots.
@@ -120,6 +231,7 @@ def setup_memory_manager(rank, world_size, num_kv_heads, tokens_per_rank):
         create_paras_kv_aliases,
         set_global_paras_memory_manager,
     )
+    set_global_paras_memory_manager(None)
 
     ep_max_tokens = max(tokens_per_rank) + 100
     heads_per_rank = max(1, num_kv_heads // world_size)
@@ -381,6 +493,208 @@ def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
 
 
 # ---------------------------------------------------------------------------
+# EP→TP gather (peer_access, mirrors _gather_cache_peer_access)
+# ---------------------------------------------------------------------------
+
+def do_ep_to_tp_gather_peer_access(mgr, rank, world_size, num_kv_heads,
+                                   tokens_per_rank, ep_max_tokens, tp_group,
+                                   peer_ctx):
+    """Execute EP→TP gather via peer_access kernel.
+
+    Mirrors the logic in ParaSReqGatherManager._gather_cache_peer_access.
+    Each rank reads its local EP tokens and writes them into all TP ranks'
+    buffers via NVLink using CUDA IPC.
+
+    Returns tp_view_tokens (the token dimension of the TP-shaped view).
+    """
+    from sglang.srt.paras.peer_access import peer_access_kv_transfer
+
+    heads_per_rank = max(1, num_kv_heads // world_size)
+    num_local = tokens_per_rank[rank]
+    tp_view_tokens = (
+        (ep_max_tokens + PAGE_SIZE) * num_kv_heads // heads_per_rank
+    )
+
+    local_buffer_ptr = mgr._buffer.data_ptr()
+    dst_base_ptrs = torch.tensor(
+        peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+    )
+    local_token_indices = torch.arange(
+        num_local, dtype=torch.int32, device="cuda"
+    )
+    dst_token_start = sum(tokens_per_rank[:rank])
+    elem_size = 2  # bfloat16
+
+    barrier_tensor = torch.zeros(1, device="cuda")
+
+    for layer_id in range(NUM_LAYERS):
+        src_k_offset = mgr._entries[
+            f"model.layers.{layer_id}.kv.ep.k"
+        ].offset_bytes
+        src_v_offset = mgr._entries[
+            f"model.layers.{layer_id}.kv.ep.v"
+        ].offset_bytes
+        dst_k_offset = mgr._entries[
+            f"model.layers.{layer_id}.kv.tp.k"
+        ].offset_bytes
+        dst_v_offset = mgr._entries[
+            f"model.layers.{layer_id}.kv.tp.v"
+        ].offset_bytes
+
+        if num_local > 0:
+            peer_access_kv_transfer(
+                local_buffer_ptr, dst_base_ptrs,
+                local_token_indices,
+                src_k_offset, src_v_offset,
+                dst_k_offset, dst_v_offset,
+                num_local, dst_token_start,
+                num_kv_heads, rank, world_size, HEAD_DIM,
+                elem_size,
+            )
+
+        # Per-layer barrier: ensures all ranks finish writing before next
+        # layer reads (TP slot i is EP slot i+1 in the N+1 design).
+        dist.all_reduce(barrier_tensor, group=tp_group)
+
+    torch.cuda.synchronize()
+    return tp_view_tokens
+
+
+# ---------------------------------------------------------------------------
+# TP→EP scatter (peer_access, mirrors _scatter_cache_peer_access)
+# ---------------------------------------------------------------------------
+
+def do_tp_to_ep_scatter_peer_access(mgr, rank, world_size, num_kv_heads,
+                                    tokens_per_rank, tp_view_tokens,
+                                    tp_group, peer_ctx):
+    """Execute TP→EP scatter via peer_access kernel.
+
+    Mirrors the logic in ParaSReqScatterManager._scatter_cache_peer_access,
+    including replication-aware 1/R token slicing and reverse-order per-layer
+    barriers.
+
+    Returns (token_partition, ep_dst_positions).
+    """
+    heads_per_rank = max(1, num_kv_heads // world_size)
+    total_tokens = sum(tokens_per_rank)
+
+    # Contiguous token partition (same as NCCL variant)
+    token_partition: List[List[int]] = []
+    offset = 0
+    for r in range(world_size):
+        n = tokens_per_rank[r]
+        token_partition.append(list(range(offset, offset + n)))
+        offset += n
+
+    ep_dst_positions = torch.arange(
+        tokens_per_rank[rank], dtype=torch.int64, device="cuda"
+    )
+
+    # Global token indices (identity mapping in this test)
+    global_token_indices = torch.arange(
+        total_tokens, dtype=torch.int64, device="cuda"
+    )
+
+    # -- Replication-aware token selection (from scatter_manager) ----------
+    replication_factor = (
+        world_size // num_kv_heads
+        if num_kv_heads < world_size
+        else 1
+    )
+    intra_rank = rank % replication_factor
+
+    my_global_indices: List[int] = []
+    my_dst_ranks: List[int] = []
+    my_ep_dst_pos: List[int] = []
+
+    for e in range(world_size):
+        full_tokens = token_partition[e]
+        full = len(full_tokens)
+        my_start = full * intra_rank // replication_factor
+        my_end = full * (intra_rank + 1) // replication_factor
+        my_slice = full_tokens[my_start:my_end]
+        for local_idx, global_idx in enumerate(my_slice):
+            my_global_indices.append(global_idx)
+            my_dst_ranks.append(e)
+            my_ep_dst_pos.append(my_start + local_idx)
+
+    num_my_tokens = len(my_global_indices)
+
+    if num_my_tokens > 0:
+        gi_tensor = torch.tensor(
+            my_global_indices, dtype=torch.long, device="cuda"
+        )
+        tp_token_positions = global_token_indices[gi_tensor].to(torch.int32)
+        token_to_rank = torch.tensor(
+            my_dst_ranks, dtype=torch.int32, device="cuda"
+        )
+        ep_dst_pos_all = torch.tensor(
+            my_ep_dst_pos, dtype=torch.int32, device="cuda"
+        )
+    else:
+        tp_token_positions = torch.empty(0, dtype=torch.int32, device="cuda")
+        token_to_rank = torch.empty(0, dtype=torch.int32, device="cuda")
+        ep_dst_pos_all = torch.empty(0, dtype=torch.int32, device="cuda")
+
+    # Build per-layer byte offsets (source=TP, dest=EP)
+    src_k_offsets: List[int] = []
+    src_v_offsets: List[int] = []
+    dst_k_offsets: List[int] = []
+    dst_v_offsets: List[int] = []
+    for layer_id in range(NUM_LAYERS):
+        src_k_offsets.append(
+            mgr._entries[f"model.layers.{layer_id}.kv.tp.k"].offset_bytes
+        )
+        src_v_offsets.append(
+            mgr._entries[f"model.layers.{layer_id}.kv.tp.v"].offset_bytes
+        )
+        dst_k_offsets.append(
+            mgr._entries[f"model.layers.{layer_id}.kv.ep.k"].offset_bytes
+        )
+        dst_v_offsets.append(
+            mgr._entries[f"model.layers.{layer_id}.kv.ep.v"].offset_bytes
+        )
+
+    local_buffer_ptr = mgr._buffer.data_ptr()
+    peer_buffer_ptrs = torch.tensor(
+        peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+    )
+    elem_size = 2  # bfloat16
+
+    # Launch kernel per layer in REVERSE order with per-layer barrier,
+    # matching the N+1 slot design (same pattern as scatter_manager).
+    import paras_peer_access_cuda as _pa_cuda
+
+    barrier_tensor = torch.zeros(1, device="cuda")
+    for layer_idx in range(NUM_LAYERS - 1, -1, -1):
+        if num_my_tokens > 0:
+            _pa_cuda.launch_peer_access_kv_scatter(
+                local_buffer_ptr,
+                peer_buffer_ptrs,
+                tp_token_positions,
+                token_to_rank,
+                ep_dst_pos_all,
+                src_k_offsets[layer_idx],
+                src_v_offsets[layer_idx],
+                dst_k_offsets[layer_idx],
+                dst_v_offsets[layer_idx],
+                num_my_tokens,
+                heads_per_rank,
+                num_kv_heads,
+                rank,
+                world_size,
+                HEAD_DIM,
+                elem_size,
+                0,  # default stream
+            )
+        # Per-layer barrier: ALL ranks participate
+        dist.all_reduce(barrier_tensor, group=tp_group)
+
+    torch.cuda.synchronize()
+    return token_partition, ep_dst_positions
+
+
+# ---------------------------------------------------------------------------
 # Evidence saving
 # ---------------------------------------------------------------------------
 
@@ -393,6 +707,129 @@ def _save_evidence(test_name, passed, rank):
     path = os.path.join(evidence_dir, "kv-cache-transfer-test.txt")
     with open(path, "a") as f:
         f.write(f"{test_name}: {'PASS' if passed else 'FAIL'}\n")
+
+
+# ---------------------------------------------------------------------------
+# Shared verification helpers
+# ---------------------------------------------------------------------------
+
+def verify_ep_to_tp(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
+                    tp_view_tokens):
+    """Verify EP→TP gather result against ground truth patterns.
+
+    Works for both R=1 (no replication) and R>1 (head replication).
+    Returns True if all checks pass.
+    """
+    replication_factor = (
+        max(1, world_size // num_kv_heads)
+        if num_kv_heads < world_size
+        else 1
+    )
+    real_head = rank // replication_factor
+    device = f"cuda:{rank}"
+
+    all_ok = True
+    for lid in range(NUM_LAYERS):
+        tp_k = mgr.get_view_as(
+            f"model.layers.{lid}.kv.tp.k",
+            (tp_view_tokens, 1, HEAD_DIM),
+        )
+        tp_v = mgr.get_view_as(
+            f"model.layers.{lid}.kv.tp.v",
+            (tp_view_tokens, 1, HEAD_DIM),
+        )
+
+        offset = 0
+        for src in range(world_size):
+            n = tokens_per_rank[src]
+            expected_k = make_pattern(src, lid, real_head, n).to(device)
+            expected_v = make_pattern(src, lid, real_head + 50, n).to(device)
+            actual_k = tp_k[offset:offset + n, 0, :]
+            actual_v = tp_v[offset:offset + n, 0, :]
+            if not torch.equal(actual_k, expected_k):
+                all_ok = False
+                if rank == 0:
+                    diff = (actual_k.float() - expected_k.float()).abs().max()
+                    print(f"  K mismatch L{lid} src={src}: max_diff={diff}")
+            if not torch.equal(actual_v, expected_v):
+                all_ok = False
+                if rank == 0:
+                    diff = (actual_v.float() - expected_v.float()).abs().max()
+                    print(f"  V mismatch L{lid} src={src}: max_diff={diff}")
+            offset += n
+
+    return all_ok
+
+
+def verify_tp_to_ep(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
+                    token_partition):
+    """Verify TP→EP scatter result against ground truth patterns.
+
+    Works for both R=1 (no replication) and R>1 (head replication).
+    Returns True if all checks pass.
+    """
+    total_tokens = sum(tokens_per_rank)
+    R = (
+        max(1, world_size // num_kv_heads)
+        if num_kv_heads < world_size
+        else 1
+    )
+    my_tokens = token_partition[rank]
+    count = len(my_tokens)
+    device = f"cuda:{rank}"
+
+    ep_dst = torch.arange(count, dtype=torch.int64, device=device)
+
+    all_ok = True
+    for lid in range(NUM_LAYERS):
+        ep_k = mgr.get_view(f"model.layers.{lid}.kv.ep.k")
+        ep_v = mgr.get_view(f"model.layers.{lid}.kv.ep.v")
+
+        for h in range(num_kv_heads):
+            for ir in range(R):
+                start = count * ir // R
+                end = count * (ir + 1) // R
+                if start == end:
+                    continue
+                src_tp_rank = h * R + ir
+
+                full_k = make_pattern(
+                    src_tp_rank, lid, 0, total_tokens
+                ).to(device)
+                full_v = make_pattern(
+                    src_tp_rank, lid, 50, total_tokens
+                ).to(device)
+
+                global_indices = torch.tensor(
+                    my_tokens[start:end], dtype=torch.long, device=device
+                )
+                expected_k = full_k[global_indices]
+                expected_v = full_v[global_indices]
+                actual_k = ep_k[ep_dst[start:end], h, :]
+                actual_v = ep_v[ep_dst[start:end], h, :]
+
+                if not torch.equal(actual_k, expected_k):
+                    all_ok = False
+                    if rank == 0:
+                        diff = (
+                            actual_k.float() - expected_k.float()
+                        ).abs().max()
+                        print(
+                            f"  K mismatch L{lid} h={h} ir={ir}: "
+                            f"max_diff={diff}"
+                        )
+                if not torch.equal(actual_v, expected_v):
+                    all_ok = False
+                    if rank == 0:
+                        diff = (
+                            actual_v.float() - expected_v.float()
+                        ).abs().max()
+                        print(
+                            f"  V mismatch L{lid} h={h} ir={ir}: "
+                            f"max_diff={diff}"
+                        )
+
+    return all_ok
 
 
 # =========================================================================
@@ -458,61 +895,42 @@ class TestEPtoTPStandalone:
         _save_evidence("ep_to_tp_no_replication", all_ok, rank)
         assert all_ok, f"EP→TP (no replication) failed on rank {rank}"
 
-    def test_ep_to_tp_with_replication(self):
-        """num_kv_heads = world_size//2 (R=2): adjacent ranks share same head."""
+    # -- Peer-access variants ------------------------------------------
+
+    @pytest.mark.skipif(
+        not _HAS_PEER_ACCESS,
+        reason="paras_peer_access_cuda not available",
+    )
+    def test_ep_to_tp_peer_access_no_replication(self):
+        """num_kv_heads == world_size: EP→TP via peer_access kernel."""
         rank, world_size = _ensure_distributed()
-        num_kv_heads = world_size // 2
+        num_kv_heads = world_size
         tokens_per_rank = _tokens_for_world(world_size)
 
         tp_group = _setup_paras_state(rank, world_size)
         mgr, ep_max, _ = setup_memory_manager(
             rank, world_size, num_kv_heads, tokens_per_rank
         )
+        peer_ctx = setup_peer_ctx(mgr, rank, world_size, tp_group)
 
         fill_ep_kv(mgr, rank, num_kv_heads, tokens_per_rank)
-        tp_view_tokens = do_ep_to_tp_gather(
+        tp_view_tokens = do_ep_to_tp_gather_peer_access(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            ep_max, tp_group,
+            ep_max, tp_group, peer_ctx,
         )
         dist.barrier(group=tp_group)
 
-        # R=2: TP rank r stores real head = r // R
-        replication_factor = world_size // num_kv_heads  # 2
-        real_head = rank // replication_factor
-        device = f"cuda:{rank}"
-
-        if rank == 0:
-            print(f"\n  EP→TP replication: {num_kv_heads} heads / {world_size} GPUs"
-                  f" → R={replication_factor}")
-
-        all_ok = True
-        for lid in range(NUM_LAYERS):
-            tp_k = mgr.get_view_as(
-                f"model.layers.{lid}.kv.tp.k",
-                (tp_view_tokens, 1, HEAD_DIM),
-            )
-            tp_v = mgr.get_view_as(
-                f"model.layers.{lid}.kv.tp.v",
-                (tp_view_tokens, 1, HEAD_DIM),
-            )
-
-            offset = 0
-            for src in range(world_size):
-                n = tokens_per_rank[src]
-                expected_k = make_pattern(src, lid, real_head, n).to(device)
-                expected_v = make_pattern(src, lid, real_head + 50, n).to(device)
-                actual_k = tp_k[offset:offset + n, 0, :]
-                actual_v = tp_v[offset:offset + n, 0, :]
-                if not torch.equal(actual_k, expected_k):
-                    all_ok = False
-                if not torch.equal(actual_v, expected_v):
-                    all_ok = False
-                offset += n
-
-        _save_evidence("ep_to_tp_with_replication", all_ok, rank)
-        assert all_ok, f"EP→TP (R={replication_factor}) failed on rank {rank}"
+        all_ok = verify_ep_to_tp(
+            mgr, rank, world_size, num_kv_heads, tokens_per_rank,
+            tp_view_tokens,
+        )
+        _save_evidence("ep_to_tp_peer_access_no_replication", all_ok, rank)
+        assert all_ok, f"EP→TP peer_access (no replication) failed on rank {rank}"
 
 
+
+# =========================================================================
+# TP→EP Tests
 # =========================================================================
 # TP→EP Tests
 # =========================================================================
@@ -585,10 +1003,16 @@ class TestTPtoEPStandalone:
         _save_evidence("tp_to_ep_no_replication", all_ok, rank)
         assert all_ok, f"TP→EP (no replication) failed on rank {rank}"
 
-    def test_tp_to_ep_with_replication(self):
-        """num_kv_heads = world_size//2 (R=2): scatter with replication-aware slicing."""
+    # -- Peer-access variants ------------------------------------------
+
+    @pytest.mark.skipif(
+        not _HAS_PEER_ACCESS,
+        reason="paras_peer_access_cuda not available",
+    )
+    def test_tp_to_ep_peer_access_no_replication(self):
+        """num_kv_heads == world_size: TP→EP via peer_access kernel."""
         rank, world_size = _ensure_distributed()
-        num_kv_heads = world_size // 2
+        num_kv_heads = world_size
         tokens_per_rank = _tokens_for_world(world_size)
         total_tokens = sum(tokens_per_rank)
 
@@ -596,75 +1020,33 @@ class TestTPtoEPStandalone:
         mgr, ep_max, _ = setup_memory_manager(
             rank, world_size, num_kv_heads, tokens_per_rank
         )
+        peer_ctx = setup_peer_ctx(mgr, rank, world_size, tp_group)
 
-        heads_per_rank = max(1, num_kv_heads // world_size)  # 1
+        heads_per_rank = num_kv_heads // world_size  # 1
         tp_view_tokens = (
             (ep_max + PAGE_SIZE) * num_kv_heads // heads_per_rank
         )
-        R = world_size // num_kv_heads  # 2
 
         fill_tp_kv(
             mgr, rank, world_size, num_kv_heads, total_tokens, tp_view_tokens
         )
 
-        token_partition, ep_dst = do_tp_to_ep_scatter(
+        token_partition, _ = do_tp_to_ep_scatter_peer_access(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            tp_view_tokens, tp_group,
+            tp_view_tokens, tp_group, peer_ctx,
         )
 
-        if rank == 0:
-            print(f"\n  TP→EP replication: {num_kv_heads} heads / {world_size} GPUs"
-                  f" → R={R}")
+        all_ok = verify_tp_to_ep(
+            mgr, rank, world_size, num_kv_heads, tokens_per_rank,
+            token_partition,
+        )
+        _save_evidence(
+            "tp_to_ep_peer_access_no_replication", all_ok, rank
+        )
+        assert all_ok, (
+            f"TP→EP peer_access (no replication) failed on rank {rank}"
+        )
 
-        # Verify: head h, position p → source TP rank = h*R + ir
-        # where ir satisfies count*ir//R <= p < count*(ir+1)//R
-        my_tokens = token_partition[rank]
-        count = len(my_tokens)
-        device = f"cuda:{rank}"
-
-        all_ok = True
-        for lid in range(NUM_LAYERS):
-            ep_k = mgr.get_view(f"model.layers.{lid}.kv.ep.k")
-            ep_v = mgr.get_view(f"model.layers.{lid}.kv.ep.v")
-
-            for h in range(num_kv_heads):
-                for ir in range(R):
-                    start = count * ir // R
-                    end = count * (ir + 1) // R
-                    if start == end:
-                        continue
-                    src_tp_rank = h * R + ir
-
-                    full_k = make_pattern(
-                        src_tp_rank, lid, 0, total_tokens
-                    ).to(device)
-                    full_v = make_pattern(
-                        src_tp_rank, lid, 50, total_tokens
-                    ).to(device)
-
-                    global_indices = torch.tensor(
-                        my_tokens[start:end], dtype=torch.long, device=device
-                    )
-                    expected_k = full_k[global_indices]
-                    expected_v = full_v[global_indices]
-                    actual_k = ep_k[ep_dst[start:end], h, :]
-                    actual_v = ep_v[ep_dst[start:end], h, :]
-
-                    if not torch.equal(actual_k, expected_k):
-                        all_ok = False
-                        if rank == 0:
-                            diff = (actual_k.float() - expected_k.float()).abs().max()
-                            print(f"  K mismatch L{lid} h={h} ir={ir}: "
-                                  f"max_diff={diff}")
-                    if not torch.equal(actual_v, expected_v):
-                        all_ok = False
-                        if rank == 0:
-                            diff = (actual_v.float() - expected_v.float()).abs().max()
-                            print(f"  V mismatch L{lid} h={h} ir={ir}: "
-                                  f"max_diff={diff}")
-
-        _save_evidence("tp_to_ep_with_replication", all_ok, rank)
-        assert all_ok, f"TP→EP (R={R}) failed on rank {rank}"
 
 
 # =========================================================================
@@ -746,12 +1128,7 @@ class TestKVRoundTrip:
         ok = self._run_roundtrip(num_kv_heads=world_size, test_name="roundtrip_no_replication")
         assert ok, f"Round-trip (no replication) failed on rank {rank}"
 
-    def test_roundtrip_with_replication(self):
-        """EP→TP→EP with num_kv_heads == world_size//2 (R=2)."""
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        ok = self._run_roundtrip(num_kv_heads=world_size // 2, test_name="roundtrip_with_replication")
-        assert ok, f"Round-trip (R=2) failed on rank {rank}"
+
 
 
 # =========================================================================
@@ -803,20 +1180,19 @@ def main():
             ("roundtrip_no_replication",
              TestKVRoundTrip().test_roundtrip_no_replication)
         )
+        if _HAS_PEER_ACCESS:
+            tests.append(
+                ("ep_to_tp_peer_access_no_replication",
+                 TestEPtoTPStandalone().test_ep_to_tp_peer_access_no_replication)
+            )
+            tests.append(
+                ("tp_to_ep_peer_access_no_replication",
+                 TestTPtoEPStandalone().test_tp_to_ep_peer_access_no_replication)
+            )
 
-    if args.num_kv_heads is None or args.num_kv_heads == 2:
-        tests.append(
-            ("ep_to_tp_with_replication",
-             TestEPtoTPStandalone().test_ep_to_tp_with_replication)
-        )
-        tests.append(
-            ("tp_to_ep_with_replication",
-             TestTPtoEPStandalone().test_tp_to_ep_with_replication)
-        )
-        tests.append(
-            ("roundtrip_with_replication",
-             TestKVRoundTrip().test_roundtrip_with_replication)
-        )
+    # Replication tests (R=2) are in test_kv_cache_transfer_replication.py
+    # to avoid CUDA IPC handle isolation issues when mixing different
+    # num_kv_heads in the same process.
 
     results = []
     for name, fn in tests:

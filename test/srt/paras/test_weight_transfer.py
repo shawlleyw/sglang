@@ -368,6 +368,47 @@ def run_peer_access_path(mgr, num_local, peer_ctx):
     return _read_tp_results(mgr, tp_inter)
 
 
+def run_peer_access_reverse_path(mgr, num_local, peer_ctx):
+    from sglang.srt.paras.paras_parallel_state import (
+        get_paras_tp_group,
+        get_paras_tp_size,
+    )
+
+    tp_size = get_paras_tp_size()
+
+    paras_tp_group = get_paras_tp_group().device_group
+    dst_base_ptrs = torch.tensor(
+        peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+    )
+    barrier_tensor = torch.zeros(1, device="cuda")
+    dist.barrier(group=paras_tp_group)
+
+    for layer_id in reversed(range(NUM_LAYERS)):
+        mixin = _make_mixin(layer_id, num_local, mgr)
+        mixin.paras_configure_ep_fused_peer_access_kernel(
+            peer_ctx, dst_base_ptrs, None
+        )
+        dist.all_reduce(
+            barrier_tensor, op=dist.ReduceOp.SUM, group=paras_tp_group
+        )
+
+    return _read_ep_results(mgr)
+
+
+def _read_ep_results(mgr):
+    results = {}
+    for layer_id in range(NUM_LAYERS):
+        results[layer_id] = (
+            mgr.get_view(
+                f"model.layers.{layer_id}.mlp.experts.w13_weight"
+            ).clone(),
+            mgr.get_view(
+                f"model.layers.{layer_id}.mlp.experts.w2_weight"
+            ).clone(),
+        )
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Peer access setup
 # ---------------------------------------------------------------------------
@@ -625,160 +666,120 @@ class TestWeightRoundTrip:
 
 
 class TestEPtoTPGroundTruth:
-    """EP→TP: standalone ground-truth verification against independently computed expected weights."""
+    """EP→TP: verify NCCL and peer_access results against independently computed ground truth."""
 
-    def __init__(self, rank, world_size, mgr, num_local, snap, tp_group):
+    def __init__(self, rank, world_size, mgr, num_local, snap, tp_group, peer_ctx):
         self.rank = rank
         self.world_size = world_size
         self.mgr = mgr
         self.num_local = num_local
         self.snap = snap
         self.tp_group = tp_group
-        self._actual = None
-        self._all_ep_w13 = None
-        self._all_ep_w2 = None
+        self.peer_ctx = peer_ctx
+        self._expected_w13 = None
+        self._expected_w2 = None
 
-    def _ensure_results(self):
-        """Run EP→TP via NCCL naive and gather all EP data for ground truth."""
-        if self._actual is not None:
+    def _build_ground_truth(self):
+        if self._expected_w13 is not None:
             return
 
-        # Restore clean EP weights and gather all ranks' EP data via all_gather
-        restore_weights(self.mgr, self.snap)
+        tp_inter = INTERMEDIATE // self.world_size
+        r = self.rank
+        self._expected_w13 = {}
+        self._expected_w2 = {}
 
-        self._all_ep_w13 = {}
-        self._all_ep_w2 = {}
         for layer_id in range(NUM_LAYERS):
-            local_w13 = self.snap[layer_id][0]  # (num_local, 2*INTERMEDIATE, HIDDEN)
-            local_w2 = self.snap[layer_id][1]   # (num_local, HIDDEN, INTERMEDIATE)
-
-            gathered_w13 = [
-                torch.empty_like(local_w13) for _ in range(self.world_size)
-            ]
-            gathered_w2 = [
-                torch.empty_like(local_w2) for _ in range(self.world_size)
-            ]
+            local_w13 = self.snap[layer_id][0]
+            local_w2 = self.snap[layer_id][1]
+            gathered_w13 = [torch.empty_like(local_w13) for _ in range(self.world_size)]
+            gathered_w2 = [torch.empty_like(local_w2) for _ in range(self.world_size)]
             dist.all_gather(gathered_w13, local_w13, group=self.tp_group)
             dist.all_gather(gathered_w2, local_w2, group=self.tp_group)
-
-            # (NUM_EXPERTS, 2*INTERMEDIATE, HIDDEN)
-            self._all_ep_w13[layer_id] = torch.cat(gathered_w13, dim=0)
-            # (NUM_EXPERTS, HIDDEN, INTERMEDIATE)
-            self._all_ep_w2[layer_id] = torch.cat(gathered_w2, dim=0)
-
-        # Run EP→TP via NCCL naive
-        restore_weights(self.mgr, self.snap)
-        tp_inter = INTERMEDIATE // self.world_size
-        self._actual = run_naive_path(self.mgr, self.num_local)
-
-    def test_w13_ground_truth(self):
-        """w13 TP result must match independently computed ground truth."""
-        self._ensure_results()
-        tp_inter = INTERMEDIATE // self.world_size
-        r = self.rank
-
-        for layer_id in range(NUM_LAYERS):
-            full_w13 = self._all_ep_w13[layer_id]  # (NUM_EXPERTS, 2*INTERMEDIATE, HIDDEN)
+            full_w13 = torch.cat(gathered_w13, dim=0)
+            full_w2 = torch.cat(gathered_w2, dim=0)
 
             gate_shard = full_w13[:, r * tp_inter : (r + 1) * tp_inter, :]
-            up_shard = full_w13[
-                :, INTERMEDIATE + r * tp_inter : INTERMEDIATE + (r + 1) * tp_inter, :
-            ]
-            expected = torch.cat([gate_shard, up_shard], dim=1)
+            up_shard = full_w13[:, INTERMEDIATE + r * tp_inter : INTERMEDIATE + (r + 1) * tp_inter, :]
+            self._expected_w13[layer_id] = torch.cat([gate_shard, up_shard], dim=1)
+            self._expected_w2[layer_id] = full_w2[:, :, r * tp_inter : (r + 1) * tp_inter]
 
-            actual = self._actual[layer_id][0]  # (NUM_EXPERTS, 2*tp_inter, HIDDEN)
-            if not torch.equal(actual, expected):
-                diff = (actual.reshape(-1) != expected.reshape(-1)).sum().item()
-                raise AssertionError(
-                    f"[Rank {self.rank}] w13 ground-truth mismatch layer={layer_id}: "
-                    f"{diff}/{actual.numel()} elements differ"
-                )
-
-        if self.rank == 0:
-            print(
-                "  [OK] w13 EP→TP ground truth: bitwise match all layers",
-                flush=True,
-            )
-
-    def test_w2_ground_truth(self):
-        """w2 TP result must match independently computed ground truth."""
-        self._ensure_results()
-        tp_inter = INTERMEDIATE // self.world_size
-        r = self.rank
-
+    def _verify_against_ground_truth(self, actual, method_name):
+        self._build_ground_truth()
         for layer_id in range(NUM_LAYERS):
-            full_w2 = self._all_ep_w2[layer_id]  # (NUM_EXPERTS, HIDDEN, INTERMEDIATE)
-
-            expected = full_w2[:, :, r * tp_inter : (r + 1) * tp_inter]
-
-            actual = self._actual[layer_id][1]  # (NUM_EXPERTS, HIDDEN, tp_inter)
-            if not torch.equal(actual, expected):
-                diff = (actual.reshape(-1) != expected.reshape(-1)).sum().item()
+            aw13, aw2 = actual[layer_id]
+            if not torch.equal(aw13, self._expected_w13[layer_id]):
+                diff = (aw13.reshape(-1) != self._expected_w13[layer_id].reshape(-1)).sum().item()
                 raise AssertionError(
-                    f"[Rank {self.rank}] w2 ground-truth mismatch layer={layer_id}: "
-                    f"{diff}/{actual.numel()} elements differ"
+                    f"[Rank {self.rank}] {method_name} w13 mismatch layer={layer_id}: "
+                    f"{diff}/{aw13.numel()} elements differ"
                 )
-
+            if not torch.equal(aw2, self._expected_w2[layer_id]):
+                diff = (aw2.reshape(-1) != self._expected_w2[layer_id].reshape(-1)).sum().item()
+                raise AssertionError(
+                    f"[Rank {self.rank}] {method_name} w2 mismatch layer={layer_id}: "
+                    f"{diff}/{aw2.numel()} elements differ"
+                )
         if self.rank == 0:
-            print(
-                "  [OK] w2 EP→TP ground truth: bitwise match all layers",
-                flush=True,
-            )
+            print(f"  [OK] EP→TP {method_name}: bitwise match ground truth all layers", flush=True)
+
+    def test_nccl_vs_ground_truth(self):
+        restore_weights(self.mgr, self.snap)
+        actual = run_naive_path(self.mgr, self.num_local)
+        self._verify_against_ground_truth(actual, "NCCL naive")
+
+    def test_peer_access_vs_ground_truth(self):
+        restore_weights(self.mgr, self.snap)
+        actual = run_peer_access_path(self.mgr, self.num_local, self.peer_ctx)
+        self._verify_against_ground_truth(actual, "peer_access")
 
 
 class TestTPtoEPGroundTruth:
-    """TP→EP reverse: verify EP weights match original after EP→TP→EP with reversed layer order."""
+    """TP→EP: verify NCCL reverse and peer_access reverse both recover original EP weights."""
 
-    def __init__(self, rank, world_size, mgr, num_local, snap):
+    def __init__(self, rank, world_size, mgr, num_local, snap, peer_ctx):
         self.rank = rank
         self.world_size = world_size
         self.mgr = mgr
         self.num_local = num_local
         self.snap = snap
+        self.peer_ctx = peer_ctx
 
-    def test_reverse_naive_vs_original(self):
-        """EP→TP then TP→EP in reversed layer order must reproduce original EP weights."""
-        # Restore clean EP weights
+    def _run_ep_to_tp(self):
         restore_weights(self.mgr, self.snap)
-
-        # EP→TP via NCCL naive all-to-all
         run_naive_path(self.mgr, self.num_local)
 
-        # TP→EP via NCCL naive reverse — MUST iterate in reversed layer order
-        # N+1 slot aliasing: forward order would corrupt source data for later layers
+    def _verify_ep_matches_original(self, method_name):
+        actual = _read_ep_results(self.mgr)
+        for layer_id in range(NUM_LAYERS):
+            w13_orig = self.snap[layer_id][0]
+            w2_orig = self.snap[layer_id][1]
+            aw13, aw2 = actual[layer_id]
+            if not torch.equal(aw13.reshape(-1), w13_orig.reshape(-1)):
+                diff = (aw13.reshape(-1) != w13_orig.reshape(-1)).sum().item()
+                raise AssertionError(
+                    f"[Rank {self.rank}] TP→EP {method_name} w13 mismatch layer={layer_id}: "
+                    f"{diff}/{aw13.numel()} elements differ"
+                )
+            if not torch.equal(aw2.reshape(-1), w2_orig.reshape(-1)):
+                diff = (aw2.reshape(-1) != w2_orig.reshape(-1)).sum().item()
+                raise AssertionError(
+                    f"[Rank {self.rank}] TP→EP {method_name} w2 mismatch layer={layer_id}: "
+                    f"{diff}/{aw2.numel()} elements differ"
+                )
+        if self.rank == 0:
+            print(f"  [OK] TP→EP {method_name}: bitwise match original EP all layers", flush=True)
+
+    def test_nccl_reverse_vs_original(self):
+        self._run_ep_to_tp()
         for layer_id in reversed(range(NUM_LAYERS)):
             mixin = _make_mixin(layer_id, self.num_local, self.mgr)
             mixin.paras_configure_ep_mlp_naive()
+        self._verify_ep_matches_original("NCCL naive reverse")
 
-        # Compare restored EP weights to original snapshot
-        for layer_id in range(NUM_LAYERS):
-            w13 = self.mgr.get_view(
-                f"model.layers.{layer_id}.mlp.experts.w13_weight"
-            )
-            w2 = self.mgr.get_view(
-                f"model.layers.{layer_id}.mlp.experts.w2_weight"
-            )
-            w13_orig = self.snap[layer_id][0]
-            w2_orig = self.snap[layer_id][1]
-
-            if not torch.equal(w13, w13_orig):
-                diff = (w13.reshape(-1) != w13_orig.reshape(-1)).sum().item()
-                raise AssertionError(
-                    f"[Rank {self.rank}] TP→EP w13 mismatch layer={layer_id}: "
-                    f"{diff}/{w13.numel()} elements differ"
-                )
-            if not torch.equal(w2, w2_orig):
-                diff = (w2.reshape(-1) != w2_orig.reshape(-1)).sum().item()
-                raise AssertionError(
-                    f"[Rank {self.rank}] TP→EP w2 mismatch layer={layer_id}: "
-                    f"{diff}/{w2.numel()} elements differ"
-                )
-
-        if self.rank == 0:
-            print(
-                "  [OK] TP→EP reverse (reversed layer order): bitwise match all layers",
-                flush=True,
-            )
+    def test_peer_access_reverse_vs_original(self):
+        self._run_ep_to_tp()
+        run_peer_access_reverse_path(self.mgr, self.num_local, self.peer_ctx)
+        self._verify_ep_matches_original("peer_access reverse")
 
 
 # ---------------------------------------------------------------------------
@@ -797,23 +798,37 @@ def main():
         fill_ep_weights(mgr, rank)
         snap = snapshot_weights(mgr)
 
-        # --- EP→TP weight transfer tests ---
-        if rank == 0:
-            print("\n=== TestEPtoTPWeightTransfer ===", flush=True)
         peer_ctx = setup_peer_ctx(mgr, rank, world_size, tp_group)
-        ep_tp = TestEPtoTPWeightTransfer(
-            rank, world_size, mgr, num_local, snap, peer_ctx
-        )
 
-        for name in ("test_w13_peer_access_vs_nccl", "test_w2_peer_access_vs_nccl"):
+        # --- EP→TP ground truth: NCCL + peer_access ---
+        if rank == 0:
+            print("\n=== TestEPtoTPGroundTruth ===", flush=True)
+        gt_ep_tp = TestEPtoTPGroundTruth(
+            rank, world_size, mgr, num_local, snap, tp_group, peer_ctx
+        )
+        for name in ("test_nccl_vs_ground_truth", "test_peer_access_vs_ground_truth"):
             try:
-                getattr(ep_tp, name)()
+                getattr(gt_ep_tp, name)()
                 passed += 1
             except Exception as e:
                 print(f"  [FAIL] {name}: {e}", flush=True)
                 failed += 1
 
-        # --- TP→EP pointer swap test ---
+        # --- TP→EP ground truth: NCCL reverse + peer_access reverse ---
+        if rank == 0:
+            print("\n=== TestTPtoEPGroundTruth ===", flush=True)
+        gt_tp_ep = TestTPtoEPGroundTruth(
+            rank, world_size, mgr, num_local, snap, peer_ctx
+        )
+        for name in ("test_nccl_reverse_vs_original", "test_peer_access_reverse_vs_original"):
+            try:
+                getattr(gt_tp_ep, name)()
+                passed += 1
+            except Exception as e:
+                print(f"  [FAIL] {name}: {e}", flush=True)
+                failed += 1
+
+        # --- TP→EP pointer swap test (module-level attribute, orthogonal to data) ---
         if rank == 0:
             print("\n=== TestTPtoEPWeightRestore ===", flush=True)
         tp_ep = TestTPtoEPWeightRestore(rank, world_size)
@@ -824,7 +839,7 @@ def main():
             print(f"  [FAIL] test_moe_pointer_swap: {e}", flush=True)
             failed += 1
 
-        # --- Round-trip test ---
+        # --- Round-trip test (full model-level flow) ---
         if rank == 0:
             print("\n=== TestWeightRoundTrip ===", flush=True)
         rt = TestWeightRoundTrip(rank, world_size, mgr, num_local, snap)
@@ -833,33 +848,6 @@ def main():
             passed += 1
         except Exception as e:
             print(f"  [FAIL] test_weight_roundtrip: {e}", flush=True)
-            failed += 1
-
-        # --- EP→TP ground truth tests ---
-        if rank == 0:
-            print("\n=== TestEPtoTPGroundTruth ===", flush=True)
-        gt_ep_tp = TestEPtoTPGroundTruth(
-            rank, world_size, mgr, num_local, snap, tp_group
-        )
-        for name in ("test_w13_ground_truth", "test_w2_ground_truth"):
-            try:
-                getattr(gt_ep_tp, name)()
-                passed += 1
-            except Exception as e:
-                print(f"  [FAIL] {name}: {e}", flush=True)
-                failed += 1
-
-        # --- TP→EP ground truth test ---
-        if rank == 0:
-            print("\n=== TestTPtoEPGroundTruth ===", flush=True)
-        gt_tp_ep = TestTPtoEPGroundTruth(
-            rank, world_size, mgr, num_local, snap
-        )
-        try:
-            gt_tp_ep.test_reverse_naive_vs_original()
-            passed += 1
-        except Exception as e:
-            print(f"  [FAIL] test_reverse_naive_vs_original: {e}", flush=True)
             failed += 1
 
         # --- Summary ---
