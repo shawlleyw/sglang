@@ -952,6 +952,11 @@ class MHATokenToKVPool(KVCache):
         The TP view has shape (tp_max_tokens + page_size, tp_heads, head_dim) which
         is exactly what gather_cache writes TP data into.
         """
+        # Save the original (EP) head_num on first resize so that
+        # paras_configure_ep() can restore it later.
+        if not hasattr(self, '_paras_original_head_num'):
+            self._paras_original_head_num = self.head_num
+        self.head_num = new_head_num
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         mgr = get_global_paras_memory_manager()
         

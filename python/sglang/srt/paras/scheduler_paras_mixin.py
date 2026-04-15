@@ -279,7 +279,7 @@ class SchedulerParasMixin:
                 self.model_config.vocab_size,
             )
         else:
-            self.running_batch = None
+            self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
 
         # Phase 3: Model switch (weights + attention)
         with TimeReporter("transfer_weights"):

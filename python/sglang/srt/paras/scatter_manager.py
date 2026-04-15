@@ -375,8 +375,8 @@ class ParaSReqScatterManager:
         Args:
             tp_kv_cache: Source TP KV cache.  If *None*, obtained from
                 ``self.token_to_kv_pool_allocator.get_kvcache()``.
-            ep_head_num: Full EP head count.  If *None*, read from
-                ``tp_kv_cache._paras_original_head_num``.
+            ep_head_num: Full EP head count.  If *None*, computed as
+                ``tp_kv_cache.head_num * self.paras_tp_size``.
         """
         if tp_kv_cache is None:
             tp_kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
@@ -384,7 +384,15 @@ class ParaSReqScatterManager:
             "Only MHATokenToKVPool is supported for now."
         )
         if ep_head_num is None:
-            ep_head_num = tp_kv_cache._paras_original_head_num
+            # In TP mode, head_num is already sharded (head_num = original // tp_size).
+            # Recover the full EP head count by multiplying back.
+            ep_head_num = tp_kv_cache.head_num * self.paras_tp_size
+
+        if self.num_global_tokens == 0:
+            # No active requests — nothing to scatter.  Still need to
+            # reconfigure the KV pool to EP head count.
+            tp_kv_cache.paras_configure_ep()
+            return
 
         if self.method == "peer_access" and self.peer_ctx is not None:
             self._scatter_cache_peer_access(tp_kv_cache, ep_head_num)
