@@ -59,6 +59,11 @@ class ParaSDecoderLayerMixin:
         """Launch fused kernels for this layer (no barriers — model level manages them)."""
         return self.mlp.paras_configure_tp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
 
+    def paras_configure_ep_attn(self):
+        """Restore attention from TP→EP for this layer (mirrors paras_configure_tp_attn)."""
+        if hasattr(self.self_attn, "paras_configure_ep"):
+            self.self_attn.paras_configure_ep()
+
     def paras_configure_ep_mlp_naive(self):
         """Reverse MoE weights from TP→EP via NCCL all-to-all for this layer."""
         self.mlp.paras_configure_ep_mlp_naive()
@@ -103,8 +108,6 @@ class ParaSDecoderLayerMixin:
     @paras_func
     def paras_configure_ep(self):
         """Switch from TP back to EP mode for this layer."""
-        if hasattr(self.self_attn, "paras_configure_ep"):
-            self.self_attn.paras_configure_ep()
         self.mlp.paras_configure_ep()
 
         # Revert to EP communicator

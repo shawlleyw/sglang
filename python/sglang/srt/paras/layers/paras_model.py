@@ -14,14 +14,14 @@ For a CausalLM class to support ParaS, define these methods:
 
     @paras_func
     def paras_configure_ep(self):
-        import os
-        method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
-        self.model.paras_configure_ep(method=method)
+        self.model.paras_configure_ep()
 
 Where ``self.model`` is the transformer body (inheriting ParaSModelMixin).
 After the switch completes, paras_configure_helper() is called by @paras_func to
 synchronize CUDA.
 """
+
+import os
 
 import torch
 import torch.distributed as dist
@@ -114,10 +114,13 @@ class ParaSModelMixin:
             self.paras_configure_tp_naive(paras_tp_size, paras_tp_rank)
 
     def paras_configure_ep_naive(self):
-        """Sequential TP→EP: reverse weight transfer + attn/communicator restore."""
+        """Sequential TP→EP: reverse weight transfer + attn/communicator restore.
+
+        Single pass in reverse layer order, mirroring paras_configure_tp_naive.
+        """
         for layer in reversed(self.layers):
+            layer.paras_configure_ep_attn()
             layer.paras_configure_ep_mlp_naive()
-        for layer in self.layers:
             layer.paras_configure_ep()
 
     def paras_configure_ep_peer_access(self):
@@ -140,13 +143,14 @@ class ParaSModelMixin:
         for layer in reversed(self.layers):
             layer.paras_configure_ep_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
             dist.all_reduce(barrier_tensor, group=paras_tp_group)
-
-        for layer in self.layers:
+            layer.paras_configure_ep_attn()
             layer.paras_configure_ep()
 
     @paras_func
     def paras_configure_ep(self, method: str = None):
         """Configure all layers back to EP mode."""
+        if method is None:
+            method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
         if method == "peer_access":
             self.paras_configure_ep_peer_access()
         else:

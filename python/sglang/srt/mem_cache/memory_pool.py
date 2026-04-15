@@ -954,8 +954,8 @@ class MHATokenToKVPool(KVCache):
         """
         # Save the original (EP) head_num on first resize so that
         # paras_configure_ep() can restore it later.
-        if not hasattr(self, '_paras_original_head_num'):
-            self._paras_original_head_num = self.head_num
+        if not hasattr(self, 'full_head_num'):
+            self.full_head_num = self.head_num
         self.head_num = new_head_num
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         mgr = get_global_paras_memory_manager()
@@ -1014,7 +1014,7 @@ class MHATokenToKVPool(KVCache):
         # ParaS: Reshape kv cache from EP to TP.
         # TODO: change the size of kv cache pool
         # It does not intrusively change the number of heads, just increases the number of slots by reshaping kv cache.
-        self._paras_original_head_num = self.head_num  # save before mutation
+        self.full_head_num = self.head_num  # save before mutation
         sharded_head_num = self.head_num // paras_tp_size
         for i in range(self.layer_num):
             self.k_buffer[i] = self.k_buffer[i].view(
@@ -1071,7 +1071,7 @@ class MHATokenToKVPool(KVCache):
         # slot[i] at different physical offsets.  After the scatter manager
         # writes to EP slots via paras_resize_cache_ep, we must point k/v_buffer[i]
         # to the EP alias from the memory manager (not just reshape the TP view).
-        self.head_num = self._paras_original_head_num  # restore original
+        self.head_num = self.full_head_num  # restore original
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         mgr = get_global_paras_memory_manager()
         if mgr is not None and mgr.materialized and mgr._kv_reserved:

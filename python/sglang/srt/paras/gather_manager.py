@@ -481,13 +481,3 @@ class ParaSReqGatherManager:
             model_config.vocab_size,
         )
 
-
-
-# Backward compatibility — scatter components moved to scatter_manager.py
-from sglang.srt.paras.scatter_manager import (  # noqa: F401, E402
-    ParaSReqScatterManager,
-    partition_requests_for_ep,
-    gather_tp_kv_and_permute,
-    permute_and_scatter_kv_to_ep,
-    _scatter_cache_nccl,
-)

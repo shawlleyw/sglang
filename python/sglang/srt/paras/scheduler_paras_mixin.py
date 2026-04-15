@@ -2,7 +2,6 @@ from types import SimpleNamespace
 from typing import List, Any, Optional
 import torch
 import logging
-import torch
 import time
 import os
 
@@ -17,9 +16,8 @@ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 
 from sglang.srt.paras.utils import paras_func, paras_profile_func
-from sglang.srt.paras.gather_manager import ParaSReqGatherManager, recover_request
+from sglang.srt.paras.gather_manager import ParaSReqGatherManager
 from sglang.srt.paras.scatter_manager import ParaSReqScatterManager
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.managers.utils import SenderWrapper
@@ -132,7 +130,6 @@ class SchedulerParasMixin:
         self.paras_parallelism_config = "TP"
         self.server_args.enable_dp_attention = False
         self.server_args.moe_a2a_backend = MoeA2ABackend.NONE
-        self.server_args.enable_dp_attention = False
         self.server_args.dp_size = 1
         self.server_args.ep_size = 1
         moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.NONE
@@ -238,48 +235,20 @@ class SchedulerParasMixin:
         with TimeReporter("partition_requests"):
             paras_scatter_manager.partition_requests()
 
-        with TimeReporter("reorchestrate_cache_reverse"):
-            paras_scatter_manager.reorchestrate_cache_reverse()
+            with TimeReporter("reorchestrate_cache"):
+                paras_scatter_manager.reorchestrate_cache()
 
         with TimeReporter("scatter_cache"):
             paras_scatter_manager.scatter_cache()
 
-        # Rebuild running batch from local subset
-        local_reqs = paras_scatter_manager.local_reqs
-        if local_reqs:
-            for req in local_reqs:
-                recover_request(req, self.tree_cache, self.tokenizer)
-            self.running_batch = ScheduleBatch.init_new(
-                local_reqs,
-                self.req_to_token_pool,
-                self.token_to_kv_pool_allocator,
-                self.tree_cache,
-                self.model_config,
-                self.enable_overlap,
-                self.spec_algorithm,
-                self.server_args.enable_custom_logit_processor,
-            )
-            device = self.req_to_token_pool.device
-            last_token_list = []
-            for req in local_reqs:
-                if len(req.output_ids) > 0:
-                    last_token_list.append(req.output_ids[-1])
-                else:
-                    last_token_list.append(req.origin_input_ids[-1])
-            req_pool_indices_list = [req.req_pool_idx for req in local_reqs]
-            seq_lens_list = [req.seqlen for req in local_reqs]
-            self.running_batch.output_ids = torch.tensor(last_token_list, dtype=torch.int64, device=device)
-            self.running_batch.req_pool_indices = torch.tensor(req_pool_indices_list, dtype=torch.int64, device=device)
-            self.running_batch.seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64, device=device)
-            self.running_batch.seq_lens_cpu = torch.tensor(seq_lens_list, dtype=torch.int64, device="cpu")
-            self.running_batch.orig_seq_lens = self.running_batch.seq_lens.clone()
-            self.running_batch.seq_lens_sum = sum(seq_lens_list)
-            self.running_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
-                self.running_batch,
-                self.model_config.vocab_size,
-            )
-        else:
-            self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.running_batch = paras_scatter_manager.get_new_running_batch(
+            self.tokenizer,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            self.server_args.enable_custom_logit_processor,
+        )
 
         # Phase 3: Model switch (weights + attention)
         with TimeReporter("transfer_weights"):
@@ -296,7 +265,6 @@ class SchedulerParasMixin:
         self.paras_parallelism_config = "EP"
         self.server_args.enable_dp_attention = True
         self.server_args.moe_a2a_backend = MoeA2ABackend.DEEPEP
-        self.server_args.enable_dp_attention = True
         self.server_args.dp_size = self.paras_ep_size
         self.server_args.ep_size = self.paras_ep_size
         moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.DEEPEP

@@ -4,9 +4,8 @@ Moved from gather_manager.py for code organization.  Contains:
 - partition_requests_for_ep  (with extensible strategy pattern)
 - gather_tp_kv_and_permute
 - permute_and_scatter_kv_to_ep
-- _scatter_cache_nccl  (with KV head duplication support, uses paras_resize_cache_ep)
 - ParaSReqScatterManager
-- _scatter_cache_nccl  (with KV head duplication support)
+- _scatter_cache_nccl  (with KV head duplication support, uses paras_resize_cache_ep)
 """
 
 from typing import Any, Callable, List, Optional
@@ -14,13 +13,15 @@ import os
 import torch
 import torch.distributed as dist
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     MHATokenToKVPool,
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.paras.gather_manager import recover_request
 
 
 # ============================================================
@@ -267,7 +268,7 @@ class ParaSReqScatterManager:
     # Step 2: shrink pools to EP capacity
     # ------------------------------------------------------------------
 
-    def reorchestrate_cache_reverse(
+    def reorchestrate_cache(
         self,
         new_ep_cache_size: Optional[int] = None,
         new_req_pool_size: Optional[int] = None,
@@ -318,7 +319,63 @@ class ParaSReqScatterManager:
             self.ep_dst_positions = None
 
     # ------------------------------------------------------------------
-    # Step 3: scatter KV cache TP → EP
+    # Step 3: build running batch from local partition
+    # ------------------------------------------------------------------
+
+    def get_new_running_batch(
+        self,
+        tokenizer: Any,
+        tree_cache: Any,
+        model_config: Any,
+        enable_overlap: bool,
+        spec_algorithm: Any,
+        enable_custom_logit_processor: bool,
+    ) -> ScheduleBatch:
+        """Create a ScheduleBatch from the local EP partition.
+
+        Mirrors ``ParaSReqGatherManager.get_new_running_batch``.
+        """
+        if not self.local_reqs:
+            return ScheduleBatch(reqs=[], batch_is_full=False)
+
+        for req in self.local_reqs:
+            recover_request(req, tree_cache, tokenizer)
+
+        batch = ScheduleBatch.init_new(
+            self.local_reqs,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            tree_cache,
+            model_config,
+            enable_overlap,
+            spec_algorithm,
+            enable_custom_logit_processor,
+        )
+
+        device = self.req_to_token_pool.device
+        last_token_list = []
+        for req in self.local_reqs:
+            if len(req.output_ids) > 0:
+                last_token_list.append(req.output_ids[-1])
+            else:
+                last_token_list.append(req.origin_input_ids[-1])
+
+        req_pool_indices_list = [req.req_pool_idx for req in self.local_reqs]
+        seq_lens_list = [req.seqlen for req in self.local_reqs]
+
+        batch.output_ids = torch.tensor(last_token_list, dtype=torch.int64, device=device)
+        batch.req_pool_indices = torch.tensor(req_pool_indices_list, dtype=torch.int64, device=device)
+        batch.seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64, device=device)
+        batch.seq_lens_cpu = torch.tensor(seq_lens_list, dtype=torch.int64, device="cpu")
+        batch.orig_seq_lens = batch.seq_lens.clone()
+        batch.seq_lens_sum = sum(seq_lens_list)
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch, model_config.vocab_size,
+        )
+        return batch
+
+    # ------------------------------------------------------------------
+    # Step 4: scatter KV cache TP → EP
     # ------------------------------------------------------------------
 
     def scatter_cache(
@@ -343,7 +400,7 @@ class ParaSReqScatterManager:
             # head_num in TP mode is sharded.  With head replication
             # (num_kv_heads < tp_size), head_num * tp_size != num_kv_heads.
             # Use the saved full head count instead.
-            ep_head_num = tp_kv_cache._paras_original_head_num
+            ep_head_num = tp_kv_cache.full_head_num
 
         if self.num_global_tokens == 0:
             # No active requests — nothing to scatter.  Still need to

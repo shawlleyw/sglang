@@ -527,7 +527,7 @@ class TestFullRoundTrip:
             )
 
         kv_pool.head_num = heads_per_peer
-        kv_pool._paras_original_head_num = NUM_KV_HEADS
+        kv_pool.full_head_num = NUM_KV_HEADS
         torch.cuda.synchronize()
         dist.barrier(group=tp_group)
 
@@ -946,7 +946,7 @@ class TestSingleRequestRoundTrip:
                 )
 
         kv_pool.head_num = heads_per_peer
-        kv_pool._paras_original_head_num = NUM_KV_HEADS
+        kv_pool.full_head_num = NUM_KV_HEADS
         torch.cuda.synchronize()
         dist.barrier(group=tp_group)
 
@@ -1136,7 +1136,7 @@ class TestEmptyBatchRoundTrip:
             )
 
         kv_pool.head_num = heads_per_peer
-        kv_pool._paras_original_head_num = NUM_KV_HEADS
+        kv_pool.full_head_num = NUM_KV_HEADS
         torch.cuda.synchronize()
         dist.barrier(group=tp_group)
 
