@@ -1027,15 +1027,42 @@ class MHATokenToKVPool(KVCache):
 
     @paras_func
     def paras_configure_ep(self):
-        # ParaS: Reshape kv cache from TP to EP.
+        # ParaS: Switch kv cache buffers from TP slots to EP slots.
+        # The N+1 slot design stores EP data in slot[i+1] and TP data in
+        # slot[i] at different physical offsets.  After the scatter manager
+        # writes to EP slots via _EPCacheView, we must point k/v_buffer[i]
+        # to the EP alias from the memory manager (not just reshape the TP view).
         self.head_num = self._paras_original_head_num  # restore original
-        for i in range(self.layer_num):
-            self.k_buffer[i] = self.k_buffer[i].view(
-                (-1, self.head_num, self.head_dim)
-            )
-            self.v_buffer[i] = self.v_buffer[i].view(
-                (-1, self.head_num, self.head_dim)
-            )
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+        mgr = get_global_paras_memory_manager()
+        if mgr is not None and mgr.materialized and mgr._kv_reserved:
+            for i in range(self.layer_num):
+                layer_id = i + self.start_layer
+                ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
+                ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
+                if ep_k_name in mgr._entries:
+                    total_elems = mgr._entries[ep_k_name].numel
+                    ep_tokens = total_elems // (self.head_num * self.head_dim)
+                    ep_shape = (ep_tokens, self.head_num, self.head_dim)
+                    self.k_buffer[i] = mgr.get_view_as(ep_k_name, ep_shape)
+                    self.v_buffer[i] = mgr.get_view_as(ep_v_name, ep_shape)
+                else:
+                    # Fallback: reshape in-place (legacy path)
+                    self.k_buffer[i] = self.k_buffer[i].view(
+                        (-1, self.head_num, self.head_dim)
+                    )
+                    self.v_buffer[i] = self.v_buffer[i].view(
+                        (-1, self.head_num, self.head_dim)
+                    )
+        else:
+            # No memory manager: reshape in-place
+            for i in range(self.layer_num):
+                self.k_buffer[i] = self.k_buffer[i].view(
+                    (-1, self.head_num, self.head_dim)
+                )
+                self.v_buffer[i] = self.v_buffer[i].view(
+                    (-1, self.head_num, self.head_dim)
+                )
 
     def paras_get_num_kv_slots(self):
         # ParaS: Get the number of kv slots in each layer.
