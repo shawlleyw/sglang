@@ -154,7 +154,7 @@ class TestTPtoEPReplication:
         )
         token_partition, _ = do_tp_to_ep_scatter(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            tp_view_tokens, tp_group, ep_max_tokens=ep_max,
+            tp_view_tokens, tp_group,
         )
 
         all_ok = verify_tp_to_ep(
@@ -253,7 +253,7 @@ class TestKVRoundTripReplication:
         # TP→EP scatter (writes back to EP slots)
         do_tp_to_ep_scatter(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            tp_view_tokens, tp_group, ep_max_tokens=ep_max,
+            tp_view_tokens, tp_group,
         )
 
         # Compare

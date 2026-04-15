@@ -2431,6 +2431,8 @@ class ModelRunner:
         )
         paras_comm_configure_tp()
 
+        self.token_to_kv_pool.paras_configure_tp(paras_tp_size)
+
         # Update attention backend cached state (head counts, req_to_token)
         if hasattr(self.attn_backend, 'paras_configure_tp'):
             self.attn_backend.paras_configure_tp(
@@ -2449,9 +2451,9 @@ class ModelRunner:
         assert not self.use_mla_backend, (
             "ParaS does not support MLA backend yet."
         )
-        assert isinstance(self.token_to_kv_pool, MHATokenToKVPool)
-        self.token_to_kv_pool.paras_configure_ep()
         paras_comm_configure_ep()
+
+        self.token_to_kv_pool.paras_configure_ep()
 
         # Update attention backend cached state for EP mode
         if hasattr(self.attn_backend, 'paras_configure_ep'):

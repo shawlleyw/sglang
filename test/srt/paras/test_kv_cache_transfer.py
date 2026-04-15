@@ -300,19 +300,23 @@ class _MockKVCache:
             return self._mgr.get_view_as(name, (vt, heads, self.head_dim))
         return self._mgr.get_view(name)
 
-    def paras_resize_cache(self, layer_id, new_size, new_head_num):
-        self.head_num = new_head_num
-        self._layer_prefix[layer_id] = "tp"
-        self._layer_heads[layer_id] = new_head_num
-        total_elems = self._mgr._entries[f"model.layers.{layer_id}.kv.tp.k"].numel
-        self._layer_view_tokens[layer_id] = total_elems // (new_head_num * self.head_dim)
+    def paras_configure_tp(self, paras_tp_size):
+        sharded = self.head_num // paras_tp_size
+        self.full_head_num = self.head_num
+        self.head_num = sharded
+        for lid in range(self.layer_num):
+            self._layer_prefix[lid] = "tp"
+            self._layer_heads[lid] = sharded
+            total_elems = self._mgr._entries[f"model.layers.{lid}.kv.tp.k"].numel
+            self._layer_view_tokens[lid] = total_elems // (sharded * self.head_dim)
 
-    def paras_resize_cache_ep(self, layer_id, new_size, new_head_num):
-        self.head_num = new_head_num
-        self._layer_prefix[layer_id] = "ep"
-        self._layer_heads[layer_id] = new_head_num
-        total_elems = self._mgr._entries[f"model.layers.{layer_id}.kv.ep.k"].numel
-        self._layer_view_tokens[layer_id] = total_elems // (new_head_num * self.head_dim)
+    def paras_configure_ep(self):
+        self.head_num = self.full_head_num
+        for lid in range(self.layer_num):
+            self._layer_prefix[lid] = "ep"
+            self._layer_heads[lid] = self.head_num
+            total_elems = self._mgr._entries[f"model.layers.{lid}.kv.ep.k"].numel
+            self._layer_view_tokens[lid] = total_elems // (self.head_num * self.head_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +463,7 @@ def do_ep_to_tp_gather(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
 # ---------------------------------------------------------------------------
 
 def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-                        tp_view_tokens, tp_group, ep_max_tokens=None):
+                        tp_view_tokens, tp_group):
     """Execute TP→EP scatter via _scatter_cache_nccl.
 
     Returns (token_partition, ep_dst_positions).
@@ -498,7 +502,6 @@ def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
         global_token_indices=global_token_indices,
         ep_dst_positions=ep_dst_positions,
         gather_group=group_coord,
-        new_ep_cache_size=ep_max_tokens,
     )
 
     return token_partition, ep_dst_positions
@@ -974,7 +977,7 @@ class TestTPtoEPStandalone:
 
         token_partition, ep_dst = do_tp_to_ep_scatter(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            tp_view_tokens, tp_group, ep_max_tokens=ep_max,
+            tp_view_tokens, tp_group,
         )
 
         # Verify: EP rank e, head h → data from TP rank h, local head 0
@@ -1104,7 +1107,7 @@ class TestKVRoundTrip:
         # processes layers in reverse order to avoid corrupting TP source.
         token_partition, ep_dst = do_tp_to_ep_scatter(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            tp_view_tokens, tp_group, ep_max_tokens=ep_max,
+            tp_view_tokens, tp_group,
         )
 
         # Step 3: Verify bitwise match
