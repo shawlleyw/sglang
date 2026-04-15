@@ -264,7 +264,11 @@ def setup_memory_manager(rank, world_size, num_kv_heads, tokens_per_rank):
 # ---------------------------------------------------------------------------
 
 class _MockKVCache:
-    """Minimal KV cache proxy backed by ParaSMemoryManager."""
+    """Minimal KV cache proxy backed by ParaSMemoryManager.
+
+    Tracks per-layer prefix/head_num/view_tokens to mirror MHATokenToKVPool's
+    per-layer k_buffer/v_buffer arrays.
+    """
 
     def __init__(self, mgr, num_heads, head_dim, num_layers, dtype, device,
                  prefix, view_tokens=None):
@@ -274,30 +278,41 @@ class _MockKVCache:
         self.store_dtype = dtype
         self.device = device
         self._mgr = mgr
-        self._prefix = prefix
-        self._view_tokens = view_tokens
+        self._layer_prefix = {i: prefix for i in range(num_layers)}
+        self._layer_heads = {i: num_heads for i in range(num_layers)}
+        self._layer_view_tokens = {i: view_tokens for i in range(num_layers)}
 
     def get_key_buffer(self, layer_id):
-        name = f"model.layers.{layer_id}.kv.{self._prefix}.k"
-        if self._view_tokens is not None:
-            return self._mgr.get_view_as(
-                name, (self._view_tokens, self.head_num, self.head_dim)
-            )
+        prefix = self._layer_prefix[layer_id]
+        heads = self._layer_heads[layer_id]
+        vt = self._layer_view_tokens[layer_id]
+        name = f"model.layers.{layer_id}.kv.{prefix}.k"
+        if vt is not None:
+            return self._mgr.get_view_as(name, (vt, heads, self.head_dim))
         return self._mgr.get_view(name)
 
     def get_value_buffer(self, layer_id):
-        name = f"model.layers.{layer_id}.kv.{self._prefix}.v"
-        if self._view_tokens is not None:
-            return self._mgr.get_view_as(
-                name, (self._view_tokens, self.head_num, self.head_dim)
-            )
+        prefix = self._layer_prefix[layer_id]
+        heads = self._layer_heads[layer_id]
+        vt = self._layer_view_tokens[layer_id]
+        name = f"model.layers.{layer_id}.kv.{prefix}.v"
+        if vt is not None:
+            return self._mgr.get_view_as(name, (vt, heads, self.head_dim))
         return self._mgr.get_view(name)
 
     def paras_resize_cache(self, layer_id, new_size, new_head_num):
-        pass  # Memory manager handles physical layout
+        self.head_num = new_head_num
+        self._layer_prefix[layer_id] = "tp"
+        self._layer_heads[layer_id] = new_head_num
+        total_elems = self._mgr._entries[f"model.layers.{layer_id}.kv.tp.k"].numel
+        self._layer_view_tokens[layer_id] = total_elems // (new_head_num * self.head_dim)
 
     def paras_resize_cache_ep(self, layer_id, new_size, new_head_num):
-        pass  # Memory manager handles physical layout
+        self.head_num = new_head_num
+        self._layer_prefix[layer_id] = "ep"
+        self._layer_heads[layer_id] = new_head_num
+        total_elems = self._mgr._entries[f"model.layers.{layer_id}.kv.ep.k"].numel
+        self._layer_view_tokens[layer_id] = total_elems // (new_head_num * self.head_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +459,7 @@ def do_ep_to_tp_gather(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
 # ---------------------------------------------------------------------------
 
 def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-                        tp_view_tokens, tp_group):
+                        tp_view_tokens, tp_group, ep_max_tokens=None):
     """Execute TP→EP scatter via _scatter_cache_nccl.
 
     Returns (token_partition, ep_dst_positions).
@@ -457,7 +472,6 @@ def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
         total_tokens, dtype=torch.int64, device="cuda"
     )
 
-    # Contiguous token partition: rank r gets tokens [offset, offset+n)
     token_partition = []
     offset = 0
     for r in range(world_size):
@@ -477,10 +491,6 @@ def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
         tp_group, world_size, f"cuda:{rank}", rank
     )
 
-    # NOTE: Do NOT zero EP buffers — they share physical memory with TP
-    # buffers via the N+1 slot design (EP layer i = slot i+1 = TP layer i+1).
-    # _scatter_cache_nccl processes layers in reverse order to avoid
-    # corrupting TP source data.
     _scatter_cache_nccl(
         kv_cache=tp_cache,
         ep_head_num=num_kv_heads,
@@ -488,7 +498,7 @@ def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
         global_token_indices=global_token_indices,
         ep_dst_positions=ep_dst_positions,
         gather_group=group_coord,
-        new_ep_cache_size=None,
+        new_ep_cache_size=ep_max_tokens,
     )
 
     return token_partition, ep_dst_positions
@@ -964,7 +974,7 @@ class TestTPtoEPStandalone:
 
         token_partition, ep_dst = do_tp_to_ep_scatter(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            tp_view_tokens, tp_group,
+            tp_view_tokens, tp_group, ep_max_tokens=ep_max,
         )
 
         # Verify: EP rank e, head h → data from TP rank h, local head 0
@@ -1094,7 +1104,7 @@ class TestKVRoundTrip:
         # processes layers in reverse order to avoid corrupting TP source.
         token_partition, ep_dst = do_tp_to_ep_scatter(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            tp_view_tokens, tp_group,
+            tp_view_tokens, tp_group, ep_max_tokens=ep_max,
         )
 
         # Step 3: Verify bitwise match

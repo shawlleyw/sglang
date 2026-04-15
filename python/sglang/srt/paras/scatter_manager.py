@@ -13,15 +13,13 @@ import os
 import torch
 import torch.distributed as dist
 
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     MHATokenToKVPool,
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.paras.gather_manager import recover_request
 
 
 # ============================================================
@@ -330,11 +328,11 @@ class ParaSReqScatterManager:
         enable_overlap: bool,
         spec_algorithm: Any,
         enable_custom_logit_processor: bool,
-    ) -> ScheduleBatch:
-        """Create a ScheduleBatch from the local EP partition.
+    ):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+        from sglang.srt.paras.gather_manager import recover_request
 
-        Mirrors ``ParaSReqGatherManager.get_new_running_batch``.
-        """
         if not self.local_reqs:
             return ScheduleBatch(reqs=[], batch_is_full=False)
 
