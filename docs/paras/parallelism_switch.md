@@ -178,15 +178,15 @@ The reverse switch (TP→EP) is now implemented, enabling full round-trip switch
 curl http://localhost:30000/paras_configure_ep
 ```
 
-### Switch Timeline (Qwen3-30B-A3B, 4×A100)
+### Switch Timeline (Qwen3-30B-A3B, 4×A100, empty batch)
 
-| Phase | Time (naive) | Time (peer_access) |
-|-------|-------------|-------------------|
-| Request partition + pool resize | ~5 ms | ~5 ms |
-| KV cache scatter | ~30 ms | TBD |
-| Weight transfer (reverse) | ~70 ms | ~500 ms |
-| Attention reconfiguration | ~5 ms | ~5 ms |
-| **Total** | **~103 ms** | **~545 ms** |
+| Phase | Time (peer_access) |
+|-------|--------------------|
+| Request partition + pool resize | ~1 ms |
+| KV cache scatter (0 tokens) | ~3 ms |
+| Weight transfer (reverse peer_access) | ~70 ms |
+| Attention reconfiguration | ~11 ms |
+| **Total** | **~88 ms** |
 
 ## Limitations and Future Work
 
@@ -195,5 +195,3 @@ curl http://localhost:30000/paras_configure_ep
 2. **Dynamic switching**: The current switch is triggered manually via `/paras_configure_tp` and `/paras_configure_ep`. An automatic policy that monitors batch size and switches when the crossover point is reached would enable fully adaptive serving.
 
 3. **FP8 support**: The kernel and memory manager support FP8 weights but FP8 KV cache is not yet wired through.
-
-4. **Peer access reverse kernel optimization**: The TP→EP peer_access weight kernels are ~5× slower than NCCL naive (545ms vs 103ms). The kernels need profiling and optimization to match the EP→TP direction's performance.
