@@ -196,10 +196,19 @@ export PARAS_KV_TRANSFER_METHOD=peer_access   # NVLink direct (fastest)
 export PARAS_KV_TRANSFER_METHOD=nccl          # NCCL all_to_all fallback
 ```
 
+## TP→EP Reverse KV Scatter
+
+The reverse direction (TP→EP) is now implemented in `scatter_manager.py`. Each TP rank sends its head's token data to the EP ranks that will own those tokens (determined by the request partition). Key design points:
+
+- **Layer order**: Reverse (N-1→0), same as EP→TP requirement but in opposite direction
+- **Head replication** (`num_kv_heads < tp_size`): subgroup members split the token load — each sends a disjoint 1/R slice, cutting NVLink traffic by R. No kernel changes; the Python wrapper builds smaller routing tensors.
+- **Per-layer barrier**: `dist.all_reduce(barrier)` after each layer kernel, with ALL ranks participating (even those with 0 tokens)
+- **NCCL fallback**: A unified `_scatter_cache_nccl` path handles both R=1 and R>1 with a single code path. The only conditional is `reassembly_groups = group_size if heads_per_rank > 1 else num_kv_heads`.
+
+See `tp_to_ep_switch.md` for the full design and `scatter_manager.py` for the implementation.
+
 ## Future Work
 
-1. **TP→EP reverse KV transfer**: Process layers in reverse order (N-1, ..., 0). Layer `i`'s read from slot `i` completes before layer `i-1`'s write to slot `i`.
+1. **FP8 KV cache**: Wire `kv_cache_dtype=fp8` through to `reserve_kv_cache()` and kernel elem_size.
 
-2. **FP8 KV cache**: Wire `kv_cache_dtype=fp8` through to `reserve_kv_cache()` and kernel elem_size.
-
-3. **NVSHMEM migration**: Replace CUDA IPC with NVSHMEM symmetric heap allocation (`nvshmem_align` + `nvshmemi_get_p2p_ptr`). Would eliminate IPC handle exchange entirely. Medium-large effort — requires coordinating with DeepEP's NVSHMEM init and wrapping NVSHMEM memory as torch tensors. Not needed now that `cudaDeviceEnablePeerAccess` overhead is eliminated.
+2. **NVSHMEM migration**: Replace CUDA IPC with NVSHMEM symmetric heap allocation (`nvshmem_align` + `nvshmemi_get_p2p_ptr`). Would eliminate IPC handle exchange entirely. Medium-large effort — requires coordinating with DeepEP's NVSHMEM init and wrapping NVSHMEM memory as torch tensors. Not needed now that `cudaDeviceEnablePeerAccess` overhead is eliminated.

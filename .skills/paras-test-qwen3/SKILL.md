@@ -164,7 +164,42 @@ curl -s --max-time 60 http://localhost:30000/v1/completions \
 
 **Expected**: Coherent output, same quality as original EP mode. May have minor wording differences due to BF16 precision.
 
-### 11. Verify no errors
+### 11. Test KV cache coherence (in-flight requests during switch)
+
+This tests that requests with accumulated KV cache survive the TP→EP switch.
+
+```bash
+# Switch back to TP first
+curl -s --max-time 30 http://localhost:30000/paras_configure_tp
+
+# Start long requests in TP mode (background)
+curl -s --max-time 120 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen3-30B-A3B","prompt":"List the first 10 prime numbers and explain why each is prime.","max_tokens":200,"temperature":0}' > /tmp/r1.json &
+PID1=$!
+
+curl -s --max-time 120 http://localhost:30000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen3-30B-A3B","prompt":"Write a recursive Fibonacci function in Python with memoization.","max_tokens":200,"temperature":0}' > /tmp/r2.json &
+PID2=$!
+
+# Wait for KV cache to build up
+sleep 4
+
+# Switch TP→EP mid-generation
+curl -s --max-time 60 http://localhost:30000/paras_configure_ep
+
+# Wait for requests to complete
+wait $PID1 $PID2
+
+# Verify outputs are coherent
+python3 -c "import json; d=json.load(open('/tmp/r1.json')); print('[R1]', d['choices'][0]['text'][:300])"
+python3 -c "import json; d=json.load(open('/tmp/r2.json')); print('[R2]', d['choices'][0]['text'][:300])"
+```
+
+**Expected**: Both outputs are coherent multi-sentence text. No degeneration, no garbage, no repeated tokens. The switch is transparent — requests continue generating after the switch with correctly transferred KV cache.
+
+### 12. Verify no errors
 
 ```bash
 grep -i "error\|exception" /tmp/sglang_paras_test.log | grep -v "import error\|Config file\|opentelemetry\|WARNING"
@@ -184,11 +219,11 @@ rm -f /tmp/sglang_paras_test.log
 |-------|------|------|
 | Model type | `Qwen3MoeForCausalLMParaS` | `Qwen3MoeForCausalLM` |
 | EP requests (3 prompts) | All coherent, 150-200 tokens | Error, timeout, or garbage |
-| ParaS switch | Returns in < 1s | Timeout or OOM |
-| `transfer_weights` | < 300ms | > 1000ms (profiler may be on) |
-| TP P1 (binary search) | Coherent Python reasoning | Garbage, `\xa0`, or repetition |
-| TP P2 (train problem) | Correct approach (140mph combined) | Wrong math or degeneration |
-| TP P3 (TCP vs UDP) | Coherent, covers handshake + reliability | Degeneration after first sentence |
+| EP→TP switch | Returns in < 300ms | Timeout or OOM |
+| TP requests (3 prompts) | Coherent, same quality as EP | Garbage, `\xa0`, or repetition |
+| TP→EP switch | Returns in < 300ms | Timeout or error |
+| EP requests after round-trip | **Identical** to original EP output | Different output or garbage |
+| In-flight KV coherence | Both requests coherent after switch | Degeneration or crash |
 | Server errors | None | Any scheduler/runtime exception |
 
 ## Important Notes

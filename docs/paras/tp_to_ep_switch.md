@@ -2,7 +2,7 @@
 
 ## Why Switch From TP to EP?
 
-As described in `ep_to_tp_switch.md`, neither Expert Parallelism (EP) nor Tensor Parallelism (TP) is universally optimal. Their relative performance depends on batch size: TP wins at small batches, EP wins at large batches. The EP→TP switch enables the system to adapt when traffic drops. The **TP→EP switch completes the round-trip**, allowing the system to switch back when traffic ramps up again.
+As described in `parallelism_switch.md`, neither Expert Parallelism (EP) nor Tensor Parallelism (TP) is universally optimal. Their relative performance depends on batch size: TP wins at small batches, EP wins at large batches. The EP→TP switch enables the system to adapt when traffic drops. The **TP→EP switch completes the round-trip**, allowing the system to switch back when traffic ramps up again.
 
 | Scenario | Direction | Why |
 |----------|-----------|-----|
@@ -20,7 +20,7 @@ The TP→EP switch is the structural reverse of EP→TP, but the two directions 
 |--------|----------------|-----------------|
 | Requests | Each rank has local subset → gather into global set (simple concat) | All ranks share identical global set → **partition into disjoint subsets** (load-balancing problem) |
 | KV cache | All heads, local tokens → subset heads, all tokens (head-split) | Subset heads, all tokens → all heads, local tokens (**head-gather**) |
-| MoE weights | Local experts → sharded experts (all-to-all redistribution) | **Pointer swap** (EP weights preserved in slot[i+1] during TP) |
+| MoE weights | Local experts → sharded experts (all-to-all redistribution) | **Reverse all-to-all** (EP weights in slot[i+1] are overwritten during EP→TP) |
 | Layer order | Forward (0, 1, ..., N-1) | **Reverse** (N-1, ..., 0) to respect N+1 slot aliasing |
 
 The new hard problem is **request partitioning**: deciding which requests go to which EP rank, balanced so no GPU is overloaded. This problem doesn't exist in EP→TP because gathering is a simple concatenation.
@@ -50,7 +50,7 @@ The new hard problem is **request partitioning**: deciding which requests go to 
 │  └─────────────────────────────────────────────────────┘ │
 │                                                         │
 │  Phase 3: Weight + attention restoration                 │
-│    MoE: pointer swap to ep_experts (no data movement)    │
+│    MoE: reverse weight transfer (NCCL or peer_access)    │
 │    Attention: restore full QKV, head counts, backend     │
 │                                                         │
 │  Phase 4: Resume scheduling in EP mode                   │
@@ -112,16 +112,22 @@ This is the reverse of EP→TP's head-splitting gather. See the dedicated sectio
 
 ### Phase 4: Weight + Attention Restoration
 
-**MoE weights**: In the N+1 slot design, EP weights live in slot[i+1] and TP weights live in slot[i]. During TP inference, only slot[i] is read — slot[i+1] is untouched. Therefore, the EP weights are **preserved** and the MoE layer simply swaps its pointer back:
+**MoE weights — Reverse transfer is MANDATORY**: Although the N+1 slot design places EP weights in slot[i+1] and TP weights in slot[i], the EP→TP forward transfer **destroys EP slots**. When EP→TP processes layer `i+1`, it writes TP data to slot[i+1] — which IS layer `i`'s EP slot. After EP→TP completes, slots 1..N-1 contain TP data, not the original EP weights.
+
+Therefore, TP→EP must perform an **actual reverse weight transfer** (inverse permute + all-to-all), not a pointer swap. The reverse reads from TP slots (which have correct TP data) and reconstructs EP data via NCCL all-to-all or peer_access kernels. Layers must be processed in **reverse order** (N-1→0) to avoid aliasing — layer `i`'s reverse writes to EP slot[i+1], which is also layer `(i+1)`'s TP source.
 
 ```python
-def paras_configure_ep(self):
-    self.experts = self.ep_experts  # pointer swap, no data movement
+# paras_model.py — naive path
+def paras_configure_ep_naive(self):
+    for layer in reversed(self.layers):
+        layer.paras_configure_ep_mlp_naive()      # reverse all-to-all
+    for layer in self.layers:
+        layer.paras_configure_ep()                 # attn + communicator restore
 ```
 
-This is a key asymmetry with EP→TP, which requires a full all-to-all redistribution of expert weights.
-
 **Attention**: The attention layer restores full (unsharded) QKV and output projection weights, resets head counts to EP values (`tp_size=1`), and re-initializes the FlashInfer backend with the EP-mode `req_to_token` mapping.
+
+**KV pool**: `MHATokenToKVPool.paras_configure_ep()` restores the original head count and points `k_buffer[i]`/`v_buffer[i]` to the EP aliases from the memory manager (slot[i+1], not a reshape of the TP view in slot[i]).
 
 **Scheduler**: Rebuilds the `ScheduleBatch` from only the local partition's requests, restores `enable_dp_attention=True`, resets `dp_size` and `tp_size` to EP values, and restores the tokenizer/detokenizer communication sockets so all ranks resume handling I/O.
 
@@ -213,7 +219,7 @@ The N+1 slot design naturally supports unlimited round-trips without explicit st
 
 | Component | Why it works |
 |-----------|-------------|
-| **Weight aliases** | `ep_experts` → slot[i+1] and `tp_experts` → slot[i] are permanent. Each switch overwrites target slots; the next switch reads from freshly-written source slots. |
+| **Weight aliases** | `ep_experts` → slot[i+1] and `tp_experts` → slot[i] are permanent. EP→TP overwrites TP slots from EP data; TP→EP reverse-transfers from TP slots back to EP slots. Both directions use the same aliases. |
 | **KV aliases** | Same principle: `kv.ep` → slot[i+1], `kv.tp` → slot[i]. |
 | **Communication groups** | Created at init in `paras_parallel_state.py` (PARAS_TP, PARAS_DP, PARAS_EP), never destroyed. |
 | **Dual LayerCommunicator** | EP and TP communicator objects co-exist in each decoder layer. The switch swaps which one is active. |
@@ -255,7 +261,7 @@ No changes to the tokenizer or detokenizer code are needed. The existing EP→TP
 | `paras/scheduler_paras_mixin.py` | `paras_configure_ep()` — full 4-phase switch orchestration |
 | `paras/layers/paras_model.py` | `paras_configure_ep_naive()`, `paras_configure_ep_peer_access()` — per-layer orchestration |
 | `paras/layers/paras_decoder_layer.py` | Swap to EP communicator, call attention + MoE configure_ep |
-| `paras/layers/paras_moe_block.py` | `paras_configure_ep()` — pointer swap to ep_experts |
+| `paras/layers/paras_moe_block.py` | `paras_configure_ep()` — pointer swap; `paras_configure_ep_mlp_naive()` / `paras_configure_ep_fused_peer_access_kernel()` — reverse weight transfer |
 | `paras/layers/paras_attention.py` | Restore full QKV weights, EP head counts |
 | `mem_cache/memory_pool.py` | `paras_configure_ep()` — restore original head_num |
 | `model_executor/model_runner.py` | `paras_configure_ep()` — call pool, attn_backend, model |
@@ -263,9 +269,41 @@ No changes to the tokenizer or detokenizer code are needed. The existing EP→TP
 | `layers/linear.py` | `QKVParallelLinear.paras_configure_ep()` — restore full weight |
 | `layers/attention/flashinfer_backend.py` | `paras_configure_ep()` — restore head counts, req_to_token |
 
+## Verified Performance (Qwen3-30B-A3B, 4×A100)
+
+### Switch Timings
+
+| Phase | EP→TP | TP→EP |
+|-------|-------|-------|
+| Request gather/partition | 16ms | <1ms |
+| Cache reorchestrate | 2ms | 1ms |
+| KV cache transfer | 46ms | 3ms (empty batch) |
+| Weight transfer (peer_access) | 78ms | 70ms |
+| Attention + config | 20ms | 11ms |
+| **Total** | **163ms** | **88ms** |
+
+### Coherence Verification (E2E on Qwen3-30B-A3B)
+
+| Test | Result |
+|------|--------|
+| EP request → EP→TP → TP request (same prompt) | ✅ Identical output |
+| TP request → TP→EP → EP request (same prompt) | ✅ Identical output |
+| In-flight request during TP→EP switch (single) | ✅ Coherent completion |
+| In-flight requests during TP→EP switch (2 concurrent) | ✅ Both coherent |
+| Full round-trip EP→TP→EP: fresh request in restored EP | ✅ Identical to original EP |
+
+### Unit Test Verification
+
+| Test Suite | Tests | Result |
+|------------|-------|--------|
+| Request partition (CPU) | 11 | ✅ All pass |
+| KV cache transfer (4-GPU, ground truth) | 6 | ✅ All pass |
+| KV cache transfer (8-GPU, R=2) | 6 | ✅ All pass |
+| Weight transfer (4-GPU, ground truth + round-trip) | 7 | ✅ All pass |
+
 ## Limitations and Future Work
 
-1. **`dp_size > 1`**: Currently only `paras_dp_size == 1` is supported. With multiple DP groups, the MoE weight restoration would require a reverse all-to-all (not just a pointer swap), and the request partition would need to account for inter-group distribution.
+1. **`dp_size > 1`**: Currently only `paras_dp_size == 1` is supported. With multiple DP groups, the request partition would need to account for inter-group distribution, and the reverse weight transfer would involve additional all-gather steps.
 
 2. **Automatic switching policy**: Both EP→TP and TP→EP are triggered manually via HTTP endpoints. An automatic policy that monitors batch size and switches at the crossover point would enable fully adaptive serving without operator intervention.
 

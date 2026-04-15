@@ -1,6 +1,6 @@
-# ParaS: Runtime EP→TP Parallelism Switching
+# ParaS: Runtime EP↔TP Parallelism Switching
 
-## Why Switch From EP to TP?
+## Why Switch Between EP and TP?
 
 Mixture-of-Experts (MoE) models can be served with two parallelism strategies:
 
@@ -155,10 +155,11 @@ The switch is transparent to clients — in-flight requests continue generating 
 | Document | Contents |
 |----------|----------|
 | `unified_memory_manager.md` | Contiguous buffer allocation, N+1 slot design, alias system, KV cache integration |
-| `nvlink_peer_access_weight_transfer.md` | w13/w2 CUDA kernels, data flow, theoretical analysis |
-| `nvlink_peer_access_kv_cache_transfer.md` | Fused K+V kernel, head replication, NCCL fallback, smem vs L1 analysis |
+| `nvlink_peer_access_weight_transfer.md` | w13/w2 CUDA kernels (EP→TP + TP→EP reverse), data flow, theoretical analysis |
+| `nvlink_peer_access_kv_cache_transfer.md` | Fused K+V kernel (EP→TP + TP→EP scatter), head replication, NCCL fallback |
 | `nvlink_peer_access_guielines.md` | NVLink store optimization guidelines (grid config, vectorization, alignment) |
 | `exploration_notes_kv_cache_peer_access.md` | Development notes: bugs found, CUDA IPC analysis, design tradeoffs |
+| `tp_to_ep_switch.md` | TP→EP reverse switch: request partition, KV scatter, weight restoration, control plane |
 
 ## TP→EP Reverse Switch
 

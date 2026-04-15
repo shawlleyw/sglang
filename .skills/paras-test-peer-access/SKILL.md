@@ -14,7 +14,7 @@ Correctness and benchmark tests for ParaS parallelism switching: KV cache transf
 - Conda env: `sgl_paras`
 - Python path: `/home/shaoyuw/miniconda3/envs/sgl_paras/bin/python`
 - Torchrun: `/home/shaoyuw/miniconda3/envs/sgl_paras/bin/torchrun`
-- CUDA extension compiled: `cd python/sglang/srt/paras/csrc && pip install -e .`
+- CUDA extension compiled: `cd python/sglang/srt/paras/csrc && python setup.py build_ext --inplace`
 - Empty GPUs required (check before running)
 
 ## GPU Check (ALWAYS run first)
