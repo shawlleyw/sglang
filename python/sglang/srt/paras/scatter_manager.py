@@ -4,7 +4,7 @@ Moved from gather_manager.py for code organization.  Contains:
 - partition_requests_for_ep  (with extensible strategy pattern)
 - gather_tp_kv_and_permute
 - permute_and_scatter_kv_to_ep
-- _EPCacheView
+- _scatter_cache_nccl  (with KV head duplication support, uses paras_resize_cache_ep)
 - ParaSReqScatterManager
 - _scatter_cache_nccl  (with KV head duplication support)
 """
@@ -163,50 +163,6 @@ def permute_and_scatter_kv_to_ep(
     # Scatter K and V into EP buffers
     k_buffer[dst_positions] = kv[:, :, 0, :]
     v_buffer[dst_positions] = kv[:, :, 1, :]
-
-
-# ============================================================
-# _EPCacheView
-# ============================================================
-
-class _EPCacheView:
-    """Proxy providing EP-layout buffer access via the ParaS memory manager.
-
-    ``_scatter_cache_nccl`` needs an ``ep_kv_cache`` with EP-shaped buffers
-    for the write destination.  The N+1 slot design stores EP data in
-    slot[i+1] and TP data in slot[i] at *different* physical offsets.
-    This proxy reads the EP aliases from the global ``ParaSMemoryManager``
-    to return buffers at the correct physical location.
-    """
-
-    def __init__(self, tp_cache: 'MHATokenToKVPool', ep_head_num: int):
-        self.head_num = ep_head_num
-        self.head_dim = tp_cache.head_dim
-        self.layer_num = tp_cache.layer_num
-        self.store_dtype = tp_cache.store_dtype
-        self.device = tp_cache.device
-        self._tp_cache = tp_cache
-
-    def _get_mgr(self):
-        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-        return get_global_paras_memory_manager()
-
-    def get_key_buffer(self, layer_id: int):
-        mgr = self._get_mgr()
-        ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
-        total_elems = mgr._entries[ep_k_name].numel
-        ep_tokens = total_elems // (self.head_num * self.head_dim)
-        return mgr.get_view_as(ep_k_name, (ep_tokens, self.head_num, self.head_dim))
-
-    def get_value_buffer(self, layer_id: int):
-        mgr = self._get_mgr()
-        ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
-        total_elems = mgr._entries[ep_v_name].numel
-        ep_tokens = total_elems // (self.head_num * self.head_dim)
-        return mgr.get_view_as(ep_v_name, (ep_tokens, self.head_num, self.head_dim))
-
-    def paras_resize_cache(self, layer_id: int, new_size: int, new_head_num: int):
-        self._tp_cache.paras_resize_cache(layer_id, new_size, new_head_num)
 
 
 # ============================================================
@@ -384,14 +340,18 @@ class ParaSReqScatterManager:
             "Only MHATokenToKVPool is supported for now."
         )
         if ep_head_num is None:
-            # In TP mode, head_num is already sharded (head_num = original // tp_size).
-            # Recover the full EP head count by multiplying back.
-            ep_head_num = tp_kv_cache.head_num * self.paras_tp_size
+            # head_num in TP mode is sharded.  With head replication
+            # (num_kv_heads < tp_size), head_num * tp_size != num_kv_heads.
+            # Use the saved full head count instead.
+            ep_head_num = tp_kv_cache._paras_original_head_num
 
         if self.num_global_tokens == 0:
             # No active requests — nothing to scatter.  Still need to
             # reconfigure the KV pool to EP head count.
-            tp_kv_cache.paras_configure_ep()
+            for layer_id in range(tp_kv_cache.layer_num):
+                tp_kv_cache.paras_resize_cache_ep(
+                    layer_id, self.new_cache_size, ep_head_num
+                )
             return
 
         if self.method == "peer_access" and self.peer_ctx is not None:
@@ -406,22 +366,15 @@ class ParaSReqScatterManager:
     ):
         torch.cuda.empty_cache()
 
-        # _scatter_cache_nccl expects separate TP/EP cache objects with
-        # different head_num.  Create a lightweight EP view.
-        ep_view = _EPCacheView(kv_cache, ep_head_num)
-
         _scatter_cache_nccl(
-            tp_kv_cache=kv_cache,
-            ep_kv_cache=ep_view,
+            kv_cache=kv_cache,
+            ep_head_num=ep_head_num,
             token_partition=self.token_partition,
             global_token_indices=self.global_token_indices,
             ep_dst_positions=self.ep_dst_positions,
             gather_group=self.scatter_group,
             new_ep_cache_size=self.new_cache_size,
         )
-
-        # Restore EP head_num (per-layer buffers already EP-shaped after resize).
-        kv_cache.paras_configure_ep()
 
     def _scatter_cache_peer_access(
         self,
@@ -551,19 +504,12 @@ class ParaSReqScatterManager:
 
         torch.cuda.synchronize()
 
-        # Point KV buffers to EP managed entries.
+        # Point KV buffers to EP aliases (slot[i+1]) per layer,
+        # mirroring how _gather_cache_peer_access calls paras_resize_cache.
         for layer_id in range(num_layers):
-            local_layer_idx = layer_id - kv_cache.start_layer
-            ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
-            ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
-            total_elements = mgr._entries[ep_k_name].numel
-            ep_slots = total_elements // (ep_head_num * head_dim)
-            ep_shape = (ep_slots, ep_head_num, head_dim)
-            kv_cache.k_buffer[local_layer_idx] = mgr.get_view_as(ep_k_name, ep_shape)
-            kv_cache.v_buffer[local_layer_idx] = mgr.get_view_as(ep_v_name, ep_shape)
-
-        # Restore EP head_num.
-        kv_cache.paras_configure_ep()
+            kv_cache.paras_resize_cache_ep(
+                layer_id, self.new_cache_size, ep_head_num
+            )
 
 
 # ============================================================
@@ -571,8 +517,8 @@ class ParaSReqScatterManager:
 # ============================================================
 
 def _scatter_cache_nccl(
-    tp_kv_cache: 'MHATokenToKVPool',
-    ep_kv_cache: 'MHATokenToKVPool',
+    kv_cache: 'MHATokenToKVPool',
+    ep_head_num: int,
     token_partition: List[List[int]],
     global_token_indices: torch.Tensor,
     ep_dst_positions: torch.Tensor,
@@ -601,9 +547,13 @@ def _scatter_cache_nccl(
          source ranks to reconstruct full ``num_kv_heads`` per token, then
          scatter K/V into EP buffers at ``ep_dst_positions``.
 
+    Uses ``paras_resize_cache_ep`` per layer to point buffers at EP
+    aliases (slot[i+1]), mirroring how the gather path uses
+    ``paras_resize_cache`` for TP aliases (slot[i]).
+
     Args:
-        tp_kv_cache: Source TP KV pool (``head_num == heads_per_rank``).
-        ep_kv_cache: Destination EP KV pool (``head_num == num_kv_heads``).
+        kv_cache: KV pool (currently in TP mode, ``head_num == heads_per_rank``).
+        ep_head_num: Full EP head count (``num_kv_heads``).
         token_partition: ``token_partition[e]`` is a list of global token
             indices (into ``global_token_indices``) assigned to EP rank *e*.
             Identical on every rank.
@@ -619,10 +569,10 @@ def _scatter_cache_nccl(
     group_size = gather_group.world_size
     tp_rank = dist.get_rank(group=gather_group.device_group)
 
-    num_layers = tp_kv_cache.layer_num
-    num_kv_heads = ep_kv_cache.head_num      # EP has all heads
-    heads_per_rank = tp_kv_cache.head_num    # TP has subset
-    head_dim = tp_kv_cache.head_dim
+    num_layers = kv_cache.layer_num
+    num_kv_heads = ep_head_num
+    heads_per_rank = kv_cache.head_num    # TP has subset
+    head_dim = kv_cache.head_dim
 
     # -- R3: Compute replication factor for KV head duplication -----------
     if num_kv_heads >= group_size:
@@ -702,30 +652,32 @@ def _scatter_cache_nccl(
     # num_kv_heads == group_size so both views are identical.
     reassembly_groups = group_size if heads_per_rank > 1 else num_kv_heads
 
-    # -- Per-layer: gather → all_to_all → scatter ------------------------
+    # -- Per-layer: gather → all_to_all → resize_ep → scatter -------------
     def scatter_one_layer(layer_id: int) -> None:
         if total_send_tokens > 0:
-            k_buf = tp_kv_cache.get_key_buffer(layer_id)
-            v_buf = tp_kv_cache.get_value_buffer(layer_id)
+            k_buf = kv_cache.get_key_buffer(layer_id)
+            v_buf = kv_cache.get_value_buffer(layer_id)
             send_buf = gather_tp_kv_and_permute(
                 k_buf, v_buf, sorted_tp_indices,
                 num_kv_heads, heads_per_rank, head_dim, group_size,
             )
         else:
             send_buf = torch.empty(
-                0, dtype=tp_kv_cache.store_dtype, device=tp_kv_cache.device
+                0, dtype=kv_cache.store_dtype, device=kv_cache.device
             )
 
+        # Point this layer's buffers at EP aliases (slot[i+1]),
+        # mirroring how gather calls paras_resize_cache for TP aliases.
         if new_ep_cache_size is not None:
-            ep_kv_cache.paras_resize_cache(
+            kv_cache.paras_resize_cache_ep(
                 layer_id, new_ep_cache_size, num_kv_heads
             )
 
         if total_global_tokens > 0:
             recv_buf = torch.empty(
                 total_recv_elems,
-                dtype=tp_kv_cache.store_dtype,
-                device=tp_kv_cache.device,
+                dtype=kv_cache.store_dtype,
+                device=kv_cache.device,
             )
             dist.all_to_all_single(
                 recv_buf, send_buf,
@@ -734,8 +686,8 @@ def _scatter_cache_nccl(
             )
 
             if recv_full_count > 0:
-                ep_k = ep_kv_cache.get_key_buffer(layer_id)
-                ep_v = ep_kv_cache.get_value_buffer(layer_id)
+                ep_k = kv_cache.get_key_buffer(layer_id)
+                ep_v = kv_cache.get_value_buffer(layer_id)
                 permute_and_scatter_kv_to_ep(
                     recv_buf, ep_k, ep_v, ep_dst_positions,
                     recv_full_count, num_kv_heads, heads_per_rank,

@@ -1025,12 +1025,51 @@ class MHATokenToKVPool(KVCache):
             )
         self.head_num = sharded_head_num
 
+    def paras_resize_cache_ep(self, layer_id: int, new_size: int, new_head_num: int):
+        """Resize KV cache for one layer during TP→EP switch.
+
+        Mirrors ``paras_resize_cache`` (which targets TP aliases in slot[i])
+        but points buffers at the EP aliases in slot[i+1].
+        """
+        self.head_num = new_head_num
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+        mgr = get_global_paras_memory_manager()
+
+        local_layer_idx = layer_id - self.start_layer
+
+        if mgr is not None and mgr.materialized and mgr._kv_reserved:
+            ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
+            ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
+            if ep_k_name in mgr._entries:
+                total_elements = mgr._entries[ep_k_name].numel
+                ep_slots = total_elements // (new_head_num * self.head_dim)
+                ep_shape = (ep_slots, new_head_num, self.head_dim)
+                self.k_buffer[local_layer_idx] = mgr.get_view_as(ep_k_name, ep_shape)
+                self.v_buffer[local_layer_idx] = mgr.get_view_as(ep_v_name, ep_shape)
+                return
+
+        # Fallback: allocate unmanaged buffer (non-ParaS or manager not ready)
+        self.k_buffer[local_layer_idx] = torch.empty(
+            new_size + self.page_size,
+            new_head_num,
+            self.head_dim,
+            dtype=self.store_dtype,
+            device=self.device,
+        )
+        self.v_buffer[local_layer_idx] = torch.empty(
+            new_size + self.page_size,
+            new_head_num,
+            self.head_dim,
+            dtype=self.store_dtype,
+            device=self.device,
+        )
+
     @paras_func
     def paras_configure_ep(self):
         # ParaS: Switch kv cache buffers from TP slots to EP slots.
         # The N+1 slot design stores EP data in slot[i+1] and TP data in
         # slot[i] at different physical offsets.  After the scatter manager
-        # writes to EP slots via _EPCacheView, we must point k/v_buffer[i]
+        # writes to EP slots via paras_resize_cache_ep, we must point k/v_buffer[i]
         # to the EP alias from the memory manager (not just reshape the TP view).
         self.head_num = self._paras_original_head_num  # restore original
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager

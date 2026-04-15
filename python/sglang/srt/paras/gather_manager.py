@@ -490,5 +490,4 @@ from sglang.srt.paras.scatter_manager import (  # noqa: F401, E402
     gather_tp_kv_and_permute,
     permute_and_scatter_kv_to_ep,
     _scatter_cache_nccl,
-    _EPCacheView,
 )

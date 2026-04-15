@@ -296,6 +296,9 @@ class _MockKVCache:
     def paras_resize_cache(self, layer_id, new_size, new_head_num):
         pass  # Memory manager handles physical layout
 
+    def paras_resize_cache_ep(self, layer_id, new_size, new_head_num):
+        pass  # Memory manager handles physical layout
+
 
 # ---------------------------------------------------------------------------
 # Fill helpers
@@ -446,7 +449,7 @@ def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
 
     Returns (token_partition, ep_dst_positions).
     """
-    from sglang.srt.paras.scatter_manager import _scatter_cache_nccl, _EPCacheView
+    from sglang.srt.paras.scatter_manager import _scatter_cache_nccl
 
     heads_per_rank = max(1, num_kv_heads // world_size)
     total_tokens = sum(tokens_per_rank)
@@ -470,7 +473,6 @@ def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
         mgr, heads_per_rank, HEAD_DIM, NUM_LAYERS, DTYPE,
         f"cuda:{rank}", "tp", view_tokens=tp_view_tokens,
     )
-    ep_cache = _EPCacheView(tp_cache, num_kv_heads)
     group_coord = _SimpleGroupCoordinator(
         tp_group, world_size, f"cuda:{rank}", rank
     )
@@ -480,8 +482,8 @@ def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
     # _scatter_cache_nccl processes layers in reverse order to avoid
     # corrupting TP source data.
     _scatter_cache_nccl(
-        tp_kv_cache=tp_cache,
-        ep_kv_cache=ep_cache,
+        kv_cache=tp_cache,
+        ep_head_num=num_kv_heads,
         token_partition=token_partition,
         global_token_indices=global_token_indices,
         ep_dst_positions=ep_dst_positions,
