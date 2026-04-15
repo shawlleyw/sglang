@@ -59,6 +59,14 @@ class ParaSDecoderLayerMixin:
         """Launch fused kernels for this layer (no barriers — model level manages them)."""
         return self.mlp.paras_configure_tp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
 
+    def paras_configure_ep_mlp_naive(self):
+        """Reverse MoE weights from TP→EP via NCCL all-to-all for this layer."""
+        self.mlp.paras_configure_ep_mlp_naive()
+
+    def paras_configure_ep_mlp_fused_peer_access_kernel(self, peer_ctx, dst_base_ptrs, stream):
+        """Launch reverse fused kernels for this layer (no barriers — model level manages them)."""
+        return self.mlp.paras_configure_ep_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
+
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
         """Switch from EP to TP mode for this layer."""
