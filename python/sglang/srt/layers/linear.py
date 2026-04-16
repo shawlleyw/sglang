@@ -164,6 +164,7 @@ class LinearBase(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
         self.quant_config = quant_config
+        self.prefix = prefix
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
@@ -1224,11 +1225,14 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         # column major
         full_weight_tensor = self.full_weight.data
+        hs = self.head_size
+
         new_weight_tensor = torch.row_stack((
-            full_weight_tensor[tp_head_start*self.head_size:tp_head_end*self.head_size, :],
-            full_weight_tensor[tp_k_head_start*self.head_size:tp_k_head_end*self.head_size, :],
-            full_weight_tensor[tp_v_head_start*self.head_size:tp_v_head_end*self.head_size, :]
+            full_weight_tensor[tp_head_start * hs : tp_head_end * hs, :],
+            full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs, :],
+            full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs, :],
         ))
+
         self.weight = torch.nn.Parameter(new_weight_tensor, requires_grad=False)
         set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
 

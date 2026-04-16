@@ -49,11 +49,28 @@ class ParaSDecoderLayerMixin:
         self.mlp.paras_configure_tp_all_gather()
         self.mlp.paras_configure_tp_all_to_all()
 
-    def paras_configure_tp_mlp_all_gather(self, stream, handles, async_op=False):
-        return self.mlp.paras_configure_tp_all_gather(stream, handles, async_op)
+    def paras_configure_tp_mlp_all_gather(self, stream, handles, async_op=False, staging_suffix=""):
+        return self.mlp.paras_configure_tp_all_gather(stream, handles, async_op, staging_suffix)
 
-    def paras_configure_tp_mlp_all_to_all(self, stream, handles):
-        return self.mlp.paras_configure_tp_all_to_all(stream, handles)
+    def paras_configure_tp_mlp_all_to_all(self, stream, handles, staging_suffix=""):
+        return self.mlp.paras_configure_tp_all_to_all(stream, handles, staging_suffix)
+
+    def paras_configure_tp_mlp_fused_peer_access_kernel(self, peer_ctx, dst_base_ptrs, stream):
+        """Launch fused kernels for this layer (no barriers — model level manages them)."""
+        return self.mlp.paras_configure_tp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
+
+    def paras_configure_ep_attn(self):
+        """Restore attention from TP→EP for this layer (mirrors paras_configure_tp_attn)."""
+        if hasattr(self.self_attn, "paras_configure_ep"):
+            self.self_attn.paras_configure_ep()
+
+    def paras_configure_ep_mlp_naive(self):
+        """Reverse MoE weights from TP→EP via NCCL all-to-all for this layer."""
+        self.mlp.paras_configure_ep_mlp_naive()
+
+    def paras_configure_ep_mlp_fused_peer_access_kernel(self, peer_ctx, dst_base_ptrs, stream):
+        """Launch reverse fused kernels for this layer (no barriers — model level manages them)."""
+        return self.mlp.paras_configure_ep_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
@@ -91,8 +108,6 @@ class ParaSDecoderLayerMixin:
     @paras_func
     def paras_configure_ep(self):
         """Switch from TP back to EP mode for this layer."""
-        if hasattr(self.self_attn, "paras_configure_ep"):
-            self.self_attn.paras_configure_ep()
         self.mlp.paras_configure_ep()
 
         # Revert to EP communicator

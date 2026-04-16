@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
+
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -578,6 +579,8 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        external_k_buffers: Optional[List[torch.Tensor]] = None,
+        external_v_buffers: Optional[List[torch.Tensor]] = None,
     ):
         super().__init__(
             size,
@@ -592,7 +595,10 @@ class MHATokenToKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
 
-        self._create_buffers()
+        self._create_buffers(
+            external_k_buffers=external_k_buffers,
+            external_v_buffers=external_v_buffers,
+        )
 
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = (
@@ -649,31 +655,47 @@ class MHATokenToKVPool(KVCache):
             num_stages=2,
         )
 
-    def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+    def _create_buffers(
+        self,
+        external_k_buffers: Optional[List[torch.Tensor]] = None,
+        external_v_buffers: Optional[List[torch.Tensor]] = None,
+    ):
+        if external_k_buffers is not None and external_v_buffers is not None:
+            # Use pre-allocated managed buffers — skip torch.zeros
+            assert len(external_k_buffers) == self.layer_num, (
+                f"Expected {self.layer_num} k buffers, got {len(external_k_buffers)}"
+            )
+            assert len(external_v_buffers) == self.layer_num, (
+                f"Expected {self.layer_num} v buffers, got {len(external_v_buffers)}"
+            )
+            self.k_buffer = external_k_buffers
+            self.v_buffer = external_v_buffers
+        else:
+            # Original path — allocate from torch.zeros
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.enable_custom_mem_pool
+                    else nullcontext()
+                ):
+                    # [size, head_num, head_dim] for each layer
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.k_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -697,6 +719,46 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+
+    def replace_buffers(
+        self,
+        new_k_buffers: List[torch.Tensor],
+        new_v_buffers: List[torch.Tensor],
+        new_size: int,
+    ) -> None:
+        """
+        Replace backing buffers in-place (for EP→TP mode switch).
+        Updates k_buffer, v_buffer, size, and rebuilds data_ptrs/data_strides.
+        Does NOT reallocate — buffers come from the memory manager.
+        """
+        assert len(new_k_buffers) == self.layer_num, (
+            f"Expected {self.layer_num} k buffers, got {len(new_k_buffers)}"
+        )
+        assert len(new_v_buffers) == self.layer_num, (
+            f"Expected {self.layer_num} v buffers, got {len(new_v_buffers)}"
+        )
+        self.k_buffer = new_k_buffers
+        self.v_buffer = new_v_buffers
+        self.size = new_size
+        # Rebuild pointer tables (Triton kernels use these directly)
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -880,47 +942,53 @@ class MHATokenToKVPool(KVCache):
         )
         self.size = self.k_buffer[0].shape[0] - self.page_size
 
-    def paras_resize_cache(self, layer_id: int, new_size: int, new_head_num: int):
-        self.k_buffer[layer_id - self.start_layer] = torch.empty(
-            new_size + self.page_size,
-            new_head_num,
-            self.head_dim,
-            dtype=self.store_dtype,
-            device=self.device,
-        )
-        self.v_buffer[layer_id - self.start_layer] = torch.empty(
-            new_size + self.page_size,
-            new_head_num,
-            self.head_dim,
-            dtype=self.store_dtype,
-            device=self.device,
-        )
-
     @paras_func
-    def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
-        # ParaS: Reshape kv cache from EP to TP.
-        # TODO: change the size of kv cache pool
-        # It does not intrusively change the number of heads, just increases the number of slots by reshaping kv cache.
+    def paras_configure_tp(self, paras_tp_size: int):
+        """Switch all KV cache buffers from EP to TP layout.
+
+        Points each layer's k/v_buffer at TP aliases (slot[i]) from the
+        memory manager and updates head_num.  Called once after gather_cache
+        finishes writing TP data.  ``@paras_func`` triggers
+        ``paras_configure_helper`` to rebuild derived state (data_ptrs, etc.).
+        """
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+        self.full_head_num = self.head_num
         sharded_head_num = self.head_num // paras_tp_size
-        for i in range(self.layer_num):
-            self.k_buffer[i] = self.k_buffer[i].view(
-                (-1, sharded_head_num, self.head_dim)
-            )
-            self.v_buffer[i] = self.v_buffer[i].view(
-                (-1, sharded_head_num, self.head_dim)
-            )
         self.head_num = sharded_head_num
+
+        mgr = get_global_paras_memory_manager()
+        for i in range(self.layer_num):
+            layer_id = i + self.start_layer
+            tp_k_name = f"model.layers.{layer_id}.kv.tp.k"
+            tp_v_name = f"model.layers.{layer_id}.kv.tp.v"
+            total_elements = mgr._entries[tp_k_name].numel
+            tp_slots = total_elements // (sharded_head_num * self.head_dim)
+            tp_shape = (tp_slots, sharded_head_num, self.head_dim)
+            self.k_buffer[i] = mgr.get_view_as(tp_k_name, tp_shape)
+            self.v_buffer[i] = mgr.get_view_as(tp_v_name, tp_shape)
 
     @paras_func
     def paras_configure_ep(self):
-        # ParaS: Reshape kv cache from TP to EP.
+        """Switch all KV cache buffers from TP to EP layout.
+
+        Points each layer's k/v_buffer at EP aliases (slot[i+1]) from the
+        memory manager and restores head_num.  Called once after scatter_cache
+        finishes writing EP data.  ``@paras_func`` triggers
+        ``paras_configure_helper`` to rebuild derived state (data_ptrs, etc.).
+        """
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+        self.head_num = self.full_head_num
+
+        mgr = get_global_paras_memory_manager()
         for i in range(self.layer_num):
-            self.k_buffer[i] = self.k_buffer[i].view(
-                (-1, self.head_num, self.head_dim)
-            )
-            self.v_buffer[i] = self.v_buffer[i].view(
-                (-1, self.head_num, self.head_dim)
-            )
+            layer_id = i + self.start_layer
+            ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
+            ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
+            total_elements = mgr._entries[ep_k_name].numel
+            ep_slots = total_elements // (self.head_num * self.head_dim)
+            ep_shape = (ep_slots, self.head_num, self.head_dim)
+            self.k_buffer[i] = mgr.get_view_as(ep_k_name, ep_shape)
+            self.v_buffer[i] = mgr.get_view_as(ep_v_name, ep_shape)
 
     def paras_get_num_kv_slots(self):
         # ParaS: Get the number of kv slots in each layer.

@@ -12,6 +12,10 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.utils import get_layer_id
@@ -21,7 +25,15 @@ from sglang.srt.paras.layers.paras_attention import ParaSAttentionMixin
 from sglang.srt.paras.layers.paras_decoder_layer import ParaSDecoderLayerMixin
 from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 from sglang.srt.paras.layers.paras_model import ParaSModelMixin
-from sglang.srt.paras.layers.utils import paras_load_tp_experts_weight, paras_weight_buffer
+
+from sglang.srt.paras.paras_memory_manager import (
+    ParaSMemoryManager,
+    create_paras_moe_aliases,
+    create_paras_kv_aliases,
+    plan_qwen_moe_layout,
+    set_global_paras_memory_manager,
+)
+from sglang.srt.paras.paras_parallel_state import get_paras_dp_size, get_paras_tp_group, get_paras_tp_size
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -125,9 +137,136 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+
+        # ---- ParaS Memory Manager ----
+        # Create the static weight buffer BEFORE building the model so that
+        # create_weights() can allocate from it via the global accessor.
+        #
+        # Flow:
+        #   1. Create manager + plan layout (reserves all tensor slots)
+        #   2. Materialize (allocates one big GPU buffer)
+        #   3. Set global manager (checked by create_weights in unquant.py)
+        #   4. Build model (create_weights allocates from managed buffer)
+        manager = ParaSMemoryManager()
+
+        quant_name = None
+        fp8_block_size = None
+        if quant_config is not None:
+            qn = quant_config.get_name()
+            if qn == "fp8":
+                quant_name = "fp8"
+                if hasattr(quant_config, "weight_block_size") and quant_config.weight_block_size:
+                    fp8_block_size = quant_config.weight_block_size[0]
+
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+
+        moe_tp_size = get_moe_tensor_parallel_world_size()
+        dp_size = get_paras_dp_size()
+
+        import os
+        configure_method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
+
+        plan_qwen_moe_layout(
+            manager,
+            num_layers=config.num_hidden_layers,
+            num_experts=config.num_experts,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=head_dim,
+            ep_size=get_moe_expert_parallel_world_size(),
+            tp_size=get_paras_tp_size(),
+            dp_size=dp_size,
+            moe_tp_size=moe_tp_size,
+            quant_name=quant_name,
+            fp8_block_size=fp8_block_size,
+            num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
+            configure_method=configure_method,
+            prefix="model",
+        )
+
+        # --- Compute KV token budgets -----------------------------------------
+        # We know exact weights+staging bytes from the manager plan.
+        # Remaining static budget goes to KV cache.
+        _server_args = get_global_server_args()
+        _mem_fraction = _server_args.mem_fraction_static
+        _page_size = getattr(_server_args, "page_size", 1)
+
+        # kv_cache_dtype: "auto" means use model dtype; fp8 stores as float8_e4m3fn
+        _kv_dtype_str = _server_args.kv_cache_dtype
+        if _kv_dtype_str == "auto":
+            _kv_store_dtype = torch.bfloat16
+        elif _kv_dtype_str in ("fp8", "fp8_e4m3fn"):
+            _kv_store_dtype = torch.float8_e4m3fn
+        else:
+            _kv_store_dtype = torch.bfloat16
+
+        # Total GPU memory
+        _total_gpu_bytes = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).total_memory
+
+        # Static budget for this rank (weights + staging + KV)
+        _static_budget_bytes = int(_total_gpu_bytes * _mem_fraction)
+
+        # KV budget = static budget minus weights+staging already reserved
+        _kv_budget_bytes = max(0, _static_budget_bytes - manager.weights_only_bytes)
+
+        # Per-token KV cost for EP mode (all heads per rank)
+        _num_layers = config.num_hidden_layers
+        _total_kv_heads = config.num_key_value_heads
+        _kv_elem_size = torch.tensor([], dtype=_kv_store_dtype).element_size()
+        _ep_cell_bytes = (
+            _total_kv_heads * head_dim * _num_layers * 2 * _kv_elem_size
+        )
+        _ep_max_tokens = max(1, int(_kv_budget_bytes // _ep_cell_bytes))
+        # TP has sharded heads → same bytes per token across tp_size more tokens
+        _tp_max_tokens = _ep_max_tokens * get_paras_tp_size()
+
+        # Reserve KV in manager (union layout: same bytes in both modes)
+        manager.reserve_kv_cache(
+            num_layers=_num_layers,
+            ep_max_tokens=_ep_max_tokens,
+            tp_max_tokens=_tp_max_tokens,
+            num_kv_heads=_total_kv_heads,
+            head_dim=head_dim,
+            kv_dtype=_kv_store_dtype,
+            page_size=_page_size,
+            prefix="model",
+        )
+        # --- End KV budget computation ----------------------------------------
+
+        total_bytes = manager.materialize()
+        create_paras_moe_aliases(manager, config.num_hidden_layers, prefix="model")
+        create_paras_kv_aliases(manager, config.num_hidden_layers)
+        logger.info("ParaSMemoryManager materialized: %s", manager)
+        self.paras_memory_manager = manager
+
+        # Set global so create_weights() can find the manager
+        set_global_paras_memory_manager(manager)
+
+        # Pre-initialize NVLink peer access during model init to avoid overhead at switch time.
+        # cudaIpcOpenMemHandle() is slow on first call (~6s for NVLink connection setup).
+        try:
+            from sglang.srt.paras.peer_access import init_peer_access
+            self._fused_peer_access_ctx = init_peer_access(
+                manager, get_paras_tp_group().device_group, get_paras_tp_size()
+            )
+            logger.info("ParaS fused peer access pre-initialized.")
+        except Exception as e:
+            logger.warning(f"ParaS fused peer access pre-init failed (will retry at switch): {e}")
+            self._fused_peer_access_ctx = None
+
         self.model = Qwen3MoeModelParaS(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        # Inject pre-initialized peer access context so the switch doesn't pay 6s init cost
+        if self._fused_peer_access_ctx is not None:
+            self.model._peer_access_ctx = self._fused_peer_access_ctx
+
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -214,10 +353,6 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
                         expert_id=expert_id,
                     )
 
-                    # ParaS: also load into tp_experts
-                    paras_load_tp_experts_weight(
-                        params_dict, name, loaded_weight, shard_id, expert_id
-                    )
                     break
                 else:
                     if is_expert_weight:
@@ -248,12 +383,13 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         )
 
     def paras_configure_helper(self):
-        torch.cuda.synchronize()
-        paras_weight_buffer.release_all()
+        pass
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
-        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
+        import os
+        method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
+        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank, method=method)
 
     @paras_func
     def paras_configure_ep(self):

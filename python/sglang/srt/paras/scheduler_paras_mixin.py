@@ -2,8 +2,8 @@ from types import SimpleNamespace
 from typing import List, Any, Optional
 import torch
 import logging
-import torch
 import time
+import os
 
 from sglang.srt.managers.io_struct import ParaSConfigureReqInput, ParaSConfigureReqType, ParaSConfigureReqOutput
 from sglang.srt.managers.schedule_batch import (
@@ -17,6 +17,7 @@ from sglang.srt.server_args import get_global_server_args
 
 from sglang.srt.paras.utils import paras_func, paras_profile_func
 from sglang.srt.paras.gather_manager import ParaSReqGatherManager
+from sglang.srt.paras.scatter_manager import ParaSReqScatterManager
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.managers.utils import SenderWrapper
@@ -129,11 +130,11 @@ class SchedulerParasMixin:
         self.paras_parallelism_config = "TP"
         self.server_args.enable_dp_attention = False
         self.server_args.moe_a2a_backend = MoeA2ABackend.NONE
-        self.server_args.enable_dp_attention = False
         self.server_args.dp_size = 1
         self.server_args.ep_size = 1
         moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.NONE
         
+        self.paras_start_profile("/tmp/paras_configure_profile")
         self.tree_cache.reset()
         local_reqs = self.paras_get_local_reqs()
         
@@ -141,7 +142,9 @@ class SchedulerParasMixin:
             local_reqs,
             self.paras_tp_group,
             self.req_to_token_pool, 
-            self.token_to_kv_pool_allocator
+            self.token_to_kv_pool_allocator,
+            peer_ctx=getattr(self.tp_worker, '_fused_peer_access_ctx', None),
+            method=os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl"),
         )
         
         start_time = time.time()
@@ -172,6 +175,8 @@ class SchedulerParasMixin:
         cost_ms = (end_time - start_time) * 1000
         logger.info(f"Time taken to configure TP: {cost_ms} ms")
 
+        self.paras_stop_profile()
+
         # drop-in replacement for scheduler tp configs 
         self.tp_size = self.paras_tp_size
         self.tp_rank = self.paras_tp_rank
@@ -197,20 +202,72 @@ class SchedulerParasMixin:
 
     @paras_func
     def paras_configure_ep(self):
+        # Entry guards
+        if self.paras_parallelism_config != "TP":
+            logger.warning("paras_configure_ep called but not in TP mode")
+            return
         if not self.paras_check():
             return
-        
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
+        assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
+        assert self.paras_dp_size == 1, "paras_configure_ep only supports dp_size==1"
+
+        self.paras_start_profile("/tmp/paras_configure_profile")
+
+        # Phase 1: Prepare — reset tree cache, merge batches, build global req list
+        self.tree_cache.reset()
+        self.merge_last_batch()
+        global_reqs = list(self.running_batch.reqs) if self.running_batch else []
+
+        # Phase 2: Scatter — partition reqs, shrink pools, scatter KV cache
+        paras_scatter_manager = ParaSReqScatterManager(
+            global_reqs=global_reqs,
+            scatter_group=self.paras_tp_group,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            peer_ctx=getattr(self.tp_worker, '_fused_peer_access_ctx', None),
+            paras_tp_rank=self.paras_tp_rank,
+            paras_tp_size=self.paras_tp_size,
+        )
+
+        start_time = time.time()
+
+        with TimeReporter("partition_requests"):
+            paras_scatter_manager.partition_requests()
+
+            with TimeReporter("reorchestrate_cache"):
+                paras_scatter_manager.reorchestrate_cache()
+
+        with TimeReporter("scatter_cache"):
+            paras_scatter_manager.scatter_cache()
+
+        self.running_batch = paras_scatter_manager.get_new_running_batch(
+            self.tokenizer,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            self.server_args.enable_custom_logit_processor,
+        )
+
+        # Phase 3: Model switch (weights + attention)
+        with TimeReporter("transfer_weights"):
+            self.tp_worker.paras_configure_ep()
+
+        end_time = time.time()
+        cost_ms = (end_time - start_time) * 1000
+        logger.info(f"Time taken to configure EP: {cost_ms} ms")
+
+        self.paras_stop_profile()
+
+        # Phase 4: Update scheduler config and restore tokenizer
         # switch from TP to EP
         self.paras_parallelism_config = "EP"
         self.server_args.enable_dp_attention = True
         self.server_args.moe_a2a_backend = MoeA2ABackend.DEEPEP
-        self.server_args.enable_dp_attention = True
         self.server_args.dp_size = self.paras_ep_size
         self.server_args.ep_size = self.paras_ep_size
         moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.DEEPEP
-        
-        self.tp_worker.paras_configure_ep()
 
         # drop-in replacement for scheduler ep configs
         self.tp_size = self.paras_ep_size
@@ -244,11 +301,13 @@ class SchedulerParasMixin:
             raise ValueError(f"Unrecognized ParaSConfigureReqType: {recv_req.type}")
         return ParaSConfigureReqOutput()
     
-    def paras_start_profile(self, op_name: str = "paras_configure"):
+    def paras_start_profile(self, output_dir: str = "/tmp/paras_configure_profile"):
+        import os
+        output_dir = os.environ.get("PARAS_PROFILE_DIR", output_dir)
         self.profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                op_name,
+                output_dir,
                 worker_name=f"rank{self.tp_rank}",
             ),
             record_shapes=True,
