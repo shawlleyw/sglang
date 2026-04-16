@@ -2072,9 +2072,10 @@ class ModelRunner:
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
-        # ParaS: capture a second set of CUDA graphs for TP mode
         if self.server_args.enable_paras_moe and self.graph_runner is not None:
-            self._paras_init_dual_cuda_graphs()
+            from sglang.srt.paras.paras_cuda_graph import paras_init_dual_cuda_graphs
+
+            paras_init_dual_cuda_graphs(self)
 
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
@@ -2421,93 +2422,6 @@ class ModelRunner:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
 
-    def _paras_init_dual_cuda_graphs(self):
-        """Capture a second set of CUDA graphs for TP mode at init time.
-
-        Sequence: save EP graphs → switch to TP → capture TP graphs → save
-        TP graphs → switch back to EP → load EP graphs.
-
-        Both graph sets share the same CUDA graph memory pool, so CUDA
-        automatically aliases their intermediate allocations — total memory
-        is max(EP, TP), not the sum.
-        """
-        from sglang.srt.layers.moe import utils as moe_utils
-        from sglang.srt.layers.moe.utils import MoeA2ABackend
-        from sglang.srt.paras.paras_parallel_state import (
-            get_paras_tp_rank,
-            get_paras_tp_size,
-            paras_comm_configure_ep,
-            paras_comm_configure_tp,
-        )
-
-        paras_tp_size = get_paras_tp_size()
-        paras_tp_rank = get_paras_tp_rank()
-
-        logger.info("ParaS: saving EP CUDA graphs and capturing TP graphs...")
-
-        # 1. Save EP graph state
-        self.graph_runner.paras_save_state("ep")
-
-        # 2. Switch to TP mode (communication groups + attention + weights)
-        #    Temporarily modify server_args and global state so CudaGraphRunner
-        #    settings are correct for TP graph capture.
-        saved_args = {
-            "enable_dp_attention": self.server_args.enable_dp_attention,
-            "dp_size": self.server_args.dp_size,
-            "ep_size": self.server_args.ep_size,
-            "moe_a2a_backend": self.server_args.moe_a2a_backend,
-        }
-        saved_moe_backend = moe_utils.MOE_A2A_BACKEND
-
-        self.server_args.enable_dp_attention = False
-        self.server_args.dp_size = 1
-        self.server_args.ep_size = 1
-        self.server_args.moe_a2a_backend = "none"
-        moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.NONE
-
-        paras_comm_configure_tp()
-        self.token_to_kv_pool.paras_configure_tp(paras_tp_size)
-        if hasattr(self.attn_backend, "paras_configure_tp"):
-            self.attn_backend.paras_configure_tp(
-                paras_tp_size, self.req_to_token_pool.req_to_token
-            )
-        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
-
-        # 3. Refresh CudaGraphRunner settings for TP mode, then re-capture
-        self.graph_runner.paras_refresh_settings()
-        from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
-
-        with model_capture_mode():
-            self.graph_runner.capture()
-
-        # 4. Save TP graph state
-        self.graph_runner.paras_save_state("tp")
-
-        # 5. Switch back to EP mode
-        self.server_args.enable_dp_attention = saved_args["enable_dp_attention"]
-        self.server_args.dp_size = saved_args["dp_size"]
-        self.server_args.ep_size = saved_args["ep_size"]
-        self.server_args.moe_a2a_backend = saved_args["moe_a2a_backend"]
-        moe_utils.MOE_A2A_BACKEND = saved_moe_backend
-
-        paras_comm_configure_ep()
-        self.token_to_kv_pool.paras_configure_ep()
-        if hasattr(self.attn_backend, "paras_configure_ep"):
-            self.attn_backend.paras_configure_ep(
-                self.req_to_token_pool.req_to_token
-            )
-        self.model.paras_configure_ep()
-
-        # 6. Load EP graph state — ready to serve in EP mode
-        self.graph_runner.paras_load_state("ep")
-        self.max_total_num_tokens = self.token_to_kv_pool_allocator.size
-        self.max_running_requests = self.req_to_token_pool.size
-
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"ParaS: dual CUDA graph capture complete. avail mem={after_mem:.2f} GB"
-        )
-
     def paras_configure_helper(self):
         """Helper function for ParaS configuration."""
         # Reconfigure token_to_kv_pool_allocator, cache related stuffs are configured in scheduler (paras gather manager)
@@ -2536,10 +2450,9 @@ class ModelRunner:
         )
         self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
-        # Swap to TP CUDA graphs (if dual graphs were captured at init)
-        if self.graph_runner and hasattr(self.graph_runner, "_paras_saved"):
-            if "tp" in self.graph_runner._paras_saved:
-                self.graph_runner.paras_load_state("tp")
+        from sglang.srt.paras.paras_cuda_graph import paras_swap_cuda_graphs
+
+        paras_swap_cuda_graphs(self, "tp")
 
     @paras_func
     def paras_configure_ep(self):
@@ -2557,10 +2470,9 @@ class ModelRunner:
 
         self.model.paras_configure_ep()
 
-        # Swap to EP CUDA graphs (if dual graphs were captured at init)
-        if self.graph_runner and hasattr(self.graph_runner, "_paras_saved"):
-            if "ep" in self.graph_runner._paras_saved:
-                self.graph_runner.paras_load_state("ep")
+        from sglang.srt.paras.paras_cuda_graph import paras_swap_cuda_graphs
+
+        paras_swap_cuda_graphs(self, "ep")
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
