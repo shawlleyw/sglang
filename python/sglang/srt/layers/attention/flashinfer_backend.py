@@ -287,6 +287,10 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
+
+        # ParaS: per-mode CUDA graph metadata storage for EP↔TP switching.
+        # Each mode's wrappers are captured with mode-specific head counts.
+        self._paras_cuda_graph_metadata = {}
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
     # ------------------------------------------------------------------
@@ -302,6 +306,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 num_attention_heads=self.indices_updater_decode.num_qo_heads,
                 num_kv_heads=self.indices_updater_decode.num_kv_heads,
             )
+
+    def paras_save_cuda_graph_metadata(self, mode: str):
+        """Save current CUDA graph wrapper metadata for the given ParaS mode."""
+        self._paras_cuda_graph_metadata[mode] = {
+            "decode": dict(self.decode_cuda_graph_metadata),
+            "prefill": dict(self.prefill_cuda_graph_metadata),
+            "draft_extend": dict(self.draft_extend_cuda_graph_metadata),
+        }
+
+    def paras_load_cuda_graph_metadata(self, mode: str):
+        """Load CUDA graph wrapper metadata for the given ParaS mode."""
+        meta = self._paras_cuda_graph_metadata[mode]
+        self.decode_cuda_graph_metadata = meta["decode"]
+        self.prefill_cuda_graph_metadata = meta["prefill"]
+        self.draft_extend_cuda_graph_metadata = meta["draft_extend"]
 
     def paras_configure_tp(self, paras_tp_size: int, req_to_token: "torch.Tensor"):
         """Update cached state for TP mode after ParaS switch."""

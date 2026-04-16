@@ -449,6 +449,123 @@ class CudaGraphRunner:
             and is_ngram_supported
         )
 
+    # ------------------------------------------------------------------
+    # ParaS: EP↔TP dual CUDA graph support
+    # ------------------------------------------------------------------
+
+    def paras_refresh_settings(self):
+        """Recompute mode-dependent settings from current model_runner state.
+        Call this after a ParaS mode switch and before re-capturing graphs."""
+        self.require_gathered_buffer = require_gathered_buffer(
+            self.model_runner.server_args
+        )
+        self.require_mlp_tp_gather = require_mlp_tp_gather(
+            self.model_runner.server_args
+        )
+        self.require_mlp_sync = require_mlp_sync(self.model_runner.server_args)
+        self.require_attn_tp_gather = require_attn_tp_gather(
+            self.model_runner.server_args
+        )
+        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_attention_tp_rank()
+        self.tp_size = self.model_runner.server_args.tp_size
+        self.dp_size = self.model_runner.server_args.dp_size
+
+    def paras_save_state(self, mode: str):
+        """Save the current CUDA graph state for the given ParaS mode (ep/tp).
+        This includes graphs, output buffers, DeepEP adapter state,
+        FlashInfer metadata, and mode-dependent settings."""
+        if not hasattr(self, "_paras_saved"):
+            self._paras_saved = {}
+        self._paras_saved[mode] = {
+            "graphs": dict(self.graphs),
+            "output_buffers": dict(self.output_buffers),
+            "deepep_mode": self.deepep_adapter._captured_deepep_mode,
+            # Mode-dependent settings
+            "require_gathered_buffer": self.require_gathered_buffer,
+            "require_mlp_tp_gather": self.require_mlp_tp_gather,
+            "require_mlp_sync": self.require_mlp_sync,
+            "require_attn_tp_gather": self.require_attn_tp_gather,
+            "attn_tp_size": self.attn_tp_size,
+            "attn_tp_rank": self.attn_tp_rank,
+            "tp_size": self.tp_size,
+            "dp_size": self.dp_size,
+        }
+        # Also save FlashInfer wrapper metadata
+        self.model_runner.attn_backend.paras_save_cuda_graph_metadata(mode)
+
+    def paras_load_state(self, mode: str):
+        """Load CUDA graph state for the given ParaS mode (ep/tp).
+        Restores graphs, output buffers, DeepEP adapter state,
+        FlashInfer metadata, and mode-dependent settings."""
+        state = self._paras_saved[mode]
+        self.graphs = state["graphs"]
+        self.output_buffers = state["output_buffers"]
+        self.deepep_adapter._captured_deepep_mode = state["deepep_mode"]
+        # Restore mode-dependent settings
+        self.require_gathered_buffer = state["require_gathered_buffer"]
+        self.require_mlp_tp_gather = state["require_mlp_tp_gather"]
+        self.require_mlp_sync = state["require_mlp_sync"]
+        self.require_attn_tp_gather = state["require_attn_tp_gather"]
+        self.attn_tp_size = state["attn_tp_size"]
+        self.attn_tp_rank = state["attn_tp_rank"]
+        self.tp_size = state["tp_size"]
+        self.dp_size = state["dp_size"]
+        # Restore FlashInfer wrapper metadata
+        self.model_runner.attn_backend.paras_load_cuda_graph_metadata(mode)
+
+    def paras_measure_instantiation_time(self):
+        """Destroy and re-instantiate all graph execs to measure pure
+        cudaGraphInstantiate overhead per batch size and total."""
+        import time
+
+        torch.cuda.synchronize()
+        times = {}
+        for bs, graph in self.graphs.items():
+            # Access internal C++ handles
+            g = graph  # torch.cuda.CUDAGraph
+            # Destroy exec, keep graph structure
+            exec_handle = graph._graph_exec
+            graph_handle = graph._graph
+
+            # Re-instantiate: reset then re-instantiate from captured graph
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            # PyTorch doesn't expose separate instantiate, so we use the
+            # internal CUDA API via the graph object.  Calling
+            # cudaGraphInstantiate is done inside replay() on first call
+            # after reset, but that also replays.  Instead, measure the
+            # full reset+instantiate cycle.
+            import ctypes
+
+            cuda_rt = ctypes.CDLL("libcudart.so")
+            # cudaGraphExecDestroy
+            cuda_rt.cudaGraphExecDestroy(ctypes.c_void_p(exec_handle))
+            # cudaGraphInstantiateV2 (simpler signature)
+            new_exec = ctypes.c_void_p()
+            log_buffer = ctypes.create_string_buffer(1024)
+            ret = cuda_rt.cudaGraphInstantiate(
+                ctypes.byref(new_exec),
+                ctypes.c_void_p(graph_handle),
+                ctypes.c_void_p(0),
+                log_buffer,
+                ctypes.c_size_t(1024),
+            )
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            assert ret == 0, f"cudaGraphInstantiate failed with code {ret}"
+            # Patch the exec handle back
+            graph._graph_exec = new_exec.value
+            times[bs] = (t1 - t0) * 1000  # ms
+
+        total = sum(times.values())
+        per_bs = ", ".join(f"bs{bs}={t:.2f}ms" for bs, t in sorted(times.items()))
+        logger.info(
+            f"CUDA graph instantiation time: total={total:.2f}ms "
+            f"({len(times)} graphs). Per-bs: {per_bs}"
+        )
+        return total, times
+
     def capture(self) -> None:
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
