@@ -83,6 +83,26 @@ def paras_memory_breakdown(device: str, gpu_id: int) -> Dict[str, Any]:
                            if isinstance(k, tuple) and len(k) == 2 and k[1] > 0)
     default_pool_total = pools.get((0, 0), 0)
 
+    # DeepEP buffer accounting: if a DeepEPBuffer singleton is live, its
+    # underlying Buffer() holds (num_nvl_bytes + num_rdma_bytes) of pinned
+    # GPU memory allocated via DeepEP's own allocator (cuMemAlloc path
+    # under the hood) - none of which shows up in torch_reserved, but it
+    # does count toward driver_used. Peel it out of the non_torch bucket
+    # so we can see it explicitly.
+    deepep_bytes = 0
+    try:
+        from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+        buf = getattr(DeepEPBuffer, "_buffer", None)
+        if buf is not None:
+            deepep_bytes = int(getattr(buf, "num_nvl_bytes", 0) or 0) + int(
+                getattr(buf, "num_rdma_bytes", 0) or 0
+            )
+    except Exception as e:
+        logger.debug(f"ParaS[mem]: DeepEPBuffer introspection failed: {e}")
+
+    non_torch = driver_used - torch_reserved
+    other_non_torch = non_torch - deepep_bytes
+
     GB = 1024 ** 3
     return {
         "driver_used_gb": driver_used / GB,
@@ -90,7 +110,9 @@ def paras_memory_breakdown(device: str, gpu_id: int) -> Dict[str, Any]:
         "torch_allocated_gb": torch_allocated / GB,
         "graph_pool_total_gb": graph_pool_total / GB,
         "default_pool_total_gb": default_pool_total / GB,
-        "driver_minus_torch_gb": (driver_used - torch_reserved) / GB,
+        "driver_minus_torch_gb": non_torch / GB,
+        "deepep_buffer_gb": deepep_bytes / GB,
+        "other_non_torch_gb": other_non_torch / GB,
         "pools": {str(k): v / GB for k, v in pools.items()},
     }
 
@@ -106,6 +128,8 @@ def paras_log_memory_breakdown(label: str, device: str, gpu_id: int) -> Dict[str
         f"graph_pool={b['graph_pool_total_gb']:.3f}GB  "
         f"default_pool={b['default_pool_total_gb']:.3f}GB  "
         f"non_torch={b['driver_minus_torch_gb']:.3f}GB  "
+        f"(deepep={b['deepep_buffer_gb']:.3f}GB  "
+        f"other={b['other_non_torch_gb']:.3f}GB)  "
         f"pools={{{pool_detail}}}"
     )
     return b
