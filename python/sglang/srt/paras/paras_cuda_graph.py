@@ -77,7 +77,18 @@ def _load_flashinfer_metadata(attn_backend: Any, mode: str):
 
 def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: str):
     """Save graphs, output buffers, DeepEP state, FlashInfer metadata,
-    and mode-dependent settings for *mode* ('ep' or 'tp')."""
+    mode-dependent settings, and the graph memory pool handle for *mode*
+    ('ep' or 'tp').
+
+    Saving the graph memory pool is required so that EP and TP can each
+    own an isolated pool; ``paras_load_cuda_graph_state`` restores it so
+    any downstream code reading ``get_global_graph_memory_pool()`` sees
+    the pool that belongs to the currently-active mode.
+    """
+    from sglang.srt.model_executor.cuda_graph_runner import (
+        get_global_graph_memory_pool,
+    )
+
     if not hasattr(runner, "_paras_saved"):
         runner._paras_saved = {}
 
@@ -85,6 +96,7 @@ def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: str):
         "graphs": dict(runner.graphs),
         "output_buffers": dict(runner.output_buffers),
         "deepep_mode": runner.deepep_adapter._captured_deepep_mode,
+        "graph_memory_pool": get_global_graph_memory_pool(),
     }
     for key in _SETTINGS_KEYS:
         state[key] = getattr(runner, key)
@@ -95,11 +107,16 @@ def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: str):
 
 def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: str):
     """Restore graphs, output buffers, DeepEP state, FlashInfer metadata,
-    and mode-dependent settings for *mode*."""
+    mode-dependent settings, and the graph memory pool handle for *mode*."""
+    from sglang.srt.model_executor.cuda_graph_runner import (
+        set_global_graph_memory_pool,
+    )
+
     state = runner._paras_saved[mode]
     runner.graphs = state["graphs"]
     runner.output_buffers = state["output_buffers"]
     runner.deepep_adapter._captured_deepep_mode = state["deepep_mode"]
+    set_global_graph_memory_pool(state["graph_memory_pool"])
     for key in _SETTINGS_KEYS:
         setattr(runner, key, state[key])
     _load_flashinfer_metadata(runner.model_runner.attn_backend, mode)
@@ -128,12 +145,21 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     Sequence: save EP graphs → switch to TP → capture TP graphs → save
     TP graphs → switch back to EP → load EP graphs.
 
-    Both graph sets share the same CUDA graph memory pool so CUDA
-    automatically aliases their intermediate allocations.
+    EP and TP graphs use **isolated** CUDA graph memory pools: the live
+    runner state (``graphs``, ``output_buffers``) is cleared and the
+    global graph memory pool is reset to ``None`` before capturing TP so
+    ``capture_one_batch_size`` allocates a fresh pool via
+    ``graph_pool_handle()``. Each mode's pool handle is saved with its
+    state and restored on load, so the two modes never share physical
+    pages and CUDA cannot alias their intermediate allocations across
+    modes.
     """
     from sglang.srt.layers.moe import utils as moe_utils
     from sglang.srt.layers.moe.utils import MoeA2ABackend
-    from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
+    from sglang.srt.model_executor.cuda_graph_runner import (
+        model_capture_mode,
+        set_global_graph_memory_pool,
+    )
     from sglang.srt.paras.paras_parallel_state import (
         get_paras_tp_rank,
         get_paras_tp_size,
@@ -147,7 +173,7 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
 
     logger.info("ParaS: saving EP CUDA graphs and capturing TP graphs...")
 
-    # 1. Save EP graph state
+    # 1. Save EP graph state (includes EP's graph memory pool handle)
     paras_save_cuda_graph_state(gr, "ep")
 
     # 2. Switch to TP mode — temporarily modify server_args & global state
@@ -173,15 +199,31 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
         )
     model_runner.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
-    # 3. Refresh settings for TP mode, then re-capture
+    # 3. Clear the live graph dicts before capturing TP. The EP graph
+    #    objects are still referenced via ``runner._paras_saved["ep"]``
+    #    (see ``paras_save_cuda_graph_state`` which stores copies), so
+    #    no EP state is lost. This prevents stale EP entries from
+    #    leaking into TP's saved state if the two modes end up with
+    #    different batch-size capture lists.
+    gr.graphs.clear()
+    gr.output_buffers.clear()
+
+    # 4. Force a fresh graph memory pool for TP so its physical pages
+    #    are isolated from EP's pool. ``capture_one_batch_size`` will
+    #    allocate a new pool via ``device_module.graph_pool_handle()``
+    #    on the first batch size and publish it via
+    #    ``set_global_graph_memory_pool``.
+    set_global_graph_memory_pool(None)
+
+    # 5. Refresh settings for TP mode, then capture
     paras_refresh_cuda_graph_settings(gr)
     with model_capture_mode():
         gr.capture()
 
-    # 4. Save TP graph state
+    # 6. Save TP graph state (includes TP's fresh pool handle)
     paras_save_cuda_graph_state(gr, "tp")
 
-    # 5. Switch back to EP mode
+    # 7. Switch back to EP mode
     model_runner.server_args.enable_dp_attention = saved_args["enable_dp_attention"]
     model_runner.server_args.dp_size = saved_args["dp_size"]
     model_runner.server_args.ep_size = saved_args["ep_size"]
@@ -196,7 +238,8 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
         )
     model_runner.model.paras_configure_ep()
 
-    # 6. Load EP graph state — ready to serve in EP mode
+    # 8. Load EP graph state — restores EP's graphs/buffers and the EP
+    #    graph memory pool as the global pool. Ready to serve in EP mode.
     paras_load_cuda_graph_state(gr, "ep")
     model_runner.max_total_num_tokens = model_runner.token_to_kv_pool_allocator.size
     model_runner.max_running_requests = model_runner.req_to_token_pool.size
