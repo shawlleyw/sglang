@@ -171,10 +171,28 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     paras_tp_size = get_paras_tp_size()
     paras_tp_rank = get_paras_tp_rank()
 
-    logger.info("ParaS: saving EP CUDA graphs and capturing TP graphs...")
+    device = model_runner.device
+    gpu_id = model_runner.gpu_id
+
+    from sglang.srt.model_executor.cuda_graph_runner import (
+        get_global_graph_memory_pool,
+    )
+
+    mem_before_ep_save = get_available_gpu_memory(device, gpu_id)
+    ep_pool = get_global_graph_memory_pool()
+    logger.info(
+        f"ParaS[mem]: before save('ep')          avail={mem_before_ep_save:.3f} GB "
+        f"ep_pool={ep_pool}"
+    )
 
     # 1. Save EP graph state (includes EP's graph memory pool handle)
     paras_save_cuda_graph_state(gr, "ep")
+
+    mem_after_ep_save = get_available_gpu_memory(device, gpu_id)
+    logger.info(
+        f"ParaS[mem]: after  save('ep')          avail={mem_after_ep_save:.3f} GB "
+        f"(delta {mem_after_ep_save - mem_before_ep_save:+.3f} GB)"
+    )
 
     # 2. Switch to TP mode — temporarily modify server_args & global state
     saved_args = {
@@ -205,6 +223,7 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     #    no EP state is lost. This prevents stale EP entries from
     #    leaking into TP's saved state if the two modes end up with
     #    different batch-size capture lists.
+    ep_graph_keys = sorted(gr.graphs.keys())
     gr.graphs.clear()
     gr.output_buffers.clear()
 
@@ -215,10 +234,26 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     #    ``set_global_graph_memory_pool``.
     set_global_graph_memory_pool(None)
 
+    mem_before_tp_capture = get_available_gpu_memory(device, gpu_id)
+    logger.info(
+        f"ParaS[mem]: before TP capture          avail={mem_before_tp_capture:.3f} GB "
+        f"(ep-captured bs={ep_graph_keys}, pool reset to None)"
+    )
+
     # 5. Refresh settings for TP mode, then capture
     paras_refresh_cuda_graph_settings(gr)
     with model_capture_mode():
         gr.capture()
+
+    tp_graph_keys = sorted(gr.graphs.keys())
+    tp_pool = get_global_graph_memory_pool()
+    mem_after_tp_capture = get_available_gpu_memory(device, gpu_id)
+    tp_capture_cost = mem_before_tp_capture - mem_after_tp_capture
+    logger.info(
+        f"ParaS[mem]: after  TP capture          avail={mem_after_tp_capture:.3f} GB "
+        f"(TP captured bs={tp_graph_keys}, cost={tp_capture_cost:.3f} GB, "
+        f"tp_pool={tp_pool}, ep_pool_was={ep_pool}, pools_differ={ep_pool != tp_pool})"
+    )
 
     # 6. Save TP graph state (includes TP's fresh pool handle)
     paras_save_cuda_graph_state(gr, "tp")
@@ -244,9 +279,14 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     model_runner.max_total_num_tokens = model_runner.token_to_kv_pool_allocator.size
     model_runner.max_running_requests = model_runner.req_to_token_pool.size
 
-    after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
+    mem_final = get_available_gpu_memory(device, gpu_id)
+    # Total dual-capture cost = EP capture cost (already paid in
+    # init_device_graphs before this function runs) + TP capture cost
+    # measured above. We report TP cost and the final availability.
     logger.info(
-        f"ParaS: dual CUDA graph capture complete. avail mem={after_mem:.2f} GB"
+        "ParaS[mem]: dual capture done            "
+        f"avail={mem_final:.3f} GB, TP capture cost={tp_capture_cost:.3f} GB, "
+        f"#EP graphs={len(ep_graph_keys)}, #TP graphs={len(tp_graph_keys)}"
     )
 
 
