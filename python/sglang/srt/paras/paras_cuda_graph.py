@@ -29,6 +29,87 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Memory breakdown helper
+# ---------------------------------------------------------------------------
+
+
+def paras_memory_breakdown(device: str, gpu_id: int) -> Dict[str, Any]:
+    """Return a dict decomposing GPU memory into:
+
+    - driver_used_gb:     cudaMemGetInfo used = total - free
+    - torch_reserved_gb:  PyTorch caching allocator's reserved segments
+    - torch_allocated_gb: PyTorch caching allocator's live tensors
+    - pools: {pool_id_tuple: bytes} from memory_snapshot
+        - ``(0, 0)`` is the default pool
+        - ``(0, N>0)`` is a graph-private pool
+    - graph_pool_total_gb:   sum of all (0, N>0) pools
+    - default_pool_total_gb: sum of (0, 0) pool
+    - driver_minus_torch_gb: driver_used - torch_reserved. This is memory held
+      by things PyTorch's caching allocator does not track: NCCL internal
+      buffers, DeepEP buffers, cuBLAS workspaces allocated via raw cudaMalloc,
+      etc. TMS's cudaMalloc LD_PRELOAD hook *can* see these, but only if they
+      were allocated inside a tms region.
+
+    Used for instrumenting what fraction of CUDA graph capture cost lands in
+    the graph-private pool (TMS-reachable) vs elsewhere (not TMS-reachable
+    via graph-pool semantics).
+    """
+    import torch
+
+    torch.cuda.synchronize(gpu_id)
+    free, total = torch.cuda.mem_get_info(gpu_id)
+    stats = torch.cuda.memory_stats(gpu_id)
+
+    driver_used = total - free
+    torch_reserved = stats.get("reserved_bytes.all.current", 0)
+    torch_allocated = stats.get("allocated_bytes.all.current", 0)
+
+    pools: Dict[Any, int] = {}
+    try:
+        snap = torch.cuda.memory_snapshot()
+        for seg in snap:
+            if seg.get("device", 0) != gpu_id:
+                continue
+            pid = seg.get("segment_pool_id", (-1, -1))
+            if isinstance(pid, list):
+                pid = tuple(pid)
+            pools[pid] = pools.get(pid, 0) + seg["total_size"]
+    except Exception as e:
+        logger.warning(f"ParaS[mem]: memory_snapshot failed: {e}")
+
+    graph_pool_total = sum(v for k, v in pools.items()
+                           if isinstance(k, tuple) and len(k) == 2 and k[1] > 0)
+    default_pool_total = pools.get((0, 0), 0)
+
+    GB = 1024 ** 3
+    return {
+        "driver_used_gb": driver_used / GB,
+        "torch_reserved_gb": torch_reserved / GB,
+        "torch_allocated_gb": torch_allocated / GB,
+        "graph_pool_total_gb": graph_pool_total / GB,
+        "default_pool_total_gb": default_pool_total / GB,
+        "driver_minus_torch_gb": (driver_used - torch_reserved) / GB,
+        "pools": {str(k): v / GB for k, v in pools.items()},
+    }
+
+
+def paras_log_memory_breakdown(label: str, device: str, gpu_id: int) -> Dict[str, Any]:
+    """Log a one-line summary + per-pool detail and return the breakdown."""
+    b = paras_memory_breakdown(device, gpu_id)
+    pool_detail = ", ".join(f"{k}={v:.3f}GB" for k, v in sorted(b["pools"].items()))
+    logger.info(
+        f"ParaS[mem-breakdown:{label}]  "
+        f"driver_used={b['driver_used_gb']:.3f}GB  "
+        f"torch_reserved={b['torch_reserved_gb']:.3f}GB  "
+        f"graph_pool={b['graph_pool_total_gb']:.3f}GB  "
+        f"default_pool={b['default_pool_total_gb']:.3f}GB  "
+        f"non_torch={b['driver_minus_torch_gb']:.3f}GB  "
+        f"pools={{{pool_detail}}}"
+    )
+    return b
+
 # ---------------------------------------------------------------------------
 # Save / load helpers
 # ---------------------------------------------------------------------------
@@ -178,21 +259,11 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
         get_global_graph_memory_pool,
     )
 
-    mem_before_ep_save = get_available_gpu_memory(device, gpu_id)
     ep_pool = get_global_graph_memory_pool()
-    logger.info(
-        f"ParaS[mem]: before save('ep')          avail={mem_before_ep_save:.3f} GB "
-        f"ep_pool={ep_pool}"
-    )
+    logger.info(f"ParaS: saving EP graphs (ep_pool={ep_pool})")
 
     # 1. Save EP graph state (includes EP's graph memory pool handle)
     paras_save_cuda_graph_state(gr, "ep")
-
-    mem_after_ep_save = get_available_gpu_memory(device, gpu_id)
-    logger.info(
-        f"ParaS[mem]: after  save('ep')          avail={mem_after_ep_save:.3f} GB "
-        f"(delta {mem_after_ep_save - mem_before_ep_save:+.3f} GB)"
-    )
 
     # 2. Switch to TP mode — temporarily modify server_args & global state
     saved_args = {
@@ -234,25 +305,23 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     #    ``set_global_graph_memory_pool``.
     set_global_graph_memory_pool(None)
 
-    mem_before_tp_capture = get_available_gpu_memory(device, gpu_id)
     logger.info(
-        f"ParaS[mem]: before TP capture          avail={mem_before_tp_capture:.3f} GB "
-        f"(ep-captured bs={ep_graph_keys}, pool reset to None)"
+        f"ParaS: capturing TP graphs (ep-captured bs={ep_graph_keys})"
     )
 
-    # 5. Refresh settings for TP mode, then capture
+    # 5. Refresh settings for TP mode, then capture. The per-capture
+    #    memory breakdown is emitted by
+    #    ``cuda_graph_runner.capture()`` via ``paras_log_memory_breakdown``.
     paras_refresh_cuda_graph_settings(gr)
     with model_capture_mode():
         gr.capture()
 
     tp_graph_keys = sorted(gr.graphs.keys())
     tp_pool = get_global_graph_memory_pool()
-    mem_after_tp_capture = get_available_gpu_memory(device, gpu_id)
-    tp_capture_cost = mem_before_tp_capture - mem_after_tp_capture
     logger.info(
-        f"ParaS[mem]: after  TP capture          avail={mem_after_tp_capture:.3f} GB "
-        f"(TP captured bs={tp_graph_keys}, cost={tp_capture_cost:.3f} GB, "
-        f"tp_pool={tp_pool}, ep_pool_was={ep_pool}, pools_differ={ep_pool != tp_pool})"
+        f"ParaS: TP capture done "
+        f"(tp_pool={tp_pool}, ep_pool_was={ep_pool}, pools_differ={ep_pool != tp_pool}, "
+        f"tp-captured bs={tp_graph_keys})"
     )
 
     # 6. Save TP graph state (includes TP's fresh pool handle)
@@ -280,13 +349,10 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     model_runner.max_running_requests = model_runner.req_to_token_pool.size
 
     mem_final = get_available_gpu_memory(device, gpu_id)
-    # Total dual-capture cost = EP capture cost (already paid in
-    # init_device_graphs before this function runs) + TP capture cost
-    # measured above. We report TP cost and the final availability.
     logger.info(
-        "ParaS[mem]: dual capture done            "
-        f"avail={mem_final:.3f} GB, TP capture cost={tp_capture_cost:.3f} GB, "
-        f"#EP graphs={len(ep_graph_keys)}, #TP graphs={len(tp_graph_keys)}"
+        f"ParaS: dual capture complete "
+        f"avail={mem_final:.3f}GB  #EP graphs={len(ep_graph_keys)}  "
+        f"#TP graphs={len(tp_graph_keys)}"
     )
 
 
