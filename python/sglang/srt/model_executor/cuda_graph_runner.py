@@ -527,7 +527,10 @@ class CudaGraphRunner:
             f"graph_pool={_mem_post['graph_pool_total_gb'] - _mem_pre['graph_pool_total_gb']:+.3f}GB  "
             f"default_pool={_mem_post['default_pool_total_gb'] - _mem_pre['default_pool_total_gb']:+.3f}GB  "
             f"non_torch={_mem_post['driver_minus_torch_gb'] - _mem_pre['driver_minus_torch_gb']:+.3f}GB  "
-            f"(deepep={_mem_post['deepep_buffer_gb'] - _mem_pre['deepep_buffer_gb']:+.3f}GB  "
+            f"(deepep_buf={_mem_post['deepep_buffer_gb'] - _mem_pre['deepep_buffer_gb']:+.3f}GB  "
+            f"deepep_ws={_mem_post['deepep_workspace_gb'] - _mem_pre['deepep_workspace_gb']:+.3f}GB  "
+            f"nvshmem={_mem_post['nvshmem_heap_gb'] - _mem_pre['nvshmem_heap_gb']:+.3f}GB  "
+            f"nccl_est={_mem_post['nccl_scratch_est_gb'] - _mem_pre['nccl_scratch_est_gb']:+.3f}GB  "
             f"other={_mem_post['other_non_torch_gb'] - _mem_pre['other_non_torch_gb']:+.3f}GB)"
         )
 

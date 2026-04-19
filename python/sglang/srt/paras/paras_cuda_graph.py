@@ -83,25 +83,110 @@ def paras_memory_breakdown(device: str, gpu_id: int) -> Dict[str, Any]:
                            if isinstance(k, tuple) and len(k) == 2 and k[1] > 0)
     default_pool_total = pools.get((0, 0), 0)
 
-    # DeepEP buffer accounting: if a DeepEPBuffer singleton is live, its
-    # underlying Buffer() holds (num_nvl_bytes + num_rdma_bytes) of pinned
-    # GPU memory allocated via DeepEP's own allocator (cuMemAlloc path
-    # under the hood) - none of which shows up in torch_reserved, but it
-    # does count toward driver_used. Peel it out of the non_torch bucket
-    # so we can see it explicitly.
-    deepep_bytes = 0
+    # ------------------------------------------------------------------
+    # Decompose non_torch = driver_used - torch_reserved into named buckets:
+    #
+    #   non_torch = deepep_buffer     (num_nvl_bytes + num_rdma_bytes,
+    #                                  cuMemCreate/cuMemMap path)
+    #             + deepep_workspace  (32 MiB hard-coded in
+    #                                  deep_ep/csrc/deep_ep.cpp:192
+    #                                  via plain cudaMalloc)
+    #             + nvshmem_heap      (symmetric heap reserved at
+    #                                  internode::init(), default 1 GiB
+    #                                  per PE; NVSHMEM_SYMMETRIC_SIZE env
+    #                                  overrides. Only allocated when
+    #                                  DeepEP's low-latency mode or
+    #                                  num_rdma_ranks>1 triggered NVSHMEM.)
+    #             + nccl_scratch_est  (per-communicator NCCL buffers:
+    #                                  ~9 MiB * nChannels * 2 for
+    #                                  collectives + ~12 MiB * nChannels
+    #                                  * (nRanks-1) for p2p send/recv.
+    #                                  We only count communicators here;
+    #                                  bytes are an upper-bound estimate.)
+    #             + other_non_torch   (residual: NCCL graph-capture VMM,
+    #                                  cuBLAS workspace, misc driver mem)
+    #
+    # All "est" numbers are labeled so they aren't confused with measured
+    # allocations. Driver doesn't expose per-library accounting, so
+    # NVSHMEM and NCCL are computed from known constants + library state,
+    # not measured at the byte level.
+    # ------------------------------------------------------------------
+
+    deepep_buffer_bytes = 0
+    deepep_workspace_bytes = 0
+    nvshmem_heap_bytes = 0
+    deepep_buffer_live = False
+
     try:
         from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
         buf = getattr(DeepEPBuffer, "_buffer", None)
         if buf is not None:
-            deepep_bytes = int(getattr(buf, "num_nvl_bytes", 0) or 0) + int(
+            deepep_buffer_live = True
+            deepep_buffer_bytes = int(getattr(buf, "num_nvl_bytes", 0) or 0) + int(
                 getattr(buf, "num_rdma_bytes", 0) or 0
             )
+            # DeepEP's csrc/deep_ep.cpp:192 always cudaMalloc's a 32 MiB
+            # workspace per Buffer instance, independent of
+            # num_nvl_bytes/num_rdma_bytes.
+            deepep_workspace_bytes = 32 * 1024 * 1024
+
+            # NVSHMEM is initialized inside Buffer's C++ constructor when
+            # (get_num_rdma_ranks() > 1 OR low_latency_mode). When active,
+            # it reserves a symmetric heap of NVSHMEM_SYMMETRIC_SIZE bytes
+            # per PE (default 1 GiB). We report the *reservation*, not the
+            # physical commit. Physical commit is lazy, bounded below by
+            # NVSHMEM_CUMEM_GRANULARITY (DeepEP sets 512 MiB).
+            low_latency = bool(getattr(buf, "low_latency_mode", False))
+            num_rdma_bytes = int(getattr(buf, "num_rdma_bytes", 0) or 0)
+            num_rdma_ranks = 1
+            runtime = getattr(buf, "runtime", None)
+            if runtime is not None:
+                try:
+                    num_rdma_ranks = int(runtime.get_num_rdma_ranks())
+                except Exception:
+                    pass
+            nvshmem_active = low_latency or num_rdma_ranks > 1
+            if nvshmem_active:
+                import os as _os
+                sym_size = _os.environ.get("NVSHMEM_SYMMETRIC_SIZE")
+                if sym_size is not None:
+                    try:
+                        nvshmem_heap_bytes = int(sym_size)
+                    except ValueError:
+                        nvshmem_heap_bytes = 1024 * 1024 * 1024
+                else:
+                    nvshmem_heap_bytes = 1024 * 1024 * 1024  # NVSHMEM default
     except Exception as e:
         logger.debug(f"ParaS[mem]: DeepEPBuffer introspection failed: {e}")
 
+    # Count live NCCL communicators (module-level singletons in sglang's
+    # distributed.parallel_state). Each non-None group holds one NCCL
+    # communicator that owns its own default buffers.
+    nccl_comm_names: list = []
+    try:
+        import sglang.srt.distributed.parallel_state as _ps
+        for name in ("_WORLD", "_TP", "_PP", "_MOE_EP", "_MOE_TP",
+                     "_PDMUX_PREFILL_TP_GROUP"):
+            g = getattr(_ps, name, None)
+            if g is not None:
+                nccl_comm_names.append(name)
+    except Exception as e:
+        logger.debug(f"ParaS[mem]: NCCL group count failed: {e}")
+    # Per-communicator estimate: NCCL Simple (4 MiB) + LL (256 KiB) +
+    # LL128 (~4.7 MiB) = ~9 MiB per protocol, × 2 (send+recv) × 8 channels
+    # default on A100 NVLink = ~144 MiB per comm. This is an UPPER BOUND
+    # (NCCL may use fewer channels; p2p send/recv buffers add 12 MiB ×
+    # (nRanks-1) × nChannels lazily on first send/recv).
+    nccl_scratch_est_bytes = len(nccl_comm_names) * 144 * 1024 * 1024
+
     non_torch = driver_used - torch_reserved
-    other_non_torch = non_torch - deepep_bytes
+    other_non_torch = (
+        non_torch
+        - deepep_buffer_bytes
+        - deepep_workspace_bytes
+        - nvshmem_heap_bytes
+        - nccl_scratch_est_bytes
+    )
 
     GB = 1024 ** 3
     return {
@@ -111,7 +196,13 @@ def paras_memory_breakdown(device: str, gpu_id: int) -> Dict[str, Any]:
         "graph_pool_total_gb": graph_pool_total / GB,
         "default_pool_total_gb": default_pool_total / GB,
         "driver_minus_torch_gb": non_torch / GB,
-        "deepep_buffer_gb": deepep_bytes / GB,
+        "deepep_buffer_gb": deepep_buffer_bytes / GB,
+        "deepep_workspace_gb": deepep_workspace_bytes / GB,
+        "nvshmem_heap_gb": nvshmem_heap_bytes / GB,
+        "nccl_scratch_est_gb": nccl_scratch_est_bytes / GB,
+        "nccl_comm_count": len(nccl_comm_names),
+        "nccl_comm_names": nccl_comm_names,
+        "deepep_buffer_live": deepep_buffer_live,
         "other_non_torch_gb": other_non_torch / GB,
         "pools": {str(k): v / GB for k, v in pools.items()},
     }
@@ -121,6 +212,7 @@ def paras_log_memory_breakdown(label: str, device: str, gpu_id: int) -> Dict[str
     """Log a one-line summary + per-pool detail and return the breakdown."""
     b = paras_memory_breakdown(device, gpu_id)
     pool_detail = ", ".join(f"{k}={v:.3f}GB" for k, v in sorted(b["pools"].items()))
+    nccl_names = ",".join(b.get("nccl_comm_names", []))
     logger.info(
         f"ParaS[mem-breakdown:{label}]  "
         f"driver_used={b['driver_used_gb']:.3f}GB  "
@@ -128,7 +220,10 @@ def paras_log_memory_breakdown(label: str, device: str, gpu_id: int) -> Dict[str
         f"graph_pool={b['graph_pool_total_gb']:.3f}GB  "
         f"default_pool={b['default_pool_total_gb']:.3f}GB  "
         f"non_torch={b['driver_minus_torch_gb']:.3f}GB  "
-        f"(deepep={b['deepep_buffer_gb']:.3f}GB  "
+        f"(deepep_buf={b['deepep_buffer_gb']:.3f}GB  "
+        f"deepep_ws={b['deepep_workspace_gb']:.3f}GB  "
+        f"nvshmem={b['nvshmem_heap_gb']:.3f}GB  "
+        f"nccl_est={b['nccl_scratch_est_gb']:.3f}GB[{b['nccl_comm_count']}:{nccl_names}]  "
         f"other={b['other_non_torch_gb']:.3f}GB)  "
         f"pools={{{pool_detail}}}"
     )
