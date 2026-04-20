@@ -1205,6 +1205,9 @@ class QKVParallelLinear(ColumnParallelLinear):
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
         """
         Shard the weights for tensor parallelism.
+        Uses a pre-allocated managed buffer (if available) to ensure
+        the TP weight address is stable across EP↔TP switches, which is
+        required for CUDA graph compatibility.
         """
         assert paras_tp_size <= self.num_kv_heads
         tp_num_heads = self.total_num_heads // paras_tp_size
@@ -1220,21 +1223,48 @@ class QKVParallelLinear(ColumnParallelLinear):
         )
         tp_v_head_end = tp_v_head_start + tp_num_kv_heads
 
-        # TODO(shaoyuw): Can we drop full weight?
         self.full_weight = self.weight
 
         # column major
         full_weight_tensor = self.full_weight.data
         hs = self.head_size
 
-        new_weight_tensor = torch.row_stack((
-            full_weight_tensor[tp_head_start * hs : tp_head_end * hs, :],
-            full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs, :],
-            full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs, :],
-        ))
+        # Try to use the pre-allocated managed buffer for address stability.
+        from sglang.srt.paras.paras_memory_manager import (
+            get_global_paras_memory_manager,
+        )
+        mgr = get_global_paras_memory_manager()
+        tp_weight_name = f"{self.prefix}.tp_weight" if hasattr(self, "prefix") else None
 
-        self.weight = torch.nn.Parameter(new_weight_tensor, requires_grad=False)
-        set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
+        if mgr and tp_weight_name and tp_weight_name in mgr._entries:
+            # Reuse the permanent managed buffer — copy slices into it
+            if not hasattr(self, "_paras_tp_weight"):
+                self._paras_tp_weight = torch.nn.Parameter(
+                    mgr.get_view(tp_weight_name), requires_grad=False
+                )
+            new_weight_tensor = self._paras_tp_weight.data
+            q_rows = tp_num_heads * hs
+            kv_rows = tp_num_kv_heads * hs
+            new_weight_tensor[:q_rows].copy_(
+                full_weight_tensor[tp_head_start * hs : tp_head_end * hs]
+            )
+            new_weight_tensor[q_rows : q_rows + kv_rows].copy_(
+                full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs]
+            )
+            new_weight_tensor[q_rows + kv_rows : q_rows + 2 * kv_rows].copy_(
+                full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs]
+            )
+            self.weight = self._paras_tp_weight
+        else:
+            new_weight_tensor = torch.row_stack((
+                full_weight_tensor[tp_head_start * hs : tp_head_end * hs, :],
+                full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs, :],
+                full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs, :],
+            ))
+            self.weight = torch.nn.Parameter(new_weight_tensor, requires_grad=False)
+
+        if not hasattr(self.weight, "input_dim"):
+            set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
 
         if self.bias is not None:
             self.full_bias = self.bias

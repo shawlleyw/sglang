@@ -2072,6 +2072,11 @@ class ModelRunner:
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
+        if self.server_args.enable_paras_moe and self.graph_runner is not None:
+            from sglang.srt.paras.paras_cuda_graph import paras_init_dual_cuda_graphs
+
+            paras_init_dual_cuda_graphs(self)
+
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
         cpu_ids_by_node = get_cpu_ids_by_node()
@@ -2445,6 +2450,10 @@ class ModelRunner:
         )
         self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
+        from sglang.srt.paras.paras_cuda_graph import paras_swap_cuda_graphs
+
+        paras_swap_cuda_graphs(self, "tp")
+
     @paras_func
     def paras_configure_ep(self):
         """Configure the ModelRunner for ParaS expert parallelism."""
@@ -2460,6 +2469,10 @@ class ModelRunner:
             self.attn_backend.paras_configure_ep(self.req_to_token_pool.req_to_token)
 
         self.model.paras_configure_ep()
+
+        from sglang.srt.paras.paras_cuda_graph import paras_swap_cuda_graphs
+
+        paras_swap_cuda_graphs(self, "ep")
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
