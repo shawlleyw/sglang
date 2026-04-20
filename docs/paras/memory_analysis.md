@@ -142,6 +142,28 @@ kv_budget_bytes        = umm_budget_bytes - manager.weights_only_bytes
 
 This is the same formula baseline uses, applied at the point ParaS needs it (before the UMM is planned).
 
+### Allocation order (no waste)
+
+Naively, you might worry that ParaS allocates weights first, then computes the KV budget from "what's left" — which would waste memory if the weight allocation itself disturbs `avail_now`. It doesn't. The actual order in `Qwen3MoeForCausalLMParaS.__init__`:
+
+| Step | Code | GPU memory side-effect |
+|---|---|---|
+| 1 | `manager = ParaSMemoryManager()` | none (empty planner) |
+| 2 | `plan_qwen_moe_layout(...)` | none — **metadata only** (reserves slot names + shapes in `_reservation_order`) |
+| 3 | `get_available_gpu_memory(distributed=True, empty_cache=True)` | none (read-only) |
+| 4 | Compute `umm_budget` and `kv_budget` from formula above | none (arithmetic) |
+| 5 | `manager.reserve_kv_cache(ep_max_tokens=...)` | none — still metadata only |
+| 6 | **`manager.materialize()`** — **single `torch.empty(total_bytes, dtype=uint8)`** | **the only GPU allocation.** Allocates weights + KV together, sized exactly to the budget |
+
+Key property: `plan_qwen_moe_layout` and `reserve_kv_cache` are **pure bookkeeping** — they populate `LayoutEntry` metadata in `manager._entries` and `manager._reservation_order` but never call `torch.empty`. The entire UMM is physically allocated by a single `torch.empty` call at step 6.
+
+This means:
+1. `avail_now` at step 3 is untouched by ParaS's own plan (no circular dependency).
+2. The UMM size at step 6 is the sum of `weights_only_bytes + kv_slot_bytes`, exactly matching what the budget allowed.
+3. No interim allocations are freed; nothing is wasted.
+
+Baseline sglang has the inverse ordering: weights allocated first via HuggingFace weight-loading (real `torch.empty` per parameter), then `avail_now` measured post-weight-load, then KV allocator sized. ParaS has to plan weights first (to know `weights_only_bytes`) but defers physical allocation until after the budget is final.
+
 ### Result
 
 `driver_used` dropped from 57.77 GB to 56.30 GB (−1.46 GB per GPU). `#tokens` in the KV pool dropped from 347,857 → 332,225 (still larger than baseline's 329,048 by only 3,177 tokens — that difference is the N+1 KV slot overhead, which is architectural, not a budget bug).
@@ -364,3 +386,4 @@ Orthogonal to ParaS overhead — would benefit baseline equally. Already support
 |---|---|
 | 2026-04-19 | Initial doc. Both NCCL alias and budget-semantics fixes applied and verified. Overhead reduced from +6.93 GB to +3.03 GB per GPU. |
 | 2026-04-19 | Cross-rank-consistency fix for the budget computation: use `distributed=True` in `get_available_gpu_memory` so every rank agrees on the MIN available memory. Prevents UMM buffer-size divergence that would fail TP-mode attention collectives. |
+| 2026-04-19 | Documented the allocation ordering (plan→compute-budget→reserve-KV→materialize) to clarify that `ParaSMemoryManager` avoids weight-before-KV waste by deferring all physical GPU allocation to a single `torch.empty` call after the budget is finalized. |
