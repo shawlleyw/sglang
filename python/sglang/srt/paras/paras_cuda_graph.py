@@ -163,13 +163,26 @@ def paras_memory_breakdown(device: str, gpu_id: int) -> Dict[str, Any]:
     # distributed.parallel_state). Each non-None group holds one NCCL
     # communicator that owns its own default buffers.
     nccl_comm_names: list = []
+    seen_group_ids: set = set()
     try:
         import sglang.srt.distributed.parallel_state as _ps
         for name in ("_WORLD", "_TP", "_PP", "_MOE_EP", "_MOE_TP",
                      "_PDMUX_PREFILL_TP_GROUP"):
             g = getattr(_ps, name, None)
-            if g is not None:
+            if g is not None and id(g) not in seen_group_ids:
                 nccl_comm_names.append(name)
+                seen_group_ids.add(id(g))
+        # Track ParaS-specific groups too, but dedup against aliases of
+        # already-counted groups so we don't double-count shared NCCL comms.
+        try:
+            import sglang.srt.paras.paras_parallel_state as _paras_ps
+            for name in ("_PARAS_TP", "_PARAS_DP", "_PARAS_EP", "_PARAS_SELF"):
+                g = getattr(_paras_ps, name, None)
+                if g is not None and id(g) not in seen_group_ids:
+                    nccl_comm_names.append(name)
+                    seen_group_ids.add(id(g))
+        except Exception as e:
+            logger.debug(f"ParaS[mem]: ParaS group count failed: {e}")
     except Exception as e:
         logger.debug(f"ParaS[mem]: NCCL group count failed: {e}")
     # Per-communicator estimate: NCCL Simple (4 MiB) + LL (256 KiB) +

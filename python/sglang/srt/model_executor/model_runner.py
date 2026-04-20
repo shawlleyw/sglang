@@ -1945,6 +1945,45 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
+        # DIAGNOSTIC: Dump torch allocator segments at memory-pool-end, enabled
+        # via SGLANG_DUMP_MEM_SEGMENTS=1. Lists the N largest live allocations
+        # with their sizes, stream, and pool id. Used to compare ParaS vs
+        # baseline EP memory footprint at a fixed lifecycle point.
+        import os as _os
+        if _os.environ.get("SGLANG_DUMP_MEM_SEGMENTS", "0") == "1":
+            try:
+                import torch as _torch
+                snapshot = _torch.cuda.memory_snapshot()
+                # Per-segment info: size, allocated_size, stream, segment_type
+                # Only keep segments with actual allocations (non-zero alloc'd).
+                live = [s for s in snapshot if s.get("allocated_size", 0) > 0]
+                live.sort(key=lambda s: s["allocated_size"], reverse=True)
+                total_alloc = sum(s["allocated_size"] for s in live)
+                total_reserved = sum(s["total_size"] for s in live)
+                tag = "PARAS" if self.server_args.enable_paras_moe else "BASE"
+                logger.info(
+                    f"[MEMDUMP:{tag}] segments={len(live)} "
+                    f"total_allocated={total_alloc/1024**3:.3f}GiB "
+                    f"total_reserved={total_reserved/1024**3:.3f}GiB"
+                )
+                for i, s in enumerate(live[:20]):
+                    alloc_mb = s["allocated_size"] / 1024**2
+                    reserv_mb = s["total_size"] / 1024**2
+                    stream = s.get("stream", "?")
+                    seg_type = s.get("segment_type", "?")
+                    # Size of the largest block inside the segment.
+                    blocks = s.get("blocks", [])
+                    largest_block = max((b["size"] for b in blocks if b.get("state") == "active_allocated"), default=0)
+                    logger.info(
+                        f"[MEMDUMP:{tag}] #{i:02d} "
+                        f"alloc={alloc_mb:8.2f}MiB reserved={reserv_mb:8.2f}MiB "
+                        f"largest_block={largest_block/1024**2:7.2f}MiB "
+                        f"type={seg_type} stream={stream} "
+                        f"nblocks={len(blocks)}"
+                    )
+            except Exception as _e:
+                logger.warning(f"[MEMDUMP] failed: {_e}")
+
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
         dtype = torch.float16

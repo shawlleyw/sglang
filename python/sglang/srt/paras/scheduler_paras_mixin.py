@@ -10,7 +10,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info, get_attention_tp_group
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, MHATokenToKVPool
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
@@ -76,8 +76,11 @@ class SchedulerParasMixin:
         self.paras_ep_rank = self.tp_rank
         self.paras_ep_group = self.tp_group
         self.paras_ep_cpu_group = self.tp_cpu_group
-        self.paras_ep_attn_tp_group = self.tp_group
-        self.paras_ep_attn_tp_cpu_group = self.tp_cpu_group
+        # Use the singleton _ATTN_TP_GROUP (built at init with enable_dp_attention=True)
+        # rather than self.tp_group (all ranks). In EP mode attn_tp_size==1, so this
+        # group should be a single-rank group matching baseline EP semantics.
+        self.paras_ep_attn_tp_group = get_attention_tp_group()
+        self.paras_ep_attn_tp_cpu_group = get_attention_tp_group().cpu_group
 
         self.ep_recv_from_tokenizer = self.recv_from_tokenizer
         self.ep_recv_from_rpc = self.recv_from_rpc

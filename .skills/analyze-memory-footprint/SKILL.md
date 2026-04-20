@@ -1,6 +1,6 @@
 ---
 name: analyze-memory-footprint
-description: Investigate GPU memory footprint of SGLang server configs (TP / EP / ParaS / MoE + DeepEP). Decompose driver-level memory into named buckets (PyTorch caching allocator, CUDA graph private pool, DeepEP Buffer + workspace, NVSHMEM symmetric heap, NCCL communicator scratch, residual "other"). Covers the ParaS[mem-breakdown] instrumentation, log parsing, experiment methodology, and offload-reachability analysis.
+description: Investigate GPU memory footprint of SGLang server configs (TP / EP / ParaS / MoE + DeepEP). Decompose driver-level memory into named buckets (PyTorch caching allocator, CUDA graph private pool, DeepEP Buffer + workspace, NVSHMEM symmetric heap, NCCL communicator scratch, residual "other"). Covers the ParaS[mem-breakdown] instrumentation, SGLANG_DUMP_MEM_SEGMENTS segment-level dump, log parsing, experiment methodology, and offload-reachability analysis.
 metadata:
   short-description: Decompose GPU memory into measurable buckets and reason about what's reclaimable
 ---
@@ -64,6 +64,95 @@ The breakdown works on **any** sglang config, not just ParaS:
 | `other` | residual after all above | Unattributed non_torch | Most-likely contributors: NCCL graph-capture VMM scratch, lazy cuBLAS workspaces, ParaS peer-access IPC |
 
 **Hard rule**: Only `driver_used`, `torch_reserved`, `graph_pool`, `default_pool`, and `deepep_buf`/`deepep_ws` are **measured**. The rest are either env-var-derived (`nvshmem`) or upper-bound estimates (`nccl_est`). Do not aggregate them as if they were all measured.
+
+---
+
+## Segment-Level Memory Dump (`SGLANG_DUMP_MEM_SEGMENTS=1`)
+
+When the breakdown is insufficient to attribute a `torch_reserved` gap — e.g. you want to know "which specific allocations inside default_pool grew between config A and config B?" — use the opt-in segment dump.
+
+### What it does
+
+At the `Memory pool end` checkpoint (after model load + KV pool init, before CUDA graph capture), `model_runner.py` calls `torch.cuda.memory_snapshot()` and logs the top-20 largest live allocations with their reserved/allocated bytes, largest block size, and block count.
+
+Source: `python/sglang/srt/model_executor/model_runner.py` (search for `SGLANG_DUMP_MEM_SEGMENTS`). Disabled by default (opt-in env var), so it never pollutes normal runs.
+
+### How to enable
+
+```bash
+SGLANG_DUMP_MEM_SEGMENTS=1 python -m sglang.launch_server ... 2>&1 | tee artifacts/<name>_memdump.log
+```
+
+### Log format
+
+Per rank, one summary line plus 20 per-segment lines:
+
+```
+[MEMDUMP:PARAS] segments=19 total_allocated=49.079GiB total_reserved=49.086GiB
+[MEMDUMP:PARAS] #00  alloc=47876.00MiB reserved=47876.00MiB largest_block=47876.00MiB type=large stream=0 nblocks=1
+[MEMDUMP:PARAS] #01  alloc= 1024.02MiB reserved= 1026.00MiB largest_block=1024.02MiB type=large stream=0 nblocks=2
+[MEMDUMP:PARAS] #02  alloc=  594.00MiB reserved=  594.00MiB largest_block= 594.00MiB type=large stream=0 nblocks=1
+...
+```
+
+The tag is `PARAS` or `BASE` depending on whether `enable_paras_moe` is set, so you can grep for the tag without checking which log you have open.
+
+### Fields
+
+| Field | Meaning |
+|---|---|
+| `alloc` | Bytes currently allocated (in-use) in the segment |
+| `reserved` | Bytes the allocator has reserved (reserved ≥ alloc; diff is cached free blocks) |
+| `largest_block` | Largest currently-active allocated block inside the segment (useful for identifying which tensor dominates) |
+| `nblocks` | Number of distinct blocks in the segment (high count → segment is holding many small tensors) |
+| `type` | `large` (>1 MiB default) or `small` (cache of small allocations) |
+| `stream` | CUDA stream the segment is associated with |
+
+### Example: diff two runs
+
+```python
+# scripts/diff_memdumps.py (or inline in a notebook)
+import re
+def parse(path, tag):
+    pat = re.compile(rf"DP0 TP0 EP0\].*\[MEMDUMP:{tag}\] #(\d+) alloc=\s*([\d.]+)MiB reserved=\s*([\d.]+)MiB largest_block=\s*([\d.]+)MiB type=(\w+) stream=(\S+) nblocks=(\d+)")
+    total_pat = re.compile(rf"DP0 TP0 EP0\].*\[MEMDUMP:{tag}\] segments=(\d+) total_allocated=([\d.]+)GiB total_reserved=([\d.]+)GiB")
+    segs, total = [], None
+    for line in open(path):
+        if m := total_pat.search(line):
+            total = (int(m.group(1)), float(m.group(2)), float(m.group(3)))
+        if m := pat.search(line):
+            segs.append({"idx": int(m.group(1)), "alloc": float(m.group(2)), "reserved": float(m.group(3)), "largest": float(m.group(4)), "type": m.group(5), "nblocks": int(m.group(7))})
+    return total, sorted(segs, key=lambda s: s["idx"])
+
+a_total, a_segs = parse("artifacts/ep_memdump.log", "BASE")
+b_total, b_segs = parse("artifacts/paras_memdump.log", "PARAS")
+print(f"BASE:  {a_total[0]:3d} segs, alloc={a_total[1]:.3f}GiB, reserved={a_total[2]:.3f}GiB")
+print(f"PARAS: {b_total[0]:3d} segs, alloc={b_total[1]:.3f}GiB, reserved={b_total[2]:.3f}GiB")
+print(f"Gap:   {b_total[2] - a_total[2]:+.3f} GiB reserved")
+```
+
+### When to use vs the `ParaS[mem-breakdown:*]` lines
+
+| Question | Tool |
+|---|---|
+| "What's in `non_torch` (NCCL, NVSHMEM, DeepEP)?" | `ParaS[mem-breakdown]` — already decomposes non_torch |
+| "How much does graph capture cost?" | `ParaS[mem-breakdown:capture-delta]` |
+| "Why is `torch_reserved` 2 GB bigger in config B?" | `SGLANG_DUMP_MEM_SEGMENTS=1`, diff segments |
+| "Is there a ParaS-only tensor baseline doesn't allocate?" | `SGLANG_DUMP_MEM_SEGMENTS=1`, diff the top segments |
+| "How many NCCL comms are live?" | `grep "nccl_est" artifacts/<log>` — comm names are in the label |
+| "What's the torch allocator fragmentation overhead?" | `SGLANG_DUMP_MEM_SEGMENTS=1`, compute `total_reserved - total_allocated` |
+
+### Gotcha: segment != tensor
+
+A single segment can contain many tensors (small-block pools especially). Conversely, one large tensor is usually one segment. Use `largest_block` and `nblocks` to distinguish: `nblocks=1` with `largest_block ≈ alloc` means one giant tensor; `nblocks=175` with `largest_block=0.5` means a small-pool holding many tiny allocations.
+
+### Gotcha: checkpoint timing
+
+The dump fires at "Memory pool end", which is:
+- **After**: model weight load, KV cache allocator init
+- **Before**: CUDA graph capture, first request, any DeepEP/NVSHMEM lazy allocation from warmup
+
+If you need a dump at a different lifecycle point (post-capture, after first request), add another call site or change the env-var-gated block.
 
 ---
 
@@ -250,7 +339,27 @@ Subtract row by row. EP − TP = 2.709 GB in capture delta, of which:
 - 0.367 GB graph_pool (EP has more graph-captured work)
 - 1.111 GB in `other` (unattributed — triggers Playbook A)
 
-### Playbook D: "What changed between two runs?"
+### Playbook D-seg: "Which specific tensor contributes to the torch_reserved gap?"
+
+When `ParaS[mem-breakdown]` shows `default_pool` grew but doesn't decompose further, use the segment dump.
+
+```bash
+SGLANG_DUMP_MEM_SEGMENTS=1 python -m sglang.launch_server ... --enable-paras-moe ... 2>&1 | tee artifacts/paras_memdump.log
+SGLANG_DUMP_MEM_SEGMENTS=1 python -m sglang.launch_server ...                       2>&1 | tee artifacts/base_memdump.log
+
+# Side-by-side top-5
+paste <(grep "DP0 TP0 EP0.*MEMDUMP:BASE"  artifacts/base_memdump.log  | head -5) \
+      <(grep "DP0 TP0 EP0.*MEMDUMP:PARAS" artifacts/paras_memdump.log | head -5)
+```
+
+Look for:
+- **New segments in PARAS that aren't in BASE** → ParaS-only tensors (IPC state, extra workspace, etc.)
+- **Segments that got bigger** → structural overhead (N+1 slot, bigger KV pool, etc.)
+- **`total_reserved - total_allocated` delta** → allocator fragmentation difference (usually small; baseline has ~35 MiB slack, single-UMM configs have ~7 MiB)
+
+See the example diff in `docs/paras/memory_analysis.md` for a fully-worked case where this approach identified a 128 MiB ParaS-only segment, the one-giant-alloc rounding cost, and the N+1 slot structural overhead.
+
+### Playbook E: "What changed between two runs?"
 
 Always save logs to `artifacts/` with a descriptive name. Compare with a dedicated script:
 
@@ -332,7 +441,9 @@ for k in sorted(set(a) | set(b)):
 
 ## Raw Logs for Reference
 
-All in `/home1/wangshao/sglang/artifacts/` on branch `paras_cudagraph`:
+All in `/home1/wangshao/sglang/artifacts/`:
+
+### On branch `paras_cudagraph` (original instrumentation runs)
 
 | File | Config |
 |---|---|
@@ -340,6 +451,17 @@ All in `/home1/wangshao/sglang/artifacts/` on branch `paras_cudagraph`:
 | `ep_bs256_v2.log` | Baseline EP=4 + DeepEP, `--cuda-graph-max-bs 256`, full decomposition |
 | `paras_bs256.log` | ParaS dual EP+TP (older: pre-decomposition instrumentation) |
 | `ep_bs256.log`, `tp_bs256.log` | Original runs (no nvshmem/nccl_est subfields) |
+
+### On branch `paras_memory_opt` (optimization runs)
+
+| File | Config |
+|---|---|
+| `paras_pre_alias.log` | ParaS before NCCL alias fix (driver_used ≈ 60.2 GB) |
+| `paras_post_alias.log` | ParaS after NCCL alias fix (driver_used ≈ 57.8 GB) |
+| `paras_budget_fix.log` | ParaS after NCCL alias + budget-semantics fix (driver_used ≈ 56.3 GB) |
+| `ep_memdump.log` | Baseline EP with `SGLANG_DUMP_MEM_SEGMENTS=1` |
+| `paras_memdump.log` | ParaS with alias fix + segment dump |
+| `paras_fix_memdump.log` | Final ParaS (alias + budget fix) with segment dump |
 
 ---
 
@@ -350,9 +472,11 @@ All in `/home1/wangshao/sglang/artifacts/` on branch `paras_cudagraph`:
 | `python/sglang/srt/paras/paras_cuda_graph.py::paras_memory_breakdown()` | Core decomposition (lines ~38–180) |
 | `python/sglang/srt/paras/paras_cuda_graph.py::paras_log_memory_breakdown()` | One-line log formatter |
 | `python/sglang/srt/model_executor/cuda_graph_runner.py::CudaGraphRunner.capture()` | Pre/post/delta call sites around capture loop |
+| `python/sglang/srt/model_executor/model_runner.py` (`SGLANG_DUMP_MEM_SEGMENTS`) | Opt-in segment-level dump at "Memory pool end" |
 | `python/sglang/srt/layers/moe/token_dispatcher/deepep.py::DeepEPBuffer` | Source of `_buffer.num_nvl_bytes + num_rdma_bytes` |
 | `python/sglang/srt/distributed/parallel_state.py` | Source of NCCL comm singleton names |
 | `docs/paras/cuda_graph.md` | Full ParaS CUDA graph doc with memory footprint tables |
+| `docs/paras/memory_analysis.md` | ParaS overhead breakdown, applied optimizations, reclaimability analysis |
 
 ---
 

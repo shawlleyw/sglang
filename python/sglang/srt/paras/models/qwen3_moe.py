@@ -189,8 +189,29 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         )
 
         # --- Compute KV token budgets -----------------------------------------
-        # We know exact weights+staging bytes from the manager plan.
-        # Remaining static budget goes to KV cache.
+        # Mirror the baseline budget semantics (model_runner.profile_max_num_token,
+        # model_runner.py:1358-1363). Baseline treats mem_fraction_static as the
+        # fraction of total GPU memory reserved for the STATIC footprint (weights +
+        # KV + any overhead already consumed by torch/NCCL/cuBLAS/CUDA context).
+        # The DYNAMIC reserve (1 - mem_fraction_static) × total is kept free for
+        # activations, KV allocator metadata, CUDA graph input buffers, and late
+        # NCCL/DeepEP/nvshmem allocations that appear after model init.
+        #
+        # Baseline formula:
+        #   rest_memory = avail_now - total × (1 - mem_fraction_static)
+        #   where avail_now is measured AFTER weights are loaded.
+        #
+        # ParaS UMM holds weights + KV in one buffer, allocated up-front. So we
+        # measure avail_now BEFORE any UMM allocation and compute:
+        #   umm_budget = avail_now - total × (1 - mem_fraction_static)
+        #   kv_budget  = umm_budget - weights_only_bytes
+        #
+        # This keeps ParaS's static footprint bounded by the same budget as
+        # baseline, preventing the UMM from stealing memory that baseline would
+        # leave free for dynamic allocations (which in turn let ParaS size its
+        # KV cache ~1.7 GiB larger than baseline — unwanted).
+        from sglang.srt.utils.common import get_available_gpu_memory
+
         _server_args = get_global_server_args()
         _mem_fraction = _server_args.mem_fraction_static
         _page_size = getattr(_server_args, "page_size", 1)
@@ -204,16 +225,28 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         else:
             _kv_store_dtype = torch.bfloat16
 
-        # Total GPU memory
+        # Total GPU memory (bytes)
         _total_gpu_bytes = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).total_memory
 
-        # Static budget for this rank (weights + staging + KV)
-        _static_budget_bytes = int(_total_gpu_bytes * _mem_fraction)
+        # Available GPU memory RIGHT NOW (bytes), before any UMM allocation.
+        # This captures pre-existing usage (torch/CUDA context, NCCL comms, cuBLAS
+        # workspace) that baseline would account for implicitly via avail_now.
+        # empty_cache=True ensures torch's caching allocator isn't hiding free
+        # blocks. Non-distributed: we use local avail since UMM is per-rank.
+        _avail_now_gib = get_available_gpu_memory(
+            "cuda", torch.cuda.current_device(), distributed=False, empty_cache=True
+        )
+        _avail_now_bytes = int(_avail_now_gib * (1 << 30))
 
-        # KV budget = static budget minus weights+staging already reserved
-        _kv_budget_bytes = max(0, _static_budget_bytes - manager.weights_only_bytes)
+        # UMM budget = avail_now - dynamic_reserve
+        # dynamic_reserve = total × (1 - mem_fraction_static)
+        _dynamic_reserve_bytes = int(_total_gpu_bytes * (1.0 - _mem_fraction))
+        _umm_budget_bytes = max(0, _avail_now_bytes - _dynamic_reserve_bytes)
+
+        # KV budget = UMM budget - (weights + any staging already reserved)
+        _kv_budget_bytes = max(0, _umm_budget_bytes - manager.weights_only_bytes)
 
         # Per-token KV cost for EP mode (all heads per rank)
         _num_layers = config.num_hidden_layers
@@ -225,6 +258,15 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         _ep_max_tokens = max(1, int(_kv_budget_bytes // _ep_cell_bytes))
         # TP has sharded heads → same bytes per token across tp_size more tokens
         _tp_max_tokens = _ep_max_tokens * get_paras_tp_size()
+        logger.info(
+            f"ParaS KV budget: avail_now={_avail_now_gib:.3f}GiB  "
+            f"total={_total_gpu_bytes/(1<<30):.3f}GiB  "
+            f"dynamic_reserve={_dynamic_reserve_bytes/(1<<30):.3f}GiB  "
+            f"umm_budget={_umm_budget_bytes/(1<<30):.3f}GiB  "
+            f"weights_only={manager.weights_only_bytes/(1<<30):.3f}GiB  "
+            f"kv_budget={_kv_budget_bytes/(1<<30):.3f}GiB  "
+            f"ep_max_tokens={_ep_max_tokens}"
+        )
 
         # Reserve KV in manager (union layout: same bytes in both modes)
         manager.reserve_kv_cache(
