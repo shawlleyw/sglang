@@ -234,9 +234,24 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         # This captures pre-existing usage (torch/CUDA context, NCCL comms, cuBLAS
         # workspace) that baseline would account for implicitly via avail_now.
         # empty_cache=True ensures torch's caching allocator isn't hiding free
-        # blocks. Non-distributed: we use local avail since UMM is per-rank.
+        # blocks.
+        #
+        # CRITICAL: distributed=True — every rank must agree on the same
+        # ep_max_tokens, otherwise UMM KV slot sizes diverge across ranks and
+        # peer-access transfers / TP-mode attention collectives will hit shape
+        # mismatches. Mirrors baseline profile_max_num_token at
+        # model_runner.py:1301-1307 which uses distributed=True with an
+        # all_reduce(MIN). Per-rank NVLink topology causes ~70 MB variance in
+        # raw mem_get_info even at identical lifecycle points, which would
+        # translate to ~760-token KV pool divergence per GPU without this.
+        from sglang.srt.distributed import get_world_group
+        _world = get_world_group()
         _avail_now_gib = get_available_gpu_memory(
-            "cuda", torch.cuda.current_device(), distributed=False, empty_cache=True
+            "cuda",
+            torch.cuda.current_device(),
+            distributed=_world.world_size > 1,
+            cpu_group=_world.cpu_group,
+            empty_cache=True,
         )
         _avail_now_bytes = int(_avail_now_gib * (1 << 30))
 

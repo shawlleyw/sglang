@@ -148,6 +148,47 @@ This is the same formula baseline uses, applied at the point ParaS needs it (bef
 
 Round-trip EP↔TP switches verified identical output before/after.
 
+### Critical follow-up: cross-rank consistency
+
+The initial implementation passed `distributed=False` to `get_available_gpu_memory`, causing each rank to use its local `cudaMemGetInfo` reading. On A100 NVLink, per-rank topology variance produces ~70 MB differences in raw available memory between ranks. With `ep_cell = 96 KiB/token`, this translated to **~768-token divergence** in the KV pool size across ranks:
+
+| Rank | `ep_max_tokens` (buggy) | KV pool `#tokens` (buggy) |
+|---|---:|---:|
+| DP0 | 332,225 | 332,225 |
+| DP1 | 331,457 | 331,457 |
+| DP2 | 331,457 | 331,457 |
+| DP3 | 332,225 | 332,225 |
+
+**This is a correctness bug.** Divergent KV pool sizes imply divergent UMM buffer sizes (the UMM contains the KV slots). In EP mode with DP attention, each rank operates on its own requests so the divergence is latent — manifests only as capacity imbalance. But in TP mode (after `paras_configure_tp`), attention is tensor-parallel and any collective over the KV tensor assumes identical shapes across ranks. ParaS's EP→TP gather itself requires identical slot sizes on source and destination UMMs.
+
+Baseline sglang avoids this via `profile_max_num_token` (`model_runner.py:1301-1307`), which passes `distributed=True` to `get_available_gpu_memory`, triggering an `all_reduce(op=MIN, cpu_group=world_group)` that returns the minimum across all ranks. Every rank then computes `max_total_num_tokens` from the same number.
+
+**Fix**: Change `qwen3_moe.py` to mirror the baseline — use `distributed=True` with the world `cpu_group`:
+
+```python
+from sglang.srt.distributed import get_world_group
+_world = get_world_group()
+_avail_now_gib = get_available_gpu_memory(
+    "cuda", torch.cuda.current_device(),
+    distributed=_world.world_size > 1,
+    cpu_group=_world.cpu_group,
+    empty_cache=True,
+)
+```
+
+**Post-fix verification**:
+
+| Rank | `ep_max_tokens` (fixed) | KV pool `#tokens` (fixed) |
+|---|---:|---:|
+| DP0 | 331,457 | 331,457 |
+| DP1 | 331,457 | 331,457 |
+| DP2 | 331,457 | 331,457 |
+| DP3 | 331,457 | 331,457 |
+
+All ranks now converge on the same value (the MIN of the per-rank locals), matching baseline sglang's semantics exactly. EP↔TP round-trip verified.
+
+**Lesson**: Any memory-sizing computation that happens before distributed all-reduce has to use the distributed variant of `get_available_gpu_memory`. Per-rank NVLink variance is not noise — it's real and measurable. Baseline sglang has this right everywhere; ParaS must match.
+
 ---
 
 ## Current overhead decomposition (after both fixes)
@@ -322,3 +363,4 @@ Orthogonal to ParaS overhead — would benefit baseline equally. Already support
 | Date | Change |
 |---|---|
 | 2026-04-19 | Initial doc. Both NCCL alias and budget-semantics fixes applied and verified. Overhead reduced from +6.93 GB to +3.03 GB per GPU. |
+| 2026-04-19 | Cross-rank-consistency fix for the budget computation: use `distributed=True` in `get_available_gpu_memory` so every rank agrees on the MIN available memory. Prevents UMM buffer-size divergence that would fail TP-mode attention collectives. |
