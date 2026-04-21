@@ -1,8 +1,8 @@
 ---
 name: bench-ep-tp
-description: Benchmark sglang MoE model inference with TP (tensor parallel) and/or EP (expert parallel + DP attention + DeepEP) using bench_one_batch. Covers the 4-way comparison (TP/TP, TP/EP, DP/TP, DP/EP), model configs, memory constraints, env vars, cold-run warmup pitfalls, and how to compare results.
+description: Benchmark sglang MoE model inference across the 4 attention/expert parallelism configurations (TP/TP, TP/EP, DP/TP, DP/EP) using bench_one_batch. Only DP/EP uses DeepEP; TP/EP uses AllReduce-based EP (--ep-size N, no DeepEP). Covers model configs, memory constraints, env vars, cold-run warmup pitfalls, and how to compare results.
 metadata:
-  short-description: Run 4-way TP/EP MoE benchmarks with bench_one_batch
+  short-description: Run 4-way attention/expert parallelism MoE benchmarks with bench_one_batch
 ---
 
 # Benchmark EP vs TP with bench_one_batch
@@ -18,10 +18,10 @@ Run MoE model benchmarks comparing the 4 attention/expert parallelism configurat
 ## Core Concepts
 
 - **Global batch = `--batch-size` × `dp_size`.** `bench_one_batch` reports PER-SCHEDULER batch & throughput. With `--enable-dp-attention --dp-size N`, there are N schedulers. To compare configs fairly, always translate to **global batch** and multiply reported throughput by `dp_size` for system throughput.
-- DeepEP `auto` mode uses normal dispatch for prefill, low-latency for decode.
-- On A100: `deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM = False` (SM < 90), so triton runner is used for MoE kernels.
 - **4 supported configs**: TP/TP (baseline), TP/EP (EP-sharded experts + AllReduce, no DeepEP), DP/TP (DP attn + TP experts), DP/EP (DP attn + DeepEP). See `analyze-ep-tp` for semantics.
 - **Only DP/EP uses DeepEP.** With TP attention, tokens are replicated across ranks after the post-attention AllReduce; DeepEP dispatch would be redundant. TP/EP therefore uses `--ep-size N` (no `--moe-a2a-backend`) — experts are partitioned across ranks, each rank runs its local experts on the full batch, results combined via full-hidden AllReduce.
+- DeepEP `--deepep-mode auto` uses normal dispatch for prefill, low-latency for decode.
+- On A100: `deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM = False` (SM < 90), so triton runner is used for MoE kernels.
 - **TP/EP is a net loss** at every tested batch on 8×A100 (each rank iterates `E/ep_size` experts over the full batch with masking; extra MoE work not offset by any comm saving). Documented as an anti-pattern for production serving.
 
 ## `bench_one_batch` Does NOT Chunk Prefills
@@ -114,17 +114,19 @@ tmux attach -t bench   # Ctrl-B then D to detach
 
 ## Profiling
 
-Add `--profile` flag and set `SGLANG_TORCH_PROFILER_DIR=<output_dir>`. Generates `.trace.json.gz` files viewable in Perfetto UI (https://ui.perfetto.dev/).
+Two options:
 
-Profile runs should use a **single batch size** per invocation to get clean traces.
+**Torch profiler** (`--profile`): set `SGLANG_TORCH_PROFILER_DIR=<output_dir>`. Generates `.trace.json.gz` viewable in Perfetto. Must use `--disable-cuda-graph` to capture in-graph kernels. Profile runs should use a **single batch size** per invocation for clean traces.
 
-## Key Environment Variables
+**nsys** (preferred, CUDA-graph-aware): wrap `bench_one_batch ... --profile --profile-activities CUDA_PROFILER` with `nsys profile --cuda-graph-trace=node --capture-range=cudaProfilerApi -o <prefix>`. `--capture-range=cudaProfilerApi` limits capture to the measured forward pass only (prefill OR decode, per `--profile-stage`). nsys captures kernels inside CUDA graphs correctly; torch profiler misses them. Works on A100 — note nsys requires a writable TMPDIR (set `TMPDIR=<workspace>/nsys_tmp` to avoid `/tmp/nvidia` permission errors).
+
+## Key Environment Variables (DP/EP only — the other configs don't use DeepEP)
 
 | Variable | Purpose | Default | Notes |
 |---|---|---|---|
-| `SGLANG_DEEPEP_BF16_DISPATCH` | Use bf16 for DeepEP dispatch (non-FP8 models) | unset | Set to `true` for bf16 models |
-| `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Max tokens per rank for DeepEP dispatch | — | Must be >= max EP batch size per rank |
-| `NVSHMEM_QP_DEPTH` | NVSHMEM queue pair depth for low-latency mode | 1024 | Must be >= `(max_dispatch + 1) * 2`. Set to 2048 for bsz 512 |
+| `SGLANG_DEEPEP_BF16_DISPATCH` | Use bf16 for DeepEP dispatch (non-FP8 models) | unset | Set to `true` for bf16 models in DP/EP |
+| `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Max tokens per rank for DeepEP dispatch | — | Must be >= `global_batch / dp_size` for DP/EP. On 8 GPUs at global batch 2048 → set to 256 |
+| `NVSHMEM_QP_DEPTH` | NVSHMEM queue pair depth for low-latency mode | 1024 | Must be >= `(max_dispatch + 1) * 2`. Default 1024 suffices for ≤511 tokens/rank; set 2048 for 512 |
 | `SGLANG_TORCH_PROFILER_DIR` | Directory for torch profiler output | — | Set when using `--profile` |
 
 ## Understanding `--mem-fraction-static`
@@ -146,15 +148,17 @@ runtime_budget = total_gpu_mem × (1 - mem_fraction_static) → DeepEP buffers, 
 - **Higher** → more KV cache (larger batch/seq capacity) but less runtime headroom → risk OOM during cuda graph capture or DeepEP buffer allocation
 - **Lower** → safer runtime but fewer KV cache slots → limits max batch size
 
-**Why EP needs lower mem-fraction than TP:**
-EP allocates DeepEP communication buffers from the runtime pool. With `deepep-mode auto`, **both** normal and low-latency buffers are allocated, consuming significantly more runtime memory. Additionally, cuda graph capture for EP graphs requires extra temporary memory. TP only needs NCCL buffers which are much smaller.
+**Why DP/EP may need lower mem-fraction than other configs:**
+DP/EP allocates DeepEP communication buffers from the runtime pool. With `--deepep-mode auto`, **both** normal and low-latency buffers are allocated, consuming significantly more runtime memory than NCCL buffers. TP/TP, TP/EP, and DP/TP use AllReduce-based collectives (NCCL buffers only, much smaller). DP/EP cuda graph capture also requires extra temporary memory for DeepEP kernels.
 
 ## Memory Guidelines (8×A100-80GB)
 
-| Model | TP mem-fraction | EP mem-fraction | Notes |
+All three AllReduce-based configs (TP/TP, TP/EP, DP/TP) use the same `--mem-fraction-static`. Only DP/EP may need a lower value for the DeepEP buffer headroom.
+
+| Model | AR configs (TP/TP, TP/EP, DP/TP) | DP/EP | Notes |
 |---|---|---|---|
 | Qwen3-30B-A3B | 0.8 | 0.8 | Comfortable on both |
-| Qwen3-235B-A22B | 0.8 | 0.88-0.9 | EP very tight; auto mode needs normal + low-latency buffers in runtime pool |
+| Qwen3-235B-A22B | 0.8 | 0.88–0.9 | DP/EP very tight; `--deepep-mode auto` needs normal + low-latency buffers in runtime pool |
 | Qwen3-235B-A22B-half (47 layers, dummy) | 0.8 | 0.8 | Use `--load-format dummy` for memory testing. 0.8 is plenty across all 4 configs. |
 
 **Debugging OOM:** If `--mem-fraction-static` is too high, you'll see either:
@@ -163,11 +167,13 @@ EP allocates DeepEP communication buffers from the runtime pool. With `deepep-mo
 
 ## Typical Batch Sizes
 
+`--batch-size` is per-scheduler. TP-attention configs (TP/TP, TP/EP) have one scheduler (dp_size=1), so `--batch-size` = global batch. DP-attention configs (DP/TP, DP/EP) have `dp_size` schedulers, so `--batch-size` = global batch / dp_size.
+
 | | Small | Medium | Large | XL |
 |---|---|---|---|---|
-| **TP** | 8 | 64 | 512 | 2048 |
-| **EP** (per rank, 8 GPUs) | 1 | 8 | 64 | 256 |
-| **Equivalent total** | 8 | 64 | 512 | 2048 |
+| **TP/TP, TP/EP** (`--batch-size`) | 8 | 64 | 512 | 2048 |
+| **DP/TP, DP/EP** (`--batch-size`, 8 GPUs) | 1 | 8 | 64 | 256 |
+| **Equivalent global total** | 8 | 64 | 512 | 2048 |
 
 ## Known Constraints & Gotchas
 
@@ -183,10 +189,10 @@ EP allocates DeepEP communication buffers from the runtime pool. With `deepep-mo
 
 6. **MoE kernel tuning**: Without tuned configs, you'll see "Performance might be sub-optimal!" warnings. Tune with:
    ```bash
-   # TP config (E=128, N for model's moe_intermediate_size / tp_size)
+   # TP/TP and DP/TP use TP-sharded experts (E=128, N=moe_intermediate_size / tp_size):
    python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
        --model <MODEL> --tp-size 8 --tune
-   # EP config (E=num_experts/ep_size, N=moe_intermediate_size)
+   # TP/EP and DP/EP use EP-sharded experts (E=num_experts/ep_size, N=moe_intermediate_size):
    python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
        --model <MODEL> --tp-size 8 --ep-size 8 --tune
    ```
@@ -225,5 +231,5 @@ Completed 4-way benchmark workspaces (driver scripts, results, reports):
 
 ## Reference Results (quick)
 
-- **Qwen3-30B-A3B, 8×A100 (2-way)**: DP/EP decode crossover ~1024; 1.50× TP/TP at 2048, 1.37× at 4096.
-- **Qwen3-235B-A22B-half, 8×A100 (4-way, dummy)**: see `analyze-ep-tp` §Reference Results.
+- **Qwen3-30B-A3B, 8×A100** (DP/EP vs TP/TP decode): crossover ~1024; 1.50× at 2048, 1.37× at 4096.
+- **Qwen3-235B-A22B-half, 8×A100** (4-way, dummy weights): see `analyze-ep-tp` §Reference Results. Headline: DP/EP 1.28× TP/TP decode at 2048; TP/EP is a net loss at every tested batch.
