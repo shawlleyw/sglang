@@ -277,6 +277,8 @@ Which config wins at this equiv batch?
 2. **Unequal equiv batches**: `--batch-size 512` for TP/TP is NOT the same global batch as `--batch-size 512` for DP/EP with dp=8 (the latter is global=4096). Always translate to equiv batch before comparing.
 3. **Dummy weights with EP**: routing becomes uniform, hiding the real-weights load imbalance problem. Always validate with real weights for production conclusions.
 4. **Short prefill (`input_len=10`)**: dominated by kernel launch overhead, not compute. Prefill numbers are unreliable for MoE GEMM-shape conclusions; use decode or larger `input_len`.
+5. **Cold-run noise on large prefills** (`bench_one_batch`): the FIRST invocation in a session runs cold (CUDA JIT cache, triton autotuning, thermal). Large prefills (batch ≥ 2048) can measure 40-70% slower on the cold run than on warm re-runs. Always re-run the largest batch once and compare; if the two differ by >10%, the first was cold and should be discarded. Note: `--chunked-prefill-size` does NOT affect `bench_one_batch` (scheduler-level setting, scheduler is not invoked by this tool — verified with identical prefill latencies at chunk=1024 vs chunk=8192).
+6. **`--ep-size N` without DeepEP backend** produces "TP/EP*" (AllReduce-based EP). On 8×A100 it is **strictly slower** than TP/TP at every tested batch (masked activation + full-hidden AR cost). Not a substitute for DeepEP-based TP/EP.
 
 ---
 
@@ -363,16 +365,42 @@ Dummy weights produce uniform routing. Real weights may skew routing, increasing
 
 Crossover: ~1024 equiv batch.
 
-### Qwen3-235B-A22B-half (8×A100, dummy weights, CUDA graphs)
+### Qwen3-235B-A22B-half (8×A100, dummy weights, CUDA graphs) — 4-way comparison
 
-| Equiv Batch | DP/EP vs TP/TP (decode) |
-|---|---|
-| 8 | 0.39× |
-| 64 | 0.60× |
-| 512 | 0.91× |
-| 2048 | **1.23×** |
+All 4 configs run with `--input-len 10 --output-len 10`, `--load-format dummy`, `--mem-fraction-static 0.8`. **Each batch measured twice per invocation** (duplicated `--batch-size` list); best-of-2 latency reported to mitigate cold-cache and DeepEP-prefill variance.
 
-Crossover: ~1024 equiv batch.
+**Decode — system throughput ratio vs TP/TP**:
+
+| Equiv Batch | TP/TP | TP/EP* | DP/TP | DP/EP | Winner |
+|---:|---:|---:|---:|---:|---|
+| 8    | 1.00× | 0.89× | 0.68× | 0.38× | TP/TP |
+| 64   | 1.00× | 0.77× | 0.84× | 0.60× | TP/TP |
+| 512  | 1.00× | 0.89× | 0.96× | 0.88× | TP/TP |
+| 2048 | 1.00× | 0.90× | 1.17× | **1.28×** | **DP/EP** |
+
+**Prefill — system throughput ratio vs TP/TP** (input_len=10):
+
+| Equiv Batch | TP/TP | TP/EP* | DP/TP | DP/EP |
+|---:|---:|---:|---:|---:|
+| 8    | 1.00× | 0.98× | 0.77× | 0.25× |
+| 64   | 1.00× | 0.98× | 0.79× | 0.50× |
+| 512  | 1.00× | 0.89× | 1.07× | 0.99× |
+| 2048 | 1.00× | 0.86× | 1.08× | **1.45×** |
+
+**Axis decomposition at batch 2048 (decode)**:
+- TP/EP* (Axis 2 only, no DeepEP) = 0.90× → **EP GEMM shape alone is a net loss** (masked activation + full-hidden AR cost outweighs full-N benefit on A100)
+- DP/TP (Axis 3 only) = 1.17× → **DP attention drives the bulk of the gain**
+- DP/EP (combined) = 1.28× → DeepEP adds ~+9 pts on top (1.28/1.17 ≈ 1.09×)
+
+**8-GPU takeaways:**
+- **TP/TP wins at batch ≤ 512**. DP/EP's ~5ms DeepEP fixed cost dominates.
+- **Crossover at batch ~1024** (bracketed by 512→0.88× and 2048→1.28×). DP/EP wins big at 2048.
+- **DP/TP is a strong middle ground**: 1.17× decode + 1.08× prefill at 2048, without needing DeepEP setup.
+- **TP/EP*** (`--ep-size 8` without `--moe-a2a-backend deepep`) is **uniformly worse than TP/TP** — do not use.
+- **Prefill at batch 2048** is DP/EP's strongest win (1.45×) — DeepEP dispatch scales better than TP AllReduce on 20k+ tokens.
+- **DeepEP prefill variance**: on second measurement of the same batch, DP/EP prefill can regress 2–4× (observed 0.52s → 2.34s at batch 256). Always run at least 2 trials and report best-of-2 for DP/EP specifically.
+
+Data/scripts: `~/qwen235b_4way_analysis/` (`results_v2.jsonl`, `analyze.py`, `run_all_v2.sh`, `report.md`).
 
 ### Qwen3-30B-A3B (4×A100, real weights, CUDA graphs) — 4-way comparison
 
@@ -422,3 +450,7 @@ TP/EP missing at 2048 because with `dp_size=1` every rank's DeepEP dispatch sees
 | `~/qwen30b_4gpu_analysis/analyze.py` | 4-way analysis script: parses `results.jsonl` → tables + ratios + plots |
 | `~/qwen30b_4gpu_analysis/run_all.sh` | 4-way driver script with OOM retry + GPU cleanup |
 | `~/qwen30b_4gpu_analysis/results.jsonl` | Raw per-config/batch measurements |
+| `~/qwen235b_4way_analysis/report.md` | **4-way comparison on 8×A100 Qwen3-235B-A22B-half** (dummy weights, best-of-2) |
+| `~/qwen235b_4way_analysis/run_all_v2.sh` | 8-GPU 4-way driver with duplicate-batch warmup |
+| `~/qwen235b_4way_analysis/analyze.py` | Best-of-2 analysis script (includes `TP/EP*` AllReduce-EP variant) |
+| `~/qwen235b_4way_analysis/results_v2.jsonl` | Raw 32 rows (4 configs × 4 batches × 2 passes) |

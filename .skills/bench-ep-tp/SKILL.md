@@ -1,13 +1,13 @@
 ---
 name: bench-ep-tp
-description: Benchmark sglang MoE model inference with TP (tensor parallel) and/or EP (expert parallel + DP attention + DeepEP) using bench_one_batch. Knows model configs, memory constraints, env vars, and how to compare results.
+description: Benchmark sglang MoE model inference with TP (tensor parallel) and/or EP (expert parallel + DP attention + DeepEP) using bench_one_batch. Covers the 4-way comparison (TP/TP, TP/EP, DP/TP, DP/EP), model configs, memory constraints, env vars, cold-run warmup pitfalls, and how to compare results.
 metadata:
-  short-description: Run TP/EP MoE benchmarks with bench_one_batch
+  short-description: Run 4-way TP/EP MoE benchmarks with bench_one_batch
 ---
 
 # Benchmark EP vs TP with bench_one_batch
 
-Run MoE model benchmarks comparing Tensor Parallel (TP) and Expert Parallel (EP with DP attention + DeepEP) modes on A100/H100 GPUs.
+Run MoE model benchmarks comparing the 4 attention/expert parallelism configurations (TP/TP, TP/EP, DP/TP, DP/EP) on A100/H100 GPUs. For the why-analysis of results, see sister skill `analyze-ep-tp`.
 
 ## Prerequisites
 
@@ -17,48 +17,101 @@ Run MoE model benchmarks comparing Tensor Parallel (TP) and Expert Parallel (EP 
 
 ## Core Concepts
 
-- **TP batch size = EP batch size × NUM_GPUS** for equivalent comparison
-- EP throughput must be **multiplied by NUM_GPUS** to get total system throughput
-- DeepEP `auto` mode uses normal dispatch for prefill, low-latency for decode
-- On A100: `deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM = False` (SM < 90), so triton runner is used for MoE kernels
+- **Global batch = `--batch-size` × `dp_size`.** `bench_one_batch` reports PER-SCHEDULER batch & throughput. With `--enable-dp-attention --dp-size N`, there are N schedulers. To compare configs fairly, always translate to **global batch** and multiply reported throughput by `dp_size` for system throughput.
+- DeepEP `auto` mode uses normal dispatch for prefill, low-latency for decode.
+- On A100: `deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM = False` (SM < 90), so triton runner is used for MoE kernels.
+- **4 supported configs**: TP/TP (baseline), TP/EP (DeepEP, no DP), DP/TP (DP attn + TP experts), DP/EP (DP attn + DeepEP). See `analyze-ep-tp` for semantics.
+- **`--ep-size N` without `--moe-a2a-backend deepep`** is technically valid ("TP/EP*" — EP-sharded experts + AllReduce). On 8×A100 it is a net loss vs TP/TP at every tested batch (masked activation + full-hidden AR outweighs full-N GEMM benefit). Use DeepEP for real EP wins.
 
-## TP Command Template
+## `bench_one_batch` Does NOT Chunk Prefills
 
+`bench_one_batch.extend()` calls `model_runner.forward(forward_batch)` as a **single forward pass** — it bypasses the scheduler entirely. `--chunked-prefill-size` has **no effect** on results from this tool (verified: identical prefill latency at batch 256 with chunk=1024 vs chunk=8192).
+
+`chunked_prefill_size` only matters for `launch_server` + real serving, where the scheduler chunks per request. `server_args.py:1385` does silently divide it by `dp_size` under `--enable-dp-attention`, which matters for production but not for `bench_one_batch`.
+
+**Real benchmark pitfall — cold vs warm runs**: The first `bench_one_batch` invocation in a fresh Python process runs "cold" (CUDA JIT cache, triton autotuning, thermal state). Large prefills (≥ batch 2048) can measure 1.5–1.7× slower on the cold run vs subsequent warm runs. **Always re-run the largest batch once** and compare — discard or investigate if the two differ by >10%.
+
+## 4-Way Command Templates
+
+Run each config as a **single invocation** with all target batches — `bench_one_batch` sweeps `--batch-size` in one process, reusing the loaded model and cuda graphs. Single invocation also amortizes the ~2–3 min model load + graph capture across the whole batch grid.
+
+Common setup:
 ```bash
+export MODEL=/data/shaoyuw/models/Qwen3-235B-A22B-half
 export NUM_GPUS=8
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-python -m sglang.bench_one_batch \
-    --model <MODEL_PATH> --trust-remote-code \
-    --tp-size $NUM_GPUS \
-    --cuda-graph-bs <BATCH_SIZES> \
-    --disable-overlap-schedule \
-    --mem-fraction-static <MEM_FRAC> \
-    --batch <BATCH_SIZES> \
-    --input-len <INPUT_LEN> --output-len <OUTPUT_LEN> \
-    --run-name tp
+export RESULT_FILE=results.jsonl
 ```
 
-## EP Command Template
-
+### 1. TP/TP — baseline
 ```bash
-export NUM_GPUS=8
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export SGLANG_DEEPEP_BF16_DISPATCH=true
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=<MAX_DISPATCH>
-export NVSHMEM_QP_DEPTH=<QP_DEPTH>  # default 1024, increase if needed
-
+unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
 python -m sglang.bench_one_batch \
-    --model <MODEL_PATH> --trust-remote-code \
-    --tp-size $NUM_GPUS --dp-size $NUM_GPUS --ep-size $NUM_GPUS \
+    --model-path "$MODEL" --trust-remote-code --load-format dummy \
+    --disable-overlap-schedule --mem-fraction-static 0.8 \
+    --input-len 10 --output-len 10 \
+    --tp-size $NUM_GPUS \
+    --batch-size 8 64 512 2048 --cuda-graph-bs 8 64 512 2048 \
+    --result-filename "$RESULT_FILE" --run-name tp_tp
+```
+
+### 2. TP/EP — TP attention + EP experts via DeepEP
+```bash
+export SGLANG_DEEPEP_BF16_DISPATCH=true
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048
+export NVSHMEM_QP_DEPTH=4096
+python -m sglang.bench_one_batch \
+    --model-path "$MODEL" --trust-remote-code --load-format dummy \
+    --disable-overlap-schedule --mem-fraction-static 0.8 \
+    --input-len 10 --output-len 10 \
+    --tp-size $NUM_GPUS \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --batch-size 8 64 512 --cuda-graph-bs 8 64 512 \
+    --result-filename "$RESULT_FILE" --run-name tp_ep
+```
+With `dp_size=1` every rank's DeepEP dispatch sees the full batch. Max testable global batch is capped by `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` (must be ≥ max batch), `NVSHMEM_QP_DEPTH` (≥ (max+1)×2), and memory.
+
+### 3. DP/TP — classic v0.4 DeepSeek DP attention, TP experts
+```bash
+unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
+python -m sglang.bench_one_batch \
+    --model-path "$MODEL" --trust-remote-code --load-format dummy \
+    --disable-overlap-schedule --mem-fraction-static 0.8 \
+    --input-len 10 --output-len 10 \
+    --tp-size $NUM_GPUS --dp-size $NUM_GPUS \
+    --enable-dp-attention --enable-dp-lm-head \
+    --batch-size 1 8 64 256 --cuda-graph-bs 1 8 64 256 \
+    --result-filename "$RESULT_FILE" --run-name dp_tp
+```
+
+### 4. DP/EP — DP attention + DeepEP
+```bash
+export SGLANG_DEEPEP_BF16_DISPATCH=true
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
+unset NVSHMEM_QP_DEPTH
+python -m sglang.bench_one_batch \
+    --model-path "$MODEL" --trust-remote-code --load-format dummy \
+    --disable-overlap-schedule --mem-fraction-static 0.8 \
+    --input-len 10 --output-len 10 \
+    --tp-size $NUM_GPUS --dp-size $NUM_GPUS \
     --enable-dp-attention --enable-dp-lm-head \
     --moe-a2a-backend deepep --deepep-mode auto \
-    --cuda-graph-bs <BATCH_SIZES> \
-    --disable-overlap-schedule \
-    --mem-fraction-static <MEM_FRAC> \
-    --batch <BATCH_SIZES> \
-    --input-len <INPUT_LEN> --output-len <OUTPUT_LEN> \
-    --run-name ep
+    --batch-size 1 8 64 256 --cuda-graph-bs 1 8 64 256 \
+    --result-filename "$RESULT_FILE" --run-name dp_ep
+```
+
+### Between configs — cleanup stragglers
+NCCL teardown occasionally leaves rank processes holding memory. Between runs:
+```bash
+pkill -9 -f "sglang.bench_one_batch" 2>/dev/null || true
+nvidia-smi --query-compute-apps=pid --format=csv,noheader | tr -d ',' | xargs -r kill -9 2>/dev/null || true
+sleep 8
+```
+
+### Launching in tmux for monitoring
+```bash
+tmux new-session -d -s bench "bash run_all.sh 2>&1 | tee logs/driver.log"
+tmux attach -t bench   # Ctrl-B then D to detach
 ```
 
 ## Profiling
@@ -104,7 +157,7 @@ EP allocates DeepEP communication buffers from the runtime pool. With `deepep-mo
 |---|---|---|---|
 | Qwen3-30B-A3B | 0.8 | 0.8 | Comfortable on both |
 | Qwen3-235B-A22B | 0.8 | 0.88-0.9 | EP very tight; auto mode needs normal + low-latency buffers in runtime pool |
-| Qwen3-235B-A22B-half (47 layers, dummy) | 0.8 | 0.8 | Use `--load-format dummy` for memory testing |
+| Qwen3-235B-A22B-half (47 layers, dummy) | 0.8 | 0.8 | Use `--load-format dummy` for memory testing. 0.8 is plenty across all 4 configs. |
 
 **Debugging OOM:** If `--mem-fraction-static` is too high, you'll see either:
 - `RuntimeError: Not enough memory` during KV cache init — the static budget can't even fit weights + minimal cache (need to reduce model size or GPUs)
@@ -143,18 +196,36 @@ EP allocates DeepEP communication buffers from the runtime pool. With `deepep-mo
 
 7. **FP8 mode**: Set `USE_FP8=1`, add `--quantization fp8`, and unset `SGLANG_DEEPEP_BF16_DISPATCH`.
 
+8. **Chunked prefill does NOT apply to `bench_one_batch`** — see top note. `chunked_prefill_size` is scheduler-level and scheduler is not used here.
+
+9. **Enable-dp-lm-head is coupled to enable-dp-attention**: `server_args.py:1390-1393` asserts. Also forced to False when `dp_size==1`. There is no way to enable DP LM head in TP-attention configs; keep it on DP configs and note the <2% decode impact in reports.
+
+10. **Cold-run noise on first large-prefill invocation**: triton autotuning and CUDA JIT warmup can inflate the first batch-2048 prefill by 40-70%. Re-run to confirm; discrepancies >10% between back-to-back runs indicate the first was cold.
+
 ## Comparison Table Format
 
-When presenting results, use two tables (Decode and Prefill) with columns:
+Present decode + prefill tables at the same global batches for all 4 configs, with system throughput (DP configs × `dp_size`) and a ratio vs TP/TP baseline:
 
 ```
-| Equiv Total Batch | TP Batch | TP Latency | TP Throughput | EP Batch (per rank) | EP Latency | EP Throughput ×N | EP / TP |
+| Global Batch | TP/TP | TP/EP | DP/TP | DP/EP |
+|---:|---:|---:|---:|---:|
+| 8 | 1.00× | ... | ... | ... |
+| 2048 | 1.00× | ... | ... | ... |
 ```
 
-Where N = number of GPUs. Mark EP/TP > 1.0 with a checkmark.
+See sister skill `analyze-ep-tp` §Axis Decomposition for how to read these.
 
-## Reference Results (Qwen3-30B-A3B, 8×A100, cuda graph + deepep auto)
+## Reference Workspaces
 
-Decode crossover: EP beats TP at ~1024 equivalent batch size.
-- Batch 2048 equiv: EP 1.31x of TP
-- Batch 4096 equiv: EP 1.37x of TP
+Completed 4-way benchmark workspaces (driver scripts, results, reports):
+
+| Path | Description |
+|---|---|
+| `~/qwen235b_4way_analysis/run_all_v2.sh` | 8-GPU 4-way driver for Qwen3-235B-A22B-half with duplicate-batch warmup |
+| `~/qwen235b_4way_analysis/analyze.py` | Best-of-2 analysis → decode/prefill/ratio tables + axis decomposition |
+| `~/qwen235b_4way_analysis/report.md` | Full 4-way analysis with interpretation |
+
+## Reference Results (quick)
+
+- **Qwen3-30B-A3B, 8×A100 (2-way)**: DP/EP decode crossover ~1024; 1.50× TP/TP at 2048, 1.37× at 4096.
+- **Qwen3-235B-A22B-half, 8×A100 (4-way, dummy)**: see `analyze-ep-tp` §Reference Results.
