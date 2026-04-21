@@ -20,8 +20,9 @@ Run MoE model benchmarks comparing the 4 attention/expert parallelism configurat
 - **Global batch = `--batch-size` × `dp_size`.** `bench_one_batch` reports PER-SCHEDULER batch & throughput. With `--enable-dp-attention --dp-size N`, there are N schedulers. To compare configs fairly, always translate to **global batch** and multiply reported throughput by `dp_size` for system throughput.
 - DeepEP `auto` mode uses normal dispatch for prefill, low-latency for decode.
 - On A100: `deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM = False` (SM < 90), so triton runner is used for MoE kernels.
-- **4 supported configs**: TP/TP (baseline), TP/EP (DeepEP, no DP), DP/TP (DP attn + TP experts), DP/EP (DP attn + DeepEP). See `analyze-ep-tp` for semantics.
-- **`--ep-size N` without `--moe-a2a-backend deepep`** is technically valid ("TP/EP*" — EP-sharded experts + AllReduce). On 8×A100 it is a net loss vs TP/TP at every tested batch (masked activation + full-hidden AR outweighs full-N GEMM benefit). Use DeepEP for real EP wins.
+- **4 supported configs**: TP/TP (baseline), TP/EP (EP-sharded experts + AllReduce, no DeepEP), DP/TP (DP attn + TP experts), DP/EP (DP attn + DeepEP). See `analyze-ep-tp` for semantics.
+- **Only DP/EP uses DeepEP.** With TP attention, tokens are replicated across ranks after the post-attention AllReduce; DeepEP dispatch would be redundant. TP/EP therefore uses `--ep-size N` (no `--moe-a2a-backend`) — experts are partitioned across ranks, each rank runs its local experts on the full batch, results combined via full-hidden AllReduce.
+- **TP/EP is a net loss** at every tested batch on 8×A100 (each rank iterates `E/ep_size` experts over the full batch with masking; extra MoE work not offset by any comm saving). Documented as an anti-pattern for production serving.
 
 ## `bench_one_batch` Does NOT Chunk Prefills
 
@@ -55,21 +56,18 @@ python -m sglang.bench_one_batch \
     --result-filename "$RESULT_FILE" --run-name tp_tp
 ```
 
-### 2. TP/EP — TP attention + EP experts via DeepEP
+### 2. TP/EP — TP attention + EP-sharded experts via AllReduce
 ```bash
-export SGLANG_DEEPEP_BF16_DISPATCH=true
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048
-export NVSHMEM_QP_DEPTH=4096
+unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
 python -m sglang.bench_one_batch \
     --model-path "$MODEL" --trust-remote-code --load-format dummy \
     --disable-overlap-schedule --mem-fraction-static 0.8 \
     --input-len 10 --output-len 10 \
-    --tp-size $NUM_GPUS \
-    --moe-a2a-backend deepep --deepep-mode auto \
-    --batch-size 8 64 512 --cuda-graph-bs 8 64 512 \
+    --tp-size $NUM_GPUS --ep-size $NUM_GPUS \
+    --batch-size 8 64 512 2048 --cuda-graph-bs 8 64 512 2048 \
     --result-filename "$RESULT_FILE" --run-name tp_ep
 ```
-With `dp_size=1` every rank's DeepEP dispatch sees the full batch. Max testable global batch is capped by `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` (must be ≥ max batch), `NVSHMEM_QP_DEPTH` (≥ (max+1)×2), and memory.
+No DeepEP: experts are partitioned across ranks (`--ep-size N`), each rank runs its local experts on the full token batch with masking for non-routed tokens, results combined via full-hidden AllReduce. No dispatch cap, all batch sizes testable. This config is an anti-pattern (net loss vs TP/TP); useful only as a reference point in 4-way analysis.
 
 ### 3. DP/TP — classic v0.4 DeepSeek DP attention, TP experts
 ```bash

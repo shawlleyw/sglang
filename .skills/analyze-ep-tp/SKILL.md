@@ -13,13 +13,14 @@ SGLang supports all four combinations of {attention: TP | DP} × {experts: TP | 
 
 | Tag | Attention | Experts | CLI flags (tp=N) | MoE comm pattern |
 |---|---|---|---|---|
-| **TP/TP** | TP | TP | `--tp N` | AllReduce |
-| **TP/EP** | TP | EP | `--tp N --moe-a2a-backend deepep --deepep-mode auto` | DeepEP all-to-all |
+| **TP/TP** | TP | TP | `--tp N` | AllReduce (full hidden) |
+| **TP/EP** | TP | EP | `--tp N --ep-size N` | AllReduce (full hidden) |
 | **DP/TP** | DP | TP | `--tp N --dp N --enable-dp-attention --enable-dp-lm-head` | AllReduce + `dp_gather`/`dp_scatter` |
-| **DP/EP** | DP | EP | `--tp N --dp N --ep N --enable-dp-attention --enable-dp-lm-head --moe-a2a-backend deepep --deepep-mode auto` | DeepEP all-to-all |
+| **DP/EP** | DP | EP | `--tp N --dp N --enable-dp-attention --enable-dp-lm-head --moe-a2a-backend deepep --deepep-mode auto` | DeepEP all-to-all |
 
 **Key semantics:**
-- `--moe-a2a-backend deepep` auto-sets `ep_size = tp_size` (`server_args._handle_a2a_moe`). You do NOT set `--ep-size` yourself.
+- **Only DP/EP uses DeepEP.** With TP attention, tokens are replicated across ranks after the post-attention AllReduce; routing them via DeepEP dispatch would be redundant (each rank would dispatch the same token set). TP/EP therefore uses AllReduce-based expert parallelism: experts are partitioned across ranks (`--ep-size N`), each rank runs its local experts on the full token batch with masking for non-routed tokens, and results are combined via full-hidden AllReduce.
+- `--moe-a2a-backend deepep` (only used in DP/EP) auto-sets `ep_size = tp_size` (`server_args._handle_a2a_moe`); do NOT also set `--ep-size`.
 - `--enable-dp-attention` requires `tp_size % dp_size == 0`. The typical choice is `dp_size == tp_size` (attention is pure DP, no intra-node TP). DeepSeek-V2/V3 and Qwen MoE models support DP attention.
 - `--deepep-mode auto` is required when prefilling with DeepEP: `low_latency` covers decode only; `normal` disables CUDA graphs. Auto routes prefill → NORMAL and decode → LOW_LATENCY.
 
@@ -32,9 +33,9 @@ SGLang supports all four combinations of {attention: TP | DP} × {experts: TP | 
 | | TP/TP | TP/EP | DP/TP | DP/EP |
 |---|---|---|---|---|
 | Attention comm | AllReduce per layer | AllReduce per layer | **None** (local DP) | **None** (local DP) |
-| MoE comm | AllReduce (full hidden) | DeepEP dispatch+combine | AllReduce + dp_gather/scatter | DeepEP dispatch+combine |
-| Comm ops/layer | 2× AllReduce | 1× AR + 1× dispatch + 1× combine | 2× AR + gather/scatter | 1× dispatch + 1× combine |
-| Scales with batch | **Linear** `B×H` | **Sub-linear** per-rank `B×H` | Linear `B×H` for MoE AR | Sub-linear per-rank `(B/dp)×H` |
+| MoE comm | AllReduce (full hidden) | AllReduce (full hidden) | AllReduce + dp_gather/scatter | DeepEP dispatch+combine |
+| Comm ops/layer | 2× AllReduce | 2× AllReduce | 2× AR + gather/scatter | 1× dispatch + 1× combine |
+| Scales with batch | **Linear** `B×H` | **Linear** `B×H` | Linear `B×H` for MoE AR | Sub-linear per-rank `(B/dp)×H` |
 
 **At small batch**: TP AllReduce is cheap (custom `cross_device_reduce_1stage` handles small tensors in <1ms). DeepEP dispatch+combine has ~5ms fixed cost in low-latency RDMA mode (buffer sync, metadata exchange). TP/TP wins because comm overhead is dominated by the small-tensor fast path.
 
@@ -92,6 +93,56 @@ EP adds its own kernel launches:
 **CUDA graph amplification**: EP benefits disproportionately from CUDA graphs because it has more kernel launches that get amortized. In our 8-GPU measurements: EP is 1.50× faster WITH cuda graphs but only 1.05× WITHOUT at equiv batch=2048.
 
 **Confirmation method**: Compare with and without `--disable-cuda-graph` to isolate launch overhead.
+
+---
+
+## Analysis Methodology: Effective Latency Aggregation
+
+When aggregating per-rank profile data into a wall-clock latency, **do NOT sum across ranks** — that measures total GPU-seconds of work, not end-to-end latency. All ranks run in parallel; the wall-clock is governed by the slowest rank's compute and the actual comm work time.
+
+| Category | Aggregation | Why |
+|---|---|---|
+| Attention | **max** across ranks | Slowest rank's compute defines when the next collective can start |
+| MoE | **max** across ranks | Same — slowest rank bottlenecks the collective |
+| Other (norms, sample, fills) | **max** across ranks | Serialized with compute |
+| Communication (AR, DeepEP dispatch/combine) | **min** across ranks (caveats below) | The collective kernel's duration on each rank includes wait-for-slowest-arrival. The fastest-arriving rank has minimal wait → its duration ≈ pure comm work |
+
+**Effective latency per forward pass**:
+```
+latency ≈ max_rank(attn) + max_rank(moe) + min_rank(comm) + max_rank(other)
+```
+
+This cleanly separates compute imbalance (shows up as larger `max` terms) from pure comm work (`min` term) **for AllReduce-based collectives**. Wait-time on slow-arriving ranks is attributed to upstream compute imbalance, not to comm itself.
+
+**DeepEP caveat — comm CV has two independent sources:**
+
+| Source | AllReduce | DeepEP dispatch/combine |
+|---|:-:|:-:|
+| 1. Arrival-time variance (upstream compute wait) | ✅ | ✅ |
+| 2. **Intrinsic volume imbalance** (different ranks exchange different amounts) | ❌ | ✅ |
+
+For AllReduce every rank exchanges identical payload → `min_comm` is clean pure-work.
+For DeepEP, the rank owning hot experts receives more tokens (dispatch) and sends more results (combine). Even with zero arrival variance, kernel durations differ because comm work differs.
+
+Consequently **`min(DeepEP comm)` is a lower bound on the critical-path comm cost**, representing the lightly-loaded rank. The true latency contribution on the slowest rank is somewhere in `[min_comm, max_comm]`. With dummy weights (uniform routing), volume imbalance ~0 and `min ≈ max ≈ actual`. With real weights, busy ranks carry ~10–20% more combine work — `min_comm` under-estimates real-weight DP/EP cost by ~5–10%.
+
+Volume-imbalance and MoE compute-imbalance are **correlated** (same routing skew drives both): busy MoE rank is also busy combine rank. Our `max_moe + min_comm` formulation slightly under-counts the critical path but does NOT double-count.
+
+**Anti-pattern**: summing kernel durations across all N ranks gives N× the correct latency (total work done, not wall-clock). At 8 ranks, this makes MoE look 8× more costly than it is relative to min-comm.
+
+**Validation**: effective latency should match `bench_one_batch`'s reported latency within ~5 ms (nsys overhead + CPU-side launch). Our Qwen3-235B-half 8×A100 run showed exactly this:
+
+| Config | nsys effective (ms) | bench (ms) |
+|---|---:|---:|
+| TP/TP decode b=2048 | 91.4 | 96.9 |
+| DP/EP decode b=2048 | 74.8 | 75.5 |
+
+### CV% interpretation
+
+- **AllReduce comm CV% is NOT work imbalance.** All ranks do identical AR work, yet CV can be 5–10% due to arrival-time jitter from upstream compute imbalance. Taking `min` strips this.
+- **DeepEP comm CV% has two components** (see DeepEP caveat above): (1) arrival-time wait (same as AR) + (2) genuine volume imbalance when routing is skewed. Dummy-weight CV ≈ (1) only; real-weight CV = (1)+(2) compounded.
+- **MoE CV% in EP configs at large batch** — genuine expert-routing imbalance. With dummy weights near-uniform; with real weights typically 5–15%. This is the same skew that drives the DeepEP volume-imbalance component.
+- **DP attention CV% >2%** usually indicates `dp_gather`/`dp_scatter` sync leaking into the attention measurement window, not compute asymmetry (each DP rank has identical token count by construction).
 
 ---
 
@@ -278,7 +329,7 @@ Which config wins at this equiv batch?
 3. **Dummy weights with EP**: routing becomes uniform, hiding the real-weights load imbalance problem. Always validate with real weights for production conclusions.
 4. **Short prefill (`input_len=10`)**: dominated by kernel launch overhead, not compute. Prefill numbers are unreliable for MoE GEMM-shape conclusions; use decode or larger `input_len`.
 5. **Cold-run noise on large prefills** (`bench_one_batch`): the FIRST invocation in a session runs cold (CUDA JIT cache, triton autotuning, thermal). Large prefills (batch ≥ 2048) can measure 40-70% slower on the cold run than on warm re-runs. Always re-run the largest batch once and compare; if the two differ by >10%, the first was cold and should be discarded. Note: `--chunked-prefill-size` does NOT affect `bench_one_batch` (scheduler-level setting, scheduler is not invoked by this tool — verified with identical prefill latencies at chunk=1024 vs chunk=8192).
-6. **`--ep-size N` without DeepEP backend** produces "TP/EP*" (AllReduce-based EP). On 8×A100 it is **strictly slower** than TP/TP at every tested batch (masked activation + full-hidden AR cost). Not a substitute for DeepEP-based TP/EP.
+6. **Summing kernel time across ranks** instead of using effective latency aggregation (see §Analysis Methodology). Summing measures total GPU-seconds of work, not wall-clock latency. Correct rule: `max` for compute categories, `min` for collectives. Our Qwen3-235B-half decode b=2048 analysis flipped from "MoE 18% of DP/EP gain" (summed) to "MoE 8%, Comm 63%" (effective) when the correction was applied.
 
 ---
 
@@ -367,11 +418,11 @@ Crossover: ~1024 equiv batch.
 
 ### Qwen3-235B-A22B-half (8×A100, dummy weights, CUDA graphs) — 4-way comparison
 
-All 4 configs run with `--input-len 10 --output-len 10`, `--load-format dummy`, `--mem-fraction-static 0.8`. **Each batch measured twice per invocation** (duplicated `--batch-size` list); best-of-2 latency reported to mitigate cold-cache and DeepEP-prefill variance.
+All 4 configs run with `--input-len 10 --output-len 10`, `--load-format dummy`, `--mem-fraction-static 0.8`. **Each batch measured twice per invocation** (duplicated `--batch-size` list); best-of-2 latency reported to mitigate cold-cache noise.
 
 **Decode — system throughput ratio vs TP/TP**:
 
-| Equiv Batch | TP/TP | TP/EP* | DP/TP | DP/EP | Winner |
+| Equiv Batch | TP/TP | TP/EP | DP/TP | DP/EP | Winner |
 |---:|---:|---:|---:|---:|---|
 | 8    | 1.00× | 0.89× | 0.68× | 0.38× | TP/TP |
 | 64   | 1.00× | 0.77× | 0.84× | 0.60× | TP/TP |
@@ -380,27 +431,32 @@ All 4 configs run with `--input-len 10 --output-len 10`, `--load-format dummy`, 
 
 **Prefill — system throughput ratio vs TP/TP** (input_len=10):
 
-| Equiv Batch | TP/TP | TP/EP* | DP/TP | DP/EP |
+| Equiv Batch | TP/TP | TP/EP | DP/TP | DP/EP |
 |---:|---:|---:|---:|---:|
 | 8    | 1.00× | 0.98× | 0.77× | 0.25× |
 | 64   | 1.00× | 0.98× | 0.79× | 0.50× |
 | 512  | 1.00× | 0.89× | 1.07× | 0.99× |
 | 2048 | 1.00× | 0.86× | 1.08× | **1.45×** |
 
-**Axis decomposition at batch 2048 (decode)**:
-- TP/EP* (Axis 2 only, no DeepEP) = 0.90× → **EP GEMM shape alone is a net loss** (masked activation + full-hidden AR cost outweighs full-N benefit on A100)
-- DP/TP (Axis 3 only) = 1.17× → **DP attention drives the bulk of the gain**
-- DP/EP (combined) = 1.28× → DeepEP adds ~+9 pts on top (1.28/1.17 ≈ 1.09×)
+**Axis decomposition at batch 2048 (effective-latency kernel analysis)**:
+
+| Axis | Metric | Prefill b=2048 | Decode b=2048 |
+|---|---|---:|---:|
+| 1. Communication | min-rank comm savings | 18% of DP/EP gain | **63%** of DP/EP gain |
+| 2. MoE GEMM shape | max-rank MoE savings | **69%** | 8% |
+| 3. DP attention | max-rank attn savings | 13% | 33% |
+
+**The dominant axis flips between prefill and decode**. At prefill, large-M GEMM with full-N experts yields massive MoE reduction (422→252 ms max-rank). At decode, per-rank MoE work is similar across configs; the win is almost entirely from cheaper DeepEP comm.
 
 **8-GPU takeaways:**
-- **TP/TP wins at batch ≤ 512**. DP/EP's ~5ms DeepEP fixed cost dominates.
-- **Crossover at batch ~1024** (bracketed by 512→0.88× and 2048→1.28×). DP/EP wins big at 2048.
-- **DP/TP is a strong middle ground**: 1.17× decode + 1.08× prefill at 2048, without needing DeepEP setup.
-- **TP/EP*** (`--ep-size 8` without `--moe-a2a-backend deepep`) is **uniformly worse than TP/TP** — do not use.
-- **Prefill at batch 2048** is DP/EP's strongest win (1.45×) — DeepEP dispatch scales better than TP AllReduce on 20k+ tokens.
-- **DeepEP prefill variance**: on second measurement of the same batch, DP/EP prefill can regress 2–4× (observed 0.52s → 2.34s at batch 256). Always run at least 2 trials and report best-of-2 for DP/EP specifically.
+- **TP/TP wins at batch ≤ 512**. DP/EP's ~5–10ms DeepEP fixed cost dominates at small batch.
+- **Crossover at batch ~1024** (bracketed by 512→0.88× and 2048→1.28× decode).
+- **DP/TP is a strong middle ground**: 1.17× decode + 1.08× prefill at 2048, without DeepEP.
+- **TP/EP (AllReduce-based EP) is uniformly worse than TP/TP** — each rank iterates `E/ep_size` experts over the full batch with masking; extra MoE work is not offset by comm savings. Do not use.
+- **Prefill at batch 2048** is DP/EP's strongest win (1.45×); decode at 1.22× (effective latency) or 1.28× (throughput).
+- **DeepEP prefill variance**: on second measurement of the same batch, DP/EP prefill can regress 2–4× (observed 0.52s → 2.34s at batch 256). Run at least 2 trials and report best-of-2 for DP/EP.
 
-Data/scripts: `~/qwen235b_4way_analysis/` (`results_v2.jsonl`, `analyze.py`, `run_all_v2.sh`, `report.md`).
+Data/scripts: `~/qwen235b_4way_analysis/` (`results_v2.jsonl`, `analyze.py`, `run_all_v2.sh`, `report.md`) + `~/qwen235b_4way_analysis/analysis/` (nsys profiles, effective-latency analysis).
 
 ### Qwen3-30B-A3B (4×A100, real weights, CUDA graphs) — 4-way comparison
 
@@ -424,13 +480,13 @@ System prefill throughput ratio vs TP/TP baseline (input_len=10):
 | 512  | 1.00× | 0.75× | **1.10×** | 0.97× |
 | 2048 | 1.00× | —     | **1.07×** | **1.07×** |
 
-TP/EP missing at 2048 because with `dp_size=1` every rank's DeepEP dispatch sees the full batch, hitting `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512`.
+TP/EP at 2048 not collected (run was skipped; would be informative to add).
 
 **4-GPU takeaways:**
 - **TP/TP wins ≤ 512** equiv batch. On 4 GPUs the TP AllReduce fast path is cheap and TP's narrow-N GEMM penalty is only 4× (vs 8× on 8 GPUs), so the overhead of every alternative dominates.
-- **DP/TP wins at 2048** (decode 1.16×, prefill 1.07×). The classic v0.4 DeepSeek mode: DP attention cuts per-rank attention/KV work 4×, MoE AllReduce stays cheap because experts stay TP-sharded — no all-to-all needed.
+- **DP/TP wins at 2048** (decode 1.16×, prefill 1.07×). DP attention cuts per-rank attention/KV work 4×; MoE AllReduce stays cheap because experts stay TP-sharded.
 - **DP/EP ties at 2048** but doesn't overtake on 4 GPUs. DeepEP fixed cost ~5ms still hurts.
-- **TP/EP loses everywhere** on 4 GPUs within the tested range. It pays the DeepEP all-to-all cost without the DP-attention savings. Crossover would be >2048 equiv batch.
+- **TP/EP loses everywhere** on 4 GPUs within the tested range. TP/EP uses AllReduce-based EP (`--ep-size N`, no DeepEP); each rank iterates `E/ep_size` experts over the full batch, adding MoE work without comm savings.
 - **Production rule of thumb for 4-GPU Qwen3-30B-A3B**: use TP/TP for interactive/low-latency, switch to DP/TP at batch ≥ 512, DP/EP only makes sense once batch ≥ 4096 or scaling to 8+ GPUs.
 
 ---
@@ -452,5 +508,7 @@ TP/EP missing at 2048 because with `dp_size=1` every rank's DeepEP dispatch sees
 | `~/qwen30b_4gpu_analysis/results.jsonl` | Raw per-config/batch measurements |
 | `~/qwen235b_4way_analysis/report.md` | **4-way comparison on 8×A100 Qwen3-235B-A22B-half** (dummy weights, best-of-2) |
 | `~/qwen235b_4way_analysis/run_all_v2.sh` | 8-GPU 4-way driver with duplicate-batch warmup |
-| `~/qwen235b_4way_analysis/analyze.py` | Best-of-2 analysis script (includes `TP/EP*` AllReduce-EP variant) |
+| `~/qwen235b_4way_analysis/analyze.py` | Best-of-2 analysis script for bench_one_batch latency sweep |
+| `~/qwen235b_4way_analysis/analysis/report.md` | Kernel root-cause analysis (nsys, effective-latency) |
+| `~/qwen235b_4way_analysis/analysis/scripts/effective_latency.py` | max-compute / min-comm aggregation reference implementation |
 | `~/qwen235b_4way_analysis/results_v2.jsonl` | Raw 32 rows (4 configs × 4 batches × 2 passes) |
