@@ -391,10 +391,15 @@ def decode(input_token_ids, batch, model_runner):
 
 def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
     if require_mlp_sync(model_runner.server_args):
+        sa = model_runner.server_args
+        # attn_tp_size * dp_size must equal tp_size (the tp_group world size).
+        # Hardcoding 1 only works for dp_size == tp_size (pure DP attention);
+        # TP attention + EP (dp_size=1, tp_size>1) needs attn_tp_size = tp_size.
+        attn_tp_size = max(sa.tp_size // max(sa.dp_size, 1), 1)
         Scheduler.prepare_mlp_sync_batch_raw(
             batch,
-            dp_size=model_runner.server_args.dp_size,
-            attn_tp_size=1,
+            dp_size=sa.dp_size,
+            attn_tp_size=attn_tp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
@@ -723,12 +728,11 @@ def latency_test(
         )
         if ret is not None:
             result_list.append(ret)
-
-    # Write results in jsonlines format on rank 0.
-    if tp_rank == 0 and bench_args.result_filename:
-        with open(bench_args.result_filename, "a") as fout:
-            for result in result_list:
-                fout.write(json.dumps(result) + "\n")
+            # Incremental write: append each result immediately so we don't lose
+            # data if a later batch_size crashes (e.g. OOM or DeepEP dispatch cap).
+            if tp_rank == 0 and bench_args.result_filename:
+                with open(bench_args.result_filename, "a") as fout:
+                    fout.write(json.dumps(ret) + "\n")
 
     if server_args.tp_size > 1:
         destroy_distributed_environment()
