@@ -520,19 +520,32 @@ class CudaGraphRunner:
             self.model_runner.device,
             self.model_runner.gpu_id,
         )
+        # Terse one-line summary is ALWAYS printed so operators can see the
+        # headline memory numbers at a glance. The detailed per-bucket
+        # breakdown (pre/post/delta) is gated behind SGLANG_PARAS_MEM_LOG=1
+        # to avoid log spam in production.
         logger.info(
-            "ParaS[mem-breakdown:capture-delta]  "
-            f"driver_used={_mem_post['driver_used_gb'] - _mem_pre['driver_used_gb']:+.3f}GB  "
-            f"torch_reserved={_mem_post['torch_reserved_gb'] - _mem_pre['torch_reserved_gb']:+.3f}GB  "
-            f"graph_pool={_mem_post['graph_pool_total_gb'] - _mem_pre['graph_pool_total_gb']:+.3f}GB  "
-            f"default_pool={_mem_post['default_pool_total_gb'] - _mem_pre['default_pool_total_gb']:+.3f}GB  "
-            f"non_torch={_mem_post['driver_minus_torch_gb'] - _mem_pre['driver_minus_torch_gb']:+.3f}GB  "
-            f"(deepep_buf={_mem_post['deepep_buffer_gb'] - _mem_pre['deepep_buffer_gb']:+.3f}GB  "
-            f"deepep_ws={_mem_post['deepep_workspace_gb'] - _mem_pre['deepep_workspace_gb']:+.3f}GB  "
-            f"nvshmem={_mem_post['nvshmem_heap_gb'] - _mem_pre['nvshmem_heap_gb']:+.3f}GB  "
-            f"nccl_est={_mem_post['nccl_scratch_est_gb'] - _mem_pre['nccl_scratch_est_gb']:+.3f}GB  "
-            f"other={_mem_post['other_non_torch_gb'] - _mem_pre['other_non_torch_gb']:+.3f}GB)"
+            "ParaS[mem-summary] post-capture: "
+            f"driver_used={_mem_post['driver_used_gb']:.2f}GB  "
+            f"torch_reserved={_mem_post['torch_reserved_gb']:.2f}GB  "
+            f"non_torch={_mem_post['driver_minus_torch_gb']:.2f}GB  "
+            f"(capture-delta: driver={_mem_post['driver_used_gb'] - _mem_pre['driver_used_gb']:+.2f}GB)"
         )
+        from sglang.srt.paras.paras_cuda_graph import paras_mem_log_enabled
+        if paras_mem_log_enabled():
+            logger.info(
+                "ParaS[mem-breakdown:capture-delta]  "
+                f"driver_used={_mem_post['driver_used_gb'] - _mem_pre['driver_used_gb']:+.3f}GB  "
+                f"torch_reserved={_mem_post['torch_reserved_gb'] - _mem_pre['torch_reserved_gb']:+.3f}GB  "
+                f"graph_pool={_mem_post['graph_pool_total_gb'] - _mem_pre['graph_pool_total_gb']:+.3f}GB  "
+                f"default_pool={_mem_post['default_pool_total_gb'] - _mem_pre['default_pool_total_gb']:+.3f}GB  "
+                f"non_torch={_mem_post['driver_minus_torch_gb'] - _mem_pre['driver_minus_torch_gb']:+.3f}GB  "
+                f"(deepep_buf={_mem_post['deepep_buffer_gb'] - _mem_pre['deepep_buffer_gb']:+.3f}GB  "
+                f"deepep_ws={_mem_post['deepep_workspace_gb'] - _mem_pre['deepep_workspace_gb']:+.3f}GB  "
+                f"nvshmem={_mem_post['nvshmem_heap_gb'] - _mem_pre['nvshmem_heap_gb']:+.3f}GB  "
+                f"nccl_est={_mem_post['nccl_scratch_est_gb'] - _mem_pre['nccl_scratch_est_gb']:+.3f}GB  "
+                f"other={_mem_post['other_non_torch_gb'] - _mem_pre['other_non_torch_gb']:+.3f}GB)"
+            )
 
         if self.enable_profile_cuda_graph:
             torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
