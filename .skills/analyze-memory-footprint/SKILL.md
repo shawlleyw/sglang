@@ -28,7 +28,20 @@ driver_used (cudaMemGetInfo used = total - free)
 
 ## Instrumentation (already wired up in this repo)
 
-Commits `a598b0b87`, `905091d5c`, `6ff7c38d1` add breakdown logging to `cuda_graph_runner.capture()`. Three log lines per capture:
+Commits `a598b0b87`, `905091d5c`, `6ff7c38d1` add breakdown logging to `cuda_graph_runner.capture()`. Two tiers of output:
+
+### Tier 1: Terse summary — ALWAYS on
+
+One line per rank per capture showing the headline numbers. Cheap, always printed:
+
+```
+ParaS[mem-summary] post-capture: driver_used=XX.XX GB  torch_reserved=XX.XX GB
+                                 non_torch=XX.XX GB  (capture-delta: driver=±X.XX GB)
+```
+
+### Tier 2: Detailed breakdown — OPT-IN via `SGLANG_PARAS_MEM_LOG=1`
+
+When the env var is set, three additional log lines per capture give the full per-bucket decomposition:
 
 ```
 ParaS[mem-breakdown:pre-capture]   driver_used  torch_reserved  graph_pool
@@ -39,12 +52,29 @@ ParaS[mem-breakdown:post-capture]  (same fields)
 ParaS[mem-breakdown:capture-delta] (post - pre) for each field
 ```
 
-Source: `python/sglang/srt/paras/paras_cuda_graph.py::paras_memory_breakdown()` and `paras_log_memory_breakdown()`. Called from `python/sglang/srt/model_executor/cuda_graph_runner.py::CudaGraphRunner.capture()`.
+**Usage:**
+```bash
+# Default prod run — only Tier 1 summary
+python -m sglang.launch_server ...
+
+# Debug / memory investigation — Tier 1 + Tier 2
+SGLANG_PARAS_MEM_LOG=1 python -m sglang.launch_server ...
+```
+
+Source: `python/sglang/srt/paras/paras_cuda_graph.py::paras_memory_breakdown()`, `paras_log_memory_breakdown()`, and `paras_mem_log_enabled()`. Called from `python/sglang/srt/model_executor/cuda_graph_runner.py::CudaGraphRunner.capture()`.
+
+### Tier 3: Segment-level dump — OPT-IN via `SGLANG_DUMP_MEM_SEGMENTS=1`
+
+See the dedicated section below. Complementary to Tier 2 — fires at Memory pool end (before graph capture), and shows torch allocator segments rather than bucket totals.
+
+### Note on config scope
 
 The breakdown works on **any** sglang config, not just ParaS:
 - Plain TP server: `graph_pool` = captured TP graphs, `deepep_*` = 0, `nvshmem` = 0.
 - Baseline EP (no ParaS): all buckets populated.
 - ParaS: two graph pools show up (one per mode), all other buckets match baseline EP.
+
+The unconditional one-time `ParaS KV budget:` log line at ParaS model init (from `qwen3_moe.py`) is orthogonal to `SGLANG_PARAS_MEM_LOG` — it always prints so users can see the derivation of `ep_max_tokens`.
 
 ---
 

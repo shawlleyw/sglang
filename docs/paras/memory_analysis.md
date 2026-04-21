@@ -23,10 +23,11 @@ The remaining +3.03 GB of ParaS overhead is fully accounted for: ~1.0 GB is the 
 
 ## Methodology
 
-Every number in this doc is measured with the instrumentation described in `.skills/analyze-memory-footprint/SKILL.md`, which also documents the log format and parsing scripts. Two instrumentation tools are used in combination:
+Every number in this doc is measured with the instrumentation described in `.skills/analyze-memory-footprint/SKILL.md`, which also documents the log format and parsing scripts. Three tiers of instrumentation, gated independently:
 
-1. **`ParaS[mem-breakdown:*]` log lines** — per-bucket driver memory at pre/post-capture (already wired into `paras_cuda_graph.py::paras_log_memory_breakdown`).
-2. **`SGLANG_DUMP_MEM_SEGMENTS=1`** — opt-in segment-level dump of the torch caching allocator at "Memory pool end", printed via `torch.cuda.memory_snapshot()`. Added to `model_runner.py` and documented in the skill. Used when a `torch_reserved` gap needs segment-level attribution.
+1. **Always on**: `ParaS[mem-summary]` one-liner per rank per capture, plus the one-time `ParaS KV budget:` log at model init. These always print — cheap and useful for headline numbers in any environment.
+2. **`SGLANG_PARAS_MEM_LOG=1`** (opt-in): `ParaS[mem-breakdown:*]` — per-bucket driver memory at pre-capture, post-capture, and capture-delta. Enable for memory investigations; leave off in production.
+3. **`SGLANG_DUMP_MEM_SEGMENTS=1`** (opt-in): segment-level dump of the torch caching allocator at "Memory pool end", printed via `torch.cuda.memory_snapshot()`. Use when a `torch_reserved` gap needs attribution at the individual-allocation level.
 
 All reference runs are stored under `artifacts/` on branch `paras_memory_opt`:
 
@@ -327,6 +328,15 @@ ParaS KV budget: avail_now=77.820GiB  total=79.251GiB  dynamic_reserve=31.700GiB
 
 `ep_max_tokens` should closely track the baseline EP's `#tokens` number for the same mem-fraction-static value. The residual difference is the +1 KV slot structural overhead.
 
+### Collecting a detailed capture breakdown
+
+```bash
+SGLANG_PARAS_MEM_LOG=1 python -m sglang.launch_server ... 2>&1 | tee artifacts/paras_breakdown.log
+grep "mem-breakdown" artifacts/paras_breakdown.log | head -12
+```
+
+Without this env var, only the one-line `ParaS[mem-summary]` per rank per capture is emitted. The detailed pre/post/delta breakdown is suppressed to keep production logs clean.
+
 ### Collecting a segment dump
 
 ```bash
@@ -387,3 +397,4 @@ Orthogonal to ParaS overhead — would benefit baseline equally. Already support
 | 2026-04-19 | Initial doc. Both NCCL alias and budget-semantics fixes applied and verified. Overhead reduced from +6.93 GB to +3.03 GB per GPU. |
 | 2026-04-19 | Cross-rank-consistency fix for the budget computation: use `distributed=True` in `get_available_gpu_memory` so every rank agrees on the MIN available memory. Prevents UMM buffer-size divergence that would fail TP-mode attention collectives. |
 | 2026-04-19 | Documented the allocation ordering (plan→compute-budget→reserve-KV→materialize) to clarify that `ParaSMemoryManager` avoids weight-before-KV waste by deferring all physical GPU allocation to a single `torch.empty` call after the budget is finalized. |
+| 2026-04-19 | Made the detailed per-bucket capture breakdown opt-in via `SGLANG_PARAS_MEM_LOG=1`. Default prod runs now only emit a one-line `ParaS[mem-summary]` per capture plus the one-time `ParaS KV budget:` log. Reduces log spam ~4× in normal operation while keeping full diagnostics one env var away. |

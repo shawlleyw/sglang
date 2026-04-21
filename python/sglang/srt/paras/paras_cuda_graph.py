@@ -221,9 +221,29 @@ def paras_memory_breakdown(device: str, gpu_id: int) -> Dict[str, Any]:
     }
 
 
+def paras_mem_log_enabled() -> bool:
+    """Return True if detailed ParaS memory-breakdown logging is enabled.
+
+    Gated by env var ``SGLANG_PARAS_MEM_LOG=1``. Default is OFF: the detailed
+    3-bucket per-pool breakdown is only emitted when the user explicitly opts
+    in. The one-line terse summary (driver_used / torch_reserved / non_torch)
+    and the one-time KV-budget log remain on unconditionally so users can
+    always see the headline memory numbers.
+    """
+    import os
+    return os.environ.get("SGLANG_PARAS_MEM_LOG", "0") == "1"
+
+
 def paras_log_memory_breakdown(label: str, device: str, gpu_id: int) -> Dict[str, Any]:
-    """Log a one-line summary + per-pool detail and return the breakdown."""
+    """Compute and (conditionally) log the memory breakdown.
+
+    - Always computes the breakdown and returns the dict (cheap; needed for
+      capture-delta arithmetic even when logging is suppressed).
+    - Logs the full per-pool detail line only when ``SGLANG_PARAS_MEM_LOG=1``.
+    """
     b = paras_memory_breakdown(device, gpu_id)
+    if not paras_mem_log_enabled():
+        return b
     pool_detail = ", ".join(f"{k}={v:.3f}GB" for k, v in sorted(b["pools"].items()))
     nccl_names = ",".join(b.get("nccl_comm_names", []))
     logger.info(
