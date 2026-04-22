@@ -145,6 +145,7 @@ class ParaSReqGatherManager:
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         peer_ctx: Optional[Any] = None,
         method: Optional[str] = None,
+        layer_specs: Optional[list] = None,
     ):
         self.local_reqs = local_reqs
         self.gather_group = gather_group
@@ -153,6 +154,7 @@ class ParaSReqGatherManager:
         self.group_size = gather_group.world_size
         self.peer_ctx = peer_ctx
         self.method = method or os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl")
+        self.layer_specs = layer_specs
         
         self.local_no_reqs = len(local_reqs) == 0
         self.local_seqlens_list = [req.seqlen for req in local_reqs]
@@ -251,20 +253,43 @@ class ParaSReqGatherManager:
         replication_factor = max(1, self.group_size // num_heads) if num_heads < self.group_size else 1
         virtual_heads = num_heads * replication_factor  # == group_size when replicated
         
+        # Default (uniform) split sizes — used when layer_specs is None.
         input_split_sizes = [2 * splited_size_per_token * self.num_local_tokens] * self.group_size
         output_split_sizes = [2 * (splited_size_per_token * num_tokens_of_rank) for num_tokens_of_rank in self.global_num_tokens]
         
         def gather_one_layer(layer_id: int) -> torch.Tensor:
+            # Per-layer token count: SWA layers may transfer fewer tokens.
+            if self.layer_specs is not None:
+                spec = self.layer_specs[layer_id]
+                if spec.kind == "swa":
+                    layer_num_local = min(self.num_local_tokens, spec.tokens_cap_ep)
+                else:
+                    layer_num_local = self.num_local_tokens
+                layer_input_split = [2 * splited_size_per_token * layer_num_local] * self.group_size
+                layer_output_split = [
+                    2 * splited_size_per_token * (min(nt, spec.tokens_cap_ep) if spec.kind == "swa" else nt)
+                    for nt in self.global_num_tokens
+                ]
+                layer_num_global = sum(
+                    min(nt, spec.tokens_cap_ep) if spec.kind == "swa" else nt
+                    for nt in self.global_num_tokens
+                )
+            else:
+                layer_num_local = self.num_local_tokens
+                layer_input_split = input_split_sizes
+                layer_output_split = output_split_sizes
+                layer_num_global = self.num_global_tokens
 
-            if self.num_local_tokens > 0:
+            if layer_num_local > 0:
                 # Read from EP buffers (current kv_cache state)
                 k_buffer = kv_cache.get_key_buffer(layer_id)
                 v_buffer = kv_cache.get_value_buffer(layer_id)
                 
-                permuted_local_kvcache = gather_kv_and_permute(k_buffer, v_buffer, self.local_token_indices)
+                local_indices = self.local_token_indices[:layer_num_local]
+                permuted_local_kvcache = gather_kv_and_permute(k_buffer, v_buffer, local_indices)
                 
                 if replication_factor > 1:
-                    N = self.num_local_tokens
+                    N = layer_num_local
                     permuted_local_kvcache = (
                         permuted_local_kvcache
                         .view(num_heads, N * 2 * head_dim)
@@ -274,9 +299,9 @@ class ParaSReqGatherManager:
             else:
                 permuted_local_kvcache = torch.empty((0, ), dtype=kv_cache.store_dtype, device=kv_cache.device)
                 
-            if self.num_global_tokens > 0:
-                gathered_kvcache = torch.empty(2 * self.num_global_tokens * splited_size_per_token, dtype=permuted_local_kvcache.dtype, device=permuted_local_kvcache.device)
-                torch.distributed.all_to_all_single(gathered_kvcache, permuted_local_kvcache, output_split_sizes, input_split_sizes, group=self.gather_group.device_group)
+            if layer_num_global > 0:
+                gathered_kvcache = torch.empty(2 * layer_num_global * splited_size_per_token, dtype=permuted_local_kvcache.dtype, device=permuted_local_kvcache.device)
+                torch.distributed.all_to_all_single(gathered_kvcache, permuted_local_kvcache, layer_output_split, layer_input_split, group=self.gather_group.device_group)
                 
                 # Write into TP buffers obtained directly from memory manager
                 tp_k_name = f"model.layers.{layer_id}.kv.tp.k"
@@ -286,9 +311,10 @@ class ParaSReqGatherManager:
                 tp_shape = (tp_slots, sharded_num_heads, head_dim)
                 tp_k = mgr.get_view_as(tp_k_name, tp_shape)
                 tp_v = mgr.get_view_as(tp_v_name, tp_shape)
+                global_indices = self.global_token_indices[:layer_num_global]
                 permute_and_scatter_kv(
-                    gathered_kvcache, tp_k, tp_v, self.global_token_indices,
-                    self.num_global_tokens, sharded_num_heads, head_dim
+                    gathered_kvcache, tp_k, tp_v, global_indices,
+                    layer_num_global, sharded_num_heads, head_dim
                 )
                 
         for layer_id in range(num_layers):
@@ -342,13 +368,20 @@ class ParaSReqGatherManager:
             dst_k_offset = mgr._entries[tp_k_name].offset_bytes
             dst_v_offset = mgr._entries[tp_v_name].offset_bytes
 
-            if self.num_local_tokens > 0:
+            # Per-layer token count for SWA layers.
+            if self.layer_specs is not None and self.layer_specs[layer_id].kind == "swa":
+                layer_num_local = min(self.num_local_tokens, self.layer_specs[layer_id].tokens_cap_ep)
+            else:
+                layer_num_local = self.num_local_tokens
+
+            if layer_num_local > 0:
+                layer_indices = local_token_indices_gpu[:layer_num_local] if local_token_indices_gpu is not None else local_token_indices_gpu
                 peer_access_kv_transfer(
                     local_buffer_ptr, dst_base_ptrs,
-                    local_token_indices_gpu,
+                    layer_indices,
                     src_k_offset, src_v_offset,
                     dst_k_offset, dst_v_offset,
-                    self.num_local_tokens, dst_token_start,
+                    layer_num_local, dst_token_start,
                     num_heads, tp_rank, self.group_size, head_dim,
                     elem_size,
                 )

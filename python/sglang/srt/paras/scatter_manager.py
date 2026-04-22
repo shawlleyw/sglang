@@ -193,6 +193,7 @@ class ParaSReqScatterManager:
         peer_ctx: Optional[Any] = None,
         paras_tp_rank: int = 0,
         paras_tp_size: int = 1,
+        layer_specs: Optional[list] = None,
     ):
         self.global_reqs = global_reqs
         self.scatter_group = scatter_group
@@ -203,6 +204,7 @@ class ParaSReqScatterManager:
         self.paras_tp_rank = paras_tp_rank
         self.paras_tp_size = paras_tp_size
         self.method = os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl")
+        self.layer_specs = layer_specs
 
         self.local_reqs: List[Req] = []
         self.local_seqlens_list: List[int] = []
@@ -391,8 +393,9 @@ class ParaSReqScatterManager:
         """
         if tp_kv_cache is None:
             tp_kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        assert isinstance(tp_kv_cache, MHATokenToKVPool), (
-            "Only MHATokenToKVPool is supported for now."
+        from sglang.srt.mem_cache.memory_pool import SWAKVPool
+        assert isinstance(tp_kv_cache, (MHATokenToKVPool, SWAKVPool)), (
+            "Only MHATokenToKVPool and SWAKVPool are supported."
         )
         if ep_head_num is None:
             # head_num in TP mode is sharded.  With head replication
@@ -422,6 +425,7 @@ class ParaSReqScatterManager:
             global_token_indices=self.global_token_indices,
             ep_dst_positions=self.ep_dst_positions,
             gather_group=self.scatter_group,
+            layer_specs=self.layer_specs,
         )
 
     def _scatter_cache_peer_access(
@@ -525,18 +529,23 @@ class ParaSReqScatterManager:
 
         barrier_tensor = torch.zeros(1, device="cuda")
         for layer_idx in range(num_layers - 1, -1, -1):
-            if num_my_tokens > 0:
+            if self.layer_specs is not None and self.layer_specs[layer_idx].kind == "swa":
+                layer_num = min(num_my_tokens, self.layer_specs[layer_idx].tokens_cap_ep)
+            else:
+                layer_num = num_my_tokens
+
+            if layer_num > 0:
                 paras_peer_access_cuda.launch_peer_access_kv_scatter(
                     local_buffer_ptr,
                     peer_buffer_ptrs,
-                    tp_token_positions,
-                    token_to_rank,
-                    ep_dst_pos_all,
+                    tp_token_positions[:layer_num],
+                    token_to_rank[:layer_num],
+                    ep_dst_pos_all[:layer_num],
                     src_k_offsets[layer_idx],
                     src_v_offsets[layer_idx],
                     dst_k_offsets[layer_idx],
                     dst_v_offsets[layer_idx],
-                    num_my_tokens,
+                    layer_num,
                     heads_per_rank,
                     num_kv_heads,
                     self.paras_tp_rank,
@@ -564,6 +573,7 @@ def _scatter_cache_nccl(
     global_token_indices: torch.Tensor,
     ep_dst_positions: torch.Tensor,
     gather_group: 'GroupCoordinator',
+    layer_specs: Optional[list] = None,
 ) -> None:
     """Scatter TP KV cache to EP KV cache via NCCL all_to_all.
 
@@ -693,12 +703,55 @@ def _scatter_cache_nccl(
     reassembly_groups = group_size if heads_per_rank > 1 else num_kv_heads
 
     def scatter_one_layer(layer_id: int) -> None:
-        # Read from TP buffers (current kv_cache state)
-        if total_send_tokens > 0:
+        # Per-layer dispatch: SWA layers transfer fewer tokens.
+        if layer_specs is not None and layer_specs[layer_id].kind == "swa":
+            cap = layer_specs[layer_id].tokens_cap_ep
+            swa_send_counts: List[int] = []
+            swa_parts: List[torch.Tensor] = []
+            for e in range(group_size):
+                full = len(token_partition[e])
+                capped = min(full, cap)
+                my_s = capped * intra_rank // replication_factor
+                my_e = capped * (intra_rank + 1) // replication_factor
+                my_cnt = my_e - my_s
+                swa_send_counts.append(my_cnt)
+                if my_cnt > 0:
+                    part_idx = torch.tensor(
+                        token_partition[e][my_s:my_e],
+                        dtype=torch.long,
+                        device=global_token_indices.device,
+                    )
+                    swa_parts.append(global_token_indices[part_idx])
+
+            use_total_send = sum(swa_send_counts)
+            use_input_split = [cnt * per_token_elems for cnt in swa_send_counts]
+            use_tp_indices = torch.cat(swa_parts) if swa_parts else torch.empty(
+                0, dtype=torch.long, device=global_token_indices.device
+            )
+            use_recv_full = min(recv_full_count, cap)
+            swa_recv_counts: List[int] = []
+            for src in range(group_size):
+                si = src % replication_factor
+                s = use_recv_full * si // replication_factor
+                e_i = use_recv_full * (si + 1) // replication_factor
+                swa_recv_counts.append(e_i - s)
+            use_output_split = [cnt * per_token_elems for cnt in swa_recv_counts]
+            use_total_recv = sum(use_output_split)
+            use_dst_pos = ep_dst_positions[:use_recv_full] if ep_dst_positions is not None and use_recv_full > 0 else ep_dst_positions
+        else:
+            use_total_send = total_send_tokens
+            use_input_split = input_split_sizes
+            use_tp_indices = sorted_tp_indices
+            use_recv_full = recv_full_count
+            use_output_split = output_split_sizes
+            use_total_recv = total_recv_elems
+            use_dst_pos = ep_dst_positions
+
+        if use_total_send > 0:
             k_buf = kv_cache.get_key_buffer(layer_id)
             v_buf = kv_cache.get_value_buffer(layer_id)
             send_buf = gather_tp_kv_and_permute(
-                k_buf, v_buf, sorted_tp_indices,
+                k_buf, v_buf, use_tp_indices,
                 num_kv_heads, heads_per_rank, head_dim, group_size,
             )
         else:
@@ -708,18 +761,17 @@ def _scatter_cache_nccl(
 
         if total_global_tokens > 0:
             recv_buf = torch.empty(
-                total_recv_elems,
+                use_total_recv,
                 dtype=kv_cache.store_dtype,
                 device=kv_cache.device,
             )
             dist.all_to_all_single(
                 recv_buf, send_buf,
-                output_split_sizes, input_split_sizes,
+                use_output_split, use_input_split,
                 group=gather_group.device_group,
             )
 
-            if recv_full_count > 0:
-                # Write into EP buffers obtained directly from memory manager
+            if use_recv_full > 0:
                 ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
                 ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
                 total_elements = mgr._entries[ep_k_name].numel
@@ -728,8 +780,8 @@ def _scatter_cache_nccl(
                 ep_k = mgr.get_view_as(ep_k_name, ep_shape)
                 ep_v = mgr.get_view_as(ep_v_name, ep_shape)
                 permute_and_scatter_kv_to_ep(
-                    recv_buf, ep_k, ep_v, ep_dst_positions,
-                    recv_full_count, num_kv_heads, heads_per_rank,
+                    recv_buf, ep_k, ep_v, use_dst_pos,
+                    use_recv_full, num_kv_heads, heads_per_rank,
                     head_dim, reassembly_groups,
                 )
 
