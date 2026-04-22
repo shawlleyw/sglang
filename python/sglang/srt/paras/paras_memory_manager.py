@@ -21,6 +21,11 @@ WHY THIS APPROACH:
   - Deterministic offsets: Reservation order → fixed offsets enables reproducible layouts.
   - Dtype-agnostic storage: uint8 buffer holds any dtype; views reinterpret as needed.
   - Aligned access: 256-byte alignment matches GPU memory coalescing patterns.
+
+HETEROGENEOUS LAYERS (layer_specs):
+  When layer_specs differ per layer, each slot is sized for its layer's family
+  (full vs SWA). Two families may have different per-layer bytes, but within
+  a family all slots have the same bytes per layer.
 """
 
 import json
@@ -184,6 +189,7 @@ class ParaSMemoryManager:
         kv_dtype: torch.dtype,
         page_size: int = 1,
         prefix: str = "model",
+        layer_specs: Optional[list] = None,
     ) -> None:
         """
         Reserve KV cache entries using EP shapes (same bytes as TP via union layout).
@@ -193,6 +199,11 @@ class ParaSMemoryManager:
         EP and TP KV have same total bytes per layer:
           ep_tokens × ep_kv_heads × head_dim == tp_tokens × tp_kv_heads × head_dim
         so we reserve once in EP shape and use get_view_as() for TP access.
+
+        When *layer_specs* is provided, each slot is sized per its layer's spec
+        (e.g., full-attention layers get more tokens than SWA layers).
+        When *layer_specs* is ``None``, all slots share the uniform shape
+        ``(ep_max_tokens + page_size, num_kv_heads, head_dim)``.
         """
         if self._materialized:
             raise RuntimeError("Cannot reserve KV cache after materialize().")
@@ -201,13 +212,27 @@ class ParaSMemoryManager:
 
         self.ep_max_kv_tokens = ep_max_tokens
         self.tp_max_kv_tokens = tp_max_tokens
+        self._layer_specs = layer_specs
 
         # Reserve N+1 physical KV slots (slot 0 is the extra "TP landing" slot,
         # matching the MoE N+1 pattern in plan_qwen_moe_layout).
-        kv_shape = (ep_max_tokens + page_size, num_kv_heads, head_dim)
-        for j in range(num_layers + 1):
-            self.reserve(f"paras.kv_slot.{j}.k", kv_shape, kv_dtype)
-            self.reserve(f"paras.kv_slot.{j}.v", kv_shape, kv_dtype)
+        if layer_specs is None:
+            kv_shape = (ep_max_tokens + page_size, num_kv_heads, head_dim)
+            for j in range(num_layers + 1):
+                self.reserve(f"paras.kv_slot.{j}.k", kv_shape, kv_dtype)
+                self.reserve(f"paras.kv_slot.{j}.v", kv_shape, kv_dtype)
+        else:
+            # Slot 0: TP landing for layer 0 (EP shape, same bytes via union layout).
+            # Slot j>=1: EP data for layer j-1.
+            for j in range(num_layers + 1):
+                spec = layer_specs[0] if j == 0 else layer_specs[j - 1]
+                kv_shape = (
+                    spec.tokens_cap_ep + page_size,
+                    spec.num_kv_heads,
+                    spec.head_dim,
+                )
+                self.reserve(f"paras.kv_slot.{j}.k", kv_shape, kv_dtype)
+                self.reserve(f"paras.kv_slot.{j}.v", kv_shape, kv_dtype)
 
         # Weight-loading aliases: model.layers.{i}.kv.k/v → slot[i+1].
         # Dict assignment (NOT alias()) — pre-materialize, same LayoutEntry object.
@@ -628,6 +653,7 @@ def create_paras_kv_aliases(
     manager: ParaSMemoryManager,
     num_layers: int,
     prefix: str = "model",
+    layer_specs: Optional[list] = None,
 ) -> None:
     """
     Create EP and TP KV aliases for the N+1 slot layout.
@@ -635,6 +661,9 @@ def create_paras_kv_aliases(
 
     ep layer i → slot i+1 (same physical buffer as EP KV data)
     tp layer i → slot i   (one slot before EP, for fused transfer)
+
+    When *layer_specs* is provided, alias shapes reflect per-layer sizes
+    (inherited from the underlying slots reserved with heterogeneous shapes).
     """
     for i in range(num_layers):
         manager.alias(f"{prefix}.layers.{i}.kv.ep.k", f"paras.kv_slot.{i+1}.k")
