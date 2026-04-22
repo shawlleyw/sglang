@@ -50,7 +50,6 @@ class MHACacheTransfer:
         local_token_indices: Optional[torch.Tensor] = None,
         global_token_indices: Optional[torch.Tensor] = None,
         global_num_tokens: Optional[List[int]] = None,
-        layer_specs: Optional[list] = None,
         # -- peer_access state --
         peer_addresses: Optional[List[int]] = None,
         # -- scatter state --
@@ -70,7 +69,6 @@ class MHACacheTransfer:
         self.local_token_indices = local_token_indices
         self.global_token_indices = global_token_indices
         self.global_num_tokens = global_num_tokens
-        self.layer_specs = layer_specs
         self.ep_head_num = ep_head_num
         self.token_partition = token_partition
         self.ep_dst_positions = ep_dst_positions
@@ -274,24 +272,10 @@ class MHACacheTransfer:
         k_buffer = self.kv_cache.get_key_buffer(layer_id)
         v_buffer = self.kv_cache.get_value_buffer(layer_id)
 
-        # SWA token capping.
-        if self.layer_specs is not None and spec.kind == "swa":
-            num_local = min(self.num_local_tokens, spec.tokens_cap_ep)
-            layer_global_num = [
-                min(n, spec.tokens_cap_ep) for n in self.global_num_tokens
-            ]
-            num_global = sum(layer_global_num)
-        else:
-            num_local = self.num_local_tokens
-            layer_global_num = self.global_num_tokens
-            num_global = self.num_global_tokens
-
-        local_indices = (
-            self.local_token_indices[:num_local]
-            if self.local_token_indices is not None
-            and num_local < self.num_local_tokens
-            else self.local_token_indices
-        )
+        num_local = self.num_local_tokens
+        layer_global_num = self.global_num_tokens
+        num_global = self.num_global_tokens
+        local_indices = self.local_token_indices
 
         if self.method == "nccl":
             do_gather_one_layer_nccl(
@@ -344,7 +328,6 @@ class MHACacheTransfer:
                 self.kv_cache,
                 self.ep_head_num,
                 spec.layer_id,
-                self.layer_specs,
                 self.token_partition,
                 self.group_size,
                 self._intra_rank,
@@ -383,7 +366,6 @@ class MHACacheTransfer:
                 self.mgr._entries[ep_k_name].offset_bytes,
                 self.mgr._entries[ep_v_name].offset_bytes,
                 self._num_my_tokens,
-                self.layer_specs,
                 spec.layer_id,
                 self._heads_per_rank,
                 self._num_kv_heads,

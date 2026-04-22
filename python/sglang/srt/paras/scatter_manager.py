@@ -89,79 +89,10 @@ def partition_requests_for_ep(
     return fn(global_reqs, num_ranks)
 
 
-# ============================================================
-# gather_tp_kv_and_permute
-# ============================================================
-
-def gather_tp_kv_and_permute(
-    k_buffer: torch.Tensor,
-    v_buffer: torch.Tensor,
-    sorted_token_indices: torch.Tensor,
-    num_kv_heads: int,
-    heads_per_rank: int,
-    head_dim: int,
-    group_size: int,
-) -> torch.Tensor:
-    """Gather K/V from TP cache and pack to [tokens, heads_per_rank, KV=2, dim].
-
-    This is the TP→EP counterpart of ``gather_kv_and_permute`` (which outputs
-    ``[heads, tokens, KV, dim]`` for EP→TP).
-
-    ``sorted_token_indices`` must be pre-sorted by destination EP rank so
-    that the flat output can be split by per-rank token counts for
-    ``all_to_all_single``.
-
-    Output layout per destination-rank chunk:
-        ``[tokens_for_rank, heads_per_rank, 2, head_dim]``
-    """
-    if sorted_token_indices.numel() == 0:
-        return torch.empty(0, dtype=k_buffer.dtype, device=k_buffer.device)
-
-    kcache = k_buffer[sorted_token_indices]   # [N, heads_per_rank, head_dim]
-    vcache = v_buffer[sorted_token_indices]   # [N, heads_per_rank, head_dim]
-    # Interleave K and V → [N, heads_per_rank, 2, head_dim]
-    kvcache = torch.stack([kcache, vcache], dim=2)
-    return kvcache.contiguous().flatten()
-
-
-# ============================================================
-# permute_and_scatter_kv_to_ep
-# ============================================================
-
-def permute_and_scatter_kv_to_ep(
-    recv_buf: torch.Tensor,
-    k_buffer: torch.Tensor,
-    v_buffer: torch.Tensor,
-    dst_positions: torch.Tensor,
-    num_local_tokens: int,
-    num_kv_heads: int,
-    heads_per_rank: int,
-    head_dim: int,
-    group_size: int,
-) -> None:
-    """Unpack all_to_all output and scatter into EP KV buffers.
-
-    This is the TP→EP counterpart of ``permute_and_scatter_kv`` (which handles
-    EP→TP).
-
-    Received layout after all_to_all: ``group_size`` contiguous chunks, each
-    ``[num_local_tokens, heads_per_rank, 2, head_dim]``.
-
-    Each chunk carries the ``heads_per_rank`` heads owned by a different TP
-    rank.  We interleave the head contributions from all ranks to reconstruct
-    the full ``num_kv_heads`` for each token, then scatter K and V separately
-    into the EP buffer at ``dst_positions``.
-    """
-    # [group_size, num_local_tokens, heads_per_rank, 2, head_dim]
-    kv = recv_buf.view(group_size, num_local_tokens, heads_per_rank, 2, head_dim)
-    # Interleave heads from different ranks →
-    #   [tokens, group_size, heads_per_rank, 2, dim]
-    kv = kv.permute(1, 0, 2, 3, 4).contiguous()
-    # Merge rank and per-rank head dims → [tokens, num_kv_heads, 2, dim]
-    kv = kv.reshape(num_local_tokens, num_kv_heads, 2, head_dim)
-    # Scatter K and V into EP buffers
-    k_buffer[dst_positions] = kv[:, :, 0, :]
-    v_buffer[dst_positions] = kv[:, :, 1, :]
+from sglang.srt.paras.cache_transfer.utils import (
+    gather_tp_kv_and_permute,
+    permute_and_scatter_kv_to_ep,
+)
 
 
 # ============================================================
@@ -422,7 +353,6 @@ class ParaSReqScatterManager:
             mgr=mgr,
             group=self.scatter_group,
             global_token_indices=self.global_token_indices,
-            layer_specs=self.layer_specs,
             peer_addresses=peer_addresses,
             ep_head_num=ep_head_num,
             token_partition=self.token_partition,
@@ -493,6 +423,10 @@ def _scatter_cache_nccl(
     gather_group,
     layer_specs: Optional[list] = None,
 ) -> None:
+    """Thin backward-compat shim for ``test_kv_cache_transfer.py``.
+
+    Delegates to ``MHACacheTransfer`` for full-attention NCCL scatter.
+    """
     from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
     from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
     from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
@@ -507,7 +441,6 @@ def _scatter_cache_nccl(
         mgr=mgr,
         group=gather_group,
         global_token_indices=global_token_indices,
-        layer_specs=layer_specs,
         ep_head_num=ep_head_num,
         token_partition=token_partition,
         ep_dst_positions=ep_dst_positions,

@@ -263,7 +263,6 @@ def do_scatter_one_layer_nccl(
     kv_cache,
     ep_head_num: int,
     layer_id: int,
-    layer_specs: Optional[list],
     token_partition: List[List[int]],
     group_size: int,
     intra_rank: int,
@@ -285,65 +284,17 @@ def do_scatter_one_layer_nccl(
     mgr,
     gather_group,
 ) -> None:
-    """Stateless NCCL scatter for one layer (TP->EP).
+    """Pure full-attention NCCL scatter for one layer (TP->EP).
 
-    The caller pre-computes all partition / split metadata and passes it in.
-    No barrier inside -- the caller is responsible for inter-layer
-    synchronization.
+    SWA cap handling lives in ``swa.py``.  The caller pre-computes all
+    partition / split metadata and passes it in.  No barrier inside --
+    the caller is responsible for inter-layer synchronization.
     """
-    # Per-layer dispatch: SWA layers transfer fewer tokens.
-    if layer_specs is not None and layer_specs[layer_id].kind == "swa":
-        cap = layer_specs[layer_id].tokens_cap_ep
-        swa_send_counts: List[int] = []
-        swa_parts: List[torch.Tensor] = []
-        for e in range(group_size):
-            full = len(token_partition[e])
-            capped = min(full, cap)
-            my_s = capped * intra_rank // replication_factor
-            my_e = capped * (intra_rank + 1) // replication_factor
-            my_cnt = my_e - my_s
-            swa_send_counts.append(my_cnt)
-            if my_cnt > 0:
-                part_idx = torch.tensor(
-                    token_partition[e][my_s:my_e],
-                    dtype=torch.long,
-                    device=global_token_indices.device,
-                )
-                swa_parts.append(global_token_indices[part_idx])
-
-        use_total_send = sum(swa_send_counts)
-        use_input_split = [cnt * per_token_elems for cnt in swa_send_counts]
-        use_tp_indices = torch.cat(swa_parts) if swa_parts else torch.empty(
-            0, dtype=torch.long, device=global_token_indices.device
-        )
-        use_recv_full = min(recv_full_count, cap)
-        swa_recv_counts: List[int] = []
-        for src in range(group_size):
-            si = src % replication_factor
-            s = use_recv_full * si // replication_factor
-            e_i = use_recv_full * (si + 1) // replication_factor
-            swa_recv_counts.append(e_i - s)
-        use_output_split = [cnt * per_token_elems for cnt in swa_recv_counts]
-        use_total_recv = sum(use_output_split)
-        use_dst_pos = (
-            ep_dst_positions[:use_recv_full]
-            if ep_dst_positions is not None and use_recv_full > 0
-            else ep_dst_positions
-        )
-    else:
-        use_total_send = total_send_tokens
-        use_input_split = input_split_sizes
-        use_tp_indices = sorted_tp_indices
-        use_recv_full = recv_full_count
-        use_output_split = output_split_sizes
-        use_total_recv = total_recv_elems
-        use_dst_pos = ep_dst_positions
-
-    if use_total_send > 0:
+    if total_send_tokens > 0:
         k_buf = kv_cache.get_key_buffer(layer_id)
         v_buf = kv_cache.get_value_buffer(layer_id)
         send_buf = gather_tp_kv_and_permute(
-            k_buf, v_buf, use_tp_indices,
+            k_buf, v_buf, sorted_tp_indices,
             num_kv_heads, heads_per_rank, head_dim, group_size,
         )
     else:
@@ -353,17 +304,17 @@ def do_scatter_one_layer_nccl(
 
     if total_global_tokens > 0:
         recv_buf = torch.empty(
-            use_total_recv,
+            total_recv_elems,
             dtype=kv_cache.store_dtype,
             device=kv_cache.device,
         )
         dist.all_to_all_single(
             recv_buf, send_buf,
-            use_output_split, use_input_split,
+            output_split_sizes, input_split_sizes,
             group=gather_group.device_group,
         )
 
-        if use_recv_full > 0:
+        if recv_full_count > 0:
             ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
             ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
             total_elements = mgr._entries[ep_k_name].numel
@@ -372,8 +323,8 @@ def do_scatter_one_layer_nccl(
             ep_k = mgr.get_view_as(ep_k_name, ep_shape)
             ep_v = mgr.get_view_as(ep_v_name, ep_shape)
             permute_and_scatter_kv_to_ep(
-                recv_buf, ep_k, ep_v, use_dst_pos,
-                use_recv_full, num_kv_heads, heads_per_rank,
+                recv_buf, ep_k, ep_v, ep_dst_positions,
+                recv_full_count, num_kv_heads, heads_per_rank,
                 head_dim, reassembly_groups,
             )
 
@@ -393,7 +344,6 @@ def do_scatter_one_layer_peer_access(
     dst_k_offset: int,
     dst_v_offset: int,
     num_my_tokens: int,
-    layer_specs: Optional[list],
     layer_id: int,
     heads_per_rank: int,
     num_kv_heads: int,
@@ -402,31 +352,27 @@ def do_scatter_one_layer_peer_access(
     head_dim: int,
     elem_size: int,
 ) -> None:
-    """Stateless peer-access scatter for one layer (TP->EP).
+    """Pure full-attention peer-access scatter for one layer (TP->EP).
 
+    SWA cap handling lives in ``swa.py``.
     Calls ``launch_peer_access_kv_scatter`` from ``paras_peer_access_cuda``.
     No barrier inside -- the caller is responsible for inter-layer
     synchronization.
     """
     import paras_peer_access_cuda
 
-    if layer_specs is not None and layer_specs[layer_id].kind == "swa":
-        layer_num = min(num_my_tokens, layer_specs[layer_id].tokens_cap_ep)
-    else:
-        layer_num = num_my_tokens
-
-    if layer_num > 0:
+    if num_my_tokens > 0:
         paras_peer_access_cuda.launch_peer_access_kv_scatter(
             local_buffer_ptr,
             peer_buffer_ptrs,
-            tp_token_positions[:layer_num],
-            token_to_rank[:layer_num],
-            ep_dst_pos_all[:layer_num],
+            tp_token_positions[:num_my_tokens],
+            token_to_rank[:num_my_tokens],
+            ep_dst_pos_all[:num_my_tokens],
             src_k_offset,
             src_v_offset,
             dst_k_offset,
             dst_v_offset,
-            layer_num,
+            num_my_tokens,
             heads_per_rank,
             num_kv_heads,
             paras_tp_rank,
