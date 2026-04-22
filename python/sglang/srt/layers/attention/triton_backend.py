@@ -92,6 +92,9 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
+        # Store for ParaS recomputation in paras_configure_tp/ep
+        self.total_num_attention_heads = model_runner.model_config.num_attention_heads
+        self._get_num_kv_heads = model_runner.model_config.get_num_kv_heads
         if (
             model_runner.hybrid_gdn_config is not None
             or model_runner.kimi_linear_config is not None
@@ -173,6 +176,40 @@ class TritonAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         self.cuda_graph_custom_mask = None
+
+    # ------------------------------------------------------------------
+    # ParaS: EP↔TP attention backend reconfiguration
+    # ------------------------------------------------------------------
+
+    def paras_configure_tp(self, paras_tp_size: int, req_to_token: "torch.Tensor"):
+        """Update cached state for TP mode after ParaS switch."""
+        self.num_head = self.total_num_attention_heads // paras_tp_size
+        self.num_kv_head = self._get_num_kv_heads(paras_tp_size)
+        self.req_to_token = req_to_token
+        self._paras_reset_buffers(req_to_token.shape[0])
+
+    def paras_configure_ep(self, req_to_token: "torch.Tensor"):
+        """Revert cached state for EP mode after ParaS switch."""
+        self.num_head = self.total_num_attention_heads
+        self.num_kv_head = self._get_num_kv_heads(1)
+        self.req_to_token = req_to_token
+        self._paras_reset_buffers(req_to_token.shape[0])
+
+    def _paras_reset_buffers(self, max_bs: int):
+        self.kv_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=self.device
+        )
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            self.window_kv_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
+        if not self.skip_prefill:
+            self.qo_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
+            self.mask_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int64, device=self.device
+            )
 
     def get_num_kv_splits(
         self,
