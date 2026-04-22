@@ -102,6 +102,40 @@ def _validate_v1_scope(
         )
 
 
+def _validate_paras_swa_runtime_scope(server_args, model_config) -> None:
+    """Raise if ParaS + SWA + incompatible runtime features are detected.
+    
+    Checks for unsupported combinations:
+    - G12: FP8-KV + SWA
+    - G13: CUDA graph + SWA
+    - G14: Speculative decoding + SWA
+    """
+    swa_attention_layer_ids = getattr(model_config, "swa_attention_layer_ids", None)
+    if not swa_attention_layer_ids:
+        return
+    
+    kv_cache_dtype = getattr(server_args, "kv_cache_dtype", None)
+    if kv_cache_dtype == "fp8":
+        raise NotImplementedError(
+            "ParaS + SWA + FP8-KV not supported in v1 "
+            "(see docs/paras/swa_support.md §12). "
+            "Disable FP8-KV or use a non-hybrid model."
+        )
+    
+    disable_cuda_graph = getattr(server_args, "disable_cuda_graph", True)
+    if not disable_cuda_graph:
+        raise NotImplementedError(
+            "ParaS + SWA + CUDA graph not supported in v1. "
+            "Set --disable-cuda-graph or use a non-hybrid model."
+        )
+    
+    speculative_algorithm = getattr(server_args, "speculative_algorithm", None)
+    if speculative_algorithm is not None:
+        raise NotImplementedError(
+            "ParaS + SWA + speculative decoding not supported in v1."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Hybrid KV budget planner
 # ---------------------------------------------------------------------------
