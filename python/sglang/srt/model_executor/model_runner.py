@@ -1840,27 +1840,24 @@ class ModelRunner:
                             ep_tokens_swa=self.swa_max_total_num_tokens,
                             tp_tokens_swa=self.swa_max_total_num_tokens * _pts,
                         )
-                        # Reserve heterogeneous KV if model class has not
-                        # done so (e.g. GPT-OSS without a ParaS model
-                        # class).  Must happen before materialize().
-                        if (
-                            not _paras_swa_mgr._kv_reserved
-                            and not _paras_swa_mgr.materialized
-                        ):
-                            _paras_swa_mgr.reserve_kv_cache(
-                                num_layers=self.model_config.num_hidden_layers,
-                                ep_max_tokens=self.full_max_total_num_tokens,
-                                tp_max_tokens=(
-                                    self.full_max_total_num_tokens * _pts
-                                ),
-                                num_kv_heads=self.model_config.get_num_kv_heads(
-                                    get_attention_tp_size()
-                                ),
-                                head_dim=self.model_config.head_dim,
-                                kv_dtype=self.kv_cache_dtype,
-                                page_size=self.page_size,
-                                layer_specs=_paras_swa_layer_specs,
-                            )
+
+                _full_ep_k = _full_ep_v = _swa_ep_k = _swa_ep_v = None
+                if (
+                    _paras_swa_mgr is not None
+                    and _paras_swa_mgr.materialized
+                    and _paras_swa_mgr._kv_reserved
+                    and _paras_swa_layer_specs is not None
+                ):
+                    _full_ep_k, _full_ep_v = _paras_swa_mgr.get_kv_views(
+                        num_layers=len(self.model_config.full_attention_layer_ids),
+                        mode="ep",
+                        layer_ids=self.model_config.full_attention_layer_ids,
+                    )
+                    _swa_ep_k, _swa_ep_v = _paras_swa_mgr.get_kv_views(
+                        num_layers=len(self.model_config.swa_attention_layer_ids),
+                        mode="ep",
+                        layer_ids=self.model_config.swa_attention_layer_ids,
+                    )
 
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
@@ -1874,17 +1871,11 @@ class ModelRunner:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    full_external_k_buffers=_full_ep_k,
+                    full_external_v_buffers=_full_ep_v,
+                    swa_external_k_buffers=_swa_ep_k,
+                    swa_external_v_buffers=_swa_ep_v,
                 )
-
-                if (
-                    _paras_swa_mgr is not None
-                    and _paras_swa_mgr.materialized
-                    and _paras_swa_mgr._kv_reserved
-                    and _paras_swa_layer_specs is not None
-                ):
-                    self.token_to_kv_pool.paras_configure_ep(
-                        _paras_swa_layer_specs
-                    )
             elif config := self.mambaish_config:
                 extra_args = {}
                 if self.use_mla_backend:

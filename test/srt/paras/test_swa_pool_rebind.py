@@ -98,6 +98,16 @@ class TestTPRebindBufferPointers:
 
         mgr.get_view_as = mock_get_view_as
 
+        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+            iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
+            k_bufs, v_bufs = [], []
+            for lid in iter_ids:
+                k_bufs.append(tp_k_buffers[f"{prefix}.layers.{lid}.kv.tp.k"])
+                v_bufs.append(tp_v_buffers[f"{prefix}.layers.{lid}.kv.tp.v"])
+            return k_bufs, v_bufs
+
+        mgr.get_kv_views = mock_get_kv_views
+
         # Patch global manager
         with patch(
             "sglang.srt.paras.paras_memory_manager.get_global_paras_memory_manager",
@@ -172,6 +182,16 @@ class TestTPRebindBufferPointers:
             raise KeyError(f"Unknown buffer: {name}")
 
         mgr.get_view_as = mock_get_view_as
+
+        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+            iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
+            k_bufs, v_bufs = [], []
+            for lid in iter_ids:
+                k_bufs.append(tp_k_buffers[f"{prefix}.layers.{lid}.kv.tp.k"])
+                v_bufs.append(tp_v_buffers[f"{prefix}.layers.{lid}.kv.tp.v"])
+            return k_bufs, v_bufs
+
+        mgr.get_kv_views = mock_get_kv_views
 
         with patch(
             "sglang.srt.paras.paras_memory_manager.get_global_paras_memory_manager",
@@ -253,6 +273,16 @@ class TestEPRebindBufferPointers:
 
         mgr.get_view_as = mock_get_view_as
 
+        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+            iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
+            k_bufs, v_bufs = [], []
+            for lid in iter_ids:
+                k_bufs.append(ep_k_buffers[f"{prefix}.layers.{lid}.kv.ep.k"])
+                v_bufs.append(ep_v_buffers[f"{prefix}.layers.{lid}.kv.ep.v"])
+            return k_bufs, v_bufs
+
+        mgr.get_kv_views = mock_get_kv_views
+
         with patch(
             "sglang.srt.paras.paras_memory_manager.get_global_paras_memory_manager",
             return_value=mgr,
@@ -323,6 +353,16 @@ class TestEPRebindBufferPointers:
             raise KeyError(f"Unknown buffer: {name}")
 
         mgr.get_view_as = mock_get_view_as
+
+        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+            iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
+            k_bufs, v_bufs = [], []
+            for lid in iter_ids:
+                k_bufs.append(ep_k_buffers[f"{prefix}.layers.{lid}.kv.ep.k"])
+                v_bufs.append(ep_v_buffers[f"{prefix}.layers.{lid}.kv.ep.v"])
+            return k_bufs, v_bufs
+
+        mgr.get_kv_views = mock_get_kv_views
 
         with patch(
             "sglang.srt.paras.paras_memory_manager.get_global_paras_memory_manager",
@@ -405,6 +445,15 @@ class TestHeadCountUpdate:
 
         mgr.get_view_as = mock_get_view_as
 
+        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+            iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
+            heads = original_head_num // tp_size if mode == "tp" else original_head_num
+            k_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
+            v_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
+            return k_bufs, v_bufs
+
+        mgr.get_kv_views = mock_get_kv_views
+
         with patch(
             "sglang.srt.paras.paras_memory_manager.get_global_paras_memory_manager",
             return_value=mgr,
@@ -464,6 +513,15 @@ class TestHeadCountUpdate:
             return torch.zeros(shape, dtype=torch.bfloat16)
 
         mgr.get_view_as = mock_get_view_as
+
+        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+            iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
+            heads = original_head_num // tp_size if mode == "tp" else original_head_num
+            k_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
+            v_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
+            return k_bufs, v_bufs
+
+        mgr.get_kv_views = mock_get_kv_views
 
         with patch(
             "sglang.srt.paras.paras_memory_manager.get_global_paras_memory_manager",
@@ -531,6 +589,15 @@ class TestFullToSWAIndexMappingUntouched:
 
         mgr.get_view_as = mock_get_view_as
 
+        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+            iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
+            heads = head_num // tp_size if mode == "tp" else head_num
+            k_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
+            v_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
+            return k_bufs, v_bufs
+
+        mgr.get_kv_views = mock_get_kv_views
+
         with patch(
             "sglang.srt.paras.paras_memory_manager.get_global_paras_memory_manager",
             return_value=mgr,
@@ -584,6 +651,15 @@ class TestFullToSWAIndexMappingUntouched:
             return torch.zeros(shape, dtype=torch.bfloat16)
 
         mgr.get_view_as = mock_get_view_as
+
+        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+            iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
+            heads = head_num // tp_size if mode == "tp" else head_num
+            k_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
+            v_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
+            return k_bufs, v_bufs
+
+        mgr.get_kv_views = mock_get_kv_views
 
         with patch(
             "sglang.srt.paras.paras_memory_manager.get_global_paras_memory_manager",
@@ -676,6 +752,20 @@ class TestRoundTripEPTPEP:
             raise KeyError(f"Unknown buffer: {name}")
 
         mgr.get_view_as = mock_get_view_as
+
+        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+            iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
+            k_bufs, v_bufs = [], []
+            for lid in iter_ids:
+                if mode == "tp":
+                    k_bufs.append(tp_k_buffers[f"{prefix}.layers.{lid}.kv.tp.k"])
+                    v_bufs.append(tp_v_buffers[f"{prefix}.layers.{lid}.kv.tp.v"])
+                else:
+                    k_bufs.append(ep_k_buffers[f"{prefix}.layers.{lid}.kv.ep.k"])
+                    v_bufs.append(ep_v_buffers[f"{prefix}.layers.{lid}.kv.ep.v"])
+            return k_bufs, v_bufs
+
+        mgr.get_kv_views = mock_get_kv_views
 
         # Initial state: EP
         with patch(

@@ -278,18 +278,24 @@ class ParaSMemoryManager:
         layer_specs: Optional[list] = None,
     ) -> None:
         """
-        Reserve KV cache entries using EP shapes (same bytes as TP via union layout).
+        Reserve KV cache using a contiguous buffer with per-layer offsets.
 
         Must be called AFTER plan_qwen_moe_layout() and BEFORE materialize().
 
-        EP and TP KV have same total bytes per layer:
-          ep_tokens × ep_kv_heads × head_dim == tp_tokens × tp_kv_heads × head_dim
-        so we reserve once in EP shape and use get_view_as() for TP access.
+        Layout (per K and V separately):
+          - Total region = max_L + sum(L_i) bytes
+          - TP view for layer i at offset prefix_i = sum(L_j for j<i)
+          - EP view for layer i at offset max_L + prefix_i
+          - L_i = (tokens_cap_ep_i + page) * num_kv_heads_i * head_dim_i * elem_size
+          - max_L = max(L_i)
 
-        When *layer_specs* is provided, each slot is sized per its layer's spec
-        (e.g., full-attention layers get more tokens than SWA layers).
-        When *layer_specs* is ``None``, all slots share the uniform shape
-        ``(ep_max_tokens + page_size, num_kv_heads, head_dim)``.
+        EP and TP KV have same total bytes per layer (union layout):
+          ep_tokens * ep_kv_heads * head_dim == tp_tokens * tp_kv_heads * head_dim
+        so each region entry is stored once and callers use get_view_as()
+        for TP access with a different shape.
+
+        Actual LayoutEntry objects are created during materialize() so that
+        offsets are computed relative to the end of the weight region.
         """
         if self._materialized:
             raise RuntimeError("Cannot reserve KV cache after materialize().")
@@ -300,32 +306,41 @@ class ParaSMemoryManager:
         self.tp_max_kv_tokens = tp_max_tokens
         self._layer_specs = layer_specs
 
-        # Reserve N+1 physical KV slots (slot 0 is the extra "TP landing" slot,
-        # matching the MoE N+1 pattern in plan_qwen_moe_layout).
-        if layer_specs is None:
-            kv_shape = (ep_max_tokens + page_size, num_kv_heads, head_dim)
-            for j in range(num_layers + 1):
-                self.reserve(f"paras.kv_slot.{j}.k", kv_shape, kv_dtype)
-                self.reserve(f"paras.kv_slot.{j}.v", kv_shape, kv_dtype)
-        else:
-            # Slot 0: TP landing for layer 0 (EP shape, same bytes via union layout).
-            # Slot j>=1: EP data for layer j-1.
-            for j in range(num_layers + 1):
-                spec = layer_specs[0] if j == 0 else layer_specs[j - 1]
-                kv_shape = (
-                    spec.tokens_cap_ep + page_size,
-                    spec.num_kv_heads,
-                    spec.head_dim,
-                )
-                self.reserve(f"paras.kv_slot.{j}.k", kv_shape, kv_dtype)
-                self.reserve(f"paras.kv_slot.{j}.v", kv_shape, kv_dtype)
+        elem_size = (
+            kv_dtype.itemsize
+            if hasattr(kv_dtype, "itemsize")
+            else torch.tensor([], dtype=kv_dtype).element_size()
+        )
 
-        # Weight-loading aliases: model.layers.{i}.kv.k/v → slot[i+1].
-        # Dict assignment (NOT alias()) — pre-materialize, same LayoutEntry object.
-        for i in range(num_layers):
-            lp = f"{prefix}.layers.{i}"
-            self._entries[f"{lp}.kv.k"] = self._entries[f"paras.kv_slot.{i+1}.k"]
-            self._entries[f"{lp}.kv.v"] = self._entries[f"paras.kv_slot.{i+1}.v"]
+        if layer_specs is None:
+            per_layer_tokens = ep_max_tokens + page_size
+            per_layer_bytes = per_layer_tokens * num_kv_heads * head_dim * elem_size
+            layer_ep_shapes = [
+                (per_layer_tokens, num_kv_heads, head_dim)
+            ] * num_layers
+            layer_bytes = [per_layer_bytes] * num_layers
+        else:
+            layer_ep_shapes = [
+                (s.tokens_cap_ep + page_size, s.num_kv_heads, s.head_dim)
+                for s in layer_specs
+            ]
+            layer_bytes = [
+                (s.tokens_cap_ep + page_size)
+                * s.num_kv_heads
+                * s.head_dim
+                * elem_size
+                for s in layer_specs
+            ]
+
+        # Save metadata for _create_kv_layout (called from materialize).
+        self._paras_kv_pending = {
+            "num_layers": num_layers,
+            "prefix": prefix,
+            "layer_bytes": layer_bytes,
+            "layer_ep_shapes": layer_ep_shapes,
+            "max_L": max(layer_bytes) if num_layers > 0 else 0,
+            "kv_dtype": kv_dtype,
+        }
 
         self._kv_reserved = True
 
@@ -358,6 +373,10 @@ class ParaSMemoryManager:
             entry.offset_bytes = self._align_up(offset, self.ALIGNMENT)
             offset = entry.offset_bytes + entry.size_bytes
 
+        pending = getattr(self, "_paras_kv_pending", None)
+        if pending is not None:
+            offset = self._create_kv_layout(offset, **pending)
+
         self._total_bytes = self._align_up(offset, self.ALIGNMENT)
         self._buffer = torch.empty(
             self._total_bytes, dtype=torch.uint8, device=self.device
@@ -368,6 +387,74 @@ class ParaSMemoryManager:
         self._buffer_end = self._buffer_start + self._total_bytes
         self._materialized = True
         return self._total_bytes
+
+    # ----- KV layout creation (called from materialize) -------------------
+
+    def _create_kv_layout(
+        self,
+        offset: int,
+        *,
+        num_layers: int,
+        prefix: str,
+        layer_bytes: List[int],
+        layer_ep_shapes: List[Tuple[int, ...]],
+        max_L: int,
+        kv_dtype: torch.dtype,
+    ) -> int:
+        """Create per-layer TP and EP LayoutEntry objects at computed offsets.
+
+        Returns the byte offset past the end of the V region.
+        """
+        if num_layers == 0:
+            return offset
+
+        elem_size = (
+            kv_dtype.itemsize
+            if hasattr(kv_dtype, "itemsize")
+            else torch.tensor([], dtype=kv_dtype).element_size()
+        )
+        kv_region_bytes = max_L + sum(layer_bytes)
+
+        k_region_start = self._align_up(offset, self.ALIGNMENT)
+        v_region_start = self._align_up(
+            k_region_start + kv_region_bytes, self.ALIGNMENT
+        )
+
+        for side, region_start in [("k", k_region_start), ("v", v_region_start)]:
+            prefix_bytes = 0
+            for i in range(num_layers):
+                li_bytes = layer_bytes[i]
+                ep_shape = layer_ep_shapes[i]
+                ep_numel = ep_shape[0] * ep_shape[1] * ep_shape[2]
+
+                tp_offset = region_start + prefix_bytes
+                ep_offset = region_start + max_L + prefix_bytes
+
+                ep_entry = LayoutEntry(
+                    name=f"{prefix}.layers.{i}.kv.ep.{side}",
+                    shape=ep_shape,
+                    dtype=kv_dtype,
+                    numel=ep_numel,
+                    element_size=elem_size,
+                    size_bytes=li_bytes,
+                    offset_bytes=ep_offset,
+                )
+                self._entries[f"{prefix}.layers.{i}.kv.ep.{side}"] = ep_entry
+                self._entries[f"{prefix}.layers.{i}.kv.{side}"] = ep_entry
+
+                self._entries[f"{prefix}.layers.{i}.kv.tp.{side}"] = LayoutEntry(
+                    name=f"{prefix}.layers.{i}.kv.tp.{side}",
+                    shape=ep_shape,
+                    dtype=kv_dtype,
+                    numel=ep_numel,
+                    element_size=elem_size,
+                    size_bytes=li_bytes,
+                    offset_bytes=tp_offset,
+                )
+
+                prefix_bytes += li_bytes
+
+        return v_region_start + kv_region_bytes
 
     # ----- view access ----------------------------------------------------
 
@@ -425,6 +512,7 @@ class ParaSMemoryManager:
         tp_size: int = 1,
         page_size: int = 1,
         prefix: str = "model",
+        layer_ids: Optional[List[int]] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Return k_buffers and v_buffers for the KV pool in the given mode.
@@ -432,11 +520,15 @@ class ParaSMemoryManager:
         EP mode: returns views with (ep_tokens + page, total_kv_heads, head_dim)
         TP mode: returns views with (tp_tokens + page, total_kv_heads//tp_size, head_dim)
                  using get_view_as to reinterpret the same bytes.
+
+        When *layer_ids* is provided, iterate over those specific layer
+        indices instead of ``range(num_layers)``.
         """
         k_bufs: List[torch.Tensor] = []
         v_bufs: List[torch.Tensor] = []
-        for i in range(num_layers):
-            lp = f"{prefix}.layers.{i}"
+        iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
+        for layer_id in iter_ids:
+            lp = f"{prefix}.layers.{layer_id}"
             k_name = f"{lp}.kv.k"
             v_name = f"{lp}.kv.v"
 
@@ -444,7 +536,7 @@ class ParaSMemoryManager:
                 k_bufs.append(self.get_view(k_name))
                 v_bufs.append(self.get_view(v_name))
             elif mode == "tp":
-                # Prefer dedicated TP aliases (N+1 slot design) when available.
+                # Prefer dedicated TP entries (contiguous-buffer design) when available.
                 tp_k_name = f"{lp}.kv.tp.k"
                 tp_v_name = f"{lp}.kv.tp.v"
                 if tp_k_name in self._entries:
@@ -537,11 +629,9 @@ class ParaSMemoryManager:
     @property
     def weights_only_bytes(self) -> int:
         """Total reserved bytes NOT including KV cache entries (for KV sizing)."""
-        kv_names = {n for n in self._reservation_order if ".kv." in n or "kv_slot." in n}
         return sum(
             self._entries[n].size_bytes
             for n in self._reservation_order
-            if n not in kv_names
         )
 
     # ----- dunder ---------------------------------------------------------
@@ -741,18 +831,15 @@ def create_paras_kv_aliases(
     prefix: str = "model",
     layer_specs: Optional[list] = None,
 ) -> None:
-    """
-    Create EP and TP KV aliases for the N+1 slot layout.
-    Call after materialize().
+    """No-op: KV aliases are now created during materialize() via _create_kv_layout.
 
-    ep layer i → slot i+1 (same physical buffer as EP KV data)
-    tp layer i → slot i   (one slot before EP, for fused transfer)
-
-    When *layer_specs* is provided, alias shapes reflect per-layer sizes
-    (inherited from the underlying slots reserved with heterogeneous shapes).
+    Kept for backward compatibility with callers (e.g. qwen3_moe.py).
     """
     for i in range(num_layers):
-        manager.alias(f"{prefix}.layers.{i}.kv.ep.k", f"paras.kv_slot.{i+1}.k")
-        manager.alias(f"{prefix}.layers.{i}.kv.ep.v", f"paras.kv_slot.{i+1}.v")
-        manager.alias(f"{prefix}.layers.{i}.kv.tp.k", f"paras.kv_slot.{i}.k")
-        manager.alias(f"{prefix}.layers.{i}.kv.tp.v", f"paras.kv_slot.{i}.v")
+        for suffix in ("ep.k", "ep.v", "tp.k", "tp.v"):
+            name = f"{prefix}.layers.{i}.kv.{suffix}"
+            if name not in manager._entries:
+                raise RuntimeError(
+                    f"Expected KV alias '{name}' missing — was reserve_kv_cache() "
+                    f"called before materialize()?"
+                )
