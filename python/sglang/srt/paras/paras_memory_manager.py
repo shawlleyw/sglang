@@ -29,11 +29,14 @@ HETEROGENEOUS LAYERS (layer_specs):
 """
 
 import json
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +100,55 @@ def _validate_v1_scope(
             f"ParaS V1 does not support quantization format '{quant_name}'. "
             "Only unquantized (BF16/FP16) and FP8 are supported."
         )
+
+
+# ---------------------------------------------------------------------------
+# Hybrid KV budget planner
+# ---------------------------------------------------------------------------
+
+def plan_hybrid_kv_budget(
+    total_tokens: int,
+    full_layers_num: int,
+    swa_layers_num: int,
+    swa_full_tokens_ratio: float,
+) -> Tuple[int, int]:
+    """Compute per-layer token budgets for a hybrid full/SWA attention model.
+
+    Mirrors the generic branch of ``set_num_token_hybrid`` in
+    ``model_runner.py`` (lines 1497-1516).  Pure arithmetic — no tensor
+    allocation.
+
+    The two unknowns satisfy:
+        swa_max * swa_layers + full_max * full_layers == total_tokens
+        swa_max == full_max * swa_full_tokens_ratio
+
+    Returns:
+        (full_max_total_num_tokens, swa_max_total_num_tokens)
+    """
+    if full_layers_num == 0 and swa_layers_num == 0:
+        raise ValueError("no layers")
+    if swa_layers_num > 0 and swa_full_tokens_ratio <= 0:
+        raise ValueError(
+            "swa_full_tokens_ratio must be > 0 when SWA layers present"
+        )
+
+    # All-MHA shortcut: no SWA layers at all.
+    if swa_layers_num == 0:
+        return (int(total_tokens / full_layers_num), 0)
+
+    denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+    full_max = int(total_tokens / denominator)
+    swa_max = int(full_max * swa_full_tokens_ratio)
+
+    if swa_max < 1:
+        logging.warning(
+            "plan_hybrid_kv_budget: computed swa_max_total_num_tokens < 1 "
+            "(ratio=%.4f, full_max=%d). SWA layers will have near-zero budget.",
+            swa_full_tokens_ratio,
+            full_max,
+        )
+
+    return (full_max, swa_max)
 
 
 # ---------------------------------------------------------------------------
