@@ -1815,6 +1815,53 @@ class ModelRunner:
             )
         else:
             if self.is_hybrid:
+                _paras_swa_mgr = None
+                _paras_swa_layer_specs = None
+                if self.server_args.enable_paras_moe:
+                    from sglang.srt.paras.paras_memory_manager import (
+                        get_global_paras_memory_manager as _get_paras_mgr_swa,
+                        _validate_paras_swa_runtime_scope,
+                    )
+                    from sglang.srt.paras.cache_transfer import (
+                        classify_layers_from_config,
+                    )
+
+                    _validate_paras_swa_runtime_scope(
+                        self.server_args, self.model_config
+                    )
+                    _paras_swa_mgr = _get_paras_mgr_swa()
+                    if _paras_swa_mgr is not None:
+                        _pts = self.server_args.paras_tp_size
+                        _paras_swa_layer_specs = classify_layers_from_config(
+                            self.model_config.hf_config,
+                            tp_size=_pts,
+                            ep_tokens_full=self.full_max_total_num_tokens,
+                            tp_tokens_full=self.full_max_total_num_tokens * _pts,
+                            ep_tokens_swa=self.swa_max_total_num_tokens,
+                            tp_tokens_swa=self.swa_max_total_num_tokens * _pts,
+                        )
+                        # Reserve heterogeneous KV if model class has not
+                        # done so (e.g. GPT-OSS without a ParaS model
+                        # class).  Must happen before materialize().
+                        if (
+                            not _paras_swa_mgr._kv_reserved
+                            and not _paras_swa_mgr.materialized
+                        ):
+                            _paras_swa_mgr.reserve_kv_cache(
+                                num_layers=self.model_config.num_hidden_layers,
+                                ep_max_tokens=self.full_max_total_num_tokens,
+                                tp_max_tokens=(
+                                    self.full_max_total_num_tokens * _pts
+                                ),
+                                num_kv_heads=self.model_config.get_num_kv_heads(
+                                    get_attention_tp_size()
+                                ),
+                                head_dim=self.model_config.head_dim,
+                                kv_dtype=self.kv_cache_dtype,
+                                page_size=self.page_size,
+                                layer_specs=_paras_swa_layer_specs,
+                            )
+
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -1828,6 +1875,16 @@ class ModelRunner:
                     enable_kvcache_transpose=False,
                     device=self.device,
                 )
+
+                if (
+                    _paras_swa_mgr is not None
+                    and _paras_swa_mgr.materialized
+                    and _paras_swa_mgr._kv_reserved
+                    and _paras_swa_layer_specs is not None
+                ):
+                    self.token_to_kv_pool.paras_configure_ep(
+                        _paras_swa_layer_specs
+                    )
             elif config := self.mambaish_config:
                 extra_args = {}
                 if self.use_mla_backend:
