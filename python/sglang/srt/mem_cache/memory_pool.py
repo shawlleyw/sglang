@@ -1188,6 +1188,7 @@ class SWAKVPool(KVCache):
         self.dtype = dtype
         self.head_num = head_num
         self.head_dim = head_dim
+        self.full_head_num = head_num
         self.device = device
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
@@ -1324,6 +1325,73 @@ class SWAKVPool(KVCache):
                 v_scale,
                 layer_id_override=layer_id_pool,
             )
+
+    def paras_configure_tp(self, paras_tp_size: int, layer_specs=None):
+        """Switch all KV cache buffers from EP to TP layout.
+
+        Routes each global layer through ``layers_mapping`` to the correct
+        inner pool (full or SWA) and rebinds its k/v_buffer entry to a TP
+        alias view from the memory manager.
+        """
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+
+        self.full_head_num = self.head_num
+        sharded_head_num = self.head_num // paras_tp_size
+        self.head_num = sharded_head_num
+
+        mgr = get_global_paras_memory_manager()
+        for g, (local_id, is_swa) in self.layers_mapping.items():
+            tp_k_name = f"model.layers.{g}.kv.tp.k"
+            tp_v_name = f"model.layers.{g}.kv.tp.v"
+            total_elements = mgr._entries[tp_k_name].numel
+            tp_slots = total_elements // (sharded_head_num * self.head_dim)
+            tp_shape = (tp_slots, sharded_head_num, self.head_dim)
+            tp_k = mgr.get_view_as(tp_k_name, tp_shape)
+            tp_v = mgr.get_view_as(tp_v_name, tp_shape)
+            if is_swa:
+                self.swa_kv_pool.k_buffer[local_id] = tp_k
+                self.swa_kv_pool.v_buffer[local_id] = tp_v
+            else:
+                self.full_kv_pool.k_buffer[local_id] = tp_k
+                self.full_kv_pool.v_buffer[local_id] = tp_v
+
+        # Rebuild derived state (data_ptrs, data_strides, size) on inner pools.
+        self.full_kv_pool.paras_configure_helper()
+        self.swa_kv_pool.paras_configure_helper()
+        self.size = self.full_kv_pool.size
+        self.size_swa = self.swa_kv_pool.size
+
+    def paras_configure_ep(self, layer_specs=None):
+        """Switch all KV cache buffers from TP to EP layout.
+
+        Restores ``head_num`` and rebinds each layer's k/v_buffer to EP
+        alias views from the memory manager.
+        """
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+
+        self.head_num = self.full_head_num
+
+        mgr = get_global_paras_memory_manager()
+        for g, (local_id, is_swa) in self.layers_mapping.items():
+            ep_k_name = f"model.layers.{g}.kv.ep.k"
+            ep_v_name = f"model.layers.{g}.kv.ep.v"
+            total_elements = mgr._entries[ep_k_name].numel
+            ep_slots = total_elements // (self.head_num * self.head_dim)
+            ep_shape = (ep_slots, self.head_num, self.head_dim)
+            ep_k = mgr.get_view_as(ep_k_name, ep_shape)
+            ep_v = mgr.get_view_as(ep_v_name, ep_shape)
+            if is_swa:
+                self.swa_kv_pool.k_buffer[local_id] = ep_k
+                self.swa_kv_pool.v_buffer[local_id] = ep_v
+            else:
+                self.full_kv_pool.k_buffer[local_id] = ep_k
+                self.full_kv_pool.v_buffer[local_id] = ep_v
+
+        # Rebuild derived state (data_ptrs, data_strides, size) on inner pools.
+        self.full_kv_pool.paras_configure_helper()
+        self.swa_kv_pool.paras_configure_helper()
+        self.size = self.full_kv_pool.size
+        self.size_swa = self.swa_kv_pool.size
 
 
 class AscendTokenToKVPool(MHATokenToKVPool):
