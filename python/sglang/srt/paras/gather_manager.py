@@ -227,167 +227,89 @@ class ParaSReqGatherManager:
         else:
             self.global_token_indices = None
 
-    def gather_cache(self) -> torch.Tensor:
-        if self.method == "peer_access" and self.peer_ctx is not None:
-            self._gather_cache_peer_access()
-        else:
-            self._gather_cache_nccl()
-
-    def _gather_cache_nccl(self):
+    def gather_cache(self) -> None:
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-        torch.cuda.empty_cache()
-        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        mgr = get_global_paras_memory_manager()
-        
-        num_layers = kv_cache.layer_num
-        num_heads = kv_cache.head_num
-        head_dim = kv_cache.head_dim
-        sharded_num_heads = max(1, num_heads // self.group_size)
-        
-        splited_size_per_token = sharded_num_heads * head_dim
-        
-        # When num_heads < group_size, heads must be replicated so that
-        # all_to_all has group_size chunks.  We chose Option A (repeat_interleave
-        # before all_to_all) over Option B (sub-head all_to_all + intra-group
-        # all_gather) for simplicity — see docs/paras/nvlink_peer_access_weight_transfer.md.
-        replication_factor = max(1, self.group_size // num_heads) if num_heads < self.group_size else 1
-        virtual_heads = num_heads * replication_factor  # == group_size when replicated
-        
-        # Default (uniform) split sizes — used when layer_specs is None.
-        input_split_sizes = [2 * splited_size_per_token * self.num_local_tokens] * self.group_size
-        output_split_sizes = [2 * (splited_size_per_token * num_tokens_of_rank) for num_tokens_of_rank in self.global_num_tokens]
-        
-        def gather_one_layer(layer_id: int) -> torch.Tensor:
-            # Per-layer token count: SWA layers may transfer fewer tokens.
-            if self.layer_specs is not None:
-                spec = self.layer_specs[layer_id]
-                if spec.kind == "swa":
-                    layer_num_local = min(self.num_local_tokens, spec.tokens_cap_ep)
-                else:
-                    layer_num_local = self.num_local_tokens
-                layer_input_split = [2 * splited_size_per_token * layer_num_local] * self.group_size
-                layer_output_split = [
-                    2 * splited_size_per_token * (min(nt, spec.tokens_cap_ep) if spec.kind == "swa" else nt)
-                    for nt in self.global_num_tokens
-                ]
-                layer_num_global = sum(
-                    min(nt, spec.tokens_cap_ep) if spec.kind == "swa" else nt
-                    for nt in self.global_num_tokens
-                )
-            else:
-                layer_num_local = self.num_local_tokens
-                layer_input_split = input_split_sizes
-                layer_output_split = output_split_sizes
-                layer_num_global = self.num_global_tokens
-
-            if layer_num_local > 0:
-                # Read from EP buffers (current kv_cache state)
-                k_buffer = kv_cache.get_key_buffer(layer_id)
-                v_buffer = kv_cache.get_value_buffer(layer_id)
-                
-                local_indices = self.local_token_indices[:layer_num_local]
-                permuted_local_kvcache = gather_kv_and_permute(k_buffer, v_buffer, local_indices)
-                
-                if replication_factor > 1:
-                    N = layer_num_local
-                    permuted_local_kvcache = (
-                        permuted_local_kvcache
-                        .view(num_heads, N * 2 * head_dim)
-                        .repeat_interleave(replication_factor, dim=0)
-                        .flatten()
-                    )
-            else:
-                permuted_local_kvcache = torch.empty((0, ), dtype=kv_cache.store_dtype, device=kv_cache.device)
-                
-            if layer_num_global > 0:
-                gathered_kvcache = torch.empty(2 * layer_num_global * splited_size_per_token, dtype=permuted_local_kvcache.dtype, device=permuted_local_kvcache.device)
-                torch.distributed.all_to_all_single(gathered_kvcache, permuted_local_kvcache, layer_output_split, layer_input_split, group=self.gather_group.device_group)
-                
-                # Write into TP buffers obtained directly from memory manager
-                tp_k_name = f"model.layers.{layer_id}.kv.tp.k"
-                tp_v_name = f"model.layers.{layer_id}.kv.tp.v"
-                total_elements = mgr._entries[tp_k_name].numel
-                tp_slots = total_elements // (sharded_num_heads * head_dim)
-                tp_shape = (tp_slots, sharded_num_heads, head_dim)
-                tp_k = mgr.get_view_as(tp_k_name, tp_shape)
-                tp_v = mgr.get_view_as(tp_v_name, tp_shape)
-                global_indices = self.global_token_indices[:layer_num_global]
-                permute_and_scatter_kv(
-                    gathered_kvcache, tp_k, tp_v, global_indices,
-                    layer_num_global, sharded_num_heads, head_dim
-                )
-                
-        for layer_id in range(num_layers):
-            gather_one_layer(layer_id)
-            
-        torch.cuda.synchronize()
-
-    def _gather_cache_peer_access(self):
-        from sglang.srt.paras.peer_access import peer_access_kv_transfer
-        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+        from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
 
         torch.cuda.empty_cache()
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         mgr = get_global_paras_memory_manager()
+        method = self.method
 
-        num_layers = kv_cache.layer_num
-        num_heads = kv_cache.head_num
-        head_dim = kv_cache.head_dim
-        sharded_num_heads = max(1, num_heads // self.group_size)
-
-        tp_rank = dist.get_rank(group=self.gather_group.device_group)
-        # Destination token start = sum of token counts for all ranks before this one
-        dst_token_start = sum(self.global_num_tokens[:tp_rank])
-
-        # Build peer addresses tensor on GPU
-        dst_base_ptrs = torch.tensor(
-            self.peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+        has_swa = self.layer_specs is not None and any(
+            s.kind == "swa" for s in self.layer_specs
+        )
+        peer_addresses = (
+            self.peer_ctx.peer_addresses
+            if method == "peer_access" and self.peer_ctx
+            else None
         )
 
-        # Barrier tensor for per-layer sync
-        barrier_tensor = torch.zeros(1, device="cuda")
+        # Construct MHA backend (handles full layers, or all layers when no SWA).
+        mha_backend = MHACacheTransfer(
+            method=method,
+            direction="gather",
+            kv_cache=kv_cache,
+            mgr=mgr,
+            group=self.gather_group,
+            num_local_tokens=self.num_local_tokens,
+            num_global_tokens=self.num_global_tokens,
+            local_token_indices=self.local_token_indices,
+            global_token_indices=self.global_token_indices,
+            global_num_tokens=self.global_num_tokens,
+            layer_specs=self.layer_specs,
+            peer_addresses=peer_addresses,
+        )
 
-        elem_size = kv_cache.store_dtype.itemsize if hasattr(kv_cache.store_dtype, 'itemsize') else 2
-        local_buffer_ptr = mgr._buffer.data_ptr()
+        # Construct SWA backend (only when hybrid layers present).
+        swa_backend = None
+        if has_swa:
+            from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 
-        # Token indices: local_token_indices are the EP slot positions
-        # If num_local_tokens == 0, we still participate in barriers
-        local_token_indices_gpu = self.local_token_indices  # already on GPU
-        # Kernel expects int32 — convert if needed
-        if local_token_indices_gpu is not None and local_token_indices_gpu.dtype != torch.int32:
-            local_token_indices_gpu = local_token_indices_gpu.to(torch.int32)
+            swa_backend = SWACacheTransfer(
+                method=method,
+                direction="gather",
+                kv_cache=kv_cache,
+                mgr=mgr,
+                group=self.gather_group,
+                num_local_tokens=self.num_local_tokens,
+                num_global_tokens=self.num_global_tokens,
+                local_token_indices=self.local_token_indices,
+                global_token_indices=self.global_token_indices,
+                global_num_tokens=self.global_num_tokens,
+                layer_specs=self.layer_specs,
+                peer_addresses=peer_addresses,
+            )
+
+        # Per-layer dispatch.
+        num_layers = kv_cache.layer_num
+        barrier_tensor = (
+            torch.zeros(1, device="cuda") if method == "peer_access" else None
+        )
 
         for layer_id in range(num_layers):
-            ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
-            ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
-            tp_k_name = f"model.layers.{layer_id}.kv.tp.k"
-            tp_v_name = f"model.layers.{layer_id}.kv.tp.v"
-
-            src_k_offset = mgr._entries[ep_k_name].offset_bytes
-            src_v_offset = mgr._entries[ep_v_name].offset_bytes
-            dst_k_offset = mgr._entries[tp_k_name].offset_bytes
-            dst_v_offset = mgr._entries[tp_v_name].offset_bytes
-
-            # Per-layer token count for SWA layers.
-            if self.layer_specs is not None and self.layer_specs[layer_id].kind == "swa":
-                layer_num_local = min(self.num_local_tokens, self.layer_specs[layer_id].tokens_cap_ep)
+            if self.layer_specs is not None:
+                spec = self.layer_specs[layer_id]
             else:
-                layer_num_local = self.num_local_tokens
-
-            if layer_num_local > 0:
-                layer_indices = local_token_indices_gpu[:layer_num_local] if local_token_indices_gpu is not None else local_token_indices_gpu
-                peer_access_kv_transfer(
-                    local_buffer_ptr, dst_base_ptrs,
-                    layer_indices,
-                    src_k_offset, src_v_offset,
-                    dst_k_offset, dst_v_offset,
-                    layer_num_local, dst_token_start,
-                    num_heads, tp_rank, self.group_size, head_dim,
-                    elem_size,
+                spec = LayerCacheSpec(
+                    layer_id=layer_id,
+                    kind="full",
+                    tokens_cap_ep=self.num_local_tokens,
+                    tokens_cap_tp=0,
+                    num_kv_heads=kv_cache.head_num,
+                    head_dim=kv_cache.head_dim,
+                    sliding_window_size=None,
                 )
 
-            # Per-layer barrier: ensures all ranks finish writing before next layer reads
-            dist.all_reduce(barrier_tensor, group=self.gather_group.device_group)
+            backend = swa_backend if spec.kind == "swa" else mha_backend
+            backend.gather_one_layer(spec)
+
+            # peer_access path needs per-layer barrier (ALL ranks participate).
+            if method == "peer_access":
+                dist.all_reduce(
+                    barrier_tensor, group=self.gather_group.device_group
+                )
 
         torch.cuda.synchronize()
 
