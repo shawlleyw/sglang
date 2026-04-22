@@ -12,10 +12,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch, 
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.mem_cache.memory_pool import (
-    ReqToTokenPool, 
-    MHATokenToKVPool,
-)
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, MHATokenToKVPool, SWAKVPool
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -24,6 +21,10 @@ from sglang.srt.paras.cache_transfer.utils import (
     gather_kv_and_permute,
     permute_and_scatter_kv,
 )
+
+from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
 
 def prune_request(req: Req):
     req.last_host_node = None
@@ -197,10 +198,15 @@ class ParaSReqGatherManager:
             self.global_token_indices = None
 
     def gather_cache(self) -> None:
-        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
-        from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
+        """Transfer KV cache from EP layout to TP layout.
 
+        Pool-type invariant:
+            - MHA-only model (no SWA layers): ``kv_cache`` is a ``MHATokenToKVPool``.
+            - Hybrid model (any SWA layer): ``kv_cache`` MUST be an ``SWAKVPool``.
+              ``SWAKVPool`` is a container holding both ``full_kv_pool`` and
+              ``swa_kv_pool`` (each a plain ``MHATokenToKVPool``) plus the
+              ``layers_mapping`` that routes per-layer access.
+        """
         torch.cuda.empty_cache()
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         mgr = get_global_paras_memory_manager()
@@ -209,6 +215,17 @@ class ParaSReqGatherManager:
         has_swa = self.layer_specs is not None and any(
             s.kind == "swa" for s in self.layer_specs
         )
+        if has_swa:
+            assert isinstance(kv_cache, SWAKVPool), (
+                f"Hybrid model (layer_specs contains SWA) requires SWAKVPool, "
+                f"got {type(kv_cache).__name__}. SWAKVPool holds both inner "
+                f"full_kv_pool and swa_kv_pool needed for per-layer dispatch."
+            )
+        else:
+            assert isinstance(kv_cache, (MHATokenToKVPool, SWAKVPool)), (
+                f"Expected MHATokenToKVPool or SWAKVPool, "
+                f"got {type(kv_cache).__name__}."
+            )
         peer_addresses = (
             self.peer_ctx.peer_addresses
             if method == "peer_access" and self.peer_ctx

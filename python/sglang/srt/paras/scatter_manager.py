@@ -1,14 +1,13 @@
 """ParaS TP→EP scatter manager.
 
-Moved from gather_manager.py for code organization.  Contains:
+Contains:
 - partition_requests_for_ep  (with extensible strategy pattern)
 - gather_tp_kv_and_permute
 - permute_and_scatter_kv_to_ep
 - ParaSReqScatterManager
-- _scatter_cache_nccl  (backward-compat shim, delegates to MHACacheTransfer)
 """
 
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Union
 import os
 import torch
 import torch.distributed as dist
@@ -17,6 +16,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     MHATokenToKVPool,
+    SWAKVPool,
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -87,13 +87,6 @@ def partition_requests_for_ep(
             f"Available: {list(PARTITION_STRATEGIES)}"
         )
     return fn(global_reqs, num_ranks)
-
-
-from sglang.srt.paras.cache_transfer.utils import (
-    gather_tp_kv_and_permute,
-    permute_and_scatter_kv_to_ep,
-)
-
 
 # ============================================================
 # ParaSReqScatterManager
@@ -311,16 +304,36 @@ class ParaSReqScatterManager:
 
     def scatter_cache(
         self,
-        tp_kv_cache: Optional['MHATokenToKVPool'] = None,
+        tp_kv_cache: Optional[Union[MHATokenToKVPool, SWAKVPool]] = None,
         ep_head_num: Optional[int] = None,
     ):
-        """Transfer KV cache from TP layout to EP layout."""
+        """Transfer KV cache from TP layout to EP layout.
+
+        Pool-type invariant:
+            - MHA-only model (no SWA layers): ``tp_kv_cache`` is a ``MHATokenToKVPool``.
+            - Hybrid model (any SWA layer): ``tp_kv_cache`` MUST be an ``SWAKVPool``.
+              ``SWAKVPool`` is a container holding both ``full_kv_pool`` and
+              ``swa_kv_pool`` (each a plain ``MHATokenToKVPool``) plus the
+              ``layers_mapping`` that routes per-layer access.
+        """
         if tp_kv_cache is None:
             tp_kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        from sglang.srt.mem_cache.memory_pool import SWAKVPool
-        assert isinstance(tp_kv_cache, (MHATokenToKVPool, SWAKVPool)), (
-            "Only MHATokenToKVPool and SWAKVPool are supported."
+
+        has_swa = self.layer_specs is not None and any(
+            s.kind == "swa" for s in self.layer_specs
         )
+        if has_swa:
+            assert isinstance(tp_kv_cache, SWAKVPool), (
+                f"Hybrid model (layer_specs contains SWA) requires SWAKVPool, "
+                f"got {type(tp_kv_cache).__name__}. SWAKVPool holds both inner "
+                f"full_kv_pool and swa_kv_pool needed for per-layer dispatch."
+            )
+        else:
+            assert isinstance(tp_kv_cache, (MHATokenToKVPool, SWAKVPool)), (
+                f"Expected MHATokenToKVPool or SWAKVPool, "
+                f"got {type(tp_kv_cache).__name__}."
+            )
+
         if ep_head_num is None:
             ep_head_num = tp_kv_cache.full_head_num
 
@@ -335,10 +348,6 @@ class ParaSReqScatterManager:
         kv_cache = tp_kv_cache
         mgr = get_global_paras_memory_manager()
         method = self.method
-
-        has_swa = self.layer_specs is not None and any(
-            s.kind == "swa" for s in self.layer_specs
-        )
         peer_addresses = (
             self.peer_ctx.peer_addresses
             if method == "peer_access" and self.peer_ctx
