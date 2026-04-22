@@ -1191,6 +1191,8 @@ class SWAKVPool(KVCache):
         self.device = device
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
+        self.layer_num = self.full_layer_nums + self.swa_layer_nums
+        self.store_dtype = dtype
         self.start_layer = 0
         self.page_size = 1
 
