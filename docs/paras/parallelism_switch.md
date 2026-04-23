@@ -26,6 +26,8 @@ Reference measurements (Qwen3-30B-A3B, 8×A100, CUDA graphs):
 
 ParaS enables the system to switch between EP and TP **at runtime** — without restarting the server, reloading weights, or dropping requests.
 
+Current ParaS model support covers both Qwen3-MoE (MHA-only) and GPT-OSS (hybrid full + sliding-window attention). Each model has a dedicated ParaS subclass registered in the ParaS model registry.
+
 | Scenario | Direction | Why |
 |----------|-----------|-----|
 | Peak traffic → off-peak | EP→TP | Small batch, TP's low-latency AllReduce wins |
@@ -207,14 +209,20 @@ Unlimited round-trips are supported without explicit state caching:
 | In-flight requests during TP→EP switch | ✅ Coherent completion |
 | Full round-trip EP→TP→EP | ✅ Identical to original EP |
 
-### Unit Tests (27 total, all pass)
+### Gated Test Coverage (91 tests)
 
 | Suite | Tests | Verified Against |
 |-------|-------|-----------------|
+| Layer cache spec + KV budget (CPU) | 14 | Formula parity and heterogeneous layer-spec invariants |
+| Unified memory manager heterogeneous layout (CPU) | 5 | Union-layout bookkeeping |
+| SWA allocator (CPU) | 8 | Allocator invariants |
+| SWA pool rebind (CPU) | 9 | Buffer rebinding invariants |
+| Hybrid round-trip (CPU) | 26 | Per-layer K/V rebinding and SWA warning behavior |
 | Request partition (CPU) | 11 | Deterministic algorithm properties |
 | KV cache R=1 (NCCL + peer_access) | 5 | Pattern ground truth |
 | KV cache R=2 (NCCL + peer_access) | 5 | Pattern ground truth |
-| Weight transfer (NCCL + peer_access) | 6 | Independent shard computation + original EP snapshot |
+| SWA KV cache R=2 (NCCL + peer_access) | 5 | Pattern ground truth with sliding-window cap |
+| GPT-OSS CUDA graph smoke | 3 | Class chain, EP↔TP round-trip, capture/replay |
 
 ## Design Documents
 
@@ -228,7 +236,7 @@ Unlimited round-trips are supported without explicit state caching:
 
 ## Limitations and Future Work
 
-1. **Head replication e2e**: When `num_kv_heads < tp_size`, the KV and weight transfers work correctly, but the attention layer's `paras_configure_tp()` asserts `tp_size <= num_kv_heads`. Extending attention reconfiguration to support replicated heads is a separate effort.
+1. **Head replication under SWA remains rare**: MHA replication is fully tested. Hybrid SWA replication is validated at replication factor 2 by the dedicated SWA cache-transfer suite, but production GPT-OSS / Gemma configs usually satisfy `num_kv_heads >= paras_tp_size`, so `SWACacheTransfer` emits a warning when replication is active to encourage end-to-end validation of the rare configuration.
 
 2. **`dp_size > 1`**: Currently only `paras_dp_size == 1` is supported.
 

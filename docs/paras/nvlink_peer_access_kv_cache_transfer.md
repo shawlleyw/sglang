@@ -65,9 +65,7 @@ KV slots:  [ slot 0 | slot 1 | slot 2 | ... | slot N ]
 
 This eliminates aliasing between source (EP) and destination (TP) without staging buffers. The overhead is one extra KV slot (~740 MB for Qwen3-30B-A3B with 4 heads, bf16).
 
-EP/TP aliases are created via `create_paras_kv_aliases()` after `materialize()`:
-- `model.layers.{i}.kv.ep.k/v` → slot `i+1`
-- `model.layers.{i}.kv.tp.k/v` → slot `i`
+EP/TP aliases (`model.layers.{i}.kv.ep.k/v` → slot `i+1`, `model.layers.{i}.kv.tp.k/v` → slot `i`) are registered by `reserve_kv_cache()` and materialized by the manager's internal KV layout builder. No separate post-materialize helper is needed.
 
 ### 2. Fused K+V CUDA Kernel
 
@@ -141,6 +139,17 @@ Write: peer_tp_k[dst_token, 0 : heads_per_peer, :]
 
 Both K and V follow the same pattern with different base offsets.
 
+## SWA Layer Handling
+
+Hybrid models such as GPT-OSS route sliding-window layers through the SWA backend (`paras/cache_transfer/swa.py`) instead of the MHA backend.
+
+Two extra steps apply for SWA layers:
+
+1. **Per-layer token cap.** Each SWA layer uses `spec.tokens_cap_ep`, which is typically smaller than the full-attention budget. The backend caps both the send and receive side to that per-layer limit before launching NCCL or peer-access transfer.
+2. **Index translation.** Request-to-token metadata stores full-pool indices, but SWA buffers live in the smaller SWA pool. `SWACacheTransfer._full_to_swa()` translates every token index through `SWAKVPool.full_to_swa_index_mapping` before indexing into the SWA K/V buffers. The original dtype is preserved: `int32` for peer-access CUDA bindings and `int64` for torch/NCCL indexing.
+
+Head replication (`num_kv_heads < paras_tp_size`) works in the SWA path with the same `intra_rank = tp_rank % replication_factor` slicing used by the MHA path. This combination is validated at replication factor 2 by `test_swa_kv_cache_transfer_replication.py`. Because current GPT-OSS and Gemma production configs usually satisfy `num_kv_heads >= paras_tp_size`, `SWACacheTransfer.__init__` emits a `UserWarning` when replication is active so deployments can validate the rare configuration end to end.
+
 ## NCCL Fallback Path
 
 ### gather_kv_and_permute Dimension Ordering
@@ -181,12 +190,20 @@ if replication_factor > 1:
 | `paras/csrc/peer_access_transfer.cu` | CUDA kernel: `peer_access_kv_transfer` (fused K+V) |
 | `paras/csrc/binding.cpp` | PyTorch C++ binding: `launch_peer_access_kv_transfer` |
 | `paras/peer_access.py` | IPC handle exchange, `peer_access_kv_transfer()` Python wrapper |
-| `paras/gather_manager.py` | `_gather_cache_peer_access()`, `_gather_cache_nccl()`, `gather_kv_and_permute()`, `permute_and_scatter_kv()` |
-| `paras/paras_memory_manager.py` | N+1 KV slot reservation, `create_paras_kv_aliases()` |
-| `paras/models/qwen3_moe.py` | Wires `create_paras_kv_aliases()` into model init |
+| `paras/cache_transfer/base.py` | Shared precompute and per-layer dispatch contract |
+| `paras/cache_transfer/mha.py` | Full-attention cache-transfer backend |
+| `paras/cache_transfer/swa.py` | Sliding-window cache-transfer backend |
+| `paras/cache_transfer/utils.py` | Stateless NCCL and peer-access gather/scatter helpers |
+| `paras/gather_manager.py` | EP→TP orchestration across layers |
+| `paras/scatter_manager.py` | TP→EP orchestration across layers |
+| `paras/paras_memory_manager.py` | N+1 KV slot reservation and KV layout registration |
+| `paras/models/qwen3_moe.py` | Qwen3 MHA-only manager wiring |
+| `paras/models/gpt_oss.py` | GPT-OSS hybrid full+SWA manager wiring |
 | `paras/scheduler_paras_mixin.py` | Passes `peer_ctx` and `PARAS_KV_TRANSFER_METHOD` to gather manager |
 | `mem_cache/memory_pool.py` | `paras_resize_cache()` N+1 TP alias path |
-| `test/srt/test_paras_kv_peer_access.py` | Multi-GPU correctness + benchmark (4-GPU and 8-GPU) |
+| `test/srt/paras/test_kv_cache_transfer.py` | MHA correctness tests |
+| `test/srt/paras/test_kv_cache_transfer_replication.py` | MHA replication tests |
+| `test/srt/paras/test_swa_kv_cache_transfer_replication.py` | SWA replication tests |
 
 ## Configuration
 
@@ -198,7 +215,7 @@ export PARAS_KV_TRANSFER_METHOD=nccl          # NCCL all_to_all fallback
 
 ## TP→EP Reverse KV Scatter
 
-The reverse direction (TP→EP) is now implemented in `scatter_manager.py`. Each TP rank sends its head's token data to the EP ranks that will own those tokens (determined by the request partition). Key design points:
+The reverse direction (TP→EP) is implemented by `scatter_manager.py` plus the MHA / SWA backends in `paras/cache_transfer/{mha,swa}.py`. Each TP rank sends its head's token data to the EP ranks that will own those tokens (determined by the request partition). Key design points:
 
 - **Layer order**: Reverse (N-1→0), same as EP→TP requirement but in opposite direction
 - **Head replication** (`num_kv_heads < tp_size`): subgroup members split the token load — each sends a disjoint 1/R slice, cutting NVLink traffic by R. No kernel changes; the Python wrapper builds smaller routing tensors.

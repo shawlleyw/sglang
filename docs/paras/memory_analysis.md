@@ -277,7 +277,7 @@ A single UMM allocation has less per-segment overhead than 300 separate allocati
 
 | Item | Reclaimable? | Cost to reclaim |
 |---|---|---|
-| 1 + 2 + 3 (N+1 slot design, 1.01 GB) | **Possible** | Redesign `peer_access.py` and `gather/scatter_manager.py` to use N-slot ping-pong transfer instead of forward-order N+1 transfer. Estimated ~1 week of engineering. |
+| 1 + 2 + 3 (N+1 slot design, 1.01 GB) | **Possible** | Redesign `peer_access.py` and the cache-transfer backends in `cache_transfer/{mha,swa,utils}.py` plus gather/scatter orchestration to use N-slot ping-pong transfer instead of forward-order N+1 transfer. Estimated ~1 week of engineering. |
 | 4 (mystery 128 MiB, 0.13 GB) | **Unknown** | Needs further probing — likely requires profiling torch allocator stack traces for that specific segment |
 | 5 (dual graph pool, 0.10 GB) | **No** | Required for zero-latency EP↔TP switching |
 | 6 (allocator rounding, 0.25 GB) | **No** | Inherent to one-big-alloc pattern; would return if we split UMM |
@@ -359,7 +359,7 @@ The biggest remaining reclaimable overhead is items 1+2: the extra MoE slot and 
 - **Bidirectional transfer**: each layer's transfer reads from its own slot and writes to the previous layer's slot, with synchronization barriers to prevent overwriting in-flight data.
 - **Scratch-then-place**: copy EP data to a small scratch buffer, write TP layout back to the same slot, consuming the scratch before the next layer.
 
-Both require updates to `peer_access.py`, `gather_manager.py`, `scatter_manager.py`, and synchronization in `paras_memory_manager.py::create_paras_moe_aliases`. Non-trivial but bounded engineering.
+Both require updates to `peer_access.py`, `cache_transfer/{mha,swa,utils}.py`, `gather_manager.py`, `scatter_manager.py`, and synchronization around the memory-manager alias scheme. Non-trivial but bounded engineering.
 
 ### 2. Identify and eliminate the 128 MiB mystery segment (saves ~0.13 GB)
 

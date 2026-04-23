@@ -56,7 +56,8 @@ For a 2-GPU setup with `ep_size=2, tp_size=2, paras_tp_size=2`:
 │  └────────────────────────────────────────────────────────────┘  │
 │                                                                 │
 │  ┌─── Staging Buffers (NCCL path only, optional) ────────────┐  │
-│  │  staging.w13_a/b, staging.w2_a/b   ~1.16 GB total         │  │
+│  │  staging.w13_pre_permute / gather and                     │  │
+│  │  staging.w2_pre_permute / gather  ~1.16 GB total         │  │
 │  │  (Skipped when using peer_access method)                   │  │
 │  └────────────────────────────────────────────────────────────┘  │
 │                                                                 │
@@ -103,7 +104,7 @@ tp_view = manager.get_view("model.layers.0.mlp.tp_experts.w13_weight")
 ### 1. Planning Phase (model `__init__`)
 
 ```
-plan_qwen_moe_layout(manager, ..., skip_staging=False)
+plan_qwen_moe_layout(manager, ...)                 # or plan_gpt_oss_moe_layout(...)
     │
     ├── Reserve N+1 MoE weight slots:
     │   └── paras.moe_slot.{0..N}.w13, paras.moe_slot.{0..N}.w2
@@ -114,17 +115,22 @@ plan_qwen_moe_layout(manager, ..., skip_staging=False)
     ├── For each layer:
     │   └── Reserve attention weights (QKV full, O_proj, QKV TP buffer)
     │
-    ├── (If not skip_staging): Reserve staging buffers (w13_a/b, w2_a/b)
+    ├── If configure_method != "peer_access":
+    │   └── Reserve staging buffers (pre_permute, gather; overlap uses _1/_2)
     │
-    └── (FP8: also reserve scale tensors per layer)
+    └── FP8 models also reserve scale tensors per layer
 
-After materialize():
-    create_paras_moe_aliases(manager, num_layers)
-        ├── ep_experts alias: layer i → slot i+1
-        └── tp_experts alias: layer i → slot i
+reserve_kv_cache(manager, ..., layer_specs=optional)
+    └── Reserve per-layer K/V slots and register kv.ep / kv.tp entries
 
-reserve_kv_cache(manager, ...)
-    └── For each layer: Reserve K and V buffers
+manager.materialize()
+    ├── Assign aligned offsets in reservation order
+    ├── Allocate one torch.empty(total_bytes, dtype=uint8, device="cuda")
+    └── Build typed views for all weight and KV entries
+
+create_paras_moe_aliases(manager, num_layers)
+    ├── ep_experts alias: layer i → slot i+1
+    └── tp_experts alias: layer i → slot i
 ```
 
 ### 2. Materialization
@@ -163,15 +169,24 @@ if use_manager:
 
 ### 4. KV Cache Integration
 
-`MHATokenToKVPool` accepts optional `external_k_buffers` / `external_v_buffers` from the manager:
+ParaS can wire either the MHA-only pool or the hybrid SWA pool into managed buffers:
 
 ```python
-# In model_runner.py:
+# MHA-only models (Qwen3-MoE)
 k_bufs, v_bufs = manager.get_kv_views(num_layers, mode="ep")
 pool = MHATokenToKVPool(..., external_k_buffers=k_bufs, external_v_buffers=v_bufs)
+
+# Hybrid full + sliding-window models (GPT-OSS)
+pool = SWAKVPool(
+    ...,
+    full_external_k_buffers=full_k_bufs,
+    full_external_v_buffers=full_v_bufs,
+    swa_external_k_buffers=swa_k_bufs,
+    swa_external_v_buffers=swa_v_bufs,
+)
 ```
 
-The pool's `data_ptrs` and `data_strides` are built from these external buffers. The pool's token allocation logic (free slots, eviction, etc.) is unchanged.
+`MHATokenToKVPool` uses one external K/V buffer pair per layer. `SWAKVPool` uses two sub-pools: one for full-attention layers and one for sliding-window layers. Each layer is routed by its `LayerCacheSpec.kind`. The allocator logic (free slots, eviction, resize/rebind) is unchanged; only the backing buffers come from the manager.
 
 ### 5. EP→TP Switch
 
@@ -244,7 +259,9 @@ manager = ParaSMemoryManager(device="cuda")
 
 # Planning phase
 manager.reserve(name, shape, dtype) -> LayoutEntry
-manager.reserve_kv_cache(num_layers, ep_max_tokens, tp_max_tokens, ...)
+plan_qwen_moe_layout(...) -> None
+plan_gpt_oss_moe_layout(...) -> None
+manager.reserve_kv_cache(num_layers, ep_max_tokens, tp_max_tokens, ..., layer_specs=None)
 
 # Materialization
 manager.materialize() -> int  # returns total bytes
@@ -257,7 +274,7 @@ manager.get_view_as(name, shape, dtype) -> Tensor # same bytes, different shape
 manager.get_kv_views(num_layers, mode="ep"|"tp", tp_size, page_size)
     -> (List[Tensor], List[Tensor])  # k_buffers, v_buffers
 
-# Aliasing (post-materialize)
+# Aliasing (post-materialize for MoE; KV aliases are registered during reserve_kv_cache/materialize)
 manager.alias(alias_name, target_name)    # create entry sharing target's offset
 create_paras_moe_aliases(manager, num_layers)  # create ep_experts + tp_experts aliases
 
@@ -276,28 +293,38 @@ set_global_paras_memory_manager(manager)  # called during model init
 get_global_paras_memory_manager() -> Optional[ParaSMemoryManager]
 ```
 
-### MHATokenToKVPool Extensions
+### KV Pool Extensions
 
 ```python
-# External buffer support (new params)
+# MHA-only external buffer support
 pool = MHATokenToKVPool(...,
     external_k_buffers=List[Tensor],  # from manager.get_kv_views()
     external_v_buffers=List[Tensor],
 )
 
-# Buffer swap during switch (new method)
-pool.replace_buffers(new_k_buffers, new_v_buffers, new_size)
+# Hybrid SWA pool support
+pool = SWAKVPool(...,
+    full_external_k_buffers=List[Tensor],
+    full_external_v_buffers=List[Tensor],
+    swa_external_k_buffers=List[Tensor],
+    swa_external_v_buffers=List[Tensor],
+)
+
+# Buffer swap during switch / pool resize
+pool.replace_buffers(...)
 ```
 
 ## File Map
 
 | File | Role |
 |------|------|
-| `paras/paras_memory_manager.py` | Core manager: reserve, materialize, get_view, layout planning |
-| `paras/models/qwen3_moe.py` | Creates manager, plans layout, computes KV budget, sets global |
+| `paras/paras_memory_manager.py` | Core manager: reserve, materialize, get_view, `plan_qwen_moe_layout`, `plan_gpt_oss_moe_layout`, KV layout registration |
+| `paras/models/qwen3_moe.py` | Creates manager, plans Qwen3 layout, computes KV budget, sets global |
+| `paras/models/gpt_oss.py` | Creates manager, plans GPT-OSS layout, computes heterogeneous full+SWA KV budget, sets global |
 | `paras/layers/paras_moe_block.py` | EP→TP switch logic using staging buffers and get_view_as |
+| `paras/cache_transfer/{base,mha,swa,utils}.py` | Cache-transfer backends and shared per-layer gather/scatter helpers |
 | `layers/quantization/unquant.py` | Intercepts create_weights for both linear and MoE modules |
-| `mem_cache/memory_pool.py` | MHATokenToKVPool external buffer support + replace_buffers |
+| `mem_cache/memory_pool.py` | `MHATokenToKVPool` and `SWAKVPool` external buffer support + rebind helpers |
 | `model_executor/model_runner.py` | Wires KV pool to manager, uses manager token counts |
 | `layers/linear.py` | Stores `self.prefix` on LinearBase for manager lookups |
 
@@ -311,18 +338,13 @@ Currently, QKV TP reconfiguration still copies q/k/v slices from the full weight
 
 ### 2. Carve Staging Buffers from KV Cache Region
 
-Staging buffers are now conditional via the `skip_staging` parameter — they're skipped entirely for the `peer_access` method, which writes directly to TP slots via NVLink. For the NCCL naive/overlap paths, the 4 staging buffers still occupy ~1.16 GiB permanently.
+Staging buffers are now conditional via `configure_method`: they are skipped entirely for `peer_access`, which writes directly to TP slots via NVLink. For the NCCL `naive` / `overlap` paths, the staging buffers still occupy ~1.16 GiB permanently.
 
 **Improvement**: Instead of separate staging reservations, dynamically carve scratch space from the end of the KV cache region during the switch. This reclaims ~1.16 GiB for KV tokens during normal operation. The manager would need a `get_scratch(size_bytes)` method that returns a view into the KV tail.
 
-### 3. TP→EP Reverse Switch
+### 3. TP→EP Reverse Switch (Implemented)
 
-The current implementation only supports EP→TP. The reverse switch would:
-- Scatter TP MoE weights back to EP layout via all-to-all (reverse direction)
-- Resize KV pool back to EP shape (fewer tokens, more heads per rank)
-- Reload full attention weights if they were modified
-
-**Improvement**: Add `paras_configure_ep()` support with reverse all-to-all into the same managed buffer. The union layout already supports this — the buffer bytes are the same, just the view shapes change.
+Reverse switching is implemented. TP→EP restores EP expert weights via reverse transfer, restores EP KV layout via per-layer scatter, and rebinds the attention / KV-pool state back to EP mode. See `parallelism_switch.md` for the control flow.
 
 ### 4. Support Shared Experts
 
@@ -330,11 +352,9 @@ Qwen models can have fused shared experts that run alongside routed experts. The
 
 **Improvement**: Reserve shared expert weights in the managed buffer. They don't participate in EP→TP redistribution (they're replicated on all ranks), so they just need a fixed reservation with no union layout.
 
-### 5. Fused Cross-Rank Weight Transfer (DONE — see `nvlink_peer_access_weight_transfer.md`)
+### 5. Fused Cross-Rank Weight Transfer (Implemented)
 
-The contiguous, deterministic layout enables fused NVLink transfers during the switch. The peer access method uses custom CUDA kernels that write directly to peer GPU memory, achieving 1.56× speedup over NCCL sequential.
-
-**Improvement**: Since all MoE weights across all layers are contiguous in the buffer, a single `all_to_all` on the entire MoE weight region could replace the per-layer loop. This would reduce NCCL launch overhead from 48x2 kernel launches to 2 (one for w13, one for w2).
+The contiguous layout now powers fused NVLink peer-access kernels for both directions. The remaining future work is to collapse the NCCL fallback from a per-layer loop to a coarser-grained collective over the MoE region.
 
 ### 6. Profile-Guided Buffer Sizing
 
