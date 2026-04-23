@@ -111,7 +111,10 @@ class SWACacheTransfer(CacheTransferBase):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], int]:
         """Cap-aware per-destination slices returning int32 tensors for peer-access."""
         group_size = self.group_size
-        replication_factor = self._replication_factor
+        num_kv_heads = self._num_kv_heads
+        replication_factor = (
+            group_size // num_kv_heads if num_kv_heads < group_size else 1
+        )
         intra_rank = self.paras_tp_rank % replication_factor
 
         capped_global_indices: List[int] = []
