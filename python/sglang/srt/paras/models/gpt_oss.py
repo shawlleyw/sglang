@@ -33,8 +33,8 @@ from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 from sglang.srt.paras.paras_memory_manager import (
     ParaSMemoryManager,
     create_paras_moe_aliases,
+    plan_gpt_oss_moe_layout,
     plan_hybrid_kv_budget,
-    plan_qwen_moe_layout,
     set_global_paras_memory_manager,
 )
 from sglang.srt.paras.paras_parallel_state import (
@@ -197,7 +197,7 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
 
         configure_method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
 
-        plan_qwen_moe_layout(
+        plan_gpt_oss_moe_layout(
             manager,
             num_layers=config.num_hidden_layers,
             num_experts=config.num_experts,

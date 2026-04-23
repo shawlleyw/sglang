@@ -791,6 +791,74 @@ def plan_qwen_moe_layout(
 
 
 # ---------------------------------------------------------------------------
+# GPT-OSS MoE layout planning
+# ---------------------------------------------------------------------------
+
+def plan_gpt_oss_moe_layout(
+    manager: ParaSMemoryManager,
+    *,
+    num_layers: int,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    ep_size: int,
+    tp_size: int,
+    dp_size: int,
+    moe_tp_size: int,
+    quant_name: Optional[str] = None,
+    fp8_block_size: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
+    configure_method: str = "peer_access",
+    prefix: str = "model",
+) -> None:
+    """Reserve all weight tensors for a GPT-OSS sparse-MoE model.
+
+    GPT-OSS shares the Qwen3-MoE layout exactly for the tensors ParaS
+    manages: w13/w2 expert weights (N+1 slot layout for EP<->TP switch),
+    QKV/O attention projections, FP8 weight scales, and pre-permute /
+    gather staging buffers for non-peer_access transfer methods.  Both
+    models are pure sparse MoE with no shared experts and identical
+    attention projection geometry.
+
+    Tensors that differ between the two models (GPT-OSS has biases on
+    expert weights and the router; Qwen3 does not) are intentionally
+    excluded from the ParaS layout in both cases.  ParaS only manages
+    tensors that switch between EP and TP modes; biases, norms, and
+    other model-static parameters live in regular PyTorch param storage
+    allocated by FusedMoE / ReplicatedLinear / RMSNorm directly.  MXFP4
+    is a checkpoint format only -- it is decompressed at load time and
+    never appears in the ParaS buffer.
+
+    Delegates to ``plan_qwen_moe_layout``.  If GPT-OSS ever needs a
+    distinct staging layout (different intermediate_size handling,
+    MXFP4-specific buffers, expert-bias switching), specialise here
+    instead of polluting the Qwen path.
+    """
+    plan_qwen_moe_layout(
+        manager,
+        num_layers=num_layers,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        ep_size=ep_size,
+        tp_size=tp_size,
+        dp_size=dp_size,
+        moe_tp_size=moe_tp_size,
+        quant_name=quant_name,
+        fp8_block_size=fp8_block_size,
+        num_fused_shared_experts=num_fused_shared_experts,
+        configure_method=configure_method,
+        prefix=prefix,
+    )
+
+
+# ---------------------------------------------------------------------------
 # MoE alias creation (call after materialize)
 # ---------------------------------------------------------------------------
 
