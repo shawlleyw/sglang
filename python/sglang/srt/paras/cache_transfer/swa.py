@@ -37,6 +37,7 @@ def _do_scatter_one_layer_nccl_swa(
     reassembly_groups: int,
     mgr,
     gather_group,
+    full_to_swa_mapping: Optional[torch.Tensor],
 ) -> None:
     cap = spec.tokens_cap_ep
     layer_id = spec.layer_id
@@ -65,6 +66,12 @@ def _do_scatter_one_layer_nccl_swa(
         if swa_parts
         else torch.empty(0, dtype=torch.long, device=global_token_indices.device)
     )
+
+    # P4 fix: translate TP-side indices from full-pool to SWA-pool space
+    # before reading from the SWA k/v buffers.
+    if full_to_swa_mapping is not None and tp_indices.numel() > 0:
+        tp_indices = full_to_swa_mapping[tp_indices].to(torch.int64)
+
     recv_full = min(recv_full_count, cap)
     swa_recv_counts: List[int] = []
     for src in range(group_size):
@@ -79,6 +86,11 @@ def _do_scatter_one_layer_nccl_swa(
         if ep_dst_positions is not None and recv_full > 0
         else ep_dst_positions
     )
+
+    # P4 fix: translate EP-side destination positions from full-pool to
+    # SWA-pool space before writing into the SWA EP buffer.
+    if full_to_swa_mapping is not None and dst_pos is not None and dst_pos.numel() > 0:
+        dst_pos = full_to_swa_mapping[dst_pos].to(torch.int64)
 
     if total_send > 0:
         k_buf = kv_cache.get_key_buffer(layer_id)
@@ -123,32 +135,78 @@ def _do_scatter_one_layer_peer_access_swa(
     spec: "LayerCacheSpec",
     local_buffer_ptr: int,
     peer_buffer_ptrs: torch.Tensor,
-    tp_token_positions: torch.Tensor,
-    token_to_rank: torch.Tensor,
-    ep_dst_pos_all: torch.Tensor,
     src_k_offset: int,
     src_v_offset: int,
     dst_k_offset: int,
     dst_v_offset: int,
-    num_my_tokens: int,
     heads_per_rank: int,
     num_kv_heads: int,
     paras_tp_rank: int,
     paras_tp_size: int,
     head_dim: int,
     elem_size: int,
+    token_partition: List[List[int]],
+    global_token_indices: torch.Tensor,
+    group_size: int,
+    full_to_swa_mapping: Optional[torch.Tensor],
 ) -> None:
+    """SWA peer-access scatter with per-destination cap and index translation.
+
+    Recomputes per-destination capped slices at dispatch time (Option Z from
+    the task spec) to avoid touching base.py.  Translates both TP source
+    positions and EP destination positions from full-pool to SWA-pool space.
+    """
     import paras_peer_access_cuda
 
-    layer_num = min(num_my_tokens, spec.tokens_cap_ep)
+    cap = spec.tokens_cap_ep
+    replication_factor = (
+        group_size // num_kv_heads if num_kv_heads < group_size else 1
+    )
+    intra_rank = paras_tp_rank % replication_factor
 
+    # Recompute per-destination capped slices (mirrors NCCL SWA path).
+    capped_global_indices: List[int] = []
+    capped_dst_ranks: List[int] = []
+    capped_ep_dst_pos: List[int] = []
+    for e in range(group_size):
+        full_tokens = token_partition[e]
+        full = len(full_tokens)
+        capped = min(full, cap)
+        my_start = capped * intra_rank // replication_factor
+        my_end = capped * (intra_rank + 1) // replication_factor
+        my_slice = full_tokens[my_start:my_end]
+        for local_idx, global_idx in enumerate(my_slice):
+            capped_global_indices.append(global_idx)
+            capped_dst_ranks.append(e)
+            # EP destination position: offset within the destination's allocation.
+            # +1 because slot 0 is the padding slot.
+            capped_ep_dst_pos.append(my_start + local_idx + 1)
+
+    layer_num = len(capped_global_indices)
     if layer_num > 0:
+        device = global_token_indices.device
+        gi_tensor = torch.tensor(
+            capped_global_indices, dtype=torch.long, device=device
+        )
+        tp_positions = global_token_indices[gi_tensor].to(torch.int32)
+        token_to_rank = torch.tensor(
+            capped_dst_ranks, dtype=torch.int32, device=device
+        )
+        ep_dst_pos = torch.tensor(
+            capped_ep_dst_pos, dtype=torch.int32, device=device
+        )
+
+        # P5 fix (b): translate from full-pool to SWA-pool index space.
+        if full_to_swa_mapping is not None:
+            tp_positions = full_to_swa_mapping[tp_positions.to(torch.int64)].to(torch.int32)
+            ep_dst_pos = full_to_swa_mapping[ep_dst_pos.to(torch.int64)].to(torch.int32)
+
         paras_peer_access_cuda.launch_peer_access_kv_scatter(
             local_buffer_ptr,
             peer_buffer_ptrs,
-            tp_token_positions[:layer_num],
-            token_to_rank[:layer_num],
-            ep_dst_pos_all[:layer_num],
+            tp_positions,
+            token_to_rank,
+            ep_dst_pos,
             src_k_offset,
             src_v_offset,
             dst_k_offset,
@@ -171,7 +229,35 @@ class SWACacheTransfer(CacheTransferBase):
     ``CacheTransferBase``.  Overrides the per-layer gather/scatter
     dispatch to read buffers from the SWA sub-pool and cap token
     counts at ``spec.tokens_cap_ep``.
+
+    Index translation
+    -----------------
+    ``req_to_token_pool`` stores **full-pool** indices.  SWA buffers
+    live in SWA index space (size ``_size_swa < _size_full``).  Attention
+    backends translate via ``SWAKVPool.full_to_swa_index_mapping`` at
+    attend time; this class does the same for cache transfer.
+
+    ``full_to_swa_index_mapping`` is zero-initialized, so translating
+    an unallocated full-pool index returns 0 (a valid but overwritten
+    padding slot).  This is harmless by design.
     """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # SWAKVPool.full_to_swa_index_mapping is set by
+        # SWATokenToKVPoolAllocator.__init__ (allocator.py:224) and kept in
+        # sync on every paras_resize_and_clear (allocator.py:318).
+        self._full_to_swa_mapping = getattr(
+            self.kv_cache, "full_to_swa_index_mapping", None
+        )
+
+    def _full_to_swa(self, full_indices: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Translate full-pool indices to SWA-pool indices."""
+        if full_indices is None or full_indices.numel() == 0:
+            return full_indices
+        if self._full_to_swa_mapping is None:
+            return full_indices
+        return self._full_to_swa_mapping[full_indices].to(torch.int64)
 
     def gather_one_layer(self, spec: LayerCacheSpec, **kwargs) -> None:
         layer_id = spec.layer_id
@@ -193,14 +279,34 @@ class SWACacheTransfer(CacheTransferBase):
             else self.local_token_indices
         )
 
+        # P3 fix: translate local EP indices from full-pool to SWA-pool space
+        # before reading from the SWA k/v buffers.
+        swa_local = self._full_to_swa(local_indices)
+
+        # P3 fix: build per-rank capped global_token_indices, then translate.
+        # self.global_token_indices is the flat concatenation of all EP ranks'
+        # tokens (uncapped).  We must slice each rank's chunk to
+        # layer_global_num[i] entries before translation.
+        if self.global_token_indices is not None and num_global > 0:
+            start = 0
+            capped_parts = []
+            for i, n_full in enumerate(self.global_num_tokens):
+                take = layer_global_num[i]
+                capped_parts.append(self.global_token_indices[start:start + take])
+                start += n_full
+            global_indices_full_capped = torch.cat(capped_parts)
+            swa_global = self._full_to_swa(global_indices_full_capped)
+        else:
+            swa_global = self.global_token_indices
+
         if self.method == "nccl":
             do_gather_one_layer_nccl(
                 k_buffer,
                 v_buffer,
                 num_local,
                 num_global,
-                local_indices,
-                self.global_token_indices,
+                swa_local,
+                swa_global,
                 layer_global_num,
                 self.group_size,
                 self.kv_cache.head_num,
@@ -217,6 +323,11 @@ class SWACacheTransfer(CacheTransferBase):
             tp_k_name = f"model.layers.{layer_id}.kv.tp.k"
             tp_v_name = f"model.layers.{layer_id}.kv.tp.v"
 
+            # Peer-access gather: local_token_indices are the READ side
+            # (EP buffer positions), so translate to SWA space.
+            # The WRITE side uses dst_token_start as a scalar offset into the
+            # TP buffer which is addressed by the CUDA kernel directly — no
+            # translation needed there.
             do_gather_one_layer_peer_access(
                 self._local_buffer_ptr,
                 self._peer_addresses_gpu,
@@ -224,7 +335,7 @@ class SWACacheTransfer(CacheTransferBase):
                 self.mgr._entries[ep_v_name].offset_bytes,
                 self.mgr._entries[tp_k_name].offset_bytes,
                 self.mgr._entries[tp_v_name].offset_bytes,
-                local_indices,
+                swa_local,
                 num_local,
                 self._dst_token_start,
                 self.kv_cache.head_num,
@@ -255,6 +366,7 @@ class SWACacheTransfer(CacheTransferBase):
                 self._reassembly_groups,
                 self.mgr,
                 self.group,
+                self._full_to_swa_mapping,
             )
         else:
             tp_k_name = f"model.layers.{spec.layer_id}.kv.tp.k"
@@ -266,20 +378,20 @@ class SWACacheTransfer(CacheTransferBase):
                 spec,
                 self._local_buffer_ptr,
                 self._peer_buffer_ptrs,
-                self._tp_token_positions,
-                self._token_to_rank,
-                self._ep_dst_pos_all,
                 self.mgr._entries[tp_k_name].offset_bytes,
                 self.mgr._entries[tp_v_name].offset_bytes,
                 self.mgr._entries[ep_k_name].offset_bytes,
                 self.mgr._entries[ep_v_name].offset_bytes,
-                self._num_my_tokens,
                 self._heads_per_rank,
                 self._num_kv_heads,
                 self.paras_tp_rank,
                 self.paras_tp_size,
                 self._head_dim,
                 self._elem_size,
+                self.token_partition,
+                self.global_token_indices,
+                self.group_size,
+                self._full_to_swa_mapping,
             )
 
 

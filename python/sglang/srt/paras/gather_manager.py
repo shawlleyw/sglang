@@ -13,7 +13,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, MHATokenToKVPool, SWAKVPool
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator, SWATokenToKVPoolAllocator
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.paras.utils import print_class_tensor_member, profile_object_members
@@ -158,7 +158,8 @@ class ParaSReqGatherManager:
     def reorchestrate_cache(
         self, 
         new_req_pool_size: Optional[int] = None,
-        new_cache_size: Optional[int] = None
+        new_cache_size: Optional[int] = None,
+        new_cache_size_swa: Optional[int] = None,
     ):
         '''
         Heads are sharded by group size, 
@@ -166,8 +167,16 @@ class ParaSReqGatherManager:
         '''
         if new_req_pool_size is None:
             new_req_pool_size = self.req_to_token_pool.size * self.group_size
-        if new_cache_size is None:
-            new_cache_size = self.token_to_kv_pool_allocator.size * self.group_size
+
+        is_swa_alloc = isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+        if is_swa_alloc:
+            if new_cache_size is None:
+                new_cache_size = self.token_to_kv_pool_allocator.size_full * self.group_size
+            if new_cache_size_swa is None:
+                new_cache_size_swa = self.token_to_kv_pool_allocator.size_swa * self.group_size
+        else:
+            if new_cache_size is None:
+                new_cache_size = self.token_to_kv_pool_allocator.size * self.group_size
         
         assert self.num_global_tokens <= new_cache_size, "The total size of the requests to reorchestrate is greater than the new size of the cache."
         
@@ -179,7 +188,10 @@ class ParaSReqGatherManager:
         self.req_to_token_pool.paras_resize_and_clear(new_req_pool_size)
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
         
-        self.token_to_kv_pool_allocator.paras_resize_and_clear(new_cache_size)
+        if is_swa_alloc:
+            self.token_to_kv_pool_allocator.paras_resize_and_clear(new_cache_size, new_cache_size_swa)
+        else:
+            self.token_to_kv_pool_allocator.paras_resize_and_clear(new_cache_size)
 
         if self.num_global_tokens > 0:        
             global_token_indices: torch.Tensor = self.token_to_kv_pool_allocator.alloc(self.num_global_tokens)

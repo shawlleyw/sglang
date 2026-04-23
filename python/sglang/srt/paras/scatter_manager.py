@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     SWAKVPool,
 )
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator, SWATokenToKVPoolAllocator
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 
@@ -196,12 +196,21 @@ class ParaSReqScatterManager:
         self,
         new_ep_cache_size: Optional[int] = None,
         new_req_pool_size: Optional[int] = None,
+        new_ep_cache_size_swa: Optional[int] = None,
     ):
         """Shrink pools to EP capacity and allocate new EP token indices."""
         if new_req_pool_size is None:
             new_req_pool_size = self.req_to_token_pool.size // self.group_size
-        if new_ep_cache_size is None:
-            new_ep_cache_size = self.token_to_kv_pool_allocator.size // self.group_size
+
+        is_swa_alloc = isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+        if is_swa_alloc:
+            if new_ep_cache_size is None:
+                new_ep_cache_size = self.token_to_kv_pool_allocator.size_full // self.group_size
+            if new_ep_cache_size_swa is None:
+                new_ep_cache_size_swa = self.token_to_kv_pool_allocator.size_swa // self.group_size
+        else:
+            if new_ep_cache_size is None:
+                new_ep_cache_size = self.token_to_kv_pool_allocator.size // self.group_size
         self.new_cache_size = new_ep_cache_size
 
         num_local_reqs = len(self.local_reqs)
@@ -214,7 +223,10 @@ class ParaSReqScatterManager:
 
         # Resize and clear allocators.
         self.req_to_token_pool.paras_resize_and_clear(new_req_pool_size)
-        self.token_to_kv_pool_allocator.paras_resize_and_clear(new_ep_cache_size)
+        if is_swa_alloc:
+            self.token_to_kv_pool_allocator.paras_resize_and_clear(new_ep_cache_size, new_ep_cache_size_swa)
+        else:
+            self.token_to_kv_pool_allocator.paras_resize_and_clear(new_ep_cache_size)
 
         # Allocate new EP pool indices for local requests.
         if num_local_reqs > 0:

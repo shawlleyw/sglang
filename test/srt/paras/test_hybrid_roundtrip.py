@@ -172,5 +172,275 @@ class TestHybridRoundtrip:
         print("OK: Head count sharding correct")
 
 
+class TestSWAAllocatorSignature:
+    """Test A (P1/P2): SWA allocator two-arg resize works via managers."""
+
+    def test_swa_allocator_paras_resize_accepts_two_args(self):
+        from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.memory_pool import SWAKVPool
+
+        kvcache = SWAKVPool(
+            size=64, size_swa=32,
+            dtype=KV_DTYPE, head_num=NUM_KV_HEADS, head_dim=HEAD_DIM,
+            swa_attention_layer_ids=[0], full_attention_layer_ids=[1],
+            enable_kvcache_transpose=False, device=DEVICE,
+        )
+        alloc = SWATokenToKVPoolAllocator(
+            size=64, size_swa=32, dtype=torch.int64,
+            device=DEVICE, kvcache=kvcache, need_sort=False,
+        )
+        alloc.paras_resize_and_clear(128, 64)
+        assert alloc._size_full == 128
+        assert alloc._size_swa == 64
+
+    def test_gather_manager_reorchestrate_with_swa_allocator(self):
+        from unittest.mock import MagicMock
+        from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.memory_pool import SWAKVPool, ReqToTokenPool
+
+        kvcache = SWAKVPool(
+            size=64, size_swa=32,
+            dtype=KV_DTYPE, head_num=NUM_KV_HEADS, head_dim=HEAD_DIM,
+            swa_attention_layer_ids=[0], full_attention_layer_ids=[1],
+            enable_kvcache_transpose=False, device=DEVICE,
+        )
+        alloc = SWATokenToKVPoolAllocator(
+            size=64, size_swa=32, dtype=torch.int64,
+            device=DEVICE, kvcache=kvcache, need_sort=False,
+        )
+        req_pool = ReqToTokenPool(size=32, max_context_len=128, device=DEVICE, enable_memory_saver=False)
+
+        group = MagicMock()
+        group.world_size = 2
+
+        from sglang.srt.paras.gather_manager import ParaSReqGatherManager
+        mgr = ParaSReqGatherManager(
+            local_reqs=[], gather_group=group,
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=alloc,
+        )
+        mgr.global_reqs = []
+        mgr.global_reqs_split_sizes = []
+        mgr.global_seqlens_list = []
+        mgr.global_num_tokens = []
+        mgr.num_global_tokens = 0
+        mgr.reorchestrate_cache()
+        assert alloc._size_full == 128
+        assert alloc._size_swa == 64
+
+    def test_scatter_manager_reorchestrate_with_swa_allocator(self):
+        from unittest.mock import MagicMock
+        from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.memory_pool import SWAKVPool, ReqToTokenPool
+
+        kvcache = SWAKVPool(
+            size=128, size_swa=64,
+            dtype=KV_DTYPE, head_num=NUM_KV_HEADS, head_dim=HEAD_DIM,
+            swa_attention_layer_ids=[0], full_attention_layer_ids=[1],
+            enable_kvcache_transpose=False, device=DEVICE,
+        )
+        alloc = SWATokenToKVPoolAllocator(
+            size=128, size_swa=64, dtype=torch.int64,
+            device=DEVICE, kvcache=kvcache, need_sort=False,
+        )
+        req_pool = ReqToTokenPool(size=64, max_context_len=256, device=DEVICE, enable_memory_saver=False)
+
+        group = MagicMock()
+        group.world_size = 2
+
+        from sglang.srt.paras.scatter_manager import ParaSReqScatterManager
+        mgr = ParaSReqScatterManager(
+            global_reqs=[], scatter_group=group,
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=alloc,
+            paras_tp_rank=0, paras_tp_size=2,
+        )
+        mgr.local_reqs = []
+        mgr.num_local_tokens = 0
+        mgr.token_partition = [[], []]
+        mgr.reorchestrate_cache()
+        assert alloc._size_full == 64
+        assert alloc._size_swa == 32
+
+
+class TestSWAIndexTranslation:
+    """Test B (P3): _full_to_swa translates correctly with divergent mapping."""
+
+    def test_full_to_swa_with_divergent_mapping(self):
+        from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
+
+        mapping = torch.zeros(20, dtype=torch.int64)
+        mapping[3] = 1
+        mapping[7] = 2
+        mapping[11] = 3
+        mapping[15] = 4
+
+        class FakeKVCache:
+            full_to_swa_index_mapping = mapping
+            head_num = 4
+            head_dim = 64
+            store_dtype = torch.bfloat16
+            device = 'cpu'
+            layer_num = 2
+
+        class FakeGroup:
+            world_size = 1
+            device_group = None
+
+        backend = object.__new__(SWACacheTransfer)
+        backend.kv_cache = FakeKVCache()
+        backend._full_to_swa_mapping = mapping
+
+        full_indices = torch.tensor([3, 7, 11, 15], dtype=torch.int64)
+        swa_indices = backend._full_to_swa(full_indices)
+        assert torch.equal(swa_indices, torch.tensor([1, 2, 3, 4], dtype=torch.int64))
+
+    def test_full_to_swa_unallocated_returns_zero(self):
+        from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
+
+        mapping = torch.zeros(20, dtype=torch.int64)
+        mapping[5] = 10
+
+        backend = object.__new__(SWACacheTransfer)
+        backend._full_to_swa_mapping = mapping
+
+        full_indices = torch.tensor([5, 8], dtype=torch.int64)
+        swa_indices = backend._full_to_swa(full_indices)
+        assert swa_indices[0].item() == 10
+        assert swa_indices[1].item() == 0
+
+    def test_full_to_swa_empty_tensor(self):
+        from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
+
+        backend = object.__new__(SWACacheTransfer)
+        backend._full_to_swa_mapping = torch.zeros(10, dtype=torch.int64)
+
+        empty = torch.empty(0, dtype=torch.int64)
+        result = backend._full_to_swa(empty)
+        assert result.numel() == 0
+
+    def test_full_to_swa_none_passthrough(self):
+        from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
+
+        backend = object.__new__(SWACacheTransfer)
+        backend._full_to_swa_mapping = torch.zeros(10, dtype=torch.int64)
+
+        assert backend._full_to_swa(None) is None
+
+    def test_full_to_swa_no_mapping_passthrough(self):
+        from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
+
+        backend = object.__new__(SWACacheTransfer)
+        backend._full_to_swa_mapping = None
+
+        indices = torch.tensor([1, 2, 3], dtype=torch.int64)
+        result = backend._full_to_swa(indices)
+        assert torch.equal(result, indices)
+
+
+class TestPeerAccessPerDestCap:
+    """Test C (P5): peer-access SWA scatter caps per-destination, not globally."""
+
+    def test_per_destination_capping(self):
+        from sglang.srt.paras.cache_transfer.swa import _do_scatter_one_layer_peer_access_swa
+        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+        from unittest.mock import MagicMock, patch
+
+        spec = LayerCacheSpec(
+            layer_id=0, kind='swa', tokens_cap_ep=3,
+            tokens_cap_tp=0, num_kv_heads=4, head_dim=64,
+            sliding_window_size=1023,
+        )
+
+        token_partition = [
+            list(range(0, 5)),
+            list(range(5, 10)),
+            list(range(10, 15)),
+        ]
+        global_token_indices = torch.arange(1, 16, dtype=torch.int64)
+
+        captured_args = {}
+        mock_cuda = MagicMock()
+        def capture_launch(*args):
+            captured_args['tp_positions'] = args[2]
+            captured_args['token_to_rank'] = args[3]
+            captured_args['ep_dst_pos'] = args[4]
+            captured_args['layer_num'] = args[9]
+        mock_cuda.launch_peer_access_kv_scatter = capture_launch
+
+        with patch.dict('sys.modules', {'paras_peer_access_cuda': mock_cuda}):
+            _do_scatter_one_layer_peer_access_swa(
+                spec=spec,
+                local_buffer_ptr=0,
+                peer_buffer_ptrs=torch.zeros(3, dtype=torch.int64),
+                src_k_offset=0, src_v_offset=0,
+                dst_k_offset=0, dst_v_offset=0,
+                heads_per_rank=1, num_kv_heads=4,
+                paras_tp_rank=0, paras_tp_size=1,
+                head_dim=64, elem_size=2,
+                token_partition=token_partition,
+                global_token_indices=global_token_indices,
+                group_size=3,
+                full_to_swa_mapping=None,
+            )
+
+        assert captured_args['layer_num'] == 9, (
+            f"Expected 3 dests * 3 tokens/dest = 9, got {captured_args['layer_num']}"
+        )
+
+        ranks = captured_args['token_to_rank'].tolist()
+        assert ranks.count(0) == 3
+        assert ranks.count(1) == 3
+        assert ranks.count(2) == 3
+
+    def test_per_destination_capping_with_translation(self):
+        from sglang.srt.paras.cache_transfer.swa import _do_scatter_one_layer_peer_access_swa
+        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+        from unittest.mock import MagicMock, patch
+
+        spec = LayerCacheSpec(
+            layer_id=0, kind='swa', tokens_cap_ep=2,
+            tokens_cap_tp=0, num_kv_heads=4, head_dim=64,
+            sliding_window_size=1023,
+        )
+
+        token_partition = [list(range(0, 4)), list(range(4, 8))]
+        global_token_indices = torch.tensor(
+            [10, 20, 30, 40, 50, 60, 70, 80], dtype=torch.int64
+        )
+
+        mapping = torch.zeros(100, dtype=torch.int64)
+        mapping[10] = 1; mapping[20] = 2
+        mapping[50] = 3; mapping[60] = 4
+
+        captured_args = {}
+        mock_cuda = MagicMock()
+        def capture_launch(*args):
+            captured_args['tp_positions'] = args[2]
+            captured_args['ep_dst_pos'] = args[4]
+            captured_args['layer_num'] = args[9]
+        mock_cuda.launch_peer_access_kv_scatter = capture_launch
+
+        with patch.dict('sys.modules', {'paras_peer_access_cuda': mock_cuda}):
+            _do_scatter_one_layer_peer_access_swa(
+                spec=spec,
+                local_buffer_ptr=0,
+                peer_buffer_ptrs=torch.zeros(2, dtype=torch.int64),
+                src_k_offset=0, src_v_offset=0,
+                dst_k_offset=0, dst_v_offset=0,
+                heads_per_rank=1, num_kv_heads=4,
+                paras_tp_rank=0, paras_tp_size=1,
+                head_dim=64, elem_size=2,
+                token_partition=token_partition,
+                global_token_indices=global_token_indices,
+                group_size=2,
+                full_to_swa_mapping=mapping,
+            )
+
+        assert captured_args['layer_num'] == 4
+        tp_pos = captured_args['tp_positions'].tolist()
+        assert tp_pos == [1, 2, 3, 4]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
