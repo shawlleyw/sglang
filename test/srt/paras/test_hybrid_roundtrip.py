@@ -18,7 +18,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 from sglang.srt.paras.cache_transfer import LayerCacheSpec
-from sglang.srt.paras.paras_memory_manager import ParaSMemoryManager, create_paras_kv_aliases
+from sglang.srt.paras.paras_memory_manager import ParaSMemoryManager
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.paras import paras_memory_manager as pmm
 
@@ -70,7 +70,6 @@ def setup_mgr_and_pool(specs):
         layer_specs=specs,
     )
     mgr.materialize()
-    create_paras_kv_aliases(mgr, num_layers=NUM_LAYERS)
     pmm._global_paras_memory_manager = mgr
 
     pool = SWAKVPool(

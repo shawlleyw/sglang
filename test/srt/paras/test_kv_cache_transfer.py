@@ -228,7 +228,6 @@ def setup_memory_manager(rank, world_size, num_kv_heads, tokens_per_rank):
     """
     from sglang.srt.paras.paras_memory_manager import (
         ParaSMemoryManager,
-        create_paras_kv_aliases,
         set_global_paras_memory_manager,
     )
     set_global_paras_memory_manager(None)
@@ -254,7 +253,6 @@ def setup_memory_manager(rank, world_size, num_kv_heads, tokens_per_rank):
         page_size=PAGE_SIZE,
     )
     mgr.materialize()
-    create_paras_kv_aliases(mgr, NUM_LAYERS)
     set_global_paras_memory_manager(mgr)
     return mgr, ep_max_tokens, tp_max_tokens
 

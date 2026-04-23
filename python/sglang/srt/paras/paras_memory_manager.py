@@ -821,25 +821,4 @@ def create_paras_moe_aliases(
         manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w2_weight", f"paras.moe_slot.{i}.w2")
 
 
-# ---------------------------------------------------------------------------
-# KV cache alias creation (call after materialize)
-# ---------------------------------------------------------------------------
 
-def create_paras_kv_aliases(
-    manager: ParaSMemoryManager,
-    num_layers: int,
-    prefix: str = "model",
-    layer_specs: Optional[list] = None,
-) -> None:
-    """No-op: KV aliases are now created during materialize() via _create_kv_layout.
-
-    Kept for backward compatibility with callers (e.g. qwen3_moe.py).
-    """
-    for i in range(num_layers):
-        for suffix in ("ep.k", "ep.v", "tp.k", "tp.v"):
-            name = f"{prefix}.layers.{i}.kv.{suffix}"
-            if name not in manager._entries:
-                raise RuntimeError(
-                    f"Expected KV alias '{name}' missing — was reserve_kv_cache() "
-                    f"called before materialize()?"
-                )
