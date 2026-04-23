@@ -442,5 +442,64 @@ class TestPeerAccessPerDestCap:
         assert tp_pos == [1, 2, 3, 4]
 
 
+class TestSWAFullToSwaDtype:
+    """Verify _full_to_swa preserves caller's input dtype.
+
+    Peer-access CUDA bindings read token-index tensors as int32* (see
+    csrc/binding.cpp); NCCL paths use torch advanced indexing which needs
+    int64.  Both consumers go through _full_to_swa, so it must round-trip
+    dtype faithfully.  Regression guard for peer-access SWA corruption.
+    """
+
+    def _make_swa_transfer_with_mapping(self):
+        """Minimal SWACacheTransfer stub that only needs _full_to_swa_mapping."""
+        from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
+        # Bypass __init__ — we only need the mapping attribute for _full_to_swa.
+        stub = SWACacheTransfer.__new__(SWACacheTransfer)
+        # Non-trivial mapping so we can check translation correctness too.
+        # Full index i maps to SWA index (i * 3) % 17.
+        stub._full_to_swa_mapping = torch.tensor(
+            [(i * 3) % 17 for i in range(32)], dtype=torch.int64
+        )
+        return stub
+
+    def test_preserves_int32_dtype(self):
+        stub = self._make_swa_transfer_with_mapping()
+        full_idx = torch.tensor([1, 4, 7], dtype=torch.int32)
+        result = stub._full_to_swa(full_idx)
+        assert result.dtype == torch.int32, (
+            f"Expected int32 (peer-access contract), got {result.dtype}"
+        )
+        # Correctness: (1*3)%17=3, (4*3)%17=12, (7*3)%17=4.
+        assert result.tolist() == [3, 12, 4]
+
+    def test_preserves_int64_dtype(self):
+        stub = self._make_swa_transfer_with_mapping()
+        full_idx = torch.tensor([1, 4, 7], dtype=torch.int64)
+        result = stub._full_to_swa(full_idx)
+        assert result.dtype == torch.int64, (
+            f"Expected int64 (NCCL torch-indexing contract), got {result.dtype}"
+        )
+        assert result.tolist() == [3, 12, 4]
+
+    def test_none_and_empty_are_passthrough(self):
+        stub = self._make_swa_transfer_with_mapping()
+        assert stub._full_to_swa(None) is None
+        empty_i32 = torch.tensor([], dtype=torch.int32)
+        out = stub._full_to_swa(empty_i32)
+        # Empty tensor returned as-is; dtype must survive.
+        assert out.numel() == 0
+        assert out.dtype == torch.int32
+
+    def test_missing_mapping_is_passthrough(self):
+        """If allocator didn't attach a mapping, pass through unchanged."""
+        from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
+        stub = SWACacheTransfer.__new__(SWACacheTransfer)
+        stub._full_to_swa_mapping = None
+        t = torch.tensor([1, 2, 3], dtype=torch.int32)
+        out = stub._full_to_swa(t)
+        assert out is t  # identity — no copy
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

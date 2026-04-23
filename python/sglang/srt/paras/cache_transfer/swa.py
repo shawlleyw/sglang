@@ -252,12 +252,21 @@ class SWACacheTransfer(CacheTransferBase):
         )
 
     def _full_to_swa(self, full_indices: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """Translate full-pool indices to SWA-pool indices."""
+        """Translate full-pool indices to SWA-pool indices.
+
+        Preserves the caller's input dtype.  The peer-access CUDA bindings
+        (see ``csrc/binding.cpp``) read token-index tensors as ``int32*`` via
+        ``data_ptr<int>()`` with no runtime dtype check.  NCCL gather/scatter
+        helpers use torch advanced indexing which needs int64.  Since both
+        consumers pass through this helper, preserve whatever dtype the
+        caller handed us so each path stays valid.
+        """
         if full_indices is None or full_indices.numel() == 0:
             return full_indices
         if self._full_to_swa_mapping is None:
             return full_indices
-        return self._full_to_swa_mapping[full_indices].to(torch.int64)
+        original_dtype = full_indices.dtype
+        return self._full_to_swa_mapping[full_indices.to(torch.int64)].to(original_dtype)
 
     def gather_one_layer(self, spec: LayerCacheSpec, **kwargs) -> None:
         layer_id = spec.layer_id
