@@ -339,12 +339,53 @@ class TestSWAIndexTranslation:
 
 
 class TestPeerAccessPerDestCap:
-    """Test C (P5): peer-access SWA scatter caps per-destination, not globally."""
+    """Test C (P5): peer-access SWA scatter caps per-destination, not globally.
 
-    def test_per_destination_capping(self):
-        from sglang.srt.paras.cache_transfer.swa import _do_scatter_one_layer_peer_access_swa
+    After the scatter refactor, SWA-specific capping and index translation
+    live in SWACacheTransfer precompute methods.  These tests exercise the
+    full scatter_one_layer path with a mocked shared helper.
+    """
+
+    def _make_swa_stub_for_peer_access(self, token_partition, global_token_indices,
+                                        group_size, num_kv_heads, mapping=None):
+        from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
+
+        stub = SWACacheTransfer.__new__(SWACacheTransfer)
+        device = "cpu"
+        stub.token_partition = token_partition
+        stub.global_token_indices = global_token_indices
+        stub.group_size = group_size
+        stub._num_kv_heads = num_kv_heads
+        stub._replication_factor = (
+            group_size // num_kv_heads if num_kv_heads < group_size else 1
+        )
+        stub.paras_tp_rank = 0
+        stub.paras_tp_size = 1
+        stub._heads_per_rank = 1
+        stub._head_dim = 64
+        stub._elem_size = 2
+        stub._local_buffer_ptr = 0
+        stub._peer_buffer_ptrs = torch.zeros(group_size, dtype=torch.int64)
+        stub._full_to_swa_mapping = mapping
+        stub.method = "peer_access"
+        stub.ep_dst_positions = None
+
+        class _StubEntry:
+            offset_bytes = 0
+        class _StubMgr:
+            _entries = {}
+        stub_mgr = _StubMgr()
+        for name in [
+            "model.layers.0.kv.tp.k", "model.layers.0.kv.tp.v",
+            "model.layers.0.kv.ep.k", "model.layers.0.kv.ep.v",
+        ]:
+            stub_mgr._entries[name] = _StubEntry()
+        stub.mgr = stub_mgr
+        return stub
+
+    def test_per_destination_capping(self, monkeypatch):
+        import sglang.srt.paras.cache_transfer.swa as swa_mod
         from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
-        from unittest.mock import MagicMock, patch
 
         spec = LayerCacheSpec(
             layer_id=0, kind='swa', tokens_cap_ep=3,
@@ -360,29 +401,23 @@ class TestPeerAccessPerDestCap:
         global_token_indices = torch.arange(1, 16, dtype=torch.int64)
 
         captured_args = {}
-        mock_cuda = MagicMock()
-        def capture_launch(*args):
-            captured_args['tp_positions'] = args[2]
-            captured_args['token_to_rank'] = args[3]
-            captured_args['ep_dst_pos'] = args[4]
-            captured_args['layer_num'] = args[9]
-        mock_cuda.launch_peer_access_kv_scatter = capture_launch
+        def fake_scatter_peer_access(
+            local_buffer_ptr, peer_buffer_ptrs, tp_token_positions, token_to_rank,
+            ep_dst_pos_all, src_k_offset, src_v_offset, dst_k_offset, dst_v_offset,
+            num_my_tokens, layer_id, heads_per_rank, num_kv_heads,
+            paras_tp_rank, paras_tp_size, head_dim, elem_size,
+        ):
+            captured_args['tp_positions'] = tp_token_positions
+            captured_args['token_to_rank'] = token_to_rank
+            captured_args['ep_dst_pos'] = ep_dst_pos_all
+            captured_args['layer_num'] = num_my_tokens
 
-        with patch.dict('sys.modules', {'paras_peer_access_cuda': mock_cuda}):
-            _do_scatter_one_layer_peer_access_swa(
-                spec=spec,
-                local_buffer_ptr=0,
-                peer_buffer_ptrs=torch.zeros(3, dtype=torch.int64),
-                src_k_offset=0, src_v_offset=0,
-                dst_k_offset=0, dst_v_offset=0,
-                heads_per_rank=1, num_kv_heads=4,
-                paras_tp_rank=0, paras_tp_size=1,
-                head_dim=64, elem_size=2,
-                token_partition=token_partition,
-                global_token_indices=global_token_indices,
-                group_size=3,
-                full_to_swa_mapping=None,
-            )
+        monkeypatch.setattr(swa_mod, "do_scatter_one_layer_peer_access", fake_scatter_peer_access)
+
+        stub = self._make_swa_stub_for_peer_access(
+            token_partition, global_token_indices, group_size=3, num_kv_heads=4,
+        )
+        stub.scatter_one_layer(spec)
 
         assert captured_args['layer_num'] == 9, (
             f"Expected 3 dests * 3 tokens/dest = 9, got {captured_args['layer_num']}"
@@ -393,10 +428,9 @@ class TestPeerAccessPerDestCap:
         assert ranks.count(1) == 3
         assert ranks.count(2) == 3
 
-    def test_per_destination_capping_with_translation(self):
-        from sglang.srt.paras.cache_transfer.swa import _do_scatter_one_layer_peer_access_swa
+    def test_per_destination_capping_with_translation(self, monkeypatch):
+        import sglang.srt.paras.cache_transfer.swa as swa_mod
         from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
-        from unittest.mock import MagicMock, patch
 
         spec = LayerCacheSpec(
             layer_id=0, kind='swa', tokens_cap_ep=2,
@@ -414,28 +448,23 @@ class TestPeerAccessPerDestCap:
         mapping[50] = 3; mapping[60] = 4
 
         captured_args = {}
-        mock_cuda = MagicMock()
-        def capture_launch(*args):
-            captured_args['tp_positions'] = args[2]
-            captured_args['ep_dst_pos'] = args[4]
-            captured_args['layer_num'] = args[9]
-        mock_cuda.launch_peer_access_kv_scatter = capture_launch
+        def fake_scatter_peer_access(
+            local_buffer_ptr, peer_buffer_ptrs, tp_token_positions, token_to_rank,
+            ep_dst_pos_all, src_k_offset, src_v_offset, dst_k_offset, dst_v_offset,
+            num_my_tokens, layer_id, heads_per_rank, num_kv_heads,
+            paras_tp_rank, paras_tp_size, head_dim, elem_size,
+        ):
+            captured_args['tp_positions'] = tp_token_positions
+            captured_args['ep_dst_pos'] = ep_dst_pos_all
+            captured_args['layer_num'] = num_my_tokens
 
-        with patch.dict('sys.modules', {'paras_peer_access_cuda': mock_cuda}):
-            _do_scatter_one_layer_peer_access_swa(
-                spec=spec,
-                local_buffer_ptr=0,
-                peer_buffer_ptrs=torch.zeros(2, dtype=torch.int64),
-                src_k_offset=0, src_v_offset=0,
-                dst_k_offset=0, dst_v_offset=0,
-                heads_per_rank=1, num_kv_heads=4,
-                paras_tp_rank=0, paras_tp_size=1,
-                head_dim=64, elem_size=2,
-                token_partition=token_partition,
-                global_token_indices=global_token_indices,
-                group_size=2,
-                full_to_swa_mapping=mapping,
-            )
+        monkeypatch.setattr(swa_mod, "do_scatter_one_layer_peer_access", fake_scatter_peer_access)
+
+        stub = self._make_swa_stub_for_peer_access(
+            token_partition, global_token_indices, group_size=2, num_kv_heads=4,
+            mapping=mapping,
+        )
+        stub.scatter_one_layer(spec)
 
         assert captured_args['layer_num'] == 4
         tp_pos = captured_args['tp_positions'].tolist()
@@ -499,6 +528,179 @@ class TestSWAFullToSwaDtype:
         t = torch.tensor([1, 2, 3], dtype=torch.int32)
         out = stub._full_to_swa(t)
         assert out is t  # identity — no copy
+
+
+class TestSWAScatterRefactor:
+    """Verify the refactored SWA scatter delegates to shared helpers correctly."""
+
+    def _make_swa_stub(self, token_partition, mapping_values,
+                        global_token_indices=None):
+        from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
+        stub = SWACacheTransfer.__new__(SWACacheTransfer)
+
+        device = "cpu"
+        n_tokens = sum(len(p) for p in token_partition)
+        if global_token_indices is not None:
+            stub.global_token_indices = global_token_indices
+        else:
+            stub.global_token_indices = torch.arange(
+                n_tokens, dtype=torch.long, device=device)
+
+        stub.token_partition = token_partition
+        stub.ep_dst_positions = torch.arange(
+            1, len(token_partition[0]) + 1, dtype=torch.long, device=device,
+        )
+        stub.group_size = len(token_partition)
+        stub._intra_rank = 0
+        stub._replication_factor = 1
+        stub._per_token_elems = 8
+        stub._recv_full_count = len(token_partition[0])
+        stub._num_kv_heads = 4
+        stub._heads_per_rank = 1
+        stub._head_dim = 4
+        stub._total_global_tokens = n_tokens
+        stub._reassembly_groups = len(token_partition)
+        stub.ep_head_num = 4
+        stub.paras_tp_rank = 0
+        stub.paras_tp_size = 4
+        stub.method = "nccl"
+        stub._full_to_swa_mapping = torch.tensor(
+            mapping_values, dtype=torch.int64, device=device)
+
+        class _StubKv:
+            store_dtype = torch.bfloat16
+            device = "cpu"
+            head_num = 1
+            head_dim = 4
+        stub.kv_cache = _StubKv()
+        stub.mgr = object()
+        stub.group = object()
+
+        stub._local_buffer_ptr = 0
+        stub._peer_buffer_ptrs = torch.empty(0, dtype=torch.int64, device=device)
+        stub._elem_size = 2
+
+        return stub
+
+    def test_nccl_scatter_caps_per_destination(self, monkeypatch):
+        import sglang.srt.paras.cache_transfer.swa as swa_mod
+        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+
+        captured = {}
+        def fake_scatter_nccl(
+            kv_cache, ep_head_num, layer_id, token_partition, group_size,
+            intra_rank, replication_factor, per_token_elems,
+            global_token_indices, ep_dst_positions, sorted_tp_indices,
+            total_send_tokens, input_split_sizes, recv_full_count,
+            output_split_sizes, total_recv_elems,
+            num_kv_heads, heads_per_rank, head_dim, total_global_tokens,
+            reassembly_groups, mgr, gather_group,
+        ):
+            captured["input_split_sizes"] = input_split_sizes
+            captured["output_split_sizes"] = output_split_sizes
+            captured["sorted_tp_indices"] = sorted_tp_indices
+            captured["total_send_tokens"] = total_send_tokens
+            captured["recv_full_count"] = recv_full_count
+
+        monkeypatch.setattr(swa_mod, "do_scatter_one_layer_nccl", fake_scatter_nccl)
+
+        token_partition = [[0, 1, 2, 3, 4], [5, 6, 7], [8, 9, 10, 11, 12, 13, 14]]
+        mapping = list(range(50))
+        stub = self._make_swa_stub(token_partition, mapping)
+        stub._recv_full_count = 5
+        stub.method = "nccl"
+
+        spec = LayerCacheSpec(
+            layer_id=0, kind="swa", tokens_cap_ep=3, tokens_cap_tp=0,
+            num_kv_heads=4, head_dim=4, sliding_window_size=10,
+        )
+        stub.scatter_one_layer(spec)
+
+        expected_send = [3 * stub._per_token_elems] * 3
+        assert captured["input_split_sizes"] == expected_send, (
+            f"Per-destination cap failed: {captured['input_split_sizes']} != {expected_send}"
+        )
+        assert captured["total_send_tokens"] == 9
+        assert captured["recv_full_count"] == 3
+
+    def test_nccl_scatter_translates_indices_to_swa_space(self, monkeypatch):
+        import sglang.srt.paras.cache_transfer.swa as swa_mod
+        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+
+        captured = {}
+        def fake_scatter_nccl(*args, **kwargs):
+            captured["ep_dst_positions"] = args[9]
+            captured["sorted_tp_indices"] = args[10]
+
+        monkeypatch.setattr(swa_mod, "do_scatter_one_layer_nccl", fake_scatter_nccl)
+
+        token_partition = [[0, 1], [2, 3]]
+        global_token_indices = torch.tensor([3, 7, 11, 19], dtype=torch.long)
+        mapping = [2 * i + 1 for i in range(50)]
+        stub = self._make_swa_stub(token_partition, mapping,
+                                    global_token_indices=global_token_indices)
+        stub._recv_full_count = 2
+
+        spec = LayerCacheSpec(
+            layer_id=0, kind="swa", tokens_cap_ep=10, tokens_cap_tp=0,
+            num_kv_heads=4, head_dim=4, sliding_window_size=10,
+        )
+        stub.scatter_one_layer(spec)
+
+        expected_swa = [7, 15, 23, 39]
+        actual = captured["sorted_tp_indices"].tolist()
+        assert actual == expected_swa, (
+            f"sorted_tp_indices not translated to SWA space: {actual} != {expected_swa}"
+        )
+
+    def test_peer_access_scatter_delegates_with_int32_indices(self, monkeypatch):
+        import sglang.srt.paras.cache_transfer.swa as swa_mod
+        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+
+        captured = {}
+        def fake_scatter_peer_access(
+            local_buffer_ptr, peer_buffer_ptrs, tp_token_positions, token_to_rank,
+            ep_dst_pos_all, src_k_offset, src_v_offset, dst_k_offset, dst_v_offset,
+            num_my_tokens, layer_id, heads_per_rank, num_kv_heads,
+            paras_tp_rank, paras_tp_size, head_dim, elem_size,
+        ):
+            captured["tp_positions"] = tp_token_positions
+            captured["token_to_rank"] = token_to_rank
+            captured["ep_dst_pos"] = ep_dst_pos_all
+            captured["num_my_tokens"] = num_my_tokens
+
+        monkeypatch.setattr(swa_mod, "do_scatter_one_layer_peer_access", fake_scatter_peer_access)
+
+        class _StubEntry:
+            offset_bytes = 0
+        class _StubMgr:
+            _entries = {
+                "model.layers.0.kv.tp.k": _StubEntry(),
+                "model.layers.0.kv.tp.v": _StubEntry(),
+                "model.layers.0.kv.ep.k": _StubEntry(),
+                "model.layers.0.kv.ep.v": _StubEntry(),
+            }
+
+        token_partition = [[0, 1], [2, 3]]
+        global_token_indices = torch.tensor([3, 7, 11, 19], dtype=torch.long)
+        mapping = [2 * i + 1 for i in range(50)]
+        stub = self._make_swa_stub(token_partition, mapping,
+                                    global_token_indices=global_token_indices)
+        stub.method = "peer_access"
+        stub.mgr = _StubMgr()
+
+        spec = LayerCacheSpec(
+            layer_id=0, kind="swa", tokens_cap_ep=10, tokens_cap_tp=0,
+            num_kv_heads=4, head_dim=4, sliding_window_size=10,
+        )
+        stub.scatter_one_layer(spec)
+
+        assert captured["tp_positions"].dtype == torch.int32, (
+            f"tp_positions dtype = {captured['tp_positions'].dtype}, expected int32"
+        )
+        assert captured["token_to_rank"].dtype == torch.int32
+        assert captured["ep_dst_pos"].dtype == torch.int32
+        assert captured["num_my_tokens"] == 4
 
 
 if __name__ == "__main__":

@@ -1,225 +1,16 @@
 """SWA (Sliding Window Attention) cache transfer backend for ParaS."""
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 
 from sglang.srt.paras.cache_transfer.base import CacheTransferBase, LayerCacheSpec
 from sglang.srt.paras.cache_transfer.utils import (
     do_gather_one_layer_nccl,
     do_gather_one_layer_peer_access,
-    gather_tp_kv_and_permute,
-    permute_and_scatter_kv_to_ep,
+    do_scatter_one_layer_nccl,
+    do_scatter_one_layer_peer_access,
 )
-
-
-# ------------------------------------------------------------------
-# SWA-cap-aware scatter helpers
-# ------------------------------------------------------------------
-
-def _do_scatter_one_layer_nccl_swa(
-    spec: "LayerCacheSpec",
-    kv_cache,
-    ep_head_num: int,
-    token_partition: List[List[int]],
-    group_size: int,
-    intra_rank: int,
-    replication_factor: int,
-    per_token_elems: int,
-    global_token_indices: torch.Tensor,
-    ep_dst_positions: Optional[torch.Tensor],
-    recv_full_count: int,
-    num_kv_heads: int,
-    heads_per_rank: int,
-    head_dim: int,
-    total_global_tokens: int,
-    reassembly_groups: int,
-    mgr,
-    gather_group,
-    full_to_swa_mapping: Optional[torch.Tensor],
-) -> None:
-    cap = spec.tokens_cap_ep
-    layer_id = spec.layer_id
-
-    swa_send_counts: List[int] = []
-    swa_parts: List[torch.Tensor] = []
-    for e in range(group_size):
-        full = len(token_partition[e])
-        capped = min(full, cap)
-        my_s = capped * intra_rank // replication_factor
-        my_e = capped * (intra_rank + 1) // replication_factor
-        my_cnt = my_e - my_s
-        swa_send_counts.append(my_cnt)
-        if my_cnt > 0:
-            part_idx = torch.tensor(
-                token_partition[e][my_s:my_e],
-                dtype=torch.long,
-                device=global_token_indices.device,
-            )
-            swa_parts.append(global_token_indices[part_idx])
-
-    total_send = sum(swa_send_counts)
-    input_split = [cnt * per_token_elems for cnt in swa_send_counts]
-    tp_indices = (
-        torch.cat(swa_parts)
-        if swa_parts
-        else torch.empty(0, dtype=torch.long, device=global_token_indices.device)
-    )
-
-    # P4 fix: translate TP-side indices from full-pool to SWA-pool space
-    # before reading from the SWA k/v buffers.
-    if full_to_swa_mapping is not None and tp_indices.numel() > 0:
-        tp_indices = full_to_swa_mapping[tp_indices].to(torch.int64)
-
-    recv_full = min(recv_full_count, cap)
-    swa_recv_counts: List[int] = []
-    for src in range(group_size):
-        si = src % replication_factor
-        s = recv_full * si // replication_factor
-        e_i = recv_full * (si + 1) // replication_factor
-        swa_recv_counts.append(e_i - s)
-    output_split = [cnt * per_token_elems for cnt in swa_recv_counts]
-    total_recv = sum(output_split)
-    dst_pos = (
-        ep_dst_positions[:recv_full]
-        if ep_dst_positions is not None and recv_full > 0
-        else ep_dst_positions
-    )
-
-    # P4 fix: translate EP-side destination positions from full-pool to
-    # SWA-pool space before writing into the SWA EP buffer.
-    if full_to_swa_mapping is not None and dst_pos is not None and dst_pos.numel() > 0:
-        dst_pos = full_to_swa_mapping[dst_pos].to(torch.int64)
-
-    if total_send > 0:
-        k_buf = kv_cache.get_key_buffer(layer_id)
-        v_buf = kv_cache.get_value_buffer(layer_id)
-        send_buf = gather_tp_kv_and_permute(
-            k_buf, v_buf, tp_indices,
-            num_kv_heads, heads_per_rank, head_dim, group_size,
-        )
-    else:
-        send_buf = torch.empty(
-            0, dtype=kv_cache.store_dtype, device=kv_cache.device
-        )
-
-    if total_global_tokens > 0:
-        recv_buf = torch.empty(
-            total_recv,
-            dtype=kv_cache.store_dtype,
-            device=kv_cache.device,
-        )
-        dist.all_to_all_single(
-            recv_buf, send_buf,
-            output_split, input_split,
-            group=gather_group.device_group,
-        )
-
-        if recv_full > 0:
-            ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
-            ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
-            total_elements = mgr._entries[ep_k_name].numel
-            ep_slots = total_elements // (num_kv_heads * head_dim)
-            ep_shape = (ep_slots, num_kv_heads, head_dim)
-            ep_k = mgr.get_view_as(ep_k_name, ep_shape)
-            ep_v = mgr.get_view_as(ep_v_name, ep_shape)
-            permute_and_scatter_kv_to_ep(
-                recv_buf, ep_k, ep_v, dst_pos,
-                recv_full, num_kv_heads, heads_per_rank,
-                head_dim, reassembly_groups,
-            )
-
-
-def _do_scatter_one_layer_peer_access_swa(
-    spec: "LayerCacheSpec",
-    local_buffer_ptr: int,
-    peer_buffer_ptrs: torch.Tensor,
-    src_k_offset: int,
-    src_v_offset: int,
-    dst_k_offset: int,
-    dst_v_offset: int,
-    heads_per_rank: int,
-    num_kv_heads: int,
-    paras_tp_rank: int,
-    paras_tp_size: int,
-    head_dim: int,
-    elem_size: int,
-    token_partition: List[List[int]],
-    global_token_indices: torch.Tensor,
-    group_size: int,
-    full_to_swa_mapping: Optional[torch.Tensor],
-) -> None:
-    """SWA peer-access scatter with per-destination cap and index translation.
-
-    Recomputes per-destination capped slices at dispatch time (Option Z from
-    the task spec) to avoid touching base.py.  Translates both TP source
-    positions and EP destination positions from full-pool to SWA-pool space.
-    """
-    import paras_peer_access_cuda
-
-    cap = spec.tokens_cap_ep
-    replication_factor = (
-        group_size // num_kv_heads if num_kv_heads < group_size else 1
-    )
-    intra_rank = paras_tp_rank % replication_factor
-
-    # Recompute per-destination capped slices (mirrors NCCL SWA path).
-    capped_global_indices: List[int] = []
-    capped_dst_ranks: List[int] = []
-    capped_ep_dst_pos: List[int] = []
-    for e in range(group_size):
-        full_tokens = token_partition[e]
-        full = len(full_tokens)
-        capped = min(full, cap)
-        my_start = capped * intra_rank // replication_factor
-        my_end = capped * (intra_rank + 1) // replication_factor
-        my_slice = full_tokens[my_start:my_end]
-        for local_idx, global_idx in enumerate(my_slice):
-            capped_global_indices.append(global_idx)
-            capped_dst_ranks.append(e)
-            # EP destination position: offset within the destination's allocation.
-            # +1 because slot 0 is the padding slot.
-            capped_ep_dst_pos.append(my_start + local_idx + 1)
-
-    layer_num = len(capped_global_indices)
-    if layer_num > 0:
-        device = global_token_indices.device
-        gi_tensor = torch.tensor(
-            capped_global_indices, dtype=torch.long, device=device
-        )
-        tp_positions = global_token_indices[gi_tensor].to(torch.int32)
-        token_to_rank = torch.tensor(
-            capped_dst_ranks, dtype=torch.int32, device=device
-        )
-        ep_dst_pos = torch.tensor(
-            capped_ep_dst_pos, dtype=torch.int32, device=device
-        )
-
-        # P5 fix (b): translate from full-pool to SWA-pool index space.
-        if full_to_swa_mapping is not None:
-            tp_positions = full_to_swa_mapping[tp_positions.to(torch.int64)].to(torch.int32)
-            ep_dst_pos = full_to_swa_mapping[ep_dst_pos.to(torch.int64)].to(torch.int32)
-
-        paras_peer_access_cuda.launch_peer_access_kv_scatter(
-            local_buffer_ptr,
-            peer_buffer_ptrs,
-            tp_positions,
-            token_to_rank,
-            ep_dst_pos,
-            src_k_offset,
-            src_v_offset,
-            dst_k_offset,
-            dst_v_offset,
-            layer_num,
-            heads_per_rank,
-            num_kv_heads,
-            paras_tp_rank,
-            paras_tp_size,
-            head_dim,
-            elem_size,
-            0,  # default stream
-        )
 
 
 class SWACacheTransfer(CacheTransferBase):
@@ -267,6 +58,94 @@ class SWACacheTransfer(CacheTransferBase):
             return full_indices
         original_dtype = full_indices.dtype
         return self._full_to_swa_mapping[full_indices.to(torch.int64)].to(original_dtype)
+
+    def _compute_swa_scatter_splits_nccl(
+        self, cap: int,
+    ) -> Tuple[torch.Tensor, int, List[int], int, List[int], int]:
+        """Cap-aware NCCL scatter splits: ``min(full, cap)`` per destination."""
+        group_size = self.group_size
+        intra_rank = self._intra_rank
+        replication_factor = self._replication_factor
+        per_token_elems = self._per_token_elems
+        send_counts: List[int] = []
+        sorted_parts: List[torch.Tensor] = []
+        for e in range(group_size):
+            capped = min(len(self.token_partition[e]), cap)
+            my_s = capped * intra_rank // replication_factor
+            my_e = capped * (intra_rank + 1) // replication_factor
+            my_cnt = my_e - my_s
+            send_counts.append(my_cnt)
+            if my_cnt > 0:
+                part_idx = torch.tensor(
+                    self.token_partition[e][my_s:my_e],
+                    dtype=torch.long,
+                    device=self.global_token_indices.device,
+                )
+                sorted_parts.append(self.global_token_indices[part_idx])
+
+        total_send_tokens = sum(send_counts)
+        input_split_sizes = [c * per_token_elems for c in send_counts]
+
+        sorted_tp_indices = (
+            torch.cat(sorted_parts) if sorted_parts
+            else torch.empty(0, dtype=torch.long,
+                             device=self.global_token_indices.device)
+        )
+
+        recv_full_capped = min(self._recv_full_count, cap)
+        recv_counts: List[int] = []
+        for src in range(group_size):
+            src_intra = src % replication_factor
+            s = recv_full_capped * src_intra // replication_factor
+            e_idx = recv_full_capped * (src_intra + 1) // replication_factor
+            recv_counts.append(e_idx - s)
+
+        output_split_sizes = [c * per_token_elems for c in recv_counts]
+        total_recv_elems = sum(output_split_sizes)
+
+        return (sorted_tp_indices, total_send_tokens, input_split_sizes,
+                recv_full_capped, output_split_sizes, total_recv_elems)
+
+    def _compute_swa_scatter_slices_peer_access(
+        self, cap: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], int]:
+        """Cap-aware per-destination slices returning int32 tensors for peer-access."""
+        group_size = self.group_size
+        replication_factor = self._replication_factor
+        intra_rank = self.paras_tp_rank % replication_factor
+
+        capped_global_indices: List[int] = []
+        capped_dst_ranks: List[int] = []
+        capped_ep_dst_pos: List[int] = []
+        for e in range(group_size):
+            full_tokens = self.token_partition[e]
+            full = len(full_tokens)
+            capped = min(full, cap)
+            my_s = capped * intra_rank // replication_factor
+            my_e = capped * (intra_rank + 1) // replication_factor
+            my_slice = full_tokens[my_s:my_e]
+            for local_idx, global_idx in enumerate(my_slice):
+                capped_global_indices.append(global_idx)
+                capped_dst_ranks.append(e)
+                # +1: slot 0 is the padding slot.
+                capped_ep_dst_pos.append(my_s + local_idx + 1)
+
+        layer_num = len(capped_global_indices)
+        if layer_num == 0:
+            return None, None, None, 0
+
+        device = self.global_token_indices.device
+        gi_tensor = torch.tensor(
+            capped_global_indices, dtype=torch.long, device=device
+        )
+        tp_positions = self.global_token_indices[gi_tensor].to(torch.int32)
+        token_to_rank = torch.tensor(
+            capped_dst_ranks, dtype=torch.int32, device=device
+        )
+        ep_dst_pos = torch.tensor(
+            capped_ep_dst_pos, dtype=torch.int32, device=device
+        )
+        return tp_positions, token_to_rank, ep_dst_pos, layer_num
 
     def gather_one_layer(self, spec: LayerCacheSpec, **kwargs) -> None:
         layer_id = spec.layer_id
@@ -355,19 +234,34 @@ class SWACacheTransfer(CacheTransferBase):
             )
 
     def scatter_one_layer(self, spec: LayerCacheSpec, **kwargs) -> None:
+        cap = spec.tokens_cap_ep
         if self.method == "nccl":
-            _do_scatter_one_layer_nccl_swa(
-                spec,
+            (sorted_tp_indices_full, total_send_tokens, input_split_sizes,
+             recv_full_capped, output_split_sizes, total_recv_elems,
+             ) = self._compute_swa_scatter_splits_nccl(cap)
+            sorted_tp_indices_swa = self._full_to_swa(sorted_tp_indices_full)
+            if self.ep_dst_positions is not None and recv_full_capped > 0:
+                ep_dst_pos_swa = self._full_to_swa(
+                    self.ep_dst_positions[:recv_full_capped])
+            else:
+                ep_dst_pos_swa = self.ep_dst_positions
+            do_scatter_one_layer_nccl(
                 self.kv_cache,
                 self.ep_head_num,
+                spec.layer_id,
                 self.token_partition,
                 self.group_size,
                 self._intra_rank,
                 self._replication_factor,
                 self._per_token_elems,
                 self.global_token_indices,
-                self.ep_dst_positions,
-                self._recv_full_count,
+                ep_dst_pos_swa,
+                sorted_tp_indices_swa,
+                total_send_tokens,
+                input_split_sizes,
+                recv_full_capped,
+                output_split_sizes,
+                total_recv_elems,
                 self._num_kv_heads,
                 self._heads_per_rank,
                 self._head_dim,
@@ -375,32 +269,36 @@ class SWACacheTransfer(CacheTransferBase):
                 self._reassembly_groups,
                 self.mgr,
                 self.group,
-                self._full_to_swa_mapping,
             )
         else:
             tp_k_name = f"model.layers.{spec.layer_id}.kv.tp.k"
             tp_v_name = f"model.layers.{spec.layer_id}.kv.tp.v"
             ep_k_name = f"model.layers.{spec.layer_id}.kv.ep.k"
             ep_v_name = f"model.layers.{spec.layer_id}.kv.ep.v"
-
-            _do_scatter_one_layer_peer_access_swa(
-                spec,
+            tp_positions_full, token_to_rank, ep_dst_pos_full, layer_num = \
+                self._compute_swa_scatter_slices_peer_access(cap)
+            if layer_num == 0:
+                return
+            tp_positions_swa = self._full_to_swa(tp_positions_full)
+            ep_dst_pos_swa = self._full_to_swa(ep_dst_pos_full)
+            do_scatter_one_layer_peer_access(
                 self._local_buffer_ptr,
                 self._peer_buffer_ptrs,
+                tp_positions_swa,
+                token_to_rank,
+                ep_dst_pos_swa,
                 self.mgr._entries[tp_k_name].offset_bytes,
                 self.mgr._entries[tp_v_name].offset_bytes,
                 self.mgr._entries[ep_k_name].offset_bytes,
                 self.mgr._entries[ep_v_name].offset_bytes,
+                layer_num,
+                spec.layer_id,
                 self._heads_per_rank,
                 self._num_kv_heads,
                 self.paras_tp_rank,
                 self.paras_tp_size,
                 self._head_dim,
                 self._elem_size,
-                self.token_partition,
-                self.global_token_indices,
-                self.group_size,
-                self._full_to_swa_mapping,
             )
 
 
