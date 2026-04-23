@@ -1,5 +1,6 @@
 """SWA (Sliding Window Attention) cache transfer backend for ParaS."""
 
+import warnings
 from typing import List, Optional, Tuple
 
 import torch
@@ -35,12 +36,42 @@ class SWACacheTransfer(CacheTransferBase):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._warn_if_head_replication()
         # SWAKVPool.full_to_swa_index_mapping is set by
         # SWATokenToKVPoolAllocator.__init__ (allocator.py:224) and kept in
         # sync on every paras_resize_and_clear (allocator.py:318).
         self._full_to_swa_mapping = getattr(
             self.kv_cache, "full_to_swa_index_mapping", None
         )
+
+    def _warn_if_head_replication(self) -> None:
+        """Emit a UserWarning when SWA + head replication is in use.
+
+        ``test_swa_kv_cache_transfer_replication.py`` validates the
+        replication-aware paths in ``_compute_swa_scatter_*()`` at R=2
+        on 4 GPUs, but production traffic at this combination is rare
+        (GPT-OSS / Gemma typically have ``num_kv_heads >= paras_tp_size``).
+        Surface a warning so deployments that hit this combo can flag
+        it for extra scrutiny rather than failing silently if a future
+        edge case slips past the tests.
+        """
+        group_size = self.group_size
+        num_kv_heads = (
+            self.kv_cache.head_num
+            if self.direction == "gather"
+            else self.ep_head_num
+        )
+        if num_kv_heads < group_size:
+            warnings.warn(
+                f"SWACacheTransfer with head replication "
+                f"(num_kv_heads={num_kv_heads}, paras_tp_size={group_size}, "
+                f"replication_factor={group_size // num_kv_heads}) is "
+                f"gate-tested at R=2 but rarely exercised in production. "
+                f"Verify correctness end-to-end before relying on this "
+                f"configuration.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def _full_to_swa(self, full_indices: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Translate full-pool indices to SWA-pool indices.

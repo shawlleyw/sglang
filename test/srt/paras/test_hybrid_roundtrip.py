@@ -702,5 +702,56 @@ class TestSWAScatterRefactor:
         assert captured["num_my_tokens"] == 4
 
 
+class TestSWAReplicationWarning:
+    """SWA + head replication is gate-tested at R=2 but warns on use.
+
+    ``test_swa_kv_cache_transfer_replication.py`` validates the path
+    end-to-end on 4 GPUs.  ``SWACacheTransfer.__init__`` still emits a
+    UserWarning so deployments that hit this combo flag it for extra
+    scrutiny.  Drive the warning directly to keep these tests CPU-only.
+    """
+
+    def _stub(self, *, direction, group_size, num_kv_heads, ep_head_num=None):
+        from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
+
+        stub = SWACacheTransfer.__new__(SWACacheTransfer)
+        stub.group_size = group_size
+        stub.direction = direction
+
+        class _KV:
+            head_num = num_kv_heads
+        stub.kv_cache = _KV()
+        stub.ep_head_num = num_kv_heads if ep_head_num is None else ep_head_num
+        return stub
+
+    def test_gather_replication_warns(self):
+        stub = self._stub(direction="gather", group_size=4, num_kv_heads=2)
+        with pytest.warns(UserWarning, match="head replication"):
+            stub._warn_if_head_replication()
+
+    def test_scatter_replication_warns(self):
+        stub = self._stub(direction="scatter", group_size=4, num_kv_heads=2)
+        with pytest.warns(UserWarning, match="head replication"):
+            stub._warn_if_head_replication()
+
+    def test_scatter_uses_ep_head_num_not_kv_cache(self):
+        stub = self._stub(
+            direction="scatter", group_size=4,
+            num_kv_heads=999, ep_head_num=2,
+        )
+        with pytest.warns(UserWarning, match="head replication"):
+            stub._warn_if_head_replication()
+
+    def test_no_replication_silent(self):
+        import warnings as _warnings
+        for direction, num_kv_heads in (("gather", 4), ("scatter", 8)):
+            stub = self._stub(
+                direction=direction, group_size=4, num_kv_heads=num_kv_heads,
+            )
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("error")
+                stub._warn_if_head_replication()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
