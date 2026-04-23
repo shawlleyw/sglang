@@ -1815,49 +1815,32 @@ class ModelRunner:
             )
         else:
             if self.is_hybrid:
-                _paras_swa_mgr = None
-                _paras_swa_layer_specs = None
+                _full_ep_k = _full_ep_v = _swa_ep_k = _swa_ep_v = None
                 if self.server_args.enable_paras_moe:
                     from sglang.srt.paras.paras_memory_manager import (
                         get_global_paras_memory_manager as _get_paras_mgr_swa,
                         _validate_paras_swa_runtime_scope,
-                    )
-                    from sglang.srt.paras.cache_transfer import (
-                        classify_layers_from_config,
                     )
 
                     _validate_paras_swa_runtime_scope(
                         self.server_args, self.model_config
                     )
                     _paras_swa_mgr = _get_paras_mgr_swa()
-                    if _paras_swa_mgr is not None:
-                        _pts = self.server_args.paras_tp_size
-                        _paras_swa_layer_specs = classify_layers_from_config(
-                            self.model_config.hf_config,
-                            tp_size=_pts,
-                            ep_tokens_full=self.full_max_total_num_tokens,
-                            tp_tokens_full=self.full_max_total_num_tokens * _pts,
-                            ep_tokens_swa=self.swa_max_total_num_tokens,
-                            tp_tokens_swa=self.swa_max_total_num_tokens * _pts,
+                    if (
+                        _paras_swa_mgr is not None
+                        and _paras_swa_mgr.materialized
+                        and _paras_swa_mgr._kv_reserved
+                    ):
+                        _full_ep_k, _full_ep_v = _paras_swa_mgr.get_kv_views(
+                            num_layers=len(self.model_config.full_attention_layer_ids),
+                            mode="ep",
+                            layer_ids=self.model_config.full_attention_layer_ids,
                         )
-
-                _full_ep_k = _full_ep_v = _swa_ep_k = _swa_ep_v = None
-                if (
-                    _paras_swa_mgr is not None
-                    and _paras_swa_mgr.materialized
-                    and _paras_swa_mgr._kv_reserved
-                    and _paras_swa_layer_specs is not None
-                ):
-                    _full_ep_k, _full_ep_v = _paras_swa_mgr.get_kv_views(
-                        num_layers=len(self.model_config.full_attention_layer_ids),
-                        mode="ep",
-                        layer_ids=self.model_config.full_attention_layer_ids,
-                    )
-                    _swa_ep_k, _swa_ep_v = _paras_swa_mgr.get_kv_views(
-                        num_layers=len(self.model_config.swa_attention_layer_ids),
-                        mode="ep",
-                        layer_ids=self.model_config.swa_attention_layer_ids,
-                    )
+                        _swa_ep_k, _swa_ep_v = _paras_swa_mgr.get_kv_views(
+                            num_layers=len(self.model_config.swa_attention_layer_ids),
+                            mode="ep",
+                            layer_ids=self.model_config.swa_attention_layer_ids,
+                        )
 
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,

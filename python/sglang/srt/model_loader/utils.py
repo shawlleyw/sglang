@@ -121,12 +121,18 @@ _PARAS_MODEL_REGISTRY: dict = {}
 def _get_paras_model_class(base_cls: Type[nn.Module]) -> Type[nn.Module]:
     """Look up the ParaS variant of a model class."""
     if not _PARAS_MODEL_REGISTRY:
-        # Lazy populate on first call
         try:
             from sglang.srt.paras.models.qwen3_moe import Qwen3MoeForCausalLMParaS
             from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 
             _PARAS_MODEL_REGISTRY[Qwen3MoeForCausalLM] = Qwen3MoeForCausalLMParaS
+        except ImportError:
+            pass
+        try:
+            from sglang.srt.paras.models.gpt_oss import GptOssForCausalLMParaS
+            from sglang.srt.models.gpt_oss import GptOssForCausalLM
+
+            _PARAS_MODEL_REGISTRY[GptOssForCausalLM] = GptOssForCausalLMParaS
         except ImportError:
             pass
 
