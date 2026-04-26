@@ -155,12 +155,24 @@ sliding layer counts according to `swa_full_tokens_ratio`. The resulting
 `LayerCacheSpec` entries that `manager.reserve_kv_cache` uses to materialize
 the right KV pool layout.
 
-The hybrid SWA+ParaS path was enabled after the dual-pool CUDA graph
-capture was verified to replay correctly across the two KV layouts. The
-`disable_hybrid_swa_memory = True` flag set by `_handle_attention_backend_compatibility`
-for GPT-OSS ensures the scheduler keeps sliding and full layers in a single
-memory pool rather than splitting them into separate pools, which
-simplifies the ParaS reservation and swap.
+The hybrid SWA+ParaS path is enabled by default. The runtime instantiates
+`SWAKVPool` (a container of `full_kv_pool` + `swa_kv_pool` with per-layer
+routing via `layers_mapping`) and `SWATokenToKVPoolAllocator` (dual sub-allocators
+plus a `full_to_swa_index_mapping` tensor). The scheduler reserves heterogeneous
+KV using `plan_hybrid_kv_budget` and `classify_layers_from_config`. Three
+defects had to be fixed before the dual-pool path was end-to-end correct
+on the gpt-oss-120b-bf16 + 4×A100 + Triton + cuda-graph configuration:
+(1) `SWAKVPool.paras_configure_tp/ep` used `get_view` (which returns the
+EP-shaped LayoutEntry) instead of `get_view_as` with an explicit TP shape,
+so the inner sub-pools' k/v buffers kept the EP head count after the switch;
+(2) `Scheduler.full_tokens_per_layer` and `swa_tokens_per_layer` were not
+refreshed after the allocator resized, so the runtime memory-leak detector
+falsely flagged a leak on the first decode; (3) `paras_resize_and_clear`
+unconditionally allocated a fresh `full_to_swa_index_mapping` tensor, which
+invalidated the `data_ptr` baked into captured cuda graphs at boot. Fix
+(3) pre-grows the mapping at allocator construction time to the TP-mode
+max size and zeros it in place on subsequent resizes, keeping `data_ptr`
+stable across switches.
 
 ### DP-Attention in EP Mode
 
