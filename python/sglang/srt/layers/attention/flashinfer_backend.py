@@ -204,6 +204,22 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             self.workspace_buffer = global_workspace_buffer
         max_bs = model_runner.req_to_token_pool.size
+        # ParaS: when EP↔TP switching is enabled, ``req_to_token_pool`` is
+        # resized by ``paras_tp_size`` during EP→TP (see
+        # ``ParaSReqGatherManager.reorchestrate_cache``: ``new_req_pool_size =
+        # self.req_to_token_pool.size * self.group_size``). Pre-size these
+        # runtime metadata buffers (``kv_indptr``, ``kv_last_page_len``,
+        # ``qo_indptr``) to the larger TP capacity so the eager metadata-setup
+        # path does not overflow after the switch. Without this,
+        # ``kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)`` raises a
+        # shape mismatch (or illegal memory access) when the TP-mode
+        # ``forward_batch.batch_size`` exceeds the original EP-local pool size.
+        # See ``docs/paras/runs/2026-04-26-flashinfer-paras-buffer-capacity.md``.
+        server_args = getattr(model_runner, "server_args", None)
+        if server_args is not None and getattr(server_args, "enable_paras_moe", False):
+            paras_tp_size = getattr(server_args, "paras_tp_size", 1) or 1
+            if paras_tp_size > 1:
+                max_bs = max_bs * paras_tp_size
         if kv_indptr_buf is None:
             self.kv_indptr = [
                 torch.zeros(
