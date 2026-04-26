@@ -29,7 +29,6 @@ from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 from sglang.srt.paras.paras_memory_manager import (
     ParaSMemoryManager,
     create_paras_moe_aliases,
-    create_paras_kv_aliases,
     plan_qwen_moe_layout,
     set_global_paras_memory_manager,
 )
@@ -56,7 +55,9 @@ class Qwen3MoeSparseMoeBlockParaS(ParaSMoeBlockMixin, Qwen3MoeSparseMoeBlock):
 
     def __init__(self, layer_id, config, quant_config=None, prefix=""):
         super().__init__(layer_id, config, quant_config, prefix)
-        self.paras_init_moe(config, quant_config, prefix, layer_id)
+        self.paras_init_moe(
+            config, quant_config, prefix, layer_id, interleaved_w13=False
+        )
 
     def forward(
         self,
@@ -298,7 +299,6 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
 
         total_bytes = manager.materialize()
         create_paras_moe_aliases(manager, config.num_hidden_layers, prefix="model")
-        create_paras_kv_aliases(manager, config.num_hidden_layers)
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
 

@@ -291,32 +291,20 @@ def paras_refresh_cuda_graph_settings(runner: CudaGraphRunner):
     runner.dp_size = sa.dp_size
 
 
-def _save_flashinfer_metadata(attn_backend: Any, mode: str):
-    if not hasattr(attn_backend, "_paras_cuda_graph_metadata"):
-        attn_backend._paras_cuda_graph_metadata = {}
-    attn_backend._paras_cuda_graph_metadata[mode] = {
-        "decode": dict(attn_backend.decode_cuda_graph_metadata),
-        "prefill": dict(attn_backend.prefill_cuda_graph_metadata),
-        "draft_extend": dict(attn_backend.draft_extend_cuda_graph_metadata),
-    }
-
-
-def _load_flashinfer_metadata(attn_backend: Any, mode: str):
-    meta = attn_backend._paras_cuda_graph_metadata[mode]
-    attn_backend.decode_cuda_graph_metadata = meta["decode"]
-    attn_backend.prefill_cuda_graph_metadata = meta["prefill"]
-    attn_backend.draft_extend_cuda_graph_metadata = meta["draft_extend"]
-
-
 def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: str):
-    """Save graphs, output buffers, DeepEP state, FlashInfer metadata,
-    mode-dependent settings, and the graph memory pool handle for *mode*
-    ('ep' or 'tp').
+    """Save graphs, output buffers, DeepEP state, attention-backend
+    cuda-graph state, mode-dependent settings, and the graph memory pool
+    handle for *mode* ('ep' or 'tp').
 
     Saving the graph memory pool is required so that EP and TP can each
     own an isolated pool; ``paras_load_cuda_graph_state`` restores it so
     any downstream code reading ``get_global_graph_memory_pool()`` sees
     the pool that belongs to the currently-active mode.
+
+    The attention-backend's per-mode buffer references (kv_indptr family
+    for Triton, per-mode metadata dicts for FlashInfer) are captured
+    through the generic ``paras_save_cuda_graph_state`` hook on the
+    backend; see ``AttentionBackend.paras_save_cuda_graph_state``.
     """
     from sglang.srt.model_executor.cuda_graph_runner import (
         get_global_graph_memory_pool,
@@ -330,17 +318,18 @@ def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: str):
         "output_buffers": dict(runner.output_buffers),
         "deepep_mode": runner.deepep_adapter._captured_deepep_mode,
         "graph_memory_pool": get_global_graph_memory_pool(),
+        "attn_backend": runner.model_runner.attn_backend.paras_save_cuda_graph_state(),
     }
     for key in _SETTINGS_KEYS:
         state[key] = getattr(runner, key)
 
     runner._paras_saved[mode] = state
-    _save_flashinfer_metadata(runner.model_runner.attn_backend, mode)
 
 
 def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: str):
-    """Restore graphs, output buffers, DeepEP state, FlashInfer metadata,
-    mode-dependent settings, and the graph memory pool handle for *mode*."""
+    """Restore graphs, output buffers, DeepEP state, attention-backend
+    cuda-graph state, mode-dependent settings, and the graph memory pool
+    handle for *mode*."""
     from sglang.srt.model_executor.cuda_graph_runner import (
         set_global_graph_memory_pool,
     )
@@ -352,7 +341,7 @@ def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: str):
     set_global_graph_memory_pool(state["graph_memory_pool"])
     for key in _SETTINGS_KEYS:
         setattr(runner, key, state[key])
-    _load_flashinfer_metadata(runner.model_runner.attn_backend, mode)
+    runner.model_runner.attn_backend.paras_load_cuda_graph_state(state["attn_backend"])
 
 
 # ---------------------------------------------------------------------------

@@ -56,7 +56,9 @@ def _import_scatter_manager():
         stub.__dict__.setdefault("Req", type("Req", (), {}))
         stub.__dict__.setdefault("ReqToTokenPool", type("ReqToTokenPool", (), {}))
         stub.__dict__.setdefault("MHATokenToKVPool", type("MHATokenToKVPool", (), {}))
+        stub.__dict__.setdefault("SWAKVPool", type("SWAKVPool", (), {}))
         stub.__dict__.setdefault("TokenToKVPoolAllocator", type("TokenToKVPoolAllocator", (), {}))
+        stub.__dict__.setdefault("SWATokenToKVPoolAllocator", type("SWATokenToKVPoolAllocator", (), {}))
         stub.__dict__.setdefault("GroupCoordinator", type("GroupCoordinator", (), {}))
         sys.modules[name] = stub
 

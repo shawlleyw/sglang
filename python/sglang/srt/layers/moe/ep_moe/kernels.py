@@ -787,9 +787,14 @@ def ep_gather(
     num_warps = 2
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
-    BLOCK_D = 128 if hidden_size % 1024 != 0 else 1024  # block size of quantization
-    assert hidden_size % BLOCK_D == 0, (
-        f"input shape: {input_tensor.shape}, hidden_size: {hidden_size}, BLOCK_D: {BLOCK_D}"
+    # The triton kernel below loads one BLOCK_D tile at a time without
+    # masking, so BLOCK_D must divide hidden_size exactly. Models like
+    # gpt-oss use hidden_size=2880, which 128 does not divide; pick the
+    # largest standard tile size that does.
+    BLOCK_D = next(
+        (cand for cand in (1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
+         if hidden_size % cand == 0),
+        1,
     )
     grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
     if num_tokens == 0:

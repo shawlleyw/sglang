@@ -21,14 +21,22 @@ WHY THIS APPROACH:
   - Deterministic offsets: Reservation order → fixed offsets enables reproducible layouts.
   - Dtype-agnostic storage: uint8 buffer holds any dtype; views reinterpret as needed.
   - Aligned access: 256-byte alignment matches GPU memory coalescing patterns.
+
+HETEROGENEOUS LAYERS (layer_specs):
+  When layer_specs differ per layer, each slot is sized for its layer's family
+  (full vs SWA). Two families may have different per-layer bytes, but within
+  a family all slots have the same bytes per layer.
 """
 
 import json
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +100,81 @@ def _validate_v1_scope(
             f"ParaS V1 does not support quantization format '{quant_name}'. "
             "Only unquantized (BF16/FP16) and FP8 are supported."
         )
+
+
+def _validate_paras_swa_runtime_scope(server_args, model_config) -> None:
+    """Raise if ParaS + SWA + incompatible runtime features are detected.
+
+    Checks for unsupported combinations:
+    - G12: FP8-KV + SWA
+    - G14: Speculative decoding + SWA
+    """
+    swa_attention_layer_ids = getattr(model_config, "swa_attention_layer_ids", None)
+    if not swa_attention_layer_ids:
+        return
+
+    kv_cache_dtype = getattr(server_args, "kv_cache_dtype", None)
+    if kv_cache_dtype == "fp8":
+        raise NotImplementedError(
+            "ParaS + SWA + FP8-KV not supported in v1 "
+            "(see docs/paras/swa_support.md §12). "
+            "Disable FP8-KV or use a non-hybrid model."
+        )
+
+    speculative_algorithm = getattr(server_args, "speculative_algorithm", None)
+    if speculative_algorithm is not None:
+        raise NotImplementedError(
+            "ParaS + SWA + speculative decoding not supported in v1."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Hybrid KV budget planner
+# ---------------------------------------------------------------------------
+
+def plan_hybrid_kv_budget(
+    total_tokens: int,
+    full_layers_num: int,
+    swa_layers_num: int,
+    swa_full_tokens_ratio: float,
+) -> Tuple[int, int]:
+    """Compute per-layer token budgets for a hybrid full/SWA attention model.
+
+    Mirrors the generic branch of ``set_num_token_hybrid`` in
+    ``model_runner.py`` (lines 1497-1516).  Pure arithmetic — no tensor
+    allocation.
+
+    The two unknowns satisfy:
+        swa_max * swa_layers + full_max * full_layers == total_tokens
+        swa_max == full_max * swa_full_tokens_ratio
+
+    Returns:
+        (full_max_total_num_tokens, swa_max_total_num_tokens)
+    """
+    if full_layers_num == 0 and swa_layers_num == 0:
+        raise ValueError("no layers")
+    if swa_layers_num > 0 and swa_full_tokens_ratio <= 0:
+        raise ValueError(
+            "swa_full_tokens_ratio must be > 0 when SWA layers present"
+        )
+
+    # All-MHA shortcut: no SWA layers at all.
+    if swa_layers_num == 0:
+        return (int(total_tokens / full_layers_num), 0)
+
+    denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+    full_max = int(total_tokens / denominator)
+    swa_max = int(full_max * swa_full_tokens_ratio)
+
+    if swa_max < 1:
+        logging.warning(
+            "plan_hybrid_kv_budget: computed swa_max_total_num_tokens < 1 "
+            "(ratio=%.4f, full_max=%d). SWA layers will have near-zero budget.",
+            swa_full_tokens_ratio,
+            full_max,
+        )
+
+    return (full_max, swa_max)
 
 
 # ---------------------------------------------------------------------------
@@ -184,15 +267,27 @@ class ParaSMemoryManager:
         kv_dtype: torch.dtype,
         page_size: int = 1,
         prefix: str = "model",
+        layer_specs: Optional[list] = None,
     ) -> None:
         """
-        Reserve KV cache entries using EP shapes (same bytes as TP via union layout).
+        Reserve KV cache using a contiguous buffer with per-layer offsets.
 
         Must be called AFTER plan_qwen_moe_layout() and BEFORE materialize().
 
-        EP and TP KV have same total bytes per layer:
-          ep_tokens × ep_kv_heads × head_dim == tp_tokens × tp_kv_heads × head_dim
-        so we reserve once in EP shape and use get_view_as() for TP access.
+        Layout (per K and V separately):
+          - Total region = max_L + sum(L_i) bytes
+          - TP view for layer i at offset prefix_i = sum(L_j for j<i)
+          - EP view for layer i at offset max_L + prefix_i
+          - L_i = (tokens_cap_ep_i + page) * num_kv_heads_i * head_dim_i * elem_size
+          - max_L = max(L_i)
+
+        EP and TP KV have same total bytes per layer (union layout):
+          ep_tokens * ep_kv_heads * head_dim == tp_tokens * tp_kv_heads * head_dim
+        so each region entry is stored once and callers use get_view_as()
+        for TP access with a different shape.
+
+        Actual LayoutEntry objects are created during materialize() so that
+        offsets are computed relative to the end of the weight region.
         """
         if self._materialized:
             raise RuntimeError("Cannot reserve KV cache after materialize().")
@@ -201,20 +296,43 @@ class ParaSMemoryManager:
 
         self.ep_max_kv_tokens = ep_max_tokens
         self.tp_max_kv_tokens = tp_max_tokens
+        self._layer_specs = layer_specs
 
-        # Reserve N+1 physical KV slots (slot 0 is the extra "TP landing" slot,
-        # matching the MoE N+1 pattern in plan_qwen_moe_layout).
-        kv_shape = (ep_max_tokens + page_size, num_kv_heads, head_dim)
-        for j in range(num_layers + 1):
-            self.reserve(f"paras.kv_slot.{j}.k", kv_shape, kv_dtype)
-            self.reserve(f"paras.kv_slot.{j}.v", kv_shape, kv_dtype)
+        elem_size = (
+            kv_dtype.itemsize
+            if hasattr(kv_dtype, "itemsize")
+            else torch.tensor([], dtype=kv_dtype).element_size()
+        )
 
-        # Weight-loading aliases: model.layers.{i}.kv.k/v → slot[i+1].
-        # Dict assignment (NOT alias()) — pre-materialize, same LayoutEntry object.
-        for i in range(num_layers):
-            lp = f"{prefix}.layers.{i}"
-            self._entries[f"{lp}.kv.k"] = self._entries[f"paras.kv_slot.{i+1}.k"]
-            self._entries[f"{lp}.kv.v"] = self._entries[f"paras.kv_slot.{i+1}.v"]
+        if layer_specs is None:
+            per_layer_tokens = ep_max_tokens + page_size
+            per_layer_bytes = per_layer_tokens * num_kv_heads * head_dim * elem_size
+            layer_ep_shapes = [
+                (per_layer_tokens, num_kv_heads, head_dim)
+            ] * num_layers
+            layer_bytes = [per_layer_bytes] * num_layers
+        else:
+            layer_ep_shapes = [
+                (s.tokens_cap_ep + page_size, s.num_kv_heads, s.head_dim)
+                for s in layer_specs
+            ]
+            layer_bytes = [
+                (s.tokens_cap_ep + page_size)
+                * s.num_kv_heads
+                * s.head_dim
+                * elem_size
+                for s in layer_specs
+            ]
+
+        # Save metadata for _create_kv_layout (called from materialize).
+        self._paras_kv_pending = {
+            "num_layers": num_layers,
+            "prefix": prefix,
+            "layer_bytes": layer_bytes,
+            "layer_ep_shapes": layer_ep_shapes,
+            "max_L": max(layer_bytes) if num_layers > 0 else 0,
+            "kv_dtype": kv_dtype,
+        }
 
         self._kv_reserved = True
 
@@ -247,6 +365,10 @@ class ParaSMemoryManager:
             entry.offset_bytes = self._align_up(offset, self.ALIGNMENT)
             offset = entry.offset_bytes + entry.size_bytes
 
+        pending = getattr(self, "_paras_kv_pending", None)
+        if pending is not None:
+            offset = self._create_kv_layout(offset, **pending)
+
         self._total_bytes = self._align_up(offset, self.ALIGNMENT)
         self._buffer = torch.empty(
             self._total_bytes, dtype=torch.uint8, device=self.device
@@ -257,6 +379,74 @@ class ParaSMemoryManager:
         self._buffer_end = self._buffer_start + self._total_bytes
         self._materialized = True
         return self._total_bytes
+
+    # ----- KV layout creation (called from materialize) -------------------
+
+    def _create_kv_layout(
+        self,
+        offset: int,
+        *,
+        num_layers: int,
+        prefix: str,
+        layer_bytes: List[int],
+        layer_ep_shapes: List[Tuple[int, ...]],
+        max_L: int,
+        kv_dtype: torch.dtype,
+    ) -> int:
+        """Create per-layer TP and EP LayoutEntry objects at computed offsets.
+
+        Returns the byte offset past the end of the V region.
+        """
+        if num_layers == 0:
+            return offset
+
+        elem_size = (
+            kv_dtype.itemsize
+            if hasattr(kv_dtype, "itemsize")
+            else torch.tensor([], dtype=kv_dtype).element_size()
+        )
+        kv_region_bytes = max_L + sum(layer_bytes)
+
+        k_region_start = self._align_up(offset, self.ALIGNMENT)
+        v_region_start = self._align_up(
+            k_region_start + kv_region_bytes, self.ALIGNMENT
+        )
+
+        for side, region_start in [("k", k_region_start), ("v", v_region_start)]:
+            prefix_bytes = 0
+            for i in range(num_layers):
+                li_bytes = layer_bytes[i]
+                ep_shape = layer_ep_shapes[i]
+                ep_numel = ep_shape[0] * ep_shape[1] * ep_shape[2]
+
+                tp_offset = region_start + prefix_bytes
+                ep_offset = region_start + max_L + prefix_bytes
+
+                ep_entry = LayoutEntry(
+                    name=f"{prefix}.layers.{i}.kv.ep.{side}",
+                    shape=ep_shape,
+                    dtype=kv_dtype,
+                    numel=ep_numel,
+                    element_size=elem_size,
+                    size_bytes=li_bytes,
+                    offset_bytes=ep_offset,
+                )
+                self._entries[f"{prefix}.layers.{i}.kv.ep.{side}"] = ep_entry
+                self._entries[f"{prefix}.layers.{i}.kv.{side}"] = ep_entry
+
+                self._entries[f"{prefix}.layers.{i}.kv.tp.{side}"] = LayoutEntry(
+                    name=f"{prefix}.layers.{i}.kv.tp.{side}",
+                    shape=ep_shape,
+                    dtype=kv_dtype,
+                    numel=ep_numel,
+                    element_size=elem_size,
+                    size_bytes=li_bytes,
+                    offset_bytes=tp_offset,
+                )
+
+                prefix_bytes += li_bytes
+
+        return v_region_start + kv_region_bytes
 
     # ----- view access ----------------------------------------------------
 
@@ -314,6 +504,7 @@ class ParaSMemoryManager:
         tp_size: int = 1,
         page_size: int = 1,
         prefix: str = "model",
+        layer_ids: Optional[List[int]] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Return k_buffers and v_buffers for the KV pool in the given mode.
@@ -321,11 +512,15 @@ class ParaSMemoryManager:
         EP mode: returns views with (ep_tokens + page, total_kv_heads, head_dim)
         TP mode: returns views with (tp_tokens + page, total_kv_heads//tp_size, head_dim)
                  using get_view_as to reinterpret the same bytes.
+
+        When *layer_ids* is provided, iterate over those specific layer
+        indices instead of ``range(num_layers)``.
         """
         k_bufs: List[torch.Tensor] = []
         v_bufs: List[torch.Tensor] = []
-        for i in range(num_layers):
-            lp = f"{prefix}.layers.{i}"
+        iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
+        for layer_id in iter_ids:
+            lp = f"{prefix}.layers.{layer_id}"
             k_name = f"{lp}.kv.k"
             v_name = f"{lp}.kv.v"
 
@@ -333,7 +528,7 @@ class ParaSMemoryManager:
                 k_bufs.append(self.get_view(k_name))
                 v_bufs.append(self.get_view(v_name))
             elif mode == "tp":
-                # Prefer dedicated TP aliases (N+1 slot design) when available.
+                # Prefer dedicated TP entries (contiguous-buffer design) when available.
                 tp_k_name = f"{lp}.kv.tp.k"
                 tp_v_name = f"{lp}.kv.tp.v"
                 if tp_k_name in self._entries:
@@ -426,11 +621,9 @@ class ParaSMemoryManager:
     @property
     def weights_only_bytes(self) -> int:
         """Total reserved bytes NOT including KV cache entries (for KV sizing)."""
-        kv_names = {n for n in self._reservation_order if ".kv." in n or "kv_slot." in n}
         return sum(
             self._entries[n].size_bytes
             for n in self._reservation_order
-            if n not in kv_names
         )
 
     # ----- dunder ---------------------------------------------------------
@@ -524,6 +717,13 @@ def plan_qwen_moe_layout(
         manager.reserve(f"paras.moe_slot.{slot}.w13", w13_shape, weight_dtype)
         manager.reserve(f"paras.moe_slot.{slot}.w2", w2_shape, weight_dtype)
 
+    # w13 and w2 biases are NOT stored in the UMM.  Biases are replicated
+    # on every rank as one full-expert tensor per layer (see
+    # paras_moe_block.py: self._full_w{13,2}_bias), and the EP and TP
+    # forward paths read through Parameter views into that replicated
+    # storage.  Total replicated bias memory is <=0.1% of weight storage,
+    # far cheaper than the UMM-staged transport path it replaces.
+
     # Create 'experts' aliases for create_weights() / weight loading compatibility.
     # These point to the same LayoutEntry objects as slot i+1 — no copy, no duplication.
     # materialize() processes _reservation_order, so aliases won't be double-processed.
@@ -598,6 +798,74 @@ def plan_qwen_moe_layout(
 
 
 # ---------------------------------------------------------------------------
+# GPT-OSS MoE layout planning
+# ---------------------------------------------------------------------------
+
+def plan_gpt_oss_moe_layout(
+    manager: ParaSMemoryManager,
+    *,
+    num_layers: int,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    ep_size: int,
+    tp_size: int,
+    dp_size: int,
+    moe_tp_size: int,
+    quant_name: Optional[str] = None,
+    fp8_block_size: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
+    configure_method: str = "peer_access",
+    prefix: str = "model",
+) -> None:
+    """Reserve all weight tensors for a GPT-OSS sparse-MoE model.
+
+    GPT-OSS shares the Qwen3-MoE layout exactly for the tensors ParaS
+    manages: w13/w2 expert weights (N+1 slot layout for EP<->TP switch),
+    QKV/O attention projections, FP8 weight scales, and pre-permute /
+    gather staging buffers for non-peer_access transfer methods.  Both
+    models are pure sparse MoE with no shared experts and identical
+    attention projection geometry.
+
+    Tensors that differ between the two models (GPT-OSS has biases on
+    expert weights and the router; Qwen3 does not) are intentionally
+    excluded from the ParaS layout in both cases.  ParaS only manages
+    tensors that switch between EP and TP modes; biases, norms, and
+    other model-static parameters live in regular PyTorch param storage
+    allocated by FusedMoE / ReplicatedLinear / RMSNorm directly.  MXFP4
+    is a checkpoint format only -- it is decompressed at load time and
+    never appears in the ParaS buffer.
+
+    Delegates to ``plan_qwen_moe_layout``.  If GPT-OSS ever needs a
+    distinct staging layout (different intermediate_size handling,
+    MXFP4-specific buffers, expert-bias switching), specialise here
+    instead of polluting the Qwen path.
+    """
+    plan_qwen_moe_layout(
+        manager,
+        num_layers=num_layers,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        ep_size=ep_size,
+        tp_size=tp_size,
+        dp_size=dp_size,
+        moe_tp_size=moe_tp_size,
+        quant_name=quant_name,
+        fp8_block_size=fp8_block_size,
+        num_fused_shared_experts=num_fused_shared_experts,
+        configure_method=configure_method,
+        prefix=prefix,
+    )
+
+
+# ---------------------------------------------------------------------------
 # MoE alias creation (call after materialize)
 # ---------------------------------------------------------------------------
 
@@ -620,24 +888,4 @@ def create_paras_moe_aliases(
         manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w2_weight", f"paras.moe_slot.{i}.w2")
 
 
-# ---------------------------------------------------------------------------
-# KV cache alias creation (call after materialize)
-# ---------------------------------------------------------------------------
 
-def create_paras_kv_aliases(
-    manager: ParaSMemoryManager,
-    num_layers: int,
-    prefix: str = "model",
-) -> None:
-    """
-    Create EP and TP KV aliases for the N+1 slot layout.
-    Call after materialize().
-
-    ep layer i → slot i+1 (same physical buffer as EP KV data)
-    tp layer i → slot i   (one slot before EP, for fused transfer)
-    """
-    for i in range(num_layers):
-        manager.alias(f"{prefix}.layers.{i}.kv.ep.k", f"paras.kv_slot.{i+1}.k")
-        manager.alias(f"{prefix}.layers.{i}.kv.ep.v", f"paras.kv_slot.{i+1}.v")
-        manager.alias(f"{prefix}.layers.{i}.kv.tp.k", f"paras.kv_slot.{i}.k")
-        manager.alias(f"{prefix}.layers.{i}.kv.tp.v", f"paras.kv_slot.{i}.v")

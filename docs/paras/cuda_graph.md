@@ -6,6 +6,8 @@ ParaS maintains two sets of CUDA graphs — one for EP mode and one for TP mode 
 
 All ParaS-specific CUDA graph logic lives in `python/sglang/srt/paras/paras_cuda_graph.py`. The `CudaGraphRunner` and `ModelRunner` classes have no ParaS-specific code beyond the memory-breakdown log hook.
 
+Hybrid sliding-window-attention models now use the same dual-pool capture design. The earlier startup restriction that rejected SWA + ParaS under CUDA graphs was removed once the EP↔TP hot-switch path was verified to run outside the captured region.
+
 ## Capture Flow
 
 ### Init-time sequence

@@ -177,7 +177,7 @@ Both reads and writes are coalesced within each row. The row stride causes 25% H
 The N+1 slot design is not exclusive to peer access — the NCCL naive and overlap paths also use it. This means all three methods share the same memory layout and alias structure:
 
 - **All-to-all output target**: NCCL writes directly to the TP slot (slot `i`) for each layer. Since `tp_experts` already points to slot `i` from init, no copy or view update is needed after the collective completes.
-- **No staging for peer access**: The peer access kernel reads directly from the EP slot with strided access, bypassing the permute step entirely. Staging buffers are skipped via `skip_staging=True`, saving ~1.16 GiB.
+- **No staging for peer access**: The peer access kernel reads directly from the EP slot with strided access, bypassing the permute step entirely. Staging buffers are skipped when `configure_method="peer_access"`, saving ~1.16 GiB.
 
 In all cases, the TP slot (slot `i`) holds valid TP data after the transfer, and `tp_experts` views remain correct without any post-transfer alias updates.
 
@@ -216,7 +216,7 @@ gather size      = same as pre_permute                    = 580 MB  (DP>1 only)
 
 For DP>1 the `staging_experts` grows by `dp_size`, making each buffer proportionally larger. With `dp_size=2`, each buffer is 2× larger (1.16 GiB), and the overlap path needs 4 such buffers (4.64 GiB total). This makes peer_access especially attractive for DP>1 configurations where staging memory pressure is highest.
 
-The `plan_qwen_moe_layout()` function accepts `configure_method` to reserve only the buffers needed, controlled by the `PARAS_CONFIGURE_METHOD` environment variable.
+The `plan_qwen_moe_layout()` and `plan_gpt_oss_moe_layout()` functions accept `configure_method` to reserve only the buffers needed, controlled by the `PARAS_CONFIGURE_METHOD` environment variable.
 
 #### Overlap Path: Dual-Stream Pipelining and NCCL Stream Behavior
 
@@ -331,7 +331,8 @@ The v2 kernel time (9 ms) is well below the NVLink-bound theoretical minimum (69
 | `paras/peer_access.py` | Peer access init (IPC handles), Python kernel wrappers |
 | `paras/layers/paras_moe_block.py` | Per-layer kernel launch (`paras_configure_tp_fused_peer_access_kernel`) |
 | `paras/layers/paras_model.py` | No-barrier orchestration, `@paras_func` handles sync via `paras_configure_helper()` |
-| `paras/models/qwen3_moe.py` | Pre-initializes peer access during model load |
+| `paras/models/qwen3_moe.py` | Qwen3 ParaS model init, pre-initializes peer access |
+| `paras/models/gpt_oss.py` | GPT-OSS ParaS model init, pre-initializes peer access |
 | `paras/paras_memory_manager.py` | N+1 slot reservation (`paras.moe_slot.{0..N}.*`), `alias()`, `create_paras_moe_aliases()` |
 | `test/srt/test_paras_peer_access.py` | 4-GPU correctness + benchmark test |
 
@@ -339,9 +340,7 @@ The v2 kernel time (9 ms) is well below the NVLink-bound theoretical minimum (69
 
 1. **FP8 scale transfer**: The peer access kernels currently only transfer weight data (w13, w2). FP8 quantized models also need their per-expert scale tensors (`w13_weight_scale`, `w2_weight_scale`) redistributed during EP→TP switching. This is not yet implemented.
 
-2. **TP→EP reverse switch**: The N+1 slot design supports this by processing layers in reverse order (N-1, N-2, ..., 0). Layer `i`'s read from slot `i` completes before layer `i-1`'s write to slot `i`.
-
-2. **KV cache migration**: Currently uses NCCL. Could use the same peer access approach since KV buffers are also in the managed buffer.
+2. **KV cache migration**: Peer-access kernels now exist for both EP→TP gather and TP→EP scatter. The remaining work is deeper kernel tuning and broader production coverage, not initial support.
 
 3. **Larger TP groups (8 GPUs)**: More peers = more NVLink bandwidth available. The warp-level peer assignment scales naturally.
 

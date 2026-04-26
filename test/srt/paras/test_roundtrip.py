@@ -498,7 +498,7 @@ class TestFullRoundTrip:
         for lid in range(NUM_LAYERS):
             k_buf = kv_pool.get_key_buffer(lid)
             v_buf = kv_pool.get_value_buffer(lid)
-            permuted = gather_kv_and_permute(k_buf, v_buf, local_token_indices)
+            permuted = gather_kv_and_permute(k_buf, v_buf, local_token_indices, heads_per_peer)
 
             # Resize to TP layout
             kv_pool.k_buffer[lid] = torch.empty(
@@ -918,7 +918,7 @@ class TestSingleRequestRoundTrip:
             v_buf = kv_pool.get_value_buffer(lid)
 
             if num_local_tokens > 0:
-                permuted = gather_kv_and_permute(k_buf, v_buf, local_token_indices)
+                permuted = gather_kv_and_permute(k_buf, v_buf, local_token_indices, heads_per_peer)
             else:
                 permuted = torch.empty(0, dtype=KV_DTYPE, device=f"cuda:{rank}")
 

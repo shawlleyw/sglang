@@ -9,6 +9,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -47,18 +48,98 @@ class ParaSMoeBlockMixin:
     # Initialization
     # ------------------------------------------------------------------
 
+    _LOADER_PARAM_ATTRS = ("weight_loader", "output_dim", "input_dim")
+
+    def _copy_loader_attrs(self, src_param, dst_param):
+        """Propagate weight-loader attributes (weight_loader, output_dim,
+        input_dim) from one Parameter to another.  Used when we replace a
+        FusedMoE-allocated Parameter via ``register_parameter`` -- the
+        replacement would otherwise lose the attributes the checkpoint
+        loader depends on.
+        """
+        for attr in self._LOADER_PARAM_ATTRS:
+            if hasattr(src_param, attr):
+                setattr(dst_param, attr, getattr(src_param, attr))
+
+    def _build_full_bias(self, ref_bias):
+        """Allocate a full ``(num_global_experts, D)`` zero bias on this
+        rank and return a Parameter that wraps it.
+
+        The returned Parameter is what the checkpoint loader writes into:
+        every rank loads the full bias directly so no transfer is needed
+        at switch time.  After load, ``paras_finalize_moe_bias_views``
+        replaces this full-shape Parameter with a local-slice view so the
+        ep forward path can index it with local expert ids.
+        """
+        full = torch.zeros(
+            self.num_global_experts,
+            ref_bias.shape[1],
+            dtype=ref_bias.dtype,
+            device=ref_bias.device,
+        )
+        return full, nn.Parameter(full, requires_grad=False)
+
     def paras_init_moe(
-        self, config, quant_config, prefix, layer_id
+        self,
+        config,
+        quant_config,
+        prefix,
+        layer_id,
+        *,
+        interleaved_w13: bool = False,
+        activation: str = "silu",
+        gemm1_alpha: Optional[float] = None,
+        gemm1_clamp_limit: Optional[float] = None,
     ):
         """
         Set up EP and TP expert modules for ParaS switching.
         Call this at the end of the subclass ``__init__`` (after ``super().__init__``).
 
         TP experts will reuse the EP buffer during switching.
+
+        Args:
+            interleaved_w13: If True, treat the w13 (gate_up) 2*I axis as
+                interleaved [g0, u0, g1, u1, ..., g_{I-1}, u_{I-1}] during
+                EP<->TP transport (the GPT-OSS convention, exercised by
+                ``swiglu_with_alpha_and_limit``'s ``x[..., ::2]``/``[..., 1::2]``
+                split).  If False (default), treat the 2*I axis as
+                concatenated [gate(I) | up(I)] (the Qwen3 convention,
+                exercised by ``silu_and_mul``'s half-split kernel).  The
+                checkpoint layout is model-dependent; each ParaS model
+                subclass must set this to match its base model.
+            activation, gemm1_alpha, gemm1_clamp_limit: Forwarded to the
+                tp_experts FusedMoE so tp mode runs the same nonlinearity
+                as ep.  Defaults match the FusedMoE defaults (silu, no
+                alpha, no clamp) used by Qwen3; GPT-OSS must pass the
+                swiglu + alpha=1.702 + clamp values from its config.
         """
         # Save the EP experts that were created by the base class __init__
         self.ep_experts = self.experts
         self._paras_layer_id = layer_id
+        self._paras_interleaved_w13 = interleaved_w13
+
+        # Match ep_experts' with_bias and use_weight_loader_fused so the
+        # weight_loader attribute on tp_experts params matches ep_experts'
+        # (the base model's _load_normal_weights uses the fused 4-arg
+        # signature when bias mappings fire).  Bound-method identity is not
+        # preserved across attribute access (each read of
+        # ep_experts.weight_loader_fused returns a fresh bound-method
+        # wrapper), so compare the underlying functions via __func__.
+        ep_with_bias = getattr(
+            getattr(self.ep_experts, "quant_method", None), "with_bias", False
+        )
+        _ep_w13_loader = getattr(
+            getattr(self.ep_experts, "w13_weight", None), "weight_loader", None
+        )
+        _ep_fused_func = getattr(
+            getattr(self.ep_experts, "weight_loader_fused", None),
+            "__func__",
+            None,
+        )
+        _ep_w13_func = getattr(_ep_w13_loader, "__func__", None)
+        ep_uses_fused_loader = (
+            _ep_fused_func is not None and _ep_w13_func is _ep_fused_func
+        )
 
         # TP experts: created with skip_weights_init=True because their weights
         # arrive via all-to-all redistribution at runtime (not from checkpoint).
@@ -77,12 +158,36 @@ class ParaSMoeBlockMixin:
             moe_tp_size_override=get_paras_tp_size(),
             moe_tp_rank_override=get_paras_tp_rank(),
             paras_force_standard_dispatcher=True,
+            with_bias=ep_with_bias,
+            use_weight_loader_fused=ep_uses_fused_loader,
+            activation=activation,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_clamp_limit=gemm1_clamp_limit,
         )
 
         self.num_global_experts = config.num_experts
         self.num_local_experts = self.num_global_experts // self.tp_size
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
+
+        # Allocate the full (num_global_experts, D) bias tensors on every
+        # rank.  ep_experts.w{13,2}_weight_bias is registered as a full-
+        # shape Parameter here so the checkpoint loader writes the full
+        # bias directly into self._full_*_bias with no transfer.  The
+        # ep local-slice view and tp views are built in
+        # paras_finalize_moe_bias_views after load completes.
+        self._full_w13_bias = None
+        self._full_w2_bias = None
+        if ep_with_bias and hasattr(self.ep_experts, "w13_weight_bias"):
+            _old_w13 = self.ep_experts.w13_weight_bias
+            self._full_w13_bias, _ep_w13_param = self._build_full_bias(_old_w13)
+            self._copy_loader_attrs(_old_w13, _ep_w13_param)
+            self.ep_experts.register_parameter("w13_weight_bias", _ep_w13_param)
+        if ep_with_bias and hasattr(self.ep_experts, "w2_weight_bias"):
+            _old_w2 = self.ep_experts.w2_weight_bias
+            self._full_w2_bias, _ep_w2_param = self._build_full_bias(_old_w2)
+            self._copy_loader_attrs(_old_w2, _ep_w2_param)
+            self.ep_experts.register_parameter("w2_weight_bias", _ep_w2_param)
 
         # Pre-register TP expert weights using TP alias entries.
         # TP aliases point to slot i (one before EP slot i+1), so after the
@@ -203,17 +308,32 @@ class ParaSMoeBlockMixin:
             for handle in handles:
                 handle.wait()
 
-            w13_ep = self.w13_ep_gathered.view(
-                self.num_local_experts,
-                2,
-                paras_tp_size,
-                moe_intermediate_size_after_tp * self.hidden_size,
-            )
-            w13_ep_permuted = mgr.get_view(f"staging.w13_pre_permute{staging_suffix}").view(
-                paras_tp_size, self.num_local_experts, 2,
-                moe_intermediate_size_after_tp * self.hidden_size,
-            )
-            w13_ep_permuted.copy_(w13_ep.permute(2, 0, 1, 3))
+            if self._paras_interleaved_w13:
+                w13_ep = self.w13_ep_gathered.view(
+                    self.num_local_experts,
+                    paras_tp_size,
+                    2 * moe_intermediate_size_after_tp * self.hidden_size,
+                )
+                w13_ep_permuted = mgr.get_view(
+                    f"staging.w13_pre_permute{staging_suffix}"
+                ).view(
+                    paras_tp_size,
+                    self.num_local_experts,
+                    2 * moe_intermediate_size_after_tp * self.hidden_size,
+                )
+                w13_ep_permuted.copy_(w13_ep.permute(1, 0, 2))
+            else:
+                w13_ep = self.w13_ep_gathered.view(
+                    self.num_local_experts,
+                    2,
+                    paras_tp_size,
+                    moe_intermediate_size_after_tp * self.hidden_size,
+                )
+                w13_ep_permuted = mgr.get_view(f"staging.w13_pre_permute{staging_suffix}").view(
+                    paras_tp_size, self.num_local_experts, 2,
+                    moe_intermediate_size_after_tp * self.hidden_size,
+                )
+                w13_ep_permuted.copy_(w13_ep.permute(2, 0, 1, 3))
 
             if paras_dp_size > 1:
                 w13_tp = self.w13_ep_gathered
@@ -272,6 +392,55 @@ class ParaSMoeBlockMixin:
                 )
                 tp_w2 = mgr.get_view_as(tp_w2_name, tp_w2_shape)
                 tp_w2.copy_(w2_post.view_as(tp_w2))
+
+    def paras_finalize_moe_bias_views(self):
+        """Build ep_experts and tp_experts bias Parameter views after
+        load_weights populates ``self._full_*_bias``.
+
+        ep_experts receives a ``(num_local_experts, D)`` local-slice view
+        so its forward path indexes with local expert ids.  tp_experts
+        receives a slice view sized for the paras TP layout:
+          * w13 bias: ``(num_global_experts, 2*I/paras_tp)`` interleaved
+            slice of the full (num_global_experts, 2*I) tensor.  For the
+            GPT-OSS [g0,u0,g1,u1,...] layout, the slice
+            ``[:, 2*tp_start:2*tp_end]`` gives this rank's contiguous
+            block of (g_k, u_k) pairs; the triton kernel reads biases
+            with explicit stride_bias_n so the strided view is correct.
+          * w2 bias: rank-0 registers the full ``(num_global_experts, H)``
+            tensor; non-rank-0 leaves the attribute unregistered so the
+            kernel skips the bias add (applied exactly once after the
+            tp all-reduce).
+        """
+        ep_rank = self.ep_experts.moe_ep_rank
+        ep_n_local = self.ep_experts.num_local_experts
+        ep_start = ep_rank * ep_n_local
+        ep_end = ep_start + ep_n_local
+        for full_bias, ep_param_name in (
+            (self._full_w13_bias, "w13_weight_bias"),
+            (self._full_w2_bias, "w2_weight_bias"),
+        ):
+            if full_bias is None:
+                continue
+            ep_view = nn.Parameter(
+                full_bias[ep_start:ep_end], requires_grad=False
+            )
+            self.ep_experts.register_parameter(ep_param_name, ep_view)
+
+        paras_tp_size = get_paras_tp_size()
+        paras_tp_rank = get_paras_tp_rank()
+        if self._full_w13_bias is not None:
+            i_per_tp = self.moe_intermediate_size // paras_tp_size
+            tp_w13_view = self._full_w13_bias[
+                :,
+                2 * paras_tp_rank * i_per_tp : 2 * (paras_tp_rank + 1) * i_per_tp,
+            ]
+            tp_w13_param = nn.Parameter(tp_w13_view, requires_grad=False)
+            set_weight_attrs(tp_w13_param, self.tp_experts.extra_weight_attrs)
+            self.tp_experts.register_parameter("w13_weight_bias", tp_w13_param)
+        if self._full_w2_bias is not None and paras_tp_rank == 0:
+            tp_w2_param = nn.Parameter(self._full_w2_bias, requires_grad=False)
+            set_weight_attrs(tp_w2_param, self.tp_experts.extra_weight_attrs)
+            self.tp_experts.register_parameter("w2_weight_bias", tp_w2_param)
 
     def paras_configure_tp_fused_peer_access_kernel(
         self,
@@ -344,31 +513,48 @@ class ParaSMoeBlockMixin:
         tp_w13_name = f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"
         tp_w2_name = f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"
 
-        # --- w13: TP (E_total, 2*I', H) → all_to_all → inv_permute → EP (E_local, 2*I, H) ---
         tp_w13 = mgr.get_view_as(
             tp_w13_name,
             (self.num_global_experts, 2 * moe_inter_tp, self.hidden_size),
         )
-        tp_w13_for_a2a = tp_w13.view(
-            paras_tp_size, self.num_local_experts, 2,
-            moe_inter_tp * self.hidden_size,
-        )
-
-        staging_w13 = mgr.get_view("staging.w13_pre_permute").view(
-            paras_tp_size, self.num_local_experts, 2,
-            moe_inter_tp * self.hidden_size,
-        )
-        dist.all_to_all_single(
-            output=staging_w13.view(tp_w13.shape),
-            input=tp_w13_for_a2a.reshape(tp_w13.shape),
-            group=paras_tp_group,
-        )
-
-        ep_w13 = self.ep_experts.w13_weight.data.view(
-            self.num_local_experts, 2, paras_tp_size,
-            moe_inter_tp * self.hidden_size,
-        )
-        ep_w13.copy_(staging_w13.permute(1, 2, 0, 3))
+        if self._paras_interleaved_w13:
+            tp_w13_for_a2a = tp_w13.view(
+                paras_tp_size, self.num_local_experts,
+                2 * moe_inter_tp * self.hidden_size,
+            )
+            staging_w13 = mgr.get_view("staging.w13_pre_permute").view(
+                paras_tp_size, self.num_local_experts,
+                2 * moe_inter_tp * self.hidden_size,
+            )
+            dist.all_to_all_single(
+                output=staging_w13.view(tp_w13.shape),
+                input=tp_w13_for_a2a.reshape(tp_w13.shape),
+                group=paras_tp_group,
+            )
+            ep_w13 = self.ep_experts.w13_weight.data.view(
+                self.num_local_experts, paras_tp_size,
+                2 * moe_inter_tp * self.hidden_size,
+            )
+            ep_w13.copy_(staging_w13.permute(1, 0, 2))
+        else:
+            tp_w13_for_a2a = tp_w13.view(
+                paras_tp_size, self.num_local_experts, 2,
+                moe_inter_tp * self.hidden_size,
+            )
+            staging_w13 = mgr.get_view("staging.w13_pre_permute").view(
+                paras_tp_size, self.num_local_experts, 2,
+                moe_inter_tp * self.hidden_size,
+            )
+            dist.all_to_all_single(
+                output=staging_w13.view(tp_w13.shape),
+                input=tp_w13_for_a2a.reshape(tp_w13.shape),
+                group=paras_tp_group,
+            )
+            ep_w13 = self.ep_experts.w13_weight.data.view(
+                self.num_local_experts, 2, paras_tp_size,
+                moe_inter_tp * self.hidden_size,
+            )
+            ep_w13.copy_(staging_w13.permute(1, 2, 0, 3))
 
         # --- w2: TP (E_total, H, I') → all_to_all → inv_permute → EP (E_local, H, I) ---
         tp_w2 = mgr.get_view_as(
@@ -396,6 +582,10 @@ class ParaSMoeBlockMixin:
         )
         ep_w2.copy_(staging_w2.permute(1, 2, 0, 3))
 
+        # Biases require no TP->EP transport: ep_experts.w{13,2}_weight_bias
+        # are views into self._full_*_bias which was populated in full on
+        # every rank at load time.
+
     def paras_configure_ep_fused_peer_access_kernel(
         self,
         peer_ctx,
@@ -412,6 +602,10 @@ class ParaSMoeBlockMixin:
         paras_tp_rank = get_paras_tp_rank()
         layer_id = self._paras_layer_id
         moe_intermediate_size_after_tp = self.moe_intermediate_size // paras_tp_size
+
+        # Biases require no TP->EP transport: ep_experts views into
+        # self._full_*_bias which was populated in full on every rank at
+        # load time.
 
         tp_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"]
         tp_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"]

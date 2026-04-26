@@ -1815,6 +1815,33 @@ class ModelRunner:
             )
         else:
             if self.is_hybrid:
+                _full_ep_k = _full_ep_v = _swa_ep_k = _swa_ep_v = None
+                if self.server_args.enable_paras_moe:
+                    from sglang.srt.paras.paras_memory_manager import (
+                        get_global_paras_memory_manager as _get_paras_mgr_swa,
+                        _validate_paras_swa_runtime_scope,
+                    )
+
+                    _validate_paras_swa_runtime_scope(
+                        self.server_args, self.model_config
+                    )
+                    _paras_swa_mgr = _get_paras_mgr_swa()
+                    if (
+                        _paras_swa_mgr is not None
+                        and _paras_swa_mgr.materialized
+                        and _paras_swa_mgr._kv_reserved
+                    ):
+                        _full_ep_k, _full_ep_v = _paras_swa_mgr.get_kv_views(
+                            num_layers=len(self.model_config.full_attention_layer_ids),
+                            mode="ep",
+                            layer_ids=self.model_config.full_attention_layer_ids,
+                        )
+                        _swa_ep_k, _swa_ep_v = _paras_swa_mgr.get_kv_views(
+                            num_layers=len(self.model_config.swa_attention_layer_ids),
+                            mode="ep",
+                            layer_ids=self.model_config.swa_attention_layer_ids,
+                        )
+
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -1827,6 +1854,10 @@ class ModelRunner:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    full_external_k_buffers=_full_ep_k,
+                    full_external_v_buffers=_full_ep_v,
+                    swa_external_k_buffers=_swa_ep_k,
+                    swa_external_v_buffers=_swa_ep_v,
                 )
             elif config := self.mambaish_config:
                 extra_args = {}
