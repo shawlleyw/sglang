@@ -224,6 +224,7 @@ def _make_mixin(layer_id, num_local, mgr, set_gathered=True):
 
     m = object.__new__(ParaSMoeBlockMixin)
     m._paras_layer_id = layer_id
+    m._paras_interleaved_w13 = False
     m.num_local_experts = num_local
     m.num_global_experts = NUM_EXPERTS
     m.hidden_size = HIDDEN
