@@ -328,6 +328,22 @@ class FlashInferAttnBackend(AttentionBackend):
                 updater.req_to_token = req_to_token
         self.paras_configure_helper()
 
+    def paras_save_cuda_graph_state(self):
+        return {
+            "decode_cuda_graph_metadata": dict(self.decode_cuda_graph_metadata),
+            "prefill_cuda_graph_metadata": dict(self.prefill_cuda_graph_metadata),
+            "draft_extend_cuda_graph_metadata": dict(
+                self.draft_extend_cuda_graph_metadata
+            ),
+        }
+
+    def paras_load_cuda_graph_state(self, state):
+        self.decode_cuda_graph_metadata = state["decode_cuda_graph_metadata"]
+        self.prefill_cuda_graph_metadata = state["prefill_cuda_graph_metadata"]
+        self.draft_extend_cuda_graph_metadata = state[
+            "draft_extend_cuda_graph_metadata"
+        ]
+
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
     ) -> MultiItemScoringParams:

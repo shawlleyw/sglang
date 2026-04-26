@@ -182,33 +182,87 @@ class TritonAttnBackend(AttentionBackend):
     # ------------------------------------------------------------------
 
     def paras_configure_tp(self, paras_tp_size: int, req_to_token: "torch.Tensor"):
-        """Update cached state for TP mode after ParaS switch."""
+        """Switch to TP mode: rebind state, allocate fresh buffers.
+
+        Allocates fresh ``kv_indptr`` family + CUDA graph buffers sized for
+        the new (TP) ReqToTokenPool. The previous mode's buffers must
+        already be saved via ``paras_save_cuda_graph_state`` if any
+        captured graph references them; otherwise they are dropped.
+        Callers in the cuda-graph path then restore mode-appropriate
+        buffer references via ``paras_load_cuda_graph_state``.
+        """
         self.num_head = self.total_num_attention_heads // paras_tp_size
         self.num_kv_head = self._get_num_kv_heads(paras_tp_size)
         self.req_to_token = req_to_token
-        self._paras_reset_buffers(req_to_token.shape[0])
+        self._paras_alloc_fresh_buffers()
 
     def paras_configure_ep(self, req_to_token: "torch.Tensor"):
-        """Revert cached state for EP mode after ParaS switch."""
+        """Switch to EP mode: rebind state, allocate fresh buffers.
+
+        See ``paras_configure_tp`` for the buffer-allocation contract.
+        """
         self.num_head = self.total_num_attention_heads
         self.num_kv_head = self._get_num_kv_heads(1)
         self.req_to_token = req_to_token
-        self._paras_reset_buffers(req_to_token.shape[0])
+        self._paras_alloc_fresh_buffers()
 
-    def _paras_reset_buffers(self, max_bs: int):
+    _PARAS_CUDA_GRAPH_BUFFER_ATTRS = (
+        "kv_indptr",
+        "window_kv_indptr",
+        "qo_indptr",
+        "mask_indptr",
+        "cuda_graph_attn_logits",
+        "cuda_graph_attn_lse",
+        "cuda_graph_num_kv_splits",
+        "cuda_graph_kv_indices",
+        "cuda_graph_custom_mask",
+        "cuda_graph_window_kv_indices",
+        "cuda_graph_window_num_kv_splits",
+        "cuda_graph_window_kv_offsets",
+    )
+
+    def paras_save_cuda_graph_state(self):
+        """Snapshot tensor refs whose ``data_ptr()`` is baked into captured
+        graph kernel args. Restoring these refs makes a previously captured
+        graph valid again after a mode switch reallocated them.
+        """
+        return {
+            attr: getattr(self, attr)
+            for attr in self._PARAS_CUDA_GRAPH_BUFFER_ATTRS
+            if hasattr(self, attr)
+        }
+
+    def paras_load_cuda_graph_state(self, state):
+        for attr, value in state.items():
+            setattr(self, attr, value)
+
+    def _paras_alloc_fresh_buffers(self):
+        """Allocate fresh kv_indptr family and (if cuda graph is enabled)
+        cuda graph buffers, sized for the current mode's pool.
+
+        Called from paras_configure_tp/ep. Previous mode's buffers stay
+        alive via Python refs in any saved cuda-graph state dict.
+        """
+        max_bs_plus_1 = self.req_to_token.shape[0] + 1
+        device = self.device
         self.kv_indptr = torch.zeros(
-            (max_bs + 1,), dtype=torch.int32, device=self.device
+            (max_bs_plus_1,), dtype=torch.int32, device=device,
         )
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             self.window_kv_indptr = torch.zeros(
-                (max_bs + 1,), dtype=torch.int32, device=self.device
+                (max_bs_plus_1,), dtype=torch.int32, device=device,
             )
         if not self.skip_prefill:
             self.qo_indptr = torch.zeros(
-                (max_bs + 1,), dtype=torch.int32, device=self.device
+                (max_bs_plus_1,), dtype=torch.int32, device=device,
             )
             self.mask_indptr = torch.zeros(
-                (max_bs + 1,), dtype=torch.int64, device=self.device
+                (max_bs_plus_1,), dtype=torch.int64, device=device,
+            )
+        if hasattr(self, "_paras_cuda_graph_max_bs"):
+            self.init_cuda_graph_state(
+                self._paras_cuda_graph_max_bs,
+                self._paras_cuda_graph_max_num_tokens,
             )
 
     def get_num_kv_splits(
@@ -472,6 +526,8 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
         cuda_graph_num_kv_splits_buf: Optional[torch.Tensor] = None,
     ):
+        self._paras_cuda_graph_max_bs = max_bs
+        self._paras_cuda_graph_max_num_tokens = max_num_tokens
         self.cuda_graph_attn_logits = torch.zeros(
             (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
             dtype=torch.float32,

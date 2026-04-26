@@ -18,19 +18,19 @@ def gather_kv_and_permute(
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
     indices: torch.Tensor,
+    tp_num_heads: int,
 ) -> torch.Tensor:
-    """Gather K/V from cache buffers and permute to [heads, tokens, KV, dim].
-
-    Each head's chunk is token-interleaved (t0_K, t0_V, t1_K, t1_V, ...),
-    so that after all_to_all splits by head, concatenating received chunks
-    gives [total_tokens, KV, heads, dim] which permute_and_scatter_kv expects.
+    """Gather K/V into per-destination chunks laid out as
+    ``[num_ranks, tokens, KV, sharded_heads, dim]`` flat. After ``all_to_all_single``
+    concatenates chunks from each source, the receiver sees
+    ``[total_tokens, KV, sharded_heads, dim]`` -- exactly the layout
+    ``permute_and_scatter_kv`` expects.
     """
-    local_kcache = k_buffer[indices]
-    local_vcache = v_buffer[indices]
-    local_kvcache = torch.stack([local_kcache, local_vcache], dim=0).view(
-        2, -1, k_buffer.shape[1], k_buffer.shape[2]
-    )
-    return local_kvcache.permute(2, 1, 0, 3).contiguous().flatten()
+    local_kvcache = torch.stack([k_buffer[indices], v_buffer[indices]], dim=0)
+    _, n_tokens, n_heads, head_dim = local_kvcache.shape
+    num_ranks = n_heads // tp_num_heads
+    permuted_kvcache = local_kvcache.view(2, n_tokens, num_ranks, tp_num_heads, head_dim)
+    return permuted_kvcache.permute(2, 1, 0, 3, 4).contiguous().flatten()
 
 
 # ------------------------------------------------------------------
@@ -155,9 +155,7 @@ def do_gather_one_layer_nccl(
     is responsible for inter-layer synchronization.
     """
     sharded_num_heads = max(1, num_heads // group_size)
-    replication_factor = (
-        max(1, group_size // num_heads) if num_heads < group_size else 1
-    )
+    replication_factor = max(1, group_size // num_heads)
     splited_size_per_token = sharded_num_heads * head_dim
 
     input_split_sizes = [
@@ -169,7 +167,7 @@ def do_gather_one_layer_nccl(
 
     if num_local_tokens > 0:
         permuted_local_kvcache = gather_kv_and_permute(
-            k_buffer, v_buffer, local_token_indices,
+            k_buffer, v_buffer, local_token_indices, sharded_num_heads,
         )
         if replication_factor > 1:
             permuted_local_kvcache = (

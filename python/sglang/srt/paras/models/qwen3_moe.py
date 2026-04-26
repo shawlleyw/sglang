@@ -55,7 +55,9 @@ class Qwen3MoeSparseMoeBlockParaS(ParaSMoeBlockMixin, Qwen3MoeSparseMoeBlock):
 
     def __init__(self, layer_id, config, quant_config=None, prefix=""):
         super().__init__(layer_id, config, quant_config, prefix)
-        self.paras_init_moe(config, quant_config, prefix, layer_id)
+        self.paras_init_moe(
+            config, quant_config, prefix, layer_id, interleaved_w13=False
+        )
 
     def forward(
         self,

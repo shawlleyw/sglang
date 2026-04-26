@@ -349,7 +349,9 @@ def classify_layers_from_config(
     """
     num_layers = hf_config.num_hidden_layers
     num_kv_heads = hf_config.num_key_value_heads
-    head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+    head_dim = getattr(
+        hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads
+    )
 
     if hasattr(hf_config, "layer_types") and hf_config.layer_types is not None:
         layer_types = hf_config.layer_types

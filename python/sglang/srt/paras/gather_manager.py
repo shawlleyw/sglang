@@ -354,10 +354,14 @@ class ParaSReqGatherManager:
                 # No output yet, use last input token
                 last_token_list.append(req.origin_input_ids[-1])
         
-        # Get req_pool_indices and seq_lens
+        # Get req_pool_indices and seq_lens.
+        # SGLang convention: batch.seq_lens = K/V cache history length, which is
+        # req.seqlen - 1 because req.output_ids[-1] is the most recently sampled
+        # token but its K/V is not yet stored (it will be written when this token
+        # becomes the input on the next decode iteration via alloc_for_decode).
         req_pool_indices_list = [req.req_pool_idx for req in self.global_reqs]
-        seq_lens_list = [req.seqlen for req in self.global_reqs]
-        
+        seq_lens_list = [req.seqlen - 1 for req in self.global_reqs]
+
         # Convert to tensors
         batch.output_ids = torch.tensor(last_token_list, dtype=torch.int64, device=device)
         batch.req_pool_indices = torch.tensor(req_pool_indices_list, dtype=torch.int64, device=device)
@@ -405,10 +409,12 @@ class ParaSReqGatherManager:
                 # No output yet, use last input token
                 input_ids_list.append(req.origin_input_ids[-1])
         
-        # Get req_pool_indices and seq_lens
+        # See get_new_running_batch: batch.seq_lens excludes the last output
+        # token whose K/V is not yet stored (it will be written when that token
+        # becomes the input on the next decode iteration via alloc_for_decode).
         req_pool_indices_list = [req.req_pool_idx for req in self.global_reqs]
-        seq_lens_list = [req.seqlen for req in self.global_reqs]
-        
+        seq_lens_list = [req.seqlen - 1 for req in self.global_reqs]
+
         # Update batch tensors
         running_batch.input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device=device)
         running_batch.req_pool_indices = torch.tensor(req_pool_indices_list, dtype=torch.int64, device=device)

@@ -250,6 +250,30 @@ rm -f /tmp/sglang_paras_test.log
 | In-flight TP→EP coherence | Both requests coherent after switch | Degeneration or crash |
 | Server errors | None | Any scheduler/runtime exception |
 
+## Optional: CUDA-Graph-Enabled Variant
+
+The default procedure runs with `--disable-cuda-graph` for a clean eager path. To exercise the per-mode CUDA graph state preservation hooks (`paras_save_cuda_graph_state` / `paras_load_cuda_graph_state` on `AttentionBackend`) introduced for gpt-oss but applicable to qwen3+FlashInfer too, swap the launch flag:
+
+```diff
+-    --disable-cuda-graph --disable-overlap-schedule \
++    --cuda-graph-max-bs 8 --disable-overlap-schedule \
+```
+
+Then run the same 14-step procedure. After step 2, also verify dual capture happened:
+
+```bash
+grep -E "ParaS: dual capture complete|saving EP graphs|capturing TP graphs|TP capture done" /tmp/sglang_paras_test.log
+# Should show 4 lines per phase (one per DP rank), ending in:
+# "ParaS: dual capture complete avail=...GB  #EP graphs=4  #TP graphs=4"
+# and "TP capture done (..., pools_differ=True, ...)" — pools_differ=True confirms each mode owns its own buffer set.
+```
+
+Pass criteria: same as eager run, plus `pools_differ=True` and `#EP graphs=4 #TP graphs=4` after dual capture.
+
+## See Also
+
+- `.skills/paras-test-gpt-oss/SKILL.md` — parallel test skill for gpt-oss-120b-bf16. The gpt-oss path always runs with CUDA graphs enabled and uses Triton attention; runs both eager (FlashInfer) and Triton+graph paths gives full coverage of the ParaS attention-backend matrix.
+
 ## Important Notes
 
 - **mem-fraction-static=0.75 will OOM** during weight redistribution on A100-80GB. Use 0.6.
@@ -258,9 +282,11 @@ rm -f /tmp/sglang_paras_test.log
 - **Slow timing (~3s instead of ~100ms)**: Likely GPU in bad state from prior OOM. Kill all processes, wait 5 seconds, retry on clean GPU.
 - **Profiler overhead**: If `transfer_weights` > 500ms, check that `paras_start_profile`/`paras_stop_profile` are not called in `scheduler_paras_mixin.py` and `paras_memory_check` is not called in `model_runner.py`.
 - **Wording differences EP vs TP**: Normal. BF16 floating point differences cause minor sampling divergence at `temperature=0`. The content/meaning must be equivalent, not the exact words.
+- **CUDA graph state preservation**: Both FlashInfer and Triton implement the `paras_save_cuda_graph_state` / `paras_load_cuda_graph_state` hooks on `AttentionBackend`. If a future backend forgets to override these, `paras_init_dual_cuda_graphs` raises `NotImplementedError` immediately on first switch. See `docs/paras/gpt_oss_support.md` Bug 5/6 sections for the design rationale.
 
 ## Known Failure Modes
 
 1. **`TypeError: NoneType - int`** after configure_tp: `scheduler_paras_mixin.paras_configure_helper` is missing `max_queued_requests` in the tuple unpacking from `get_worker_info()`.
 2. **`RuntimeError: shape '[N, 2048]' is invalid`**: FusedMoE `no_combine=True` is set on tp_experts. Check that `FusedMoE.__init__` skips `no_combine=True` when `paras_force_standard_dispatcher=True`.
 3. **Decode degenerates to `\xa0`**: FlashInfer updaters have stale `req_to_token` / `num_kv_heads`. Check that `FlashInferAttnBackend.paras_configure_tp()` is called from `model_runner.paras_configure_tp()`.
+4. **`NotImplementedError: <Backend> does not implement paras_save_cuda_graph_state`** during dual capture: a non-Triton/non-FlashInfer attention backend was selected with `--enable-paras-moe`. Either switch to a supported backend or implement the two hooks on the new backend (see `python/sglang/srt/layers/attention/triton_backend.py` for a reference implementation).

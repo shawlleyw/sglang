@@ -717,6 +717,13 @@ def plan_qwen_moe_layout(
         manager.reserve(f"paras.moe_slot.{slot}.w13", w13_shape, weight_dtype)
         manager.reserve(f"paras.moe_slot.{slot}.w2", w2_shape, weight_dtype)
 
+    # w13 and w2 biases are NOT stored in the UMM.  Biases are replicated
+    # on every rank as one full-expert tensor per layer (see
+    # paras_moe_block.py: self._full_w{13,2}_bias), and the EP and TP
+    # forward paths read through Parameter views into that replicated
+    # storage.  Total replicated bias memory is <=0.1% of weight storage,
+    # far cheaper than the UMM-staged transport path it replaces.
+
     # Create 'experts' aliases for create_weights() / weight loading compatibility.
     # These point to the same LayoutEntry objects as slot i+1 — no copy, no duplication.
     # materialize() processes _reservation_order, so aliases won't be double-processed.
