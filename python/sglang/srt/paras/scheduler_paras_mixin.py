@@ -103,6 +103,10 @@ class SchedulerParasMixin:
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        if self.is_hybrid:
+            self.full_tokens_per_layer, self.swa_tokens_per_layer = (
+                self.tp_worker.get_tokens_per_layer_info()
+            )
         
     def paras_check(self):
         if len(self.waiting_queue) > 0:

@@ -307,14 +307,26 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Resize both sub-allocators and rebuild the mapping for ParaS."""
         self.full_attn_allocator.paras_resize_and_clear(new_full_size)
         self.swa_attn_allocator.paras_resize_and_clear(new_swa_size)
-        self.full_to_swa_index_mapping = torch.empty(
-            new_full_size + new_swa_size + 1,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        self.full_to_swa_index_mapping.fill_(0)
+        needed = new_full_size + new_swa_size + 1
+        if self.full_to_swa_index_mapping.numel() >= needed:
+            self.full_to_swa_index_mapping.fill_(0)
+        else:
+            self.full_to_swa_index_mapping = torch.empty(
+                needed, dtype=torch.int64, device=self.device,
+            )
+            self.full_to_swa_index_mapping.fill_(0)
         self._size_full = new_full_size
         self._size_swa = new_swa_size
+        self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
+
+    def paras_pre_grow_mapping(self, max_full_size: int, max_swa_size: int):
+        needed = max_full_size + max_swa_size + 1
+        if self.full_to_swa_index_mapping.numel() >= needed:
+            return
+        self.full_to_swa_index_mapping = torch.empty(
+            needed, dtype=torch.int64, device=self.device,
+        )
+        self.full_to_swa_index_mapping.fill_(0)
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
 
 

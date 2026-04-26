@@ -1950,6 +1950,12 @@ class ModelRunner:
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )
+                        if self.server_args.enable_paras_moe:
+                            paras_tp_size = self.server_args.paras_tp_size
+                            self.token_to_kv_pool_allocator.paras_pre_grow_mapping(
+                                self.full_max_total_num_tokens * paras_tp_size,
+                                self.swa_max_total_num_tokens * paras_tp_size,
+                            )
                     else:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
@@ -2495,7 +2501,16 @@ class ModelRunner:
     def paras_configure_helper(self):
         """Helper function for ParaS configuration."""
         # Reconfigure token_to_kv_pool_allocator, cache related stuffs are configured in scheduler (paras gather manager)
-        self.max_total_num_tokens = self.token_to_kv_pool_allocator.size
+        if self.is_hybrid:
+            self.full_max_total_num_tokens = (
+                self.token_to_kv_pool_allocator.size_full
+            )
+            self.swa_max_total_num_tokens = (
+                self.token_to_kv_pool_allocator.size_swa
+            )
+            self.max_total_num_tokens = self.full_max_total_num_tokens
+        else:
+            self.max_total_num_tokens = self.token_to_kv_pool_allocator.size
         self.max_running_requests = self.req_to_token_pool.size
 
     @paras_func
