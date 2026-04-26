@@ -103,18 +103,18 @@ All three follow the same pattern:
    `_full_w13_bias[:, 2*tp_start:2*tp_end]` (interleaved I-dim slice).
    `tp_experts.w2_weight_bias` wraps the full `_full_w2_bias` on
    `paras_tp_rank == 0`; non-rank-0 leaves the attribute unregistered.
-3. **No cross-rank transfer is required at switch time** for biases that
-   are already full on every rank. `sinks` are already full on every rank
-   right out of the checkpoint loader, so nothing further is needed.
-   Biases, on the other hand, load as EP-local slices (`_slice_ep_expert_weights`
-   narrows the fused gpt-oss checkpoint to each rank's local expert range).
-   `ParaSMoeBlockMixin.paras_all_gather_biases` runs one
-   `dist.all_gather_into_tensor` per full tensor to fill in the non-local
-   slices on every rank; it is called from both the NCCL path
-   (`paras_configure_tp_all_to_all`) and the peer-access path
-   (`paras_configure_tp_fused_peer_access_kernel`). The call is idempotent:
-   the ep_experts views never change, so re-running the gather produces
-   identical `_full_*_bias` contents.
+3. **No cross-rank transfer is required at switch time** for biases or
+   sinks. `sinks` are already full on every rank right out of the
+   checkpoint loader. Biases are also loaded **full on every rank** at
+   init time: `paras_init_moe` re-registers the FusedMoE-allocated
+   bias parameters as zero-filled `(num_global_experts, D)` tensors
+   (`_full_w13_bias`, `_full_w2_bias`) before `load_weights` runs, so
+   the checkpoint loader writes the full bias directly into them with
+   no transport. After load, `paras_finalize_moe_bias_views` rebinds
+   `ep_experts.w{13,2}_weight_bias` to local-slice views and
+   `tp_experts.w{13,2}_weight_bias` to TP slice views (rank-0 only for
+   w2). Switching mode is a pure Parameter rebind; no kernel and no
+   collective fires for biases on the switch path.
 
 The `tp_experts.w2_weight_bias` rank-0-only registration is important: in
 TP mode the Triton fused-MoE kernel adds `w2` bias inside each rank's
@@ -771,12 +771,23 @@ should be addressed before those configurations are used:
   0. A full fix would compute the expected local size from
   `num_local_experts + ep_num_redundant_experts` and adjust the
   `all_gather_into_tensor` shape math accordingly.
-- `PARAS_CONFIGURE_METHOD=peer_access` with GPT-OSS raises
-  `NotImplementedError` at `paras_moe_block.py:489-497` because the fused
-  NVLink peer-access kernel does not yet carry biases. The naive and
-  overlap methods handle biases through the NCCL path and work correctly.
-  Enabling peer_access for GPT-OSS requires writing a bias-aware peer kernel
-  or a fallback.
+- `PARAS_CONFIGURE_METHOD=peer_access` is now supported for GPT-OSS. The
+  v2 / `_ep` peer-access kernels in `paras/csrc/peer_access_transfer.cu`
+  handle the interleaved w13 layout without `.cu` changes — the call
+  sites in `paras_configure_tp_fused_peer_access_kernel` and
+  `paras_configure_ep_fused_peer_access_kernel` branch on
+  `_paras_interleaved_w13` and pass `num_gates=1` together with a
+  doubled per-chunk extent (`2 * I' * H` instead of `I' * H`). Each
+  rank's `2*I'*H` contiguous interleaved `(g_k, u_k)` slab is then
+  transferred as a single chunk per (expert, peer), preserving
+  interleaving end-to-end. Biases are not part of the kernel transfer
+  contract; they are loaded full on every rank at init time and exposed
+  to the EP and TP forward paths via Parameter views into
+  `_full_w{13,2}_bias` (see `paras_finalize_moe_bias_views`). End-to-end
+  validation: 4×A100, gpt-oss-120b-bf16, `PARAS_CONFIGURE_METHOD=peer_access`,
+  switch latency ~270 ms (vs ~600–900 ms for the previous naive default),
+  three-prompt EP/TP/EP-RT batches and in-flight EP↔TP both directions
+  all coherent, zero server errors.
 
 Sinks are not propagated through the prefill attention path
 (`unified_attention_with_output` drops kwargs). This is a pre-existing

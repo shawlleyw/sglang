@@ -6,6 +6,7 @@ Each direction verified independently against pattern-based ground truth.
 Usage:
   torchrun --nproc_per_node=4 test/srt/paras/test_kv_cache_transfer.py
   torchrun --nproc_per_node=4 test/srt/paras/test_kv_cache_transfer.py --num-kv-heads 2  # replication
+  torchrun --nproc_per_node=4 test/srt/paras/test_kv_cache_transfer.py --num-kv-heads 8  # sharded heads (gpt-oss)
 """
 
 import ctypes
@@ -1080,6 +1081,233 @@ class TestTPtoEPStandalone:
 
 
 # =========================================================================
+# Sharded-heads Tests (num_kv_heads > tp_size — gpt-oss-style config)
+# =========================================================================
+#
+# These tests exercise the case where each TP rank owns MULTIPLE KV heads
+# (heads_per_rank > 1). For 4 GPUs with num_kv_heads=8, heads_per_rank=2.
+# This is the configuration that the original NCCL Bug 4 fix in commit
+# b9e8c9321 enabled (silently corrupted gpt-oss-style configs because
+# gather_kv_and_permute used a heads-first layout that only matched scatter
+# for sharded_heads == 1).
+#
+# The peer_access kernel does not use all_to_all, so it cannot have the
+# same Bug 4 layout mismatch. These tests verify the peer_access path is
+# correct end-to-end for sharded_heads > 1, which had zero coverage prior
+# to this addition.
+# =========================================================================
+
+
+def verify_ep_to_tp_sharded(mgr, rank, world_size, num_kv_heads,
+                            tokens_per_rank, tp_view_tokens):
+    """Verify EP→TP gather for heads_per_rank > 1.
+
+    TP rank r owns heads ``[r*heads_per_rank, (r+1)*heads_per_rank)``
+    (global indices).  For each (source_rank, local_token) we expect
+    ``make_pattern(src, layer, global_head, n)`` for K and
+    ``make_pattern(src, layer, global_head + 50, n)`` for V.
+    """
+    heads_per_rank = num_kv_heads // world_size
+    assert heads_per_rank > 1, (
+        "verify_ep_to_tp_sharded requires heads_per_rank > 1; "
+        "use verify_ep_to_tp for heads_per_rank == 1"
+    )
+    device = f"cuda:{rank}"
+
+    all_ok = True
+    for lid in range(NUM_LAYERS):
+        tp_k = mgr.get_view_as(
+            f"model.layers.{lid}.kv.tp.k",
+            (tp_view_tokens, heads_per_rank, HEAD_DIM),
+        )
+        tp_v = mgr.get_view_as(
+            f"model.layers.{lid}.kv.tp.v",
+            (tp_view_tokens, heads_per_rank, HEAD_DIM),
+        )
+
+        for lh in range(heads_per_rank):
+            global_head = rank * heads_per_rank + lh
+            offset = 0
+            for src in range(world_size):
+                n = tokens_per_rank[src]
+                expected_k = make_pattern(src, lid, global_head, n).to(device)
+                expected_v = make_pattern(src, lid, global_head + 50, n).to(device)
+                actual_k = tp_k[offset:offset + n, lh, :]
+                actual_v = tp_v[offset:offset + n, lh, :]
+                if not torch.equal(actual_k, expected_k):
+                    all_ok = False
+                    if rank == 0:
+                        diff = (actual_k.float() - expected_k.float()).abs().max()
+                        print(
+                            f"  K mismatch L{lid} src={src} lh={lh} "
+                            f"(global_head={global_head}): max_diff={diff}"
+                        )
+                if not torch.equal(actual_v, expected_v):
+                    all_ok = False
+                    if rank == 0:
+                        diff = (actual_v.float() - expected_v.float()).abs().max()
+                        print(
+                            f"  V mismatch L{lid} src={src} lh={lh} "
+                            f"(global_head={global_head}): max_diff={diff}"
+                        )
+                offset += n
+
+    return all_ok
+
+
+def verify_tp_to_ep_sharded(mgr, rank, world_size, num_kv_heads,
+                            tokens_per_rank, token_partition):
+    """Verify TP→EP scatter for heads_per_rank > 1.
+
+    EP rank ``e`` receives ``token_partition[e]`` tokens.  For each global
+    EP head ``h``:
+      ``src_tp_rank = h // heads_per_rank``
+      ``src_local_head = h % heads_per_rank``
+    Expected K = ``make_pattern(src_tp_rank, lid, src_local_head, total)``
+    indexed by ``token_partition[e]`` (and analogously for V with +50).
+    """
+    heads_per_rank = num_kv_heads // world_size
+    assert heads_per_rank > 1, (
+        "verify_tp_to_ep_sharded requires heads_per_rank > 1; "
+        "use verify_tp_to_ep for heads_per_rank == 1"
+    )
+    total_tokens = sum(tokens_per_rank)
+    my_tokens = token_partition[rank]
+    count = len(my_tokens)
+    device = f"cuda:{rank}"
+
+    ep_dst = torch.arange(count, dtype=torch.int64, device=device)
+
+    all_ok = True
+    for lid in range(NUM_LAYERS):
+        ep_k = mgr.get_view(f"model.layers.{lid}.kv.ep.k")
+        ep_v = mgr.get_view(f"model.layers.{lid}.kv.ep.v")
+
+        for h in range(num_kv_heads):
+            src_tp_rank = h // heads_per_rank
+            src_local_head = h % heads_per_rank
+
+            full_k = make_pattern(
+                src_tp_rank, lid, src_local_head, total_tokens
+            ).to(device)
+            full_v = make_pattern(
+                src_tp_rank, lid, src_local_head + 50, total_tokens
+            ).to(device)
+
+            global_indices = torch.tensor(
+                my_tokens, dtype=torch.long, device=device
+            )
+            expected_k = full_k[global_indices]
+            expected_v = full_v[global_indices]
+            actual_k = ep_k[ep_dst, h, :]
+            actual_v = ep_v[ep_dst, h, :]
+
+            if not torch.equal(actual_k, expected_k):
+                all_ok = False
+                if rank == 0:
+                    diff = (actual_k.float() - expected_k.float()).abs().max()
+                    print(
+                        f"  K mismatch L{lid} h={h} "
+                        f"(src_rank={src_tp_rank} src_lh={src_local_head}): "
+                        f"max_diff={diff}"
+                    )
+            if not torch.equal(actual_v, expected_v):
+                all_ok = False
+                if rank == 0:
+                    diff = (actual_v.float() - expected_v.float()).abs().max()
+                    print(
+                        f"  V mismatch L{lid} h={h} "
+                        f"(src_rank={src_tp_rank} src_lh={src_local_head}): "
+                        f"max_diff={diff}"
+                    )
+
+    return all_ok
+
+
+@pytest.mark.skipif(not _is_distributed(), reason="Requires torchrun with 4 GPUs")
+class TestShardedHeads:
+    """num_kv_heads > tp_size: each TP rank owns multiple heads (gpt-oss case).
+
+    For 4 GPUs with num_kv_heads=8, heads_per_rank=2.
+    """
+
+    @pytest.mark.skipif(
+        not _HAS_PEER_ACCESS,
+        reason="paras_peer_access_cuda not available",
+    )
+    def test_ep_to_tp_peer_access_sharded_heads(self):
+        """EP→TP via peer_access kernel with heads_per_rank > 1."""
+        rank, world_size = _ensure_distributed()
+        # 2x world_size gives heads_per_rank == 2 on any supported world size.
+        num_kv_heads = world_size * 2
+        tokens_per_rank = _tokens_for_world(world_size)
+
+        tp_group = _setup_paras_state(rank, world_size)
+        mgr, ep_max, _ = setup_memory_manager(
+            rank, world_size, num_kv_heads, tokens_per_rank
+        )
+        peer_ctx = setup_peer_ctx(mgr, rank, world_size, tp_group)
+
+        fill_ep_kv(mgr, rank, num_kv_heads, tokens_per_rank)
+        tp_view_tokens = do_ep_to_tp_gather_peer_access(
+            mgr, rank, world_size, num_kv_heads, tokens_per_rank,
+            ep_max, tp_group, peer_ctx,
+        )
+        dist.barrier(group=tp_group)
+
+        all_ok = verify_ep_to_tp_sharded(
+            mgr, rank, world_size, num_kv_heads, tokens_per_rank,
+            tp_view_tokens,
+        )
+        _save_evidence("ep_to_tp_peer_access_sharded_heads", all_ok, rank)
+        assert all_ok, (
+            f"EP→TP peer_access (sharded_heads) failed on rank {rank}"
+        )
+
+    @pytest.mark.skipif(
+        not _HAS_PEER_ACCESS,
+        reason="paras_peer_access_cuda not available",
+    )
+    def test_tp_to_ep_peer_access_sharded_heads(self):
+        """TP→EP via peer_access kernel with heads_per_rank > 1."""
+        rank, world_size = _ensure_distributed()
+        num_kv_heads = world_size * 2
+        tokens_per_rank = _tokens_for_world(world_size)
+        total_tokens = sum(tokens_per_rank)
+
+        tp_group = _setup_paras_state(rank, world_size)
+        mgr, ep_max, _ = setup_memory_manager(
+            rank, world_size, num_kv_heads, tokens_per_rank
+        )
+        peer_ctx = setup_peer_ctx(mgr, rank, world_size, tp_group)
+
+        heads_per_rank = num_kv_heads // world_size
+        tp_view_tokens = (
+            (ep_max + PAGE_SIZE) * num_kv_heads // heads_per_rank
+        )
+
+        fill_tp_kv(
+            mgr, rank, world_size, num_kv_heads, total_tokens, tp_view_tokens
+        )
+
+        token_partition, _ = do_tp_to_ep_scatter_peer_access(
+            mgr, rank, world_size, num_kv_heads, tokens_per_rank,
+            tp_view_tokens, tp_group, peer_ctx,
+        )
+
+        all_ok = verify_tp_to_ep_sharded(
+            mgr, rank, world_size, num_kv_heads, tokens_per_rank,
+            token_partition,
+        )
+        _save_evidence(
+            "tp_to_ep_peer_access_sharded_heads", all_ok, rank
+        )
+        assert all_ok, (
+            f"TP→EP peer_access (sharded_heads) failed on rank {rank}"
+        )
+
+
+# =========================================================================
 # Round-trip Tests
 # =========================================================================
 
@@ -1173,7 +1401,7 @@ def main():
     )
     parser.add_argument(
         "--num-kv-heads", type=int, default=None,
-        help="Run only tests matching this head count (2 or 4)",
+        help="Run only tests matching this head count (2, 4, or 8)",
     )
     args = parser.parse_args()
 
@@ -1218,6 +1446,17 @@ def main():
             tests.append(
                 ("tp_to_ep_peer_access_no_replication",
                  TestTPtoEPStandalone().test_tp_to_ep_peer_access_no_replication)
+            )
+
+    if args.num_kv_heads is None or args.num_kv_heads == world_size * 2:
+        if _HAS_PEER_ACCESS:
+            tests.append(
+                ("ep_to_tp_peer_access_sharded_heads",
+                 TestShardedHeads().test_ep_to_tp_peer_access_sharded_heads)
+            )
+            tests.append(
+                ("tp_to_ep_peer_access_sharded_heads",
+                 TestShardedHeads().test_tp_to_ep_peer_access_sharded_heads)
             )
 
     # Replication tests (R=2) are in test_kv_cache_transfer_replication.py

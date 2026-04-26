@@ -454,6 +454,13 @@ class ParaSMoeBlockMixin:
           - Layer i reads local slot[i+1], writes to peer slot[i]
           - Layer i+1 reads local slot[i+2], writes to peer slot[i+1]
           - Different slots → no race → barriers only needed at sweep start/end.
+
+        w13 layout dispatch:
+          - Qwen3 (concat [g0..g_I, u0..u_I]): num_gates=2, chunk=I'*H per (e, k)
+          - GPT-OSS (interleaved [g0,u0,g1,u1,...]): num_gates=1, chunk=2*I'*H per
+            (e,) since each rank's slab is 2*I'*H contiguous interleaved bytes.
+            The kernel copies contiguous bytes regardless of interpretation, so
+            the interleaving is preserved end-to-end with no .cu changes.
         """
         mgr = get_global_paras_memory_manager()
         paras_tp_size = get_paras_tp_size()
@@ -471,13 +478,20 @@ class ParaSMoeBlockMixin:
         local_buffer_ptr = mgr._buffer.data_ptr()
         dtype_bytes = ep_w13_entry.dtype.itemsize
 
+        if self._paras_interleaved_w13:
+            w13_num_gates = 1
+            w13_chunk_elems = 2 * moe_intermediate_size_after_tp * self.hidden_size
+        else:
+            w13_num_gates = 2
+            w13_chunk_elems = moe_intermediate_size_after_tp * self.hidden_size
+
         peer_access_fused_transfer_w13_v2(
             local_buffer_ptr, dst_base_ptrs,
             ep_w13_entry.offset_bytes, tp_w13_entry.offset_bytes,
             paras_tp_rank, paras_tp_size,
             self.num_local_experts,
-            moe_intermediate_size_after_tp * self.hidden_size,
-            num_gates=2, elem_size=dtype_bytes, stream=stream,
+            w13_chunk_elems,
+            num_gates=w13_num_gates, elem_size=dtype_bytes, stream=stream,
         )
         peer_access_fused_transfer_w2_v2(
             local_buffer_ptr, dst_base_ptrs,
@@ -596,6 +610,11 @@ class ParaSMoeBlockMixin:
 
         NO barriers — caller manages per-layer synchronization.
         Layer ordering must be REVERSE (N-1→0) at the model level.
+
+        w13 layout dispatch matches the EP→TP path (see
+        ``paras_configure_tp_fused_peer_access_kernel``): GPT-OSS
+        interleaved layout uses ``num_gates=1`` and
+        ``chunk=2*I'*H`` so the contiguous (g,u) pairs stay contiguous.
         """
         mgr = get_global_paras_memory_manager()
         paras_tp_size = get_paras_tp_size()
@@ -615,13 +634,20 @@ class ParaSMoeBlockMixin:
         local_buffer_ptr = mgr._buffer.data_ptr()
         dtype_bytes = tp_w13_entry.dtype.itemsize
 
+        if self._paras_interleaved_w13:
+            w13_num_gates = 1
+            w13_chunk_elems = 2 * moe_intermediate_size_after_tp * self.hidden_size
+        else:
+            w13_num_gates = 2
+            w13_chunk_elems = moe_intermediate_size_after_tp * self.hidden_size
+
         peer_access_fused_transfer_w13_ep(
             local_buffer_ptr, dst_base_ptrs,
             tp_w13_entry.offset_bytes, ep_w13_entry.offset_bytes,
             paras_tp_rank, paras_tp_size,
             self.num_local_experts,
-            moe_intermediate_size_after_tp * self.hidden_size,
-            num_gates=2, elem_size=dtype_bytes, stream=stream,
+            w13_chunk_elems,
+            num_gates=w13_num_gates, elem_size=dtype_bytes, stream=stream,
         )
         peer_access_fused_transfer_w2_ep(
             local_buffer_ptr, dst_base_ptrs,

@@ -656,5 +656,98 @@ def test_gpt_oss_w13_layout_semantics_interleaved():
     _run_layout_semantics_test(interleaved_w13=True)
 
 
+def _run_peer_access_layout_semantics_test(interleaved_w13: bool):
+    """Same semantics check as _run_layout_semantics_test but via peer_access.
+
+    Verifies that ``paras_configure_tp_fused_peer_access_kernel`` produces
+    the same TP layout as the NCCL ``paras_configure_tp_all_to_all`` path
+    for both concat and interleaved w13 layouts.
+    """
+    rank, world_size = setup_distributed()
+    tp_group = setup_paras_state(rank, world_size)
+
+    try:
+        mgr, num_local = build_manager(rank, world_size)
+        _fill_tagged_w13(mgr, rank, interleaved_w13, world_size)
+        ep_snap = snapshot_weights(mgr)
+
+        from sglang.srt.paras.peer_access import init_peer_access
+        from sglang.srt.paras.paras_parallel_state import (
+            get_paras_tp_group,
+            get_paras_tp_size,
+        )
+
+        peer_ctx = init_peer_access(
+            mgr, get_paras_tp_group().device_group, get_paras_tp_size()
+        )
+        dst_base_ptrs = torch.tensor(
+            peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+        )
+        paras_tp_group = get_paras_tp_group().device_group
+        barrier_tensor = torch.zeros(1, device="cuda")
+        dist.barrier(group=paras_tp_group)
+
+        for layer_id in range(NUM_LAYERS):
+            mixin = _make_mixin(
+                layer_id, num_local, mgr, interleaved_w13=interleaved_w13
+            )
+            mixin.paras_configure_tp_fused_peer_access_kernel(
+                peer_ctx, dst_base_ptrs, None
+            )
+            dist.all_reduce(
+                barrier_tensor, op=dist.ReduceOp.SUM, group=paras_tp_group
+            )
+
+        _assert_tp_w13_layout(mgr, rank, world_size, interleaved_w13)
+
+        dist.barrier(group=paras_tp_group)
+        barrier_tensor.zero_()
+        for layer_id in reversed(range(NUM_LAYERS)):
+            mixin = _make_mixin(
+                layer_id, num_local, mgr, interleaved_w13=interleaved_w13
+            )
+            mixin.paras_configure_ep_fused_peer_access_kernel(
+                peer_ctx, dst_base_ptrs, None
+            )
+            dist.all_reduce(
+                barrier_tensor, op=dist.ReduceOp.SUM, group=paras_tp_group
+            )
+
+        for layer_id in range(NUM_LAYERS):
+            w13_now = mgr.get_view(
+                f"model.layers.{layer_id}.mlp.experts.w13_weight"
+            )
+            w2_now = mgr.get_view(
+                f"model.layers.{layer_id}.mlp.experts.w2_weight"
+            )
+            assert torch.equal(w13_now, ep_snap[layer_id][0]), (
+                f"Layer {layer_id} w13 mismatch after peer_access "
+                f"round-trip (interleaved_w13={interleaved_w13})"
+            )
+            assert torch.equal(w2_now, ep_snap[layer_id][1]), (
+                f"Layer {layer_id} w2 mismatch after peer_access "
+                f"round-trip (interleaved_w13={interleaved_w13})"
+            )
+
+        if rank == 0:
+            print(
+                "PASS: peer_access layout semantics + round-trip "
+                f"(interleaved_w13={interleaved_w13})"
+            )
+
+    finally:
+        teardown_distributed()
+
+
+def test_gpt_oss_w13_peer_access_layout_concat():
+    """peer_access: concat layout TP shape and EP round-trip restoration."""
+    _run_peer_access_layout_semantics_test(interleaved_w13=False)
+
+
+def test_gpt_oss_w13_peer_access_layout_interleaved():
+    """peer_access: interleaved layout TP shape and EP round-trip restoration."""
+    _run_peer_access_layout_semantics_test(interleaved_w13=True)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

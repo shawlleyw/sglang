@@ -15,7 +15,7 @@ description: Test ParaS EP↔TP configure on gpt-oss-120b-bf16 with 4 GPUs. Use 
 | MoE biases | None | Per-expert `w13_weight_bias` / `w2_weight_bias` (replicated, see `gpt_oss_support.md`) |
 | Attention sinks | None | Per-head `sinks` parameter |
 | Checkpoint layout | Per-projection BF16 | Fused `gate_up_proj` / `down_proj`, interleaved w13 |
-| Weight transfer method | peer_access (default) | **naive** (`PARAS_CONFIGURE_METHOD=naive`); peer_access kernel does not yet carry biases |
+| Weight transfer method | peer_access (default) | **peer_access** (`PARAS_CONFIGURE_METHOD=peer_access`); the v2/_ep kernels handle the interleaved w13 layout via `num_gates=1, chunk=2*I'*H` (see `paras_moe_block.py:481-486`). Biases are not transported — loaded full on every rank at init time. |
 
 The gpt-oss test thus covers a different code matrix from qwen3 — both should be run when touching shared ParaS code.
 
@@ -44,8 +44,9 @@ cd /home/shaoyuw/sglang
 pip install -e python/ -q --no-deps
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-PARAS_CONFIGURE_METHOD=naive \
+PARAS_CONFIGURE_METHOD=peer_access \
 PARAS_KV_TRANSFER_METHOD=nccl \
+PARAS_DISABLE_PEER_ACCESS=0 \
 SGLANG_DEEPEP_BF16_DISPATCH=true \
 SGLANG_ATTN_MAX_BS=256 \
 SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256 \
@@ -140,15 +141,15 @@ curl -s --max-time 10 http://localhost:30000/paras_configure_tp
 grep -E "Time taken to configure TP|transfer_weights|gather_cache" /tmp/sglang_paras_gptoss.log | tail -10
 ```
 
-**Baseline performance** (4×A100-80GB, naive transfer, NCCL KV, measured 2026-04-26):
+**Baseline performance** (4×A100-80GB, peer_access transfer, NCCL KV, measured 2026-04-26):
 
 | Metric | Baseline | Pass threshold |
 |---|---|---|
-| `transfer_weights` (naive) | ~600–900 ms | < 2000 ms |
+| `transfer_weights` (peer_access) | ~270 ms | < 2000 ms |
 | `gather_cache` (no in-flight) | ~10 ms | < 100 ms |
-| `configure TP` total | ~700 ms–1 s | < 2500 ms |
+| `configure TP` total | ~290–340 ms | < 2500 ms |
 
-Naive transfer is significantly slower than peer_access (which qwen3 uses by default). This is expected — peer_access for gpt-oss is unimplemented (the fused NVLink kernel does not yet carry biases; see `paras_moe_block.py:489-497`).
+Peer-access is ~2.2-3.4× faster than the older naive NCCL all-to-all baseline (which was ~600-900 ms). The v2/_ep kernels handle the interleaved w13 layout by setting `num_gates=1` and doubling the per-chunk extent so each rank's contiguous (g,u) interleaved slab is transferred as a single chunk — no `.cu` changes were required (see `paras_moe_block.py:481-486`).
 
 ### 8. Send same requests in TP mode (after switch)
 
@@ -270,8 +271,8 @@ rm -f /tmp/sglang_paras_gptoss.log /tmp/gptoss_r*.json
 
 - **`--max-running-requests 1024` is canonical**, NOT the older `256` workaround. The state-preservation redesign (commit `098b8a37a`) freed the ~3 GB of permanent GPU memory the pre-grow consumed. If you see OOM at 1024, suspect either a regression in the redesign or an unrelated change to memory accounting.
 - **`--cuda-graph-max-bs 8` exercises the per-mode state preservation hooks**. The hooks (`paras_save_cuda_graph_state` / `paras_load_cuda_graph_state` on `AttentionBackend`) raise `NotImplementedError` if a future backend forgets to override; that surfaces as a clean error during dual capture rather than silent garbage at first replay.
-- **`PARAS_CONFIGURE_METHOD=naive` is required for gpt-oss**. The fused NVLink peer-access kernel at `paras_moe_block.py:489-497` raises `NotImplementedError` because it does not carry biases, which gpt-oss requires.
-- **`PARAS_DISABLE_PEER_ACCESS=1` is the implicit default** for gpt-oss on A100 (set in `python/sglang/srt/paras/models/gpt_oss.py:438-454`). The peer-access pre-init step interacted badly with NCCL on A100 (Bug 7 in `gpt_oss_support.md`); skipping it costs ~6 s of first-switch latency but avoids the crash.
+- **`PARAS_CONFIGURE_METHOD=peer_access` is the canonical method for gpt-oss**. The peer-access path now handles the interleaved w13 layout by passing `num_gates=1, chunk=2*I'*H` to the v2/_ep kernels (see `paras_moe_block.py:445-505` and `:589-650`); the kernels themselves were unchanged. Biases are not transferred during the switch — `_full_w13_bias` and `_full_w2_bias` are loaded full on every rank at init time and exposed via Parameter views that get rebound on switch (see `paras_finalize_moe_bias_views` in `paras_moe_block.py`).
+- **`PARAS_DISABLE_PEER_ACCESS=0` is required** to enable the peer-access pre-init at boot for the MoE weight transfer kernels. The Bug 7 workaround that defaulted this to `1` was for the old `naive` configuration where peer-access was unused; with `peer_access` selected, the pre-init is necessary and validated end-to-end on 4×A100.
 - **Hybrid attention budget**: gpt-oss layers alternate full-attention and sliding-window. The KV budget split is controlled by `swa_full_tokens_ratio` (default 0.8). The scheduler treats full and sliding layers in a single memory pool (`disable_hybrid_swa_memory=True`).
 - **CUDA graph round-trip determinism is degraded vs eager**. With cuda graph, EP→TP→EP outputs match for ~30 tokens then diverge into semantically equivalent but different completions. This is expected (Triton autotune picks different configs across captures); functional correctness is unaffected.
 
@@ -293,8 +294,8 @@ This file covers:
 
 ## Known Failure Modes
 
-1. **`NotImplementedError: peer_access not supported for GPT-OSS biases`** at first switch: `PARAS_CONFIGURE_METHOD` is unset or set to `peer_access`. Set `PARAS_CONFIGURE_METHOD=naive` (or `overlap`).
-2. **`CUDA error: Invalid access of peer GPU memory over nvlink`** at first switch on A100: `PARAS_DISABLE_PEER_ACCESS` was overridden to `0`. Restore the default.
+1. **`KeyError: "No reservation named 'model.layers.0.mlp.tp_experts.w13_weight_bias'"`** when running `test_gpt_oss_bias_nccl_roundtrip_*` in `test_paras_gpt_oss_cuda_graph.py`: pre-existing test bug introduced when commit `f9baf8a` removed UMM bias entries (biases moved to per-rank `_full_*_bias` tensors) but the test wasn't updated. The NCCL transport itself works at the e2e level; only the unit test's UMM-key lookup is stale.
+2. **`CUDA error: Invalid access of peer GPU memory over nvlink`** at first switch on A100 with the legacy `PARAS_CONFIGURE_METHOD=naive` setting: this was the pre-peer-access workaround. With `PARAS_CONFIGURE_METHOD=peer_access` (the new default) the peer-access path is validated end-to-end and the workaround is unnecessary.
 3. **`OutOfMemoryError` during dual capture**: a regression has re-introduced a pre-grow somewhere, or `--cuda-graph-max-bs` is too high. The redesign verified `--cuda-graph-max-bs 8 --max-running-requests 1024 --mem-fraction-static 0.8` fits in 80 GB; larger graph batch sizes may not.
 4. **`NotImplementedError: <Backend> does not implement paras_save_cuda_graph_state`** during dual capture: the configured attention backend (other than Triton or FlashInfer) was selected with `--enable-paras-moe`. Switch to `--attention-backend triton` (gpt-oss-required) or implement the two hooks on the new backend (`triton_backend.py:224-249` is the reference).
 5. **Decode garbage like `Photos. 1990. 1990. 1990.`**: pre-redesign Bug 6 symptom — captured EP graph reading freed `kv_indptr` memory after dual capture reallocated it. Confirm HEAD is at or after `098b8a37a` (per-mode state preservation).
