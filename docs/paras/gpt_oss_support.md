@@ -711,17 +711,25 @@ the NCCL transfer path.
 
 Workaround (this commit): skip the pre-init by default, gated on
 `PARAS_DISABLE_PEER_ACCESS=1` (the new default). The peer-access
-KV transfer path can still be selected by setting both
-`PARAS_DISABLE_PEER_ACCESS=0` and
-`PARAS_KV_TRANSFER_METHOD=peer_access`, but no end-to-end
-verification of that path on A100 has been performed in this session.
+KV transfer path is selected by setting both
+`PARAS_DISABLE_PEER_ACCESS=0` and `PARAS_KV_TRANSFER_METHOD=peer_access`.
 
-Open questions:
+Status update: end-to-end peer-access KV transfer is now verified on
+4×A100 for both Qwen3-30B-A3B (heads_per_rank=1) and gpt-oss-120b-bf16
+(heads_per_rank=2, the sharded-heads case). EP→TP `gather_cache` runs
+in ~8–15 ms via the fused NVLink kernel; TP→EP `scatter_cache` runs in
+~10–24 ms; in-flight switches in both directions produce coherent
+continuations with no `Invalid access of peer GPU memory over nvlink`
+errors. Bug 7's original concern about the pre-init step interacting
+badly with NCCL applied only when NCCL was used for the same fabric;
+selecting peer-access for both weights and KV avoids the conflict.
+
+Open question:
 - Whether the peer-access pre-init step is harmless in isolation and
-  conflicts only when followed by NCCL all-to-all on the same
-  NVLink fabric.
-- Whether the peer-access KV transfer path itself produces correct
-  results on A100 (vs being known-good on H100).
+  conflicts only when followed by NCCL all-to-all on the same NVLink
+  fabric. The verification above suggests yes — the pre-init is fine
+  as long as the same fabric is used by peer-access kernels rather
+  than NCCL all-to-all.
 - Whether the pre-init should be deferred to first switch (when it
   is actually needed) instead of paid at boot.
 

@@ -153,7 +153,11 @@ class SchedulerParasMixin:
             self.paras_tp_group,
             self.req_to_token_pool, 
             self.token_to_kv_pool_allocator,
-            peer_ctx=getattr(self.tp_worker, '_fused_peer_access_ctx', None),
+            peer_ctx=getattr(
+                self.tp_worker.model_runner.model,
+                '_fused_peer_access_ctx',
+                None,
+            ),
             method=os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl"),
         )
         
@@ -235,7 +239,11 @@ class SchedulerParasMixin:
             scatter_group=self.paras_tp_group,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            peer_ctx=getattr(self.tp_worker, '_fused_peer_access_ctx', None),
+            peer_ctx=getattr(
+                self.tp_worker.model_runner.model,
+                '_fused_peer_access_ctx',
+                None,
+            ),
             paras_tp_rank=self.paras_tp_rank,
             paras_tp_size=self.paras_tp_size,
         )

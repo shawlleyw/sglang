@@ -45,7 +45,7 @@ pip install -e python/ -q --no-deps
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 PARAS_CONFIGURE_METHOD=peer_access \
-PARAS_KV_TRANSFER_METHOD=nccl \
+PARAS_KV_TRANSFER_METHOD=peer_access \
 PARAS_DISABLE_PEER_ACCESS=0 \
 SGLANG_DEEPEP_BF16_DISPATCH=true \
 SGLANG_ATTN_MAX_BS=256 \
@@ -141,15 +141,17 @@ curl -s --max-time 10 http://localhost:30000/paras_configure_tp
 grep -E "Time taken to configure TP|transfer_weights|gather_cache" /tmp/sglang_paras_gptoss.log | tail -10
 ```
 
-**Baseline performance** (4×A100-80GB, peer_access transfer, NCCL KV, measured 2026-04-26):
+**Baseline performance** (4×A100-80GB, peer_access weights + peer_access KV, measured 2026-04-26):
 
 | Metric | Baseline | Pass threshold |
 |---|---|---|
 | `transfer_weights` (peer_access) | ~270 ms | < 2000 ms |
-| `gather_cache` (no in-flight) | ~10 ms | < 100 ms |
-| `configure TP` total | ~290–340 ms | < 2500 ms |
+| `gather_cache` (peer_access, in-flight, sharded_heads=2) | ~8 ms | < 100 ms |
+| `scatter_cache` (peer_access, in-flight, sharded_heads=2) | ~18–24 ms | < 100 ms |
+| `configure TP` total | ~280–335 ms | < 2500 ms |
+| `configure EP` total | ~290–300 ms | < 2500 ms |
 
-Peer-access is ~2.2-3.4× faster than the older naive NCCL all-to-all baseline (which was ~600-900 ms). The v2/_ep kernels handle the interleaved w13 layout by setting `num_gates=1` and doubling the per-chunk extent so each rank's contiguous (g,u) interleaved slab is transferred as a single chunk — no `.cu` changes were required (see `paras_moe_block.py:481-486`).
+Peer-access is ~2.2-3.4× faster than the older naive NCCL all-to-all baseline (which was ~600-900 ms). The v2/_ep kernels handle the interleaved w13 layout by setting `num_gates=1` and doubling the per-chunk extent so each rank's contiguous (g,u) interleaved slab is transferred as a single chunk — no `.cu` changes were required (see `paras_moe_block.py:481-486`). The peer-access KV transfer path uses the existing `peer_access_kv_transfer` (gather, EP→TP) and `peer_access_kv_scatter` (scatter, TP→EP) kernels; both are correct for `heads_per_rank > 1` (gpt-oss configuration).
 
 ### 8. Send same requests in TP mode (after switch)
 
