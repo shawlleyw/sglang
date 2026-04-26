@@ -1266,16 +1266,6 @@ class QKVParallelLinear(ColumnParallelLinear):
         if not hasattr(self.weight, "input_dim"):
             set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
 
-        if self.bias is not None:
-            self.full_bias = self.bias
-            full_bias_tensor = self.full_bias.data
-            new_bias_tensor = torch.cat([
-                full_bias_tensor[tp_head_start:tp_head_end],
-                full_bias_tensor[tp_k_head_start:tp_k_head_end],
-                full_bias_tensor[tp_v_head_start:tp_v_head_end]
-            ])
-            self.bias = torch.nn.Parameter(new_bias_tensor, requires_grad=False)
-
         self.tp_size = paras_tp_size
         self.tp_rank = paras_tp_rank
 
@@ -1284,7 +1274,6 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.tp_size = 1
         self.tp_rank = 0
         self.weight = self.full_weight
-        self.bias = self.full_bias if self.bias is not None else None
 
 
 class RowParallelLinear(LinearBase):

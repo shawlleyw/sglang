@@ -93,7 +93,19 @@ class SWACacheTransfer(CacheTransferBase):
     def _compute_swa_scatter_splits_nccl(
         self, cap: int,
     ) -> Tuple[torch.Tensor, int, List[int], int, List[int], int]:
-        """Cap-aware NCCL scatter splits: ``min(full, cap)`` per destination."""
+        """Cap-aware NCCL scatter splits: ``min(full, cap)`` per destination.
+
+        This cannot reuse ``CacheTransferBase._precompute_scatter_nccl``
+        because the SWA cap varies per layer (``spec.tokens_cap_ep``),
+        while the base precompute runs once in ``__init__``.  Under head
+        replication the per-destination slice is
+        ``[full*intra/R, full*(intra+1)/R]`` for the base but
+        ``[cap*intra/R, cap*(intra+1)/R]`` for the SWA layer, and the
+        latter is not a contiguous subset of the former when
+        ``intra > 0`` (e.g. full=10, cap=6, R=2, intra=1 → base takes
+        tokens [5, 10), SWA takes tokens [3, 6)).  So SWA layers must
+        recompute the per-destination slicing at dispatch time.
+        """
         group_size = self.group_size
         intra_rank = self._intra_rank
         replication_factor = self._replication_factor
@@ -140,7 +152,13 @@ class SWACacheTransfer(CacheTransferBase):
     def _compute_swa_scatter_slices_peer_access(
         self, cap: int,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], int]:
-        """Cap-aware per-destination slices returning int32 tensors for peer-access."""
+        """Cap-aware per-destination slices returning int32 tensors for peer-access.
+
+        See ``_compute_swa_scatter_splits_nccl`` for why this cannot
+        reuse ``CacheTransferBase._precompute_scatter_peer_access``:
+        per-layer cap semantics make the per-destination slice a
+        non-subset of the base precompute output under head replication.
+        """
         group_size = self.group_size
         num_kv_heads = self._num_kv_heads
         replication_factor = (

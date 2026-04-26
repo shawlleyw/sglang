@@ -296,8 +296,9 @@ class ParaSReqScatterManager:
             else:
                 last_token_list.append(req.origin_input_ids[-1])
 
+        # See ParaSReqGatherManager.get_new_running_batch for the seqlen - 1 invariant.
         req_pool_indices_list = [req.req_pool_idx for req in self.local_reqs]
-        seq_lens_list = [req.seqlen for req in self.local_reqs]
+        seq_lens_list = [req.seqlen - 1 for req in self.local_reqs]
 
         batch.output_ids = torch.tensor(last_token_list, dtype=torch.int64, device=device)
         batch.req_pool_indices = torch.tensor(req_pool_indices_list, dtype=torch.int64, device=device)
@@ -433,54 +434,3 @@ class ParaSReqScatterManager:
                 )
 
         torch.cuda.synchronize()
-
-
-def _scatter_cache_nccl(
-    kv_cache,
-    ep_head_num: int,
-    token_partition: List[List[int]],
-    global_token_indices: torch.Tensor,
-    ep_dst_positions: torch.Tensor,
-    gather_group,
-    layer_specs: Optional[list] = None,
-) -> None:
-    """Thin backward-compat shim for ``test_kv_cache_transfer.py``.
-
-    Delegates to ``MHACacheTransfer`` for full-attention NCCL scatter.
-    """
-    from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-    from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
-    from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
-
-    torch.cuda.empty_cache()
-    mgr = get_global_paras_memory_manager()
-
-    backend = MHACacheTransfer(
-        method="nccl",
-        direction="scatter",
-        kv_cache=kv_cache,
-        mgr=mgr,
-        group=gather_group,
-        global_token_indices=global_token_indices,
-        ep_head_num=ep_head_num,
-        token_partition=token_partition,
-        ep_dst_positions=ep_dst_positions,
-    )
-
-    num_layers = kv_cache.layer_num
-    for layer_id in reversed(range(num_layers)):
-        if layer_specs is not None:
-            spec = layer_specs[layer_id]
-        else:
-            spec = LayerCacheSpec(
-                layer_id=layer_id,
-                kind="full",
-                tokens_cap_ep=0,
-                tokens_cap_tp=0,
-                num_kv_heads=ep_head_num,
-                head_dim=kv_cache.head_dim,
-                sliding_window_size=None,
-            )
-        backend.scatter_one_layer(spec)
-
-    torch.cuda.synchronize()

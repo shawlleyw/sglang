@@ -419,7 +419,7 @@ def do_ep_to_tp_gather(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
         ep_k = mgr.get_view(f"model.layers.{lid}.kv.ep.k")
         ep_v = mgr.get_view(f"model.layers.{lid}.kv.ep.v")
 
-        permuted = gather_kv_and_permute(ep_k, ep_v, local_token_indices)
+        permuted = gather_kv_and_permute(ep_k, ep_v, local_token_indices, heads_per_rank)
 
         # Replicate heads for all_to_all when num_kv_heads < world_size
         if replication_factor > 1:
@@ -457,16 +457,17 @@ def do_ep_to_tp_gather(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
 
 
 # ---------------------------------------------------------------------------
-# TP→EP scatter (using _scatter_cache_nccl directly)
+# TP→EP scatter (MHACacheTransfer backend)
 # ---------------------------------------------------------------------------
 
 def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
                         tp_view_tokens, tp_group):
-    """Execute TP→EP scatter via _scatter_cache_nccl.
+    """Execute TP→EP scatter by driving ``MHACacheTransfer`` directly.
 
     Returns (token_partition, ep_dst_positions).
     """
-    from sglang.srt.paras.scatter_manager import _scatter_cache_nccl
+    from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+    from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
 
     heads_per_rank = max(1, num_kv_heads // world_size)
     total_tokens = sum(tokens_per_rank)
@@ -493,15 +494,31 @@ def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
         tp_group, world_size, f"cuda:{rank}", rank
     )
 
-    _scatter_cache_nccl(
+    backend = MHACacheTransfer(
+        method="nccl",
+        direction="scatter",
         kv_cache=tp_cache,
+        mgr=mgr,
+        group=group_coord,
+        global_token_indices=global_token_indices,
         ep_head_num=num_kv_heads,
         token_partition=token_partition,
-        global_token_indices=global_token_indices,
         ep_dst_positions=ep_dst_positions,
-        gather_group=group_coord,
     )
 
+    for layer_id in reversed(range(NUM_LAYERS)):
+        spec = LayerCacheSpec(
+            layer_id=layer_id,
+            kind="full",
+            tokens_cap_ep=0,
+            tokens_cap_tp=0,
+            num_kv_heads=num_kv_heads,
+            head_dim=HEAD_DIM,
+            sliding_window_size=None,
+        )
+        backend.scatter_one_layer(spec)
+
+    torch.cuda.synchronize()
     return token_partition, ep_dst_positions
 
 
@@ -1101,7 +1118,7 @@ class TestKVRoundTrip:
 
         # Step 2: TP→EP scatter
         # NOTE: Do NOT zero EP buffers here — they share physical memory
-        # with TP buffers via the N+1 slot design.  _scatter_cache_nccl
+        # with TP buffers via the N+1 slot design.  MHACacheTransfer
         # processes layers in reverse order to avoid corrupting TP source.
         token_partition, ep_dst = do_tp_to_ep_scatter(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,

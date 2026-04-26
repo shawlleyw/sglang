@@ -132,7 +132,14 @@ class SchedulerParasMixin:
         # switch from EP to DP x TP
         self.paras_parallelism_config = "TP"
         self.server_args.enable_dp_attention = False
-        self.server_args.moe_a2a_backend = MoeA2ABackend.NONE
+        # Store the string value (matching ServerArgs dataclass), not the Enum.
+        # `require_attn_tp_gather` compares `server_args.moe_a2a_backend != "none"`
+        # and only the string form compares equal; storing the Enum here caused
+        # the scheduler to believe a2a was still enabled and to pad the prefill
+        # batch to a multiple of attn_tp_size via `prepare_mlp_sync_batch`,
+        # injecting uninitialized padding tokens whose qkv_proj output
+        # overflows the BF16 attention softmax on some TP ranks.
+        self.server_args.moe_a2a_backend = MoeA2ABackend.NONE.value
         self.server_args.dp_size = 1
         self.server_args.ep_size = 1
         moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.NONE
@@ -267,7 +274,7 @@ class SchedulerParasMixin:
         # switch from TP to EP
         self.paras_parallelism_config = "EP"
         self.server_args.enable_dp_attention = True
-        self.server_args.moe_a2a_backend = MoeA2ABackend.DEEPEP
+        self.server_args.moe_a2a_backend = MoeA2ABackend.DEEPEP.value
         self.server_args.dp_size = self.paras_ep_size
         self.server_args.ep_size = self.paras_ep_size
         moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.DEEPEP

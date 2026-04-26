@@ -9,6 +9,29 @@ or "sliding_attention" (see config.layer_types).  This module mirrors the
 Qwen3-MoE ParaS pattern (sglang/srt/paras/models/qwen3_moe.py) while
 handling the per-layer attention geometry and MXFP4 weight loading that
 are unique to GPT-OSS.
+
+Parameter management under ParaS
+--------------------------------
+
+The unified memory manager holds only tensors whose shape differs
+between EP and TP modes and therefore need per-switch redistribution.
+Everything else is loaded through the normal PyTorch parameter path
+and stays untouched across switches.  Concretely for GPT-OSS:
+
+  Managed by the UMM:
+    * paras.moe_slot.{i}.w13 / w2  (N+1 slot layout, EP<->TP transport)
+    * self_attn.qkv_proj.weight / tp_weight
+    * self_attn.o_proj.weight
+    * FP8 weight scales (when quant_name == "fp8")
+    * Staging buffers (when configure_method != "peer_access")
+
+  Replicated across all ranks, not in the UMM:
+    * input_layernorm.weight, post_attention_layernorm.weight
+    * self_attn.sinks (full + tp slice view, rebind on switch)
+    * self_attn.qkv_proj.bias (full + tp concatenated slice, rebind on switch)
+    * self_attn.o_proj.bias  (hidden-dim output, added after AllReduce)
+    * mlp.experts.w{13,2}_weight_bias (full + ep/tp views, rebind on switch)
+    * mlp.router.weight / router.bias  (router runs on all ranks)
 """
 
 import logging
@@ -64,7 +87,16 @@ class GptOssSparseMoeBlockParaS(ParaSMoeBlockMixin, GptOssSparseMoeBlock):
 
     def __init__(self, layer_id, config, quant_config=None, prefix=""):
         super().__init__(layer_id, config, quant_config, prefix)
-        self.paras_init_moe(config, quant_config, prefix, layer_id)
+        self.paras_init_moe(
+            config,
+            quant_config,
+            prefix,
+            layer_id,
+            interleaved_w13=True,
+            activation=self.activation,
+            gemm1_alpha=self.gemm1_alpha,
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
+        )
 
     def forward_normal(
         self,
@@ -89,9 +121,76 @@ class GptOssSparseMoeBlockParaS(ParaSMoeBlockMixin, GptOssSparseMoeBlock):
 
 # 2. ParaS Attention — adds paras_configure_tp/ep methods
 class GptOssAttentionParaS(ParaSAttentionMixin, GptOssAttention):
-    """ParaS-enabled attention. Mixin adds paras_configure_tp/ep/helper."""
+    """ParaS-enabled attention with GPT-OSS-specific attention-sink handling.
 
-    pass
+    The model is built in EP mode with ``attn_tp_size=1``, so the
+    checkpoint loader populates full-shape tensors for both attention
+    sinks (``self.sinks``) and qkv bias (``self.qkv_proj.bias``) on every
+    rank.  ``paras_finalize_sinks_views`` and ``paras_finalize_qkv_bias_views``
+    capture each full tensor and build the ep / tp Parameters used at
+    forward time; switching is a pure rebind.
+    """
+
+    def paras_finalize_sinks_views(self):
+        from sglang.srt.paras.paras_parallel_state import (
+            get_paras_tp_rank,
+            get_paras_tp_size,
+        )
+        paras_tp_size = get_paras_tp_size()
+        paras_tp_rank = get_paras_tp_rank()
+        self.ep_sinks = self.sinks
+        heads_per_rank = self.total_num_heads // paras_tp_size
+        start = paras_tp_rank * heads_per_rank
+        end = start + heads_per_rank
+        self.tp_sinks = nn.Parameter(
+            self.sinks.data[start:end], requires_grad=False
+        )
+
+    def paras_finalize_qkv_bias_views(self):
+        if self.qkv_proj.bias is None:
+            return
+        from sglang.srt.paras.paras_parallel_state import (
+            get_paras_tp_rank,
+            get_paras_tp_size,
+        )
+        paras_tp_size = get_paras_tp_size()
+        paras_tp_rank = get_paras_tp_rank()
+        hs = self.head_dim
+        tp_num_heads = self.total_num_heads // paras_tp_size
+        tp_num_kv_heads = self.total_num_kv_heads // paras_tp_size
+        full_data = self.qkv_proj.bias.data
+        q_start = paras_tp_rank * tp_num_heads * hs
+        k_start = (
+            self.total_num_heads * hs
+            + paras_tp_rank * tp_num_kv_heads * hs
+        )
+        v_start = (
+            (self.total_num_heads + self.total_num_kv_heads) * hs
+            + paras_tp_rank * tp_num_kv_heads * hs
+        )
+        self.ep_qkv_bias = self.qkv_proj.bias
+        self.tp_qkv_bias = nn.Parameter(
+            torch.cat([
+                full_data[q_start : q_start + tp_num_heads * hs],
+                full_data[k_start : k_start + tp_num_kv_heads * hs],
+                full_data[v_start : v_start + tp_num_kv_heads * hs],
+            ]),
+            requires_grad=False,
+        )
+
+    @paras_func
+    def paras_configure_tp(self, paras_tp_size, paras_tp_rank):
+        super().paras_configure_tp(paras_tp_size, paras_tp_rank)
+        self.sinks = self.tp_sinks
+        if hasattr(self, "tp_qkv_bias"):
+            self.qkv_proj.bias = self.tp_qkv_bias
+
+    @paras_func
+    def paras_configure_ep(self):
+        super().paras_configure_ep()
+        self.sinks = self.ep_sinks
+        if hasattr(self, "ep_qkv_bias"):
+            self.qkv_proj.bias = self.ep_qkv_bias
 
 
 # 3. ParaS Decoder Layer — swaps in ParaS MoE block + attention, manages dual communicators
@@ -336,20 +435,24 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
         # Set global so create_weights() can find the manager
         set_global_paras_memory_manager(manager)
 
-        # Pre-initialize NVLink peer access during model init to avoid
-        # overhead at switch time.
-        try:
-            from sglang.srt.paras.peer_access import init_peer_access
-
-            self._fused_peer_access_ctx = init_peer_access(
-                manager, get_paras_tp_group().device_group, get_paras_tp_size()
-            )
-            logger.info("ParaS fused peer access pre-initialized.")
-        except Exception as e:
-            logger.warning(
-                "ParaS fused peer access pre-init failed (will retry at switch): %s", e
-            )
+        # Skip peer access pre-init when using NCCL transfer (no benefit
+        # and seems to interact badly with NCCL on A100).  Set
+        # PARAS_DISABLE_PEER_ACCESS=0 to re-enable for peer_access path.
+        if os.environ.get("PARAS_DISABLE_PEER_ACCESS", "1") == "1":
             self._fused_peer_access_ctx = None
+        else:
+            try:
+                from sglang.srt.paras.peer_access import init_peer_access
+
+                self._fused_peer_access_ctx = init_peer_access(
+                    manager, get_paras_tp_group().device_group, get_paras_tp_size()
+                )
+                logger.info("ParaS fused peer access pre-initialized.")
+            except Exception as e:
+                logger.warning(
+                    "ParaS fused peer access pre-init failed (will retry at switch): %s", e
+                )
+                self._fused_peer_access_ctx = None
 
         self.model = GptOssModelParaS(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -377,7 +480,22 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
         torch.cuda.synchronize()
         start_loading = time.time()
 
-        super().load_weights(weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping)
+        super().load_weights(
+            weights,
+            is_nextn=is_nextn,
+            weight_name_mapping=weight_name_mapping,
+        )
+
+        for layer in self.model.layers:
+            mlp = getattr(layer, "mlp", None)
+            if mlp is not None and hasattr(mlp, "paras_finalize_moe_bias_views"):
+                mlp.paras_finalize_moe_bias_views()
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None:
+                if hasattr(attn, "paras_finalize_sinks_views"):
+                    attn.paras_finalize_sinks_views()
+                if hasattr(attn, "paras_finalize_qkv_bias_views"):
+                    attn.paras_finalize_qkv_bias_views()
 
         end_loading = time.time()
         torch.cuda.synchronize()
