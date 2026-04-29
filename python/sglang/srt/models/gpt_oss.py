@@ -1099,7 +1099,6 @@ class GptOssForCausalLM(nn.Module):
                     weight_loader = param.weight_loader
                     if (
                         moe_ep_size > 1
-                        and "bias" not in name
                         and loaded_weight.dim() >= 1
                         and loaded_weight.shape[0] == moe_num_global_experts
                     ):
