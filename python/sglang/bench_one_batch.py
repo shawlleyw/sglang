@@ -55,9 +55,10 @@ import json
 import logging
 import multiprocessing
 import os
+import random
 import time
 from types import SimpleNamespace
-from typing import Tuple
+from typing import List, Tuple
 
 import numpy as np
 import torch
@@ -177,6 +178,8 @@ class BenchArgs:
     profile_activities: Tuple[str] = ("CPU", "GPU")
     profile_stage: str = "all"
     profile_filename_prefix: str = "profile"
+    dataset_name: str = "synthetic"
+    dataset_path: str = ""
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -231,6 +234,24 @@ class BenchArgs:
             default=BenchArgs.profile_filename_prefix,
             help="Prefix of the profiling file names. The full profiling result file(s) be "
             '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
+        )
+        parser.add_argument(
+            "--dataset-name",
+            type=str,
+            default=BenchArgs.dataset_name,
+            choices=["synthetic", "sharegpt"],
+            help="Source for input tokens. 'synthetic' (default) uses random ids in "
+            "[0, 10000) for backward compatibility. 'sharegpt' samples real "
+            "conversational prompts via sglang.bench_serving.get_dataset and "
+            "pads/truncates each to --input-len. Mutually exclusive with --prompt-filename.",
+        )
+        parser.add_argument(
+            "--dataset-path",
+            type=str,
+            default=BenchArgs.dataset_path,
+            help="Path to the dataset file (e.g. ShareGPT_V3_unfiltered_cleaned_split.json). "
+            "If empty and --dataset-name=sharegpt, the file is auto-downloaded by "
+            "bench_serving (matches its existing behavior).",
         )
 
     @classmethod
@@ -348,6 +369,63 @@ def prepare_synthetic_inputs_for_latency_test(
         reqs.append(req)
 
     return reqs
+
+
+def _load_dataset_rows(bench_args, tokenizer, batch_size_max, output_len_max):
+    from sglang.bench_serving import get_dataset
+
+    ds_args = SimpleNamespace(
+        dataset_name=bench_args.dataset_name,
+        dataset_path=bench_args.dataset_path,
+        num_prompts=batch_size_max,
+        sharegpt_output_len=output_len_max,
+        sharegpt_context_len=None,
+        prompt_suffix="",
+        apply_chat_template=False,
+        tokenize_prompt=False,
+    )
+    rng_state = random.getstate()
+    random.seed(0)
+    try:
+        rows = get_dataset(ds_args, tokenizer)
+    finally:
+        random.setstate(rng_state)
+    if not rows:
+        raise RuntimeError(
+            f"Dataset {bench_args.dataset_name!r} returned 0 rows "
+            f"(dataset_path={bench_args.dataset_path!r})."
+        )
+    return rows
+
+
+def prepare_dataset_inputs_for_latency_test(
+    dataset_rows, batch_size, input_len, tokenizer
+):
+    fixed_input_ids: List[List[int]] = []
+    for i in range(batch_size):
+        row = dataset_rows[i % len(dataset_rows)]
+        ids = tokenizer.encode(row.prompt)
+        if len(ids) == 0:
+            continue
+        if len(ids) < input_len:
+            ratio = (input_len + len(ids) - 1) // len(ids)
+            ids = (ids * ratio)[:input_len]
+        else:
+            ids = ids[:input_len]
+        fixed_input_ids.append(ids)
+
+    if not fixed_input_ids:
+        raise RuntimeError(
+            "All sampled dataset rows tokenized to empty token lists; cannot build inputs."
+        )
+    while len(fixed_input_ids) < batch_size:
+        fixed_input_ids.append(fixed_input_ids[len(fixed_input_ids) % len(fixed_input_ids)])
+
+    return prepare_synthetic_inputs_for_latency_test(
+        batch_size,
+        input_len,
+        custom_inputs=fixed_input_ids,
+    )
 
 
 @torch.no_grad
@@ -652,6 +730,24 @@ def latency_test(
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
+    dataset_rows = None
+    if bench_args.dataset_name != "synthetic":
+        if bench_args.prompt_filename:
+            raise ValueError(
+                "--prompt-filename and --dataset-name are mutually exclusive."
+            )
+        rank_print(
+            f"Loading dataset {bench_args.dataset_name!r} from "
+            f"{bench_args.dataset_path or '<auto-download>'} ..."
+        )
+        dataset_rows = _load_dataset_rows(
+            bench_args,
+            tokenizer,
+            batch_size_max=max(bench_args.batch_size),
+            output_len_max=max(bench_args.output_len),
+        )
+        rank_print(f"Loaded {len(dataset_rows)} dataset rows.")
+
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
         bench_args.batch_size[0], bench_args.input_len[0]
@@ -688,27 +784,32 @@ def latency_test(
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
-        bs_aligned_inputs = []
-        if custom_inputs:
-            if custom_input_len == bs:
-                bs_aligned_inputs = custom_inputs
-            elif custom_input_len > bs:
-                rank_print(
-                    f"Custom input size ({custom_input_len}) is larger than batch_size ({bs}). "
-                    f"Using the first {bs} prompts."
-                )
-                bs_aligned_inputs = copy.deepcopy(custom_inputs[:bs])
-            else:
-                rank_print(
-                    f"Custom input size ({custom_input_len}) is smaller than batch_size ({bs}). "
-                    f"Pad to the desired batch_size with the last prompt."
-                )
-                bs_aligned_inputs = copy.deepcopy(custom_inputs)
-                bs_aligned_inputs.extend(
-                    [bs_aligned_inputs[-1]] * (bs - custom_input_len)
-                )
+        if dataset_rows is not None:
+            reqs = prepare_dataset_inputs_for_latency_test(
+                dataset_rows, bs, il, tokenizer
+            )
+        else:
+            bs_aligned_inputs = []
+            if custom_inputs:
+                if custom_input_len == bs:
+                    bs_aligned_inputs = custom_inputs
+                elif custom_input_len > bs:
+                    rank_print(
+                        f"Custom input size ({custom_input_len}) is larger than batch_size ({bs}). "
+                        f"Using the first {bs} prompts."
+                    )
+                    bs_aligned_inputs = copy.deepcopy(custom_inputs[:bs])
+                else:
+                    rank_print(
+                        f"Custom input size ({custom_input_len}) is smaller than batch_size ({bs}). "
+                        f"Pad to the desired batch_size with the last prompt."
+                    )
+                    bs_aligned_inputs = copy.deepcopy(custom_inputs)
+                    bs_aligned_inputs.extend(
+                        [bs_aligned_inputs[-1]] * (bs - custom_input_len)
+                    )
 
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
+            reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
