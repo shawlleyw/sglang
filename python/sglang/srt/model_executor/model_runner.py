@@ -1942,6 +1942,17 @@ class ModelRunner:
             else:
                 if self.page_size == 1:
                     if self.is_hybrid:
+                        if self.server_args.enable_paras_moe:
+                            paras_tp_size = self.server_args.paras_tp_size
+                            paras_max_size = (
+                                self.full_max_total_num_tokens * paras_tp_size
+                            )
+                            paras_max_size_swa = (
+                                self.swa_max_total_num_tokens * paras_tp_size
+                            )
+                        else:
+                            paras_max_size = None
+                            paras_max_size_swa = None
                         self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                             self.full_max_total_num_tokens,
                             self.swa_max_total_num_tokens,
@@ -1949,13 +1960,9 @@ class ModelRunner:
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
+                            paras_max_size=paras_max_size,
+                            paras_max_size_swa=paras_max_size_swa,
                         )
-                        if self.server_args.enable_paras_moe:
-                            paras_tp_size = self.server_args.paras_tp_size
-                            self.token_to_kv_pool_allocator.paras_pre_grow_mapping(
-                                self.full_max_total_num_tokens * paras_tp_size,
-                                self.swa_max_total_num_tokens * paras_tp_size,
-                            )
                     else:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
