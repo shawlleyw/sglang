@@ -220,6 +220,20 @@ class TritonRunnerCore(MoeRunnerCore):
                 intermediate_cache2.view(num_experts, e_tokens, N // 2),
                 masked_m,
             )
+        elif masked_m is not None and activation == "silu" and gemm1_alpha is not None:
+            assert gemm1_limit is not None
+            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+                swiglu_with_alpha_and_limit_masked,
+            )
+
+            num_experts = running_state["num_local_experts"]
+            e_tokens = running_state["E_tokens"]
+            intermediate_cache2 = swiglu_with_alpha_and_limit_masked(
+                intermediate_cache1.view(num_experts, e_tokens, N),
+                masked_m,
+                gemm1_alpha,
+                gemm1_limit,
+            ).view(num_experts * e_tokens, N // 2)
         elif activation == "silu":
             if gemm1_alpha is not None:
                 assert gemm1_limit is not None

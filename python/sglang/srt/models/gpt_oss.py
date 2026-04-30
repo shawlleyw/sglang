@@ -1099,7 +1099,6 @@ class GptOssForCausalLM(nn.Module):
                     weight_loader = param.weight_loader
                     if (
                         moe_ep_size > 1
-                        and "bias" not in name
                         and loaded_weight.dim() >= 1
                         and loaded_weight.shape[0] == moe_num_global_experts
                     ):
@@ -1176,24 +1175,40 @@ class GptOssForCausalLM(nn.Module):
 
 
 def _canonicalize_weights(config, weights_in: Iterable[Tuple[str, torch.Tensor]]):
-    weights_out_dict = dict(weights_in)
-
-    for layer_id in range(config.num_hidden_layers):
-        for name_chunk in ["mlp1_weight", "mlp2_weight"]:
-            name_prefix = f"block.{layer_id}.mlp.{name_chunk}"
-            w_blocks = weights_out_dict.pop(f"{name_prefix}.blocks", None)
-            w_scales = weights_out_dict.pop(f"{name_prefix}.scales", None)
-            if w_blocks is not None:
-                weights_out_dict[name_prefix] = _WeightCreator(
+    # Stream weights through instead of `dict(weights_in)`: the upstream
+    # safetensors iterator yields mmap-backed lazy tensors and uses tqdm to
+    # report shard-loading progress. A `dict(weights_in)` drains every yield
+    # without ever touching the bytes, so tqdm reaches 100% in <1s while the
+    # actual disk I/O happens later when the model copies the data. By cloning
+    # each tensor as it arrives we force the read to happen here, in lockstep
+    # with the tqdm bar. Bf16 tensors flow straight through; only the mxfp4
+    # `.blocks` / `.scales` pairs need cross-tensor buffering.
+    pending: dict = {}
+    for name, tensor in weights_in:
+        materialized = tensor.clone()
+        if name.endswith(".blocks") or name.endswith(".scales"):
+            suffix = "blocks" if name.endswith(".blocks") else "scales"
+            prefix = name[: -(len(suffix) + 1)]
+            slot = pending.setdefault(prefix, {})
+            slot[suffix] = materialized
+            if "blocks" in slot and "scales" in slot:
+                pair = pending.pop(prefix)
+                yield prefix, _WeightCreator(
                     partial(
                         _dequant_mlp_weight,
-                        debug_name=name_prefix,
-                        w_blocks=w_blocks,
-                        w_scales=w_scales,
+                        debug_name=prefix,
+                        w_blocks=pair["blocks"],
+                        w_scales=pair["scales"],
                     )
                 )
+        else:
+            yield name, materialized
 
-    return list(weights_out_dict.items())
+    if pending:
+        raise ValueError(
+            f"Incomplete mxfp4 quantization pairs (missing matched .blocks/.scales): "
+            f"{sorted(pending.keys())}"
+        )
 
 
 def _dequant_mlp_weight(debug_name, w_blocks, w_scales):

@@ -60,6 +60,8 @@ class TestResizeState:
             device="cpu",
             kvcache=kvcache,
             need_sort=False,
+            paras_max_size=200,
+            paras_max_size_swa=80,
         )
 
         # Resize
@@ -93,6 +95,8 @@ class TestResizeState:
             device="cpu",
             kvcache=kvcache,
             need_sort=False,
+            paras_max_size=200,
+            paras_max_size_swa=80,
         )
 
         # Resize
@@ -137,6 +141,8 @@ class TestResizeAllocBijectivity:
             device="cpu",
             kvcache=kvcache,
             need_sort=False,
+            paras_max_size=200,
+            paras_max_size_swa=80,
         )
 
         # Resize to larger capacity
@@ -191,6 +197,8 @@ class TestSharedTensorWithKVPool:
             device="cpu",
             kvcache=kvcache,
             need_sort=False,
+            paras_max_size=200,
+            paras_max_size_swa=80,
         )
 
         # Resize
@@ -235,6 +243,8 @@ class TestDoubleResizeIdempotence:
             device="cpu",
             kvcache=kvcache,
             need_sort=False,
+            paras_max_size=200,
+            paras_max_size_swa=80,
         )
 
         # First resize
@@ -289,6 +299,8 @@ class TestInnerAllocatorResize:
             device="cpu",
             kvcache=kvcache,
             need_sort=False,
+            paras_max_size=200,
+            paras_max_size_swa=80,
         )
 
         # Resize
@@ -331,6 +343,8 @@ class TestCapacityCheck:
             device="cpu",
             kvcache=kvcache,
             need_sort=False,
+            paras_max_size=200,
+            paras_max_size_swa=80,
         )
 
         # Resize to small capacity
@@ -366,6 +380,8 @@ class TestCapacityCheck:
             device="cpu",
             kvcache=kvcache,
             need_sort=False,
+            paras_max_size=200,
+            paras_max_size_swa=80,
         )
 
         # Resize with small SWA capacity

@@ -1942,6 +1942,17 @@ class ModelRunner:
             else:
                 if self.page_size == 1:
                     if self.is_hybrid:
+                        if self.server_args.enable_paras_moe:
+                            paras_tp_size = self.server_args.paras_tp_size
+                            paras_max_size = (
+                                self.full_max_total_num_tokens * paras_tp_size
+                            )
+                            paras_max_size_swa = (
+                                self.swa_max_total_num_tokens * paras_tp_size
+                            )
+                        else:
+                            paras_max_size = None
+                            paras_max_size_swa = None
                         self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                             self.full_max_total_num_tokens,
                             self.swa_max_total_num_tokens,
@@ -1949,6 +1960,8 @@ class ModelRunner:
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
+                            paras_max_size=paras_max_size,
+                            paras_max_size_swa=paras_max_size_swa,
                         )
                     else:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
@@ -2495,7 +2508,16 @@ class ModelRunner:
     def paras_configure_helper(self):
         """Helper function for ParaS configuration."""
         # Reconfigure token_to_kv_pool_allocator, cache related stuffs are configured in scheduler (paras gather manager)
-        self.max_total_num_tokens = self.token_to_kv_pool_allocator.size
+        if self.is_hybrid:
+            self.full_max_total_num_tokens = (
+                self.token_to_kv_pool_allocator.size_full
+            )
+            self.swa_max_total_num_tokens = (
+                self.token_to_kv_pool_allocator.size_swa
+            )
+            self.max_total_num_tokens = self.full_max_total_num_tokens
+        else:
+            self.max_total_num_tokens = self.token_to_kv_pool_allocator.size
         self.max_running_requests = self.req_to_token_pool.size
 
     @paras_func

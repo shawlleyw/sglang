@@ -20,7 +20,7 @@ Page-aligned memory pool.
 """
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
@@ -195,6 +195,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: SWAKVPool,
         need_sort: bool,
+        paras_max_size: Optional[int] = None,
+        paras_max_size_swa: Optional[int] = None,
     ):
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
         assert isinstance(kvcache, SWAKVPool)
@@ -214,11 +216,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache.swa_kv_pool,
             need_sort,
         )
-        self.full_to_swa_index_mapping = torch.empty(
-            size + size_swa + 1,
+        # Reserve the mapping buffer at the largest paras topology size up
+        # front so subsequent `paras_resize_and_clear` calls can re-narrow
+        # the view without reallocating: keeping data_ptr stable for any
+        # CUDA graph captured against the mapping is required for SWA
+        # backends (see flashattention_backend / xpu_backend).
+        buffer_max_size = paras_max_size if paras_max_size is not None else size
+        buffer_max_size_swa = paras_max_size_swa if paras_max_size_swa is not None else size_swa
+        self._full_to_swa_index_mapping_buffer = torch.zeros(
+            buffer_max_size + buffer_max_size_swa + 1,
             dtype=torch.int64,
             device=device,
         )
+        self.full_to_swa_index_mapping = self._full_to_swa_index_mapping_buffer[ : size_full + size_swa + 1]
         self.clear()
 
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
@@ -304,14 +314,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
     def paras_resize_and_clear(self, new_full_size: int, new_swa_size: int):
-        """Resize both sub-allocators and rebuild the mapping for ParaS."""
+        """Resize both sub-allocators and re-narrow the mapping view for ParaS.
+
+        The mapping buffer was sized for the largest paras topology at
+        construction time; here we just re-narrow the view onto it (no
+        reallocation, so `data_ptr()` stays stable for captured CUDA graphs).
+        """
         self.full_attn_allocator.paras_resize_and_clear(new_full_size)
         self.swa_attn_allocator.paras_resize_and_clear(new_swa_size)
-        self.full_to_swa_index_mapping = torch.empty(
-            new_full_size + new_swa_size + 1,
-            dtype=torch.int64,
-            device=self.device,
+        needed = new_full_size + new_swa_size + 1
+        assert needed <= self._full_to_swa_index_mapping_buffer.numel(), (
+            f"Mapping buffer too small: needed {needed}, have "
+            f"{self._full_to_swa_index_mapping_buffer.numel()}. Pass "
+            f"paras_max_size and paras_max_size_swa at construction time."
         )
+        self.full_to_swa_index_mapping = self._full_to_swa_index_mapping_buffer[ : needed]
         self.full_to_swa_index_mapping.fill_(0)
         self._size_full = new_full_size
         self._size_swa = new_swa_size

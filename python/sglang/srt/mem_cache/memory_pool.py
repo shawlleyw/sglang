@@ -1342,24 +1342,31 @@ class SWAKVPool(KVCache):
     def paras_configure_tp(self, paras_tp_size: int, layer_specs=None):
         """Switch SWAKVPool from EP to TP layout by delegating to each inner
         pool's replace_buffers().
+
+        Mirrors MHATokenToKVPool.paras_configure_tp: uses ``get_view_as`` with
+        an explicit TP shape so the resulting buffer has ``head_num =
+        head_num // paras_tp_size`` heads (the EP-shaped LayoutEntry would
+        otherwise produce buffers with the full EP head count).
         """
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         mgr = get_global_paras_memory_manager()
         self.full_head_num = self.head_num
         sharded_head_num = self.head_num // paras_tp_size
 
-        full_new_k, full_new_v = mgr.get_kv_views(
-            num_layers=self.full_layer_nums,
-            mode="tp",
-            tp_size=paras_tp_size,
-            layer_ids=self.full_attention_layer_ids,
-        )
-        swa_new_k, swa_new_v = mgr.get_kv_views(
-            num_layers=self.swa_layer_nums,
-            mode="tp",
-            tp_size=paras_tp_size,
-            layer_ids=self.swa_attention_layer_ids,
-        )
+        def _build_tp_views(layer_ids):
+            new_k, new_v = [], []
+            for layer_id in layer_ids:
+                tp_k_name = f"model.layers.{layer_id}.kv.tp.k"
+                tp_v_name = f"model.layers.{layer_id}.kv.tp.v"
+                total_elements = mgr._entries[tp_k_name].numel
+                tp_slots = total_elements // (sharded_head_num * self.head_dim)
+                tp_shape = (tp_slots, sharded_head_num, self.head_dim)
+                new_k.append(mgr.get_view_as(tp_k_name, tp_shape))
+                new_v.append(mgr.get_view_as(tp_v_name, tp_shape))
+            return new_k, new_v
+
+        full_new_k, full_new_v = _build_tp_views(self.full_attention_layer_ids)
+        swa_new_k, swa_new_v = _build_tp_views(self.swa_attention_layer_ids)
 
         self.head_num = sharded_head_num
         self.full_kv_pool.head_num = sharded_head_num
@@ -1379,21 +1386,29 @@ class SWAKVPool(KVCache):
     def paras_configure_ep(self, layer_specs=None):
         """Switch SWAKVPool from TP to EP layout by delegating to each inner
         pool's replace_buffers().
+
+        Mirrors MHATokenToKVPool.paras_configure_ep: uses ``get_view_as`` with
+        an explicit EP shape so the resulting buffer has the full EP head
+        count even when called from TP-mode state.
         """
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         mgr = get_global_paras_memory_manager()
         self.head_num = self.full_head_num
 
-        full_new_k, full_new_v = mgr.get_kv_views(
-            num_layers=self.full_layer_nums,
-            mode="ep",
-            layer_ids=self.full_attention_layer_ids,
-        )
-        swa_new_k, swa_new_v = mgr.get_kv_views(
-            num_layers=self.swa_layer_nums,
-            mode="ep",
-            layer_ids=self.swa_attention_layer_ids,
-        )
+        def _build_ep_views(layer_ids):
+            new_k, new_v = [], []
+            for layer_id in layer_ids:
+                ep_k_name = f"model.layers.{layer_id}.kv.ep.k"
+                ep_v_name = f"model.layers.{layer_id}.kv.ep.v"
+                total_elements = mgr._entries[ep_k_name].numel
+                ep_slots = total_elements // (self.head_num * self.head_dim)
+                ep_shape = (ep_slots, self.head_num, self.head_dim)
+                new_k.append(mgr.get_view_as(ep_k_name, ep_shape))
+                new_v.append(mgr.get_view_as(ep_v_name, ep_shape))
+            return new_k, new_v
+
+        full_new_k, full_new_v = _build_ep_views(self.full_attention_layer_ids)
+        swa_new_k, swa_new_v = _build_ep_views(self.swa_attention_layer_ids)
 
         self.full_kv_pool.head_num = self.head_num
         self.swa_kv_pool.head_num = self.head_num
