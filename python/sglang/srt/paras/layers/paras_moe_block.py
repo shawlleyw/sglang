@@ -62,22 +62,42 @@ class ParaSMoeBlockMixin:
                 setattr(dst_param, attr, getattr(src_param, attr))
 
     def _build_full_bias(self, ref_bias):
-        """Allocate a full ``(num_global_experts, D)`` zero bias on this
-        rank and return a Parameter that wraps it.
+        """Allocate a full ``(num_global_experts, D)`` zero bias buffer on
+        this rank.  Each rank's local ``[ep_start:ep_end]`` slab is
+        populated by the base FusedMoE loader (writing through a slice
+        view registered as ``ep_experts.w*_weight_bias``); the non-local
+        slabs are filled by ``paras_all_gather_biases`` after load.
 
-        The returned Parameter is what the checkpoint loader writes into:
-        every rank loads the full bias directly so no transfer is needed
-        at switch time.  After load, ``paras_finalize_moe_bias_views``
-        replaces this full-shape Parameter with a local-slice view so the
-        ep forward path can index it with local expert ids.
+        Note: ``ref_bias`` is the base-FusedMoE-allocated bias Parameter
+        (shape ``(num_local_experts, D)``).  We use its trailing dim,
+        dtype, and device.  ``ref_bias`` itself is replaced with a slice
+        view of the returned buffer in ``_install_bias_slice_view``.
         """
-        full = torch.zeros(
+        return torch.zeros(
             self.num_global_experts,
             ref_bias.shape[1],
             dtype=ref_bias.dtype,
             device=ref_bias.device,
         )
-        return full, nn.Parameter(full, requires_grad=False)
+
+    def _install_bias_slice_view(self, full_bias, ep_param_name):
+        """Replace ``ep_experts.<ep_param_name>`` with a Parameter that
+        is a slice view of ``full_bias[ep_start:ep_end]``.  The base
+        FusedMoE ``weight_loader_fused`` (preserved via
+        ``_copy_loader_attrs``) writes the EP-sliced bias straight
+        into the local slab of the full buffer.
+        """
+        old_param = getattr(self.ep_experts, ep_param_name)
+        ep_rank = self.ep_experts.moe_ep_rank
+        ep_n_local = self.ep_experts.num_local_experts
+        ep_start = ep_rank * ep_n_local
+        ep_end = ep_start + ep_n_local
+
+        ep_view = nn.Parameter(
+            full_bias[ep_start:ep_end], requires_grad=False
+        )
+        self._copy_loader_attrs(old_param, ep_view)
+        self.ep_experts.register_parameter(ep_param_name, ep_view)
 
     def paras_init_moe(
         self,
@@ -170,24 +190,23 @@ class ParaSMoeBlockMixin:
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
 
-        # Allocate the full (num_global_experts, D) bias tensors on every
-        # rank.  ep_experts.w{13,2}_weight_bias is registered as a full-
-        # shape Parameter here so the checkpoint loader writes the full
-        # bias directly into self._full_*_bias with no transfer.  The
-        # ep local-slice view and tp views are built in
-        # paras_finalize_moe_bias_views after load completes.
+        # Replicated MoE bias strategy.  Every rank holds a full
+        # ``(num_global_experts, D)`` ``_full_w*_bias`` buffer.
+        # ``ep_experts.w*_weight_bias`` is registered as a slice view of
+        # the local ``[ep_start:ep_end]`` band so the base FusedMoE
+        # loader writes the EP-sliced bias directly into the right
+        # slab.  After ``super().load_weights()`` returns each rank
+        # holds its own EP slice; ``paras_all_gather_biases`` fills the
+        # non-local slices and ``paras_finalize_moe_bias_views`` builds
+        # the tp_experts views over the same shared buffer.
         self._full_w13_bias = None
         self._full_w2_bias = None
         if ep_with_bias and hasattr(self.ep_experts, "w13_weight_bias"):
-            _old_w13 = self.ep_experts.w13_weight_bias
-            self._full_w13_bias, _ep_w13_param = self._build_full_bias(_old_w13)
-            self._copy_loader_attrs(_old_w13, _ep_w13_param)
-            self.ep_experts.register_parameter("w13_weight_bias", _ep_w13_param)
+            self._full_w13_bias = self._build_full_bias(self.ep_experts.w13_weight_bias)
+            self._install_bias_slice_view(self._full_w13_bias, "w13_weight_bias")
         if ep_with_bias and hasattr(self.ep_experts, "w2_weight_bias"):
-            _old_w2 = self.ep_experts.w2_weight_bias
-            self._full_w2_bias, _ep_w2_param = self._build_full_bias(_old_w2)
-            self._copy_loader_attrs(_old_w2, _ep_w2_param)
-            self.ep_experts.register_parameter("w2_weight_bias", _ep_w2_param)
+            self._full_w2_bias = self._build_full_bias(self.ep_experts.w2_weight_bias)
+            self._install_bias_slice_view(self._full_w2_bias, "w2_weight_bias")
 
         # Pre-register TP expert weights using TP alias entries.
         # TP aliases point to slot i (one before EP slot i+1), so after the
@@ -393,39 +412,55 @@ class ParaSMoeBlockMixin:
                 tp_w2 = mgr.get_view_as(tp_w2_name, tp_w2_shape)
                 tp_w2.copy_(w2_post.view_as(tp_w2))
 
-    def paras_finalize_moe_bias_views(self):
-        """Build ep_experts and tp_experts bias Parameter views after
-        load_weights populates ``self._full_*_bias``.
+    def paras_all_gather_biases(self):
+        """Fill non-local slabs of ``self._full_w{13,2}_bias`` from peer
+        ep ranks.
 
-        ep_experts receives a ``(num_local_experts, D)`` local-slice view
-        so its forward path indexes with local expert ids.  tp_experts
-        receives a slice view sized for the paras TP layout:
-          * w13 bias: ``(num_global_experts, 2*I/paras_tp)`` interleaved
-            slice of the full (num_global_experts, 2*I) tensor.  For the
-            GPT-OSS [g0,u0,g1,u1,...] layout, the slice
-            ``[:, 2*tp_start:2*tp_end]`` gives this rank's contiguous
-            block of (g_k, u_k) pairs; the triton kernel reads biases
-            with explicit stride_bias_n so the strided view is correct.
-          * w2 bias: rank-0 registers the full ``(num_global_experts, H)``
-            tensor; non-rank-0 leaves the attribute unregistered so the
-            kernel skips the bias add (applied exactly once after the
-            tp all-reduce).
+        At entry, the base FusedMoE loader has written this rank's
+        ``[ep_start:ep_end]`` slab into the full buffer via the slice-view
+        Parameter installed by ``_install_bias_slice_view``; the other
+        slabs are still zero.  After this method returns every rank
+        holds the identical full ``(num_global_experts, D)`` tensor.
+
+        ``all_gather_into_tensor`` requires the input to not alias the
+        output; the local slab is a view into ``full_bias`` so we clone
+        it onto a separate buffer before the collective.
         """
+        if self._full_w13_bias is None and self._full_w2_bias is None:
+            return
+
+        from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+        ep_group = get_moe_ep_group().device_group
         ep_rank = self.ep_experts.moe_ep_rank
         ep_n_local = self.ep_experts.num_local_experts
         ep_start = ep_rank * ep_n_local
         ep_end = ep_start + ep_n_local
-        for full_bias, ep_param_name in (
-            (self._full_w13_bias, "w13_weight_bias"),
-            (self._full_w2_bias, "w2_weight_bias"),
-        ):
+
+        for full_bias in (self._full_w13_bias, self._full_w2_bias):
             if full_bias is None:
                 continue
-            ep_view = nn.Parameter(
-                full_bias[ep_start:ep_end], requires_grad=False
-            )
-            self.ep_experts.register_parameter(ep_param_name, ep_view)
+            local = full_bias[ep_start:ep_end].clone()
+            dist.all_gather_into_tensor(full_bias, local, group=ep_group)
 
+    def paras_finalize_moe_bias_views(self):
+        """Build the tp_experts bias views over ``self._full_w{13,2}_bias``.
+
+        ``ep_experts.w*_weight_bias`` is already a slice view of the full
+        buffer (installed in ``paras_init_moe``); after
+        ``paras_all_gather_biases`` populates the buffer the ep view
+        automatically reflects the correct local slice and needs no rebind.
+
+        tp_experts receives a paras-TP-shaped slice view:
+          * w13 bias: ``(num_global_experts, 2*I/paras_tp)`` interleaved
+            slice over the 2*I axis for the GPT-OSS [g0,u0,g1,u1,...]
+            layout.  The triton kernel reads biases with explicit
+            stride_bias_n so the strided view is correct.
+          * w2 bias: rank-0 wraps the full ``(num_global_experts, H)``
+            tensor; non-rank-0 leaves the attribute unregistered so the
+            kernel skips the bias add (applied exactly once after the
+            tp all-reduce).
+        """
         paras_tp_size = get_paras_tp_size()
         paras_tp_rank = get_paras_tp_rank()
         if self._full_w13_bias is not None:

@@ -488,6 +488,8 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
 
         for layer in self.model.layers:
             mlp = getattr(layer, "mlp", None)
+            if mlp is not None and hasattr(mlp, "paras_all_gather_biases"):
+                mlp.paras_all_gather_biases()
             if mlp is not None and hasattr(mlp, "paras_finalize_moe_bias_views"):
                 mlp.paras_finalize_moe_bias_views()
             attn = getattr(layer, "self_attn", None)
