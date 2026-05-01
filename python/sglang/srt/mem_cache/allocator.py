@@ -228,7 +228,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             dtype=torch.int64,
             device=device,
         )
-        self.full_to_swa_index_mapping = self._full_to_swa_index_mapping_buffer[ : size_full + size_swa + 1]
+        self.full_to_swa_index_mapping = self._full_to_swa_index_mapping_buffer[ : size + size_swa + 1]
         self.clear()
 
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
