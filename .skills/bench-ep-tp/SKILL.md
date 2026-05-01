@@ -36,67 +36,44 @@ Run MoE model benchmarks comparing the 4 attention/expert parallelism configurat
 
 Run each config as a **single invocation** with all target batches — `bench_one_batch` sweeps `--batch-size` in one process, reusing the loaded model and cuda graphs. Single invocation also amortizes the ~2–3 min model load + graph capture across the whole batch grid.
 
-Common setup:
+The four configs ship as scripts under [`scripts/paras/eval/a100/<model>/`](file:///home/shaoyuw/sglang/scripts/paras/eval/a100). Use `qwen/` for Qwen3-30B-A3B (default) or any Qwen3-MoE family member, and `gptoss/` for gpt-oss-120b-bf16. Each script reads env-var overrides; defaults match what each config needs (DeepEP env for DP/EP, unset for the AllReduce configs, `--attention-backend triton` for gpt-oss, etc.). All scripts source the shared helpers in [`scripts/paras/eval/lib.sh`](file:///home/shaoyuw/sglang/scripts/paras/eval/lib.sh).
+
+Common setup (every script reads these):
 ```bash
-export MODEL=/data/shaoyuw/models/Qwen3-235B-A22B-half
+export MODEL_PATH=/data/shaoyuw/models/Qwen3-235B-A22B-half
 export NUM_GPUS=8
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export RESULT_FILE=results.jsonl
+export LOAD_FORMAT=dummy            # for memory testing; omit for real weights
+export MEM_FRACTION_STATIC=0.8      # tune per model — see Memory Guidelines below
 ```
+The scripts default `CUDA_VISIBLE_DEVICES=0,1,...,NUM_GPUS-1`; override only for non-contiguous GPU sets.
 
 ### 1. TP/TP — baseline
 ```bash
-unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
-python -m sglang.bench_one_batch \
-    --model-path "$MODEL" --trust-remote-code --load-format dummy \
-    --disable-overlap-schedule --mem-fraction-static 0.8 \
-    --input-len 10 --output-len 10 \
-    --tp-size $NUM_GPUS \
-    --batch-size 8 64 512 2048 --cuda-graph-bs 8 64 512 2048 \
-    --result-filename "$RESULT_FILE" --run-name tp_tp
+RUN_NAME=tp_tp bash scripts/paras/eval/a100/qwen/bench_one_batch_tp_tp.sh
 ```
+Default batch grid `8 64 512 2048` (per-rank == global because no DP). DeepEP env is unset by the script.
 
 ### 2. TP/EP — TP attention + EP-sharded experts via AllReduce
 ```bash
-unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
-python -m sglang.bench_one_batch \
-    --model-path "$MODEL" --trust-remote-code --load-format dummy \
-    --disable-overlap-schedule --mem-fraction-static 0.8 \
-    --input-len 10 --output-len 10 \
-    --tp-size $NUM_GPUS --ep-size $NUM_GPUS \
-    --batch-size 8 64 512 2048 --cuda-graph-bs 8 64 512 2048 \
-    --result-filename "$RESULT_FILE" --run-name tp_ep
+RUN_NAME=tp_ep bash scripts/paras/eval/a100/qwen/bench_one_batch_tp_ep.sh
 ```
 No DeepEP: experts are partitioned across ranks (`--ep-size N`), each rank runs its local experts on the full token batch with masking for non-routed tokens, results combined via full-hidden AllReduce. No dispatch cap, all batch sizes testable. This config is an anti-pattern (net loss vs TP/TP); useful only as a reference point in 4-way analysis.
 
 ### 3. DP/TP — classic v0.4 DeepSeek DP attention, TP experts
 ```bash
-unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
-python -m sglang.bench_one_batch \
-    --model-path "$MODEL" --trust-remote-code --load-format dummy \
-    --disable-overlap-schedule --mem-fraction-static 0.8 \
-    --input-len 10 --output-len 10 \
-    --tp-size $NUM_GPUS --dp-size $NUM_GPUS \
-    --enable-dp-attention --enable-dp-lm-head \
-    --batch-size 1 8 64 256 --cuda-graph-bs 1 8 64 256 \
-    --result-filename "$RESULT_FILE" --run-name dp_tp
+RUN_NAME=dp_tp bash scripts/paras/eval/a100/qwen/bench_one_batch_dp_tp.sh
 ```
+Default batch grid `1 8 64 256` (per-DP-rank; equivalent global = ×`NUM_GPUS`). `--enable-dp-attention --enable-dp-lm-head`; experts stay TP-sharded with AllReduce.
 
 ### 4. DP/EP — DP attention + DeepEP
 ```bash
-export SGLANG_DEEPEP_BF16_DISPATCH=true
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
-unset NVSHMEM_QP_DEPTH
-python -m sglang.bench_one_batch \
-    --model-path "$MODEL" --trust-remote-code --load-format dummy \
-    --disable-overlap-schedule --mem-fraction-static 0.8 \
-    --input-len 10 --output-len 10 \
-    --tp-size $NUM_GPUS --dp-size $NUM_GPUS \
-    --enable-dp-attention --enable-dp-lm-head \
-    --moe-a2a-backend deepep --deepep-mode auto \
-    --batch-size 1 8 64 256 --cuda-graph-bs 1 8 64 256 \
-    --result-filename "$RESULT_FILE" --run-name dp_ep
+SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256 \
+RUN_NAME=dp_ep bash scripts/paras/eval/a100/qwen/bench_one_batch_dp_ep.sh
 ```
+The script exports `SGLANG_DEEPEP_BF16_DISPATCH=true` and `NVSHMEM_QP_DEPTH=2048` by default. Override `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` if your equivalent global batch ≥ 512×`NUM_GPUS`.
+
+For gpt-oss-120b-bf16 swap `qwen/` → `gptoss/` in any of the script paths above; the gpt-oss scripts add `--attention-backend triton --moe-runner-backend triton` and (for non-ParaS configs) `--disable-hybrid-swa-memory`.
 
 ### Between configs — cleanup stragglers
 NCCL teardown occasionally leaves rank processes holding memory. Between runs:
@@ -114,11 +91,23 @@ tmux attach -t bench   # Ctrl-B then D to detach
 
 ## Profiling
 
-Two options:
+The bench scripts expose two profile toggles (default off):
 
-**Torch profiler** (`--profile`): set `SGLANG_TORCH_PROFILER_DIR=<output_dir>`. Generates `.trace.json.gz` viewable in Perfetto. Must use `--disable-cuda-graph` to capture in-graph kernels. Profile runs should use a **single batch size** per invocation for clean traces.
+```bash
+# Torch profiler: adds --profile + --disable-cuda-graph (kernels outside cuda graph only).
+ENABLE_TORCH_PROFILE=1 SGLANG_TORCH_PROFILER_DIR=/path/to/torch_traces \
+    BATCH_SIZE=2048 CUDA_GRAPH_BS=2048 RUN_NAME=tp_tp \
+    bash scripts/paras/eval/a100/qwen/bench_one_batch_tp_tp.sh
 
-**nsys** (preferred, CUDA-graph-aware): wrap `bench_one_batch ... --profile --profile-activities CUDA_PROFILER` with `nsys profile --cuda-graph-trace=node --capture-range=cudaProfilerApi -o <prefix>`. `--capture-range=cudaProfilerApi` limits capture to the measured forward pass only (prefill OR decode, per `--profile-stage`). nsys captures kernels inside CUDA graphs correctly; torch profiler misses them. Works on A100 — note nsys requires a writable TMPDIR (set `TMPDIR=<workspace>/nsys_tmp` to avoid `/tmp/nvidia` permission errors).
+# nsys: wraps the python invocation with nsys profile --cuda-graph-trace=node -t cuda.
+ENABLE_NSYS=1 NSYS_OUTPUT=/path/to/trace_prefix \
+    BATCH_SIZE=2048 CUDA_GRAPH_BS=2048 RUN_NAME=tp_tp \
+    bash scripts/paras/eval/a100/qwen/bench_one_batch_tp_tp.sh
+```
+
+**Torch profiler**: generates `.trace.json.gz` viewable in Perfetto. The toggle automatically adds `--disable-cuda-graph` because torch profiler can't see in-graph kernels. Use a **single batch size** (`BATCH_SIZE=2048 CUDA_GRAPH_BS=2048`) per invocation for clean traces.
+
+**nsys** (preferred, CUDA-graph-aware): captures kernels inside CUDA graphs correctly. The script auto-creates `TMPDIR` next to `NSYS_OUTPUT` to avoid `/tmp/nvidia` permission errors. For finer scoping, pass `--profile-activities CUDA_PROFILER --capture-range=cudaProfilerApi --profile-stage decode|prefill` via additional sglang flags (script doesn't yet expose these; edit if needed).
 
 ## Key Environment Variables (DP/EP only — the other configs don't use DeepEP)
 

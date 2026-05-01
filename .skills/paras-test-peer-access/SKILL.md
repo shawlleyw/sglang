@@ -12,9 +12,14 @@ Correctness tests for ParaS parallelism switching: KV cache transfer (both direc
 ## Quick Run
 
 ```bash
-bash run_paras_tests.sh      # 4 GPUs
-bash run_paras_tests.sh 8    # 8 GPUs
+bash scripts/paras/eval/run_paras_tests.sh        # 4 GPUs (default)
+bash scripts/paras/eval/run_paras_tests.sh 8      # 8 GPUs
+
+# Single group (partition | kv | kv-rep | weight | gpt-oss-cuda-graph):
+ONLY=kv bash scripts/paras/eval/run_paras_tests.sh
 ```
+
+The wrapper ([`scripts/paras/eval/run_paras_tests.sh`](file:///home/shaoyuw/sglang/scripts/paras/eval/run_paras_tests.sh)) sources [`scripts/paras/eval/lib.sh`](file:///home/shaoyuw/sglang/scripts/paras/eval/lib.sh), defaults `CUDA_VISIBLE_DEVICES=0,...,NUM_GPUS-1`, runs each group, and prints a PASS/FAIL summary. Replication tests run in their own process to avoid CUDA IPC stale-handle issues across mismatched buffer sizes (see "Why KV replication is a separate file" below). Each section below documents what each group covers; the per-section `torchrun` snippets remain available for running a single test file with custom pytest options.
 
 ## Prerequisites
 

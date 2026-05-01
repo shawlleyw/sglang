@@ -23,8 +23,14 @@ The gpt-oss test thus covers a different code matrix from qwen3 — both should 
 
 - **Conda env**: `sgl_paras`
 - **GPUs**: 4× A100-80GB (use `CUDA_VISIBLE_DEVICES=0,1,2,3` or `4,5,6,7`)
-- **Model**: `/data/shaoyuw/models/gpt-oss-120b-bf16`
+- **Model**: `/data/shaoyuw/models/gpt-oss-120b-BF16-unsloth` (genuine BF16; downloaded from [`unsloth/gpt-oss-120b-BF16`](https://huggingface.co/unsloth/gpt-oss-120b-BF16) — see "Model selection" below)
 - **Working dir**: `/home/shaoyuw/sglang`
+
+### Model selection
+
+Use the **unsloth** BF16 weights, not the older `/data/shaoyuw/models/gpt-oss-120b-bf16` directory. The older directory is mislabeled — its name says "bf16" but its MoE expert weights (`mlp.experts.gate_up_proj`, `mlp.experts.down_proj`) are stored in `torch.float8_e5m2`, while only the bias and non-MoE tensors are BF16. Loading it through sglang's standard (non-mxfp4) path forces a per-tensor FP8→BF16 cross-dtype cross-device copy, which adds ~3 minutes to load time on 4×A100 with no functional benefit.
+
+The unsloth release at `unsloth/gpt-oss-120b-BF16` ([HF link](https://huggingface.co/unsloth/gpt-oss-120b-BF16)) stores **every** tensor in BF16 (verified: `experts.gate_up_proj.dtype == torch.bfloat16`). 73 shards, 218 GB on disk, declared `torch_dtype: bfloat16` in `config.json`. The eval scripts under [`scripts/paras/eval/a100/gptoss/`](file:///home/shaoyuw/sglang/scripts/paras/eval/a100/gptoss) default to this path; override `MODEL_PATH=...` only if your local layout differs.
 
 ## Test Procedure
 
@@ -43,29 +49,14 @@ conda activate sgl_paras
 cd /home/shaoyuw/sglang
 pip install -e python/ -q --no-deps
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-PARAS_CONFIGURE_METHOD=peer_access \
-PARAS_KV_TRANSFER_METHOD=peer_access \
-PARAS_DISABLE_PEER_ACCESS=0 \
-SGLANG_DEEPEP_BF16_DISPATCH=true \
-SGLANG_ATTN_MAX_BS=256 \
-SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256 \
-python -m sglang.launch_server \
-    --model-path /data/shaoyuw/models/gpt-oss-120b-bf16 --trust-remote-code \
-    --tp-size 4 --dp-size 4 --ep-size 4 \
-    --enable-dp-attention --enable-dp-lm-head \
-    --moe-a2a-backend deepep --deepep-mode auto \
-    --enable-paras-moe --paras-tp-size 4 \
-    --attention-backend triton \
-    --max-running-requests 1024 \
-    --cuda-graph-max-bs 8 \
-    --mem-fraction-static 0.8 \
-    --disable-overlap-schedule \
-    --host 0.0.0.0 --port 30000 \
+ENABLE_PARAS=1 NUM_GPUS=4 \
+    bash scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh \
     2>&1 | tee /tmp/sglang_paras_gptoss.log
 ```
 
-Note: `--max-running-requests 1024` is the canonical value. Pre-redesign (commits before `098b8a37a`) this required `256` to dodge OOM during dual capture; the state-preservation redesign recovered ~3 GB and removed that workaround.
+The launch script ([`scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh`](file:///home/shaoyuw/sglang/scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh)) detects `ENABLE_PARAS=1` and shifts the canonical defaults: `MEM_FRACTION_STATIC=0.8`, `MAX_RUNNING_REQUESTS=1024`, `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`, `SGLANG_ATTN_MAX_BS=256`, `PARAS_CONFIGURE_METHOD=peer_access`, `PARAS_KV_TRANSFER_METHOD=peer_access`, `PARAS_DISABLE_PEER_ACCESS=0`, `CUDA_GRAPH_MAX_BS=8` (gpt-oss ParaS canonical = dual capture). It drops `--disable-hybrid-swa-memory` (gpt-oss ParaS uses dual full+SWA pools) and adds `--enable-paras-moe --paras-tp-size $NUM_GPUS --disable-overlap-schedule`. `CUDA_VISIBLE_DEVICES` defaults to `0,1,2,3` for `NUM_GPUS=4`. Override any of these by setting the env var on the same line.
+
+Note: `MAX_RUNNING_REQUESTS=1024` is the canonical value. Pre-redesign (commits before `098b8a37a`) this required `256` to dodge OOM during dual capture; the state-preservation redesign recovered ~3 GB and removed that workaround.
 
 ### 3. Wait for server ready
 
@@ -110,19 +101,19 @@ grep -E "ParaS: dual capture complete|saving EP graphs|capturing TP graphs|TP ca
 # Prompt 1: Roman history — long-context narrative
 curl -s --max-time 60 http://localhost:30000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-bf16","prompt":"Tell me about the history of Rome. The Roman Empire","max_tokens":200,"temperature":0}' \
+    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Tell me about the history of Rome. The Roman Empire","max_tokens":200,"temperature":0}' \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP P1]', d['choices'][0]['text'][:300])"
 
 # Prompt 2: data structures — technical multi-step
 curl -s --max-time 60 http://localhost:30000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-bf16","prompt":"Explain how a hash table works.","max_tokens":200,"temperature":0}' \
+    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Explain how a hash table works.","max_tokens":200,"temperature":0}' \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP P2]', d['choices'][0]['text'][:300])"
 
 # Prompt 3: code generation — chain-of-thought
 curl -s --max-time 60 http://localhost:30000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-bf16","prompt":"Write a Python recursive Fibonacci function.","max_tokens":200,"temperature":0}' \
+    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Write a Python recursive Fibonacci function.","max_tokens":200,"temperature":0}' \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP P3]', d['choices'][0]['text'][:300])"
 ```
 
@@ -158,17 +149,17 @@ Peer-access is ~2.2-3.4× faster than the older naive NCCL all-to-all baseline (
 ```bash
 curl -s --max-time 60 http://localhost:30000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-bf16","prompt":"Tell me about the history of Rome. The Roman Empire","max_tokens":200,"temperature":0}' \
+    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Tell me about the history of Rome. The Roman Empire","max_tokens":200,"temperature":0}' \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print('[TP P1]', d['choices'][0]['text'][:300])"
 
 curl -s --max-time 60 http://localhost:30000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-bf16","prompt":"Explain how a hash table works.","max_tokens":200,"temperature":0}' \
+    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Explain how a hash table works.","max_tokens":200,"temperature":0}' \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print('[TP P2]', d['choices'][0]['text'][:300])"
 
 curl -s --max-time 60 http://localhost:30000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-bf16","prompt":"Write a Python recursive Fibonacci function.","max_tokens":200,"temperature":0}' \
+    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Write a Python recursive Fibonacci function.","max_tokens":200,"temperature":0}' \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print('[TP P3]', d['choices'][0]['text'][:300])"
 ```
 
@@ -191,7 +182,7 @@ curl -s --max-time 60 http://localhost:30000/paras_configure_ep
 ```bash
 curl -s --max-time 60 http://localhost:30000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-bf16","prompt":"Tell me about the history of Rome. The Roman Empire","max_tokens":200,"temperature":0}' \
+    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Tell me about the history of Rome. The Roman Empire","max_tokens":200,"temperature":0}' \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP-RT P1]', d['choices'][0]['text'][:300])"
 ```
 
@@ -205,7 +196,7 @@ Server is in EP mode after step 10. Requests started in EP must survive the swit
 # Start request in EP mode (background) with a long prompt
 curl -s --max-time 180 http://localhost:30000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-bf16","prompt":"Tell me about the history of Rome. The Roman Empire","max_tokens":300,"temperature":0}' > /tmp/gptoss_r1.json &
+    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Tell me about the history of Rome. The Roman Empire","max_tokens":300,"temperature":0}' > /tmp/gptoss_r1.json &
 PID1=$!
 
 sleep 1
@@ -226,7 +217,7 @@ Server is in TP mode after step 11.
 ```bash
 curl -s --max-time 180 http://localhost:30000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-bf16","prompt":"Describe photosynthesis in plants step by step.","max_tokens":300,"temperature":0}' > /tmp/gptoss_r2.json &
+    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Describe photosynthesis in plants step by step.","max_tokens":300,"temperature":0}' > /tmp/gptoss_r2.json &
 PID2=$!
 
 sleep 1

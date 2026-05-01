@@ -29,23 +29,12 @@ conda activate sgl_paras
 cd /home/shaoyuw/sglang
 pip install -e python/ -q --no-deps
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-SGLANG_ATTN_MAX_BS=256 \
-SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256 \
-SGLANG_DEEPEP_BF16_DISPATCH=true \
-python -m sglang.launch_server \
-    --model /data/shaoyuw/models/Qwen3-30B-A3B --trust-remote-code \
-    --chunked-prefill-size -1 --max-prefill-tokens 32000 \
-    --mem-fraction-static 0.6 \
-    --tp-size 4 --dp-size 4 --ep-size 4 \
-    --enable-dp-attention --enable-dp-lm-head \
-    --moe-a2a-backend deepep --deepep-mode auto \
-    --max-running-requests 1024 \
-    --disable-cuda-graph --disable-overlap-schedule \
-    --log-level info \
-    --enable-paras-moe --paras-tp-size 4 \
+ENABLE_PARAS=1 NUM_GPUS=4 \
+    bash scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh \
     2>&1 | tee /tmp/sglang_paras_test.log
 ```
+
+The launch script ([`scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh`](file:///home/shaoyuw/sglang/scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh)) detects `ENABLE_PARAS=1` and shifts the canonical defaults: `MEM_FRACTION_STATIC=0.6`, `MAX_RUNNING_REQUESTS=1024`, `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`, `SGLANG_ATTN_MAX_BS=256`, `PARAS_CONFIGURE_METHOD=peer_access`, `ENABLE_CUDA_GRAPH=0` (eager, qwen ParaS canonical). It also adds `--enable-paras-moe --paras-tp-size $NUM_GPUS --disable-overlap-schedule --chunked-prefill-size -1 --max-prefill-tokens 32000`. `CUDA_VISIBLE_DEVICES` defaults to `0,1,2,3` for `NUM_GPUS=4`. Override any of these by setting the env var on the same line.
 
 ### 3. Wait for server ready
 
@@ -252,11 +241,12 @@ rm -f /tmp/sglang_paras_test.log
 
 ## Optional: CUDA-Graph-Enabled Variant
 
-The default procedure runs with `--disable-cuda-graph` for a clean eager path. To exercise the per-mode CUDA graph state preservation hooks (`paras_save_cuda_graph_state` / `paras_load_cuda_graph_state` on `AttentionBackend`) introduced for gpt-oss but applicable to qwen3+FlashInfer too, swap the launch flag:
+The default procedure runs with `ENABLE_CUDA_GRAPH=0` (eager) for a clean path. To exercise the per-mode CUDA graph state preservation hooks (`paras_save_cuda_graph_state` / `paras_load_cuda_graph_state` on `AttentionBackend`) introduced for gpt-oss but applicable to qwen3+FlashInfer too, override the cuda-graph defaults:
 
-```diff
--    --disable-cuda-graph --disable-overlap-schedule \
-+    --cuda-graph-max-bs 8 --disable-overlap-schedule \
+```bash
+ENABLE_PARAS=1 NUM_GPUS=4 ENABLE_CUDA_GRAPH=1 CUDA_GRAPH_MAX_BS=8 \
+    bash scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh \
+    2>&1 | tee /tmp/sglang_paras_test.log
 ```
 
 Then run the same 14-step procedure. After step 2, also verify dual capture happened:
