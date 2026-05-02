@@ -60,6 +60,8 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqInput,
     HealthCheckOutput,
     OpenSessionReqOutput,
+    ParaSAutoSwitchReq,
+    ParaSConfigureReqType,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -398,6 +400,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
+                (ParaSAutoSwitchReq, self._handle_paras_auto_switch_req),
             ]
         )
         self.init_communicators(server_args)

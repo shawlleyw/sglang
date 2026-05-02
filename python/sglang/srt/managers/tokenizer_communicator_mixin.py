@@ -46,6 +46,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    ParaSAutoSwitchReq,
     ParaSConfigureReqType,
     ParaSConfigureReqInput,
     ParaSConfigureReqOutput,
@@ -408,6 +409,18 @@ class TokenizerCommunicatorMixin:
             comm._fan_out = self.server_args.dp_size
         req = ParaSConfigureReqInput(type=ParaSConfigureReqType.CONFIGURE_EP)
         await self.paras_configure_communicator(req)
+
+    def _handle_paras_auto_switch_req(
+        self: TokenizerManager, req: ParaSAutoSwitchReq
+    ):
+        if req.target == ParaSConfigureReqType.CONFIGURE_TP:
+            asyncio.create_task(self.paras_configure_tp())
+        elif req.target == ParaSConfigureReqType.CONFIGURE_EP:
+            asyncio.create_task(self.paras_configure_ep())
+        else:
+            logger.warning(
+                f"Unknown ParaSAutoSwitchReq target: {req.target}"
+            )
 
     async def init_weights_update_group(
         self: TokenizerManager,

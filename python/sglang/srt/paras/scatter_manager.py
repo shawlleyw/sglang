@@ -24,6 +24,7 @@ from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
 from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
 from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+from sglang.srt.paras.gather_manager import paras_tp_group_all_gather_reqs
 
 
 # ============================================================
@@ -122,6 +123,7 @@ class ParaSReqScatterManager:
         paras_tp_rank: int = 0,
         paras_tp_size: int = 1,
         layer_specs: Optional[list] = None,
+        local_waiting_reqs: Optional[List[Req]] = None,
     ):
         self.global_reqs = global_reqs
         self.scatter_group = scatter_group
@@ -133,6 +135,17 @@ class ParaSReqScatterManager:
         self.paras_tp_size = paras_tp_size
         self.method = os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl")
         self.layer_specs = layer_specs
+
+        # Only rank 0 receives requests in TP mode, so only rank 0 has a
+        # populated waiting_queue. Broadcast to all ranks via all-gather
+        # (other ranks send []) so every rank can deterministically run the
+        # same partition algorithm.
+        local_waiting_reqs = local_waiting_reqs or []
+        gathered_waiting, _ = paras_tp_group_all_gather_reqs(
+            local_waiting_reqs, scatter_group
+        )
+        self.global_waiting_reqs: List[Req] = gathered_waiting or []
+        self.local_waiting_reqs_after_partition: List[Req] = []
 
         self.local_reqs: List[Req] = []
         self.local_seqlens_list: List[int] = []
@@ -174,6 +187,11 @@ class ParaSReqScatterManager:
         self.local_reqs = partitions[self.paras_tp_rank]
         self.local_seqlens_list = [req.seqlen for req in self.local_reqs]
         self.num_local_tokens = sum(s - 1 for s in self.local_seqlens_list)
+
+        waiting_partitions = partition_requests_for_ep(
+            self.global_waiting_reqs, self.paras_tp_size
+        )
+        self.local_waiting_reqs_after_partition = waiting_partitions[self.paras_tp_rank]
 
         # Map each request to its global-token-index range.
         req_to_offset: dict = {}
@@ -258,6 +276,9 @@ class ParaSReqScatterManager:
                 self.ep_dst_positions = None
         else:
             self.ep_dst_positions = None
+
+    def get_new_waiting_queue(self) -> List[Req]:
+        return list(self.local_waiting_reqs_after_partition)
 
     # ------------------------------------------------------------------
     # Step 3: build running batch from local partition

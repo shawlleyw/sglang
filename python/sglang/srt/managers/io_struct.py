@@ -1565,6 +1565,11 @@ class ParaSConfigureReqOutput(BaseReq):
     pass
 
 
+@dataclass
+class ParaSAutoSwitchReq(BaseReq):
+    target: ParaSConfigureReqType
+
+
 def _check_all_req_types():
     """A helper function to check all request types are defined in this file."""
     import inspect

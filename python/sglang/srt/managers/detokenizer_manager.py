@@ -31,6 +31,7 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     FreezeGCReq,
+    ParaSAutoSwitchReq,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -104,6 +105,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
                 (FreezeGCReq, self.handle_freeze_gc_req),
+                (ParaSAutoSwitchReq, self.handle_paras_auto_switch_req),
             ]
         )
 
@@ -304,6 +306,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")
         return None
+
+    def handle_paras_auto_switch_req(self, recv_req: ParaSAutoSwitchReq):
+        return recv_req
 
 
 class LimitedCapacityDict(OrderedDict):

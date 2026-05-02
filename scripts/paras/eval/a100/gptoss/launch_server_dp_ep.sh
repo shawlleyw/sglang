@@ -79,4 +79,5 @@ python -m sglang.launch_server \
     --max-running-requests "$MAX_RUNNING_REQUESTS" \
     "${HYBRID_SWA_FLAGS[@]}" \
     "${CUDA_GRAPH_FLAGS[@]}" \
-    "${PARAS_FLAGS[@]}"
+    "${PARAS_FLAGS[@]}" \
+    "$@"

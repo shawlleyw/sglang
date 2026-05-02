@@ -415,6 +415,13 @@ class ServerArgs:
     mooncake_ib_device: Optional[str] = None
     enable_paras_moe: bool = False
     paras_tp_size: int = 4
+    paras_tp_cuda_graph_max_bs: Optional[int] = None
+    paras_tp_cuda_graph_bs: Optional[List[int]] = None
+    paras_auto_switch: bool = True
+    paras_auto_switch_low: int = 256
+    paras_auto_switch_high: int = 1024
+    paras_auto_switch_window: int = 32
+    paras_auto_switch_cooldown_sec: float = 60.0
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -780,6 +787,18 @@ class ServerArgs:
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
+        if self.enable_paras_moe:
+            if self.paras_tp_cuda_graph_bs is not None:
+                self.paras_tp_cuda_graph_max_bs = max(self.paras_tp_cuda_graph_bs)
+            else:
+                if self.paras_tp_cuda_graph_max_bs is None:
+                    self.paras_tp_cuda_graph_max_bs = (
+                        self.cuda_graph_max_bs * self.paras_tp_size
+                    )
+                self.paras_tp_cuda_graph_bs = self._generate_cuda_graph_batch_sizes(
+                    max_bs=self.paras_tp_cuda_graph_max_bs
+                )
+
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
                 self._generate_piecewise_cuda_graph_tokens()
@@ -831,21 +850,28 @@ class ServerArgs:
             if model_config.is_multimodal:
                 self.adjust_mem_fraction_for_vlm(model_config)
 
-    def _generate_cuda_graph_batch_sizes(self):
+    def _generate_cuda_graph_batch_sizes(self, max_bs: Optional[int] = None):
         """
-        Generate the list of batch sizes for CUDA graph capture based on cuda_graph_max_bs.
+        Generate the list of batch sizes for CUDA graph capture based on max_bs.
         This integrates the logic from cuda_graph_runner.py.
+
+        If max_bs is None, defaults to self.cuda_graph_max_bs (backward-compatible).
+        Pass an explicit max_bs (e.g., self.paras_tp_cuda_graph_max_bs) to generate
+        a list scaled to a different maximum without mutating self.cuda_graph_max_bs.
         """
+        if max_bs is None:
+            max_bs = self.cuda_graph_max_bs
+
         # Handle disable_cuda_graph_padding as the first condition for both spec and non-spec
         if self.disable_cuda_graph_padding:
-            capture_bs = list(range(1, self.cuda_graph_max_bs + 1))
+            capture_bs = list(range(1, max_bs + 1))
         elif self.speculative_algorithm is None:
-            # Normal case: [1, 2, 4, 8, 12] + list(range(16, 257, 8)) + list(range(272, 512, 16)) + list(range(512, cuda_graph_max_bs + 1))
+            # Normal case: [1, 2, 4, 8, 12] + list(range(16, 257, 8)) + list(range(272, 512, 16)) + list(range(512, max_bs + 1))
             capture_bs = (
                 [1, 2, 4, 8, 12]
                 + list(range(16, 257, 8))
                 + list(range(272, 512, 16))
-                + list(range(512, self.cuda_graph_max_bs + 1, 32))
+                + list(range(512, max_bs + 1, 32))
             )
         else:
             # Spec decoding case: list(range(1, 9, 1)) + list(range(10, 33, 2)) + list(range(40, 64, 4)) + list(range(72, 257, 8))
@@ -854,10 +880,10 @@ class ServerArgs:
                 + list(range(10, 33, 2))
                 + list(range(40, 65, 4))
                 + list(range(72, 257, 8))
-                + list(range(272, self.cuda_graph_max_bs + 1, 16))
+                + list(range(272, max_bs + 1, 16))
             )
 
-        capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
+        capture_bs = [bs for bs in capture_bs if bs <= max_bs]
 
         return capture_bs
 
@@ -1483,6 +1509,23 @@ class ServerArgs:
             assert self.enable_dp_attention, "enable_dp_attention must be set when enable_paras_moe is set"
             assert self.paras_tp_size <= 8 and self.paras_tp_size > 0, "paras_tp_size must be positive when enable_paras_moe is set"
             assert self.tp_size == self.dp_size, "paras moe requires tp_size == dp_size, which means attn tp size is 1"
+            if self.paras_auto_switch:
+                assert 0 < self.paras_auto_switch_low < self.paras_auto_switch_high, (
+                    "require 0 < --paras-auto-switch-low < --paras-auto-switch-high"
+                )
+                assert self.paras_auto_switch_window > 0, (
+                    "--paras-auto-switch-window must be positive"
+                )
+                assert self.paras_auto_switch_cooldown_sec >= 0, (
+                    "--paras-auto-switch-cooldown-sec must be non-negative"
+                )
+        else:
+            assert self.paras_tp_cuda_graph_max_bs is None, (
+                "--paras-tp-cuda-graph-max-bs requires --enable-paras-moe"
+            )
+            assert self.paras_tp_cuda_graph_bs is None, (
+                "--paras-tp-cuda-graph-bs requires --enable-paras-moe"
+            )
 
     def _handle_pipeline_parallelism(self):
         if self.pp_size > 1:
@@ -2955,6 +2998,61 @@ class ServerArgs:
             type=int,
             default=ServerArgs.paras_tp_size,
             help="TP size for ParaS MoE layers.",
+        )
+        parser.add_argument(
+            "--paras-tp-cuda-graph-max-bs",
+            type=int,
+            default=ServerArgs.paras_tp_cuda_graph_max_bs,
+            help=(
+                "Maximum cuda graph batch size for ParaS TP-mode capture. "
+                "TP per-rank batch is paras_tp_size x larger than EP per-rank "
+                "batch for the same global workload, so TP graphs typically "
+                "need a larger range. Defaults to cuda_graph_max_bs * "
+                "paras_tp_size when --enable-paras-moe is set."
+            ),
+        )
+        parser.add_argument(
+            "--paras-tp-cuda-graph-bs",
+            type=int,
+            nargs="+",
+            help=(
+                "Explicit list of cuda graph batch sizes for ParaS TP-mode "
+                "capture. If omitted, auto-generated from "
+                "--paras-tp-cuda-graph-max-bs."
+            ),
+        )
+        parser.add_argument(
+            "--paras-auto-switch",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.paras_auto_switch,
+            help=(
+                "Enable automatic EP<->TP switching driven by observed "
+                "global batch size. Default on when --enable-paras-moe."
+            ),
+        )
+        parser.add_argument(
+            "--paras-auto-switch-low",
+            type=int,
+            default=ServerArgs.paras_auto_switch_low,
+            help="Switch EP->TP when sliding-window avg global batch < this.",
+        )
+        parser.add_argument(
+            "--paras-auto-switch-high",
+            type=int,
+            default=ServerArgs.paras_auto_switch_high,
+            help="Switch TP->EP when sliding-window avg global batch > this.",
+        )
+        parser.add_argument(
+            "--paras-auto-switch-window",
+            type=int,
+            default=ServerArgs.paras_auto_switch_window,
+            help="Sliding-window size (decode iterations) for the auto-switch policy.",
+        )
+        parser.add_argument(
+            "--paras-auto-switch-cooldown-sec",
+            type=float,
+            default=ServerArgs.paras_auto_switch_cooldown_sec,
+            help="Wall-clock seconds between successive auto-switch decisions.",
         )
         parser.add_argument(
             "--elastic-ep-backend",

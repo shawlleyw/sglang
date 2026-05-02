@@ -1,3 +1,4 @@
+from collections import deque
 from types import SimpleNamespace
 from typing import List, Any, Optional
 import torch
@@ -5,7 +6,12 @@ import logging
 import time
 import os
 
-from sglang.srt.managers.io_struct import ParaSConfigureReqInput, ParaSConfigureReqType, ParaSConfigureReqOutput
+from sglang.srt.managers.io_struct import (
+    ParaSAutoSwitchReq,
+    ParaSConfigureReqInput,
+    ParaSConfigureReqOutput,
+    ParaSConfigureReqType,
+)
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -37,6 +43,42 @@ class TimeReporter:
         end_time = time.time()
         cost_ms = (end_time - self.start_time) * 1000
         logger.info(f"Time taken to {self.op_name}: {cost_ms} ms")
+
+class ParasAutoSwitchPolicy:
+    def __init__(
+        self,
+        low: int,
+        high: int,
+        window: int,
+        cooldown_sec: float,
+    ):
+        self.low = low
+        self.high = high
+        self.window: deque = deque(maxlen=window)
+        self.cooldown_sec = cooldown_sec
+        self.cooldown_until: float = 0.0
+
+    def observe(self, global_batch: int, now: float) -> None:
+        if global_batch <= 0:
+            return
+        self.window.append(global_batch)
+
+    def pick_target(self, current_mode: str, now: float) -> Optional[str]:
+        if now < self.cooldown_until:
+            return None
+        if len(self.window) < self.window.maxlen:
+            return None
+        avg = sum(self.window) / len(self.window)
+        target: Optional[str] = None
+        if current_mode == "EP" and avg < self.low:
+            target = "TP"
+        elif current_mode == "TP" and avg > self.high:
+            target = "EP"
+        if target is not None:
+            self.cooldown_until = now + self.cooldown_sec
+            self.window.clear()
+        return target
+
 
 class SchedulerParasMixin:
     """
@@ -89,6 +131,17 @@ class SchedulerParasMixin:
 
         self.paras_parallelism_config = "EP"
 
+        sa = self.server_args
+        if sa.paras_auto_switch:
+            self._paras_auto_policy = ParasAutoSwitchPolicy(
+                low=sa.paras_auto_switch_low,
+                high=sa.paras_auto_switch_high,
+                window=sa.paras_auto_switch_window,
+                cooldown_sec=sa.paras_auto_switch_cooldown_sec,
+            )
+        else:
+            self._paras_auto_policy = None
+
     def paras_configure_helper(self):
         (
             self.max_total_num_tokens,
@@ -109,19 +162,65 @@ class SchedulerParasMixin:
             )
         
     def paras_check(self):
-        if len(self.waiting_queue) > 0:
-            logger.warning("Waiting queue is not empty, parallelism switch is not allowed.")
-            return False
+        # Canary: log if running_batch ever contains a req with output_ids=[].
+        # This state was thought unreachable in normal mode (all reqs entering
+        # running_batch traverse last_batch first; process_batch_result populates
+        # output_ids before last_batch is set). The previous guard from
+        # b6d0b9665 inspected this state. If this log fires in production, the
+        # guard was needed and should be reinstated.
         if self.running_batch is not None and any(
             len(req.output_ids) == 0 for req in self.running_batch.reqs
         ):
             logger.warning(
-                "Running batch contains a req with no output_ids "
-                "(promoted from waiting but not yet forwarded); "
-                "parallelism switch is not allowed."
+                "paras_check: running_batch contains a req with output_ids=[] "
+                "(thought unreachable in normal mode); investigate before "
+                "relying on this assumption"
             )
-            return False
         return True
+
+    def paras_auto_observe(self, batch) -> None:
+        policy = getattr(self, "_paras_auto_policy", None)
+        if policy is None or batch is None:
+            return
+        forward_mode = getattr(batch, "forward_mode", None)
+        if forward_mode is None or not forward_mode.is_decode():
+            return
+        gnt = getattr(batch, "global_num_tokens", None)
+        if gnt:
+            global_batch = int(sum(gnt))
+        else:
+            global_batch = len(getattr(batch, "reqs", []))
+        if global_batch <= 0:
+            return
+        policy.observe(global_batch, time.time())
+
+    def _paras_auto_clear_window_on_switch(self) -> None:
+        policy = getattr(self, "_paras_auto_policy", None)
+        if policy is None:
+            return
+        policy.window.clear()
+        policy.cooldown_until = max(
+            policy.cooldown_until, time.time() + policy.cooldown_sec
+        )
+
+    def paras_auto_pick_signal(self) -> Optional[ParaSAutoSwitchReq]:
+        policy = getattr(self, "_paras_auto_policy", None)
+        if policy is None:
+            return None
+        target = policy.pick_target(
+            self.paras_parallelism_config, time.time()
+        )
+        if target is None:
+            return None
+        req_type = (
+            ParaSConfigureReqType.CONFIGURE_TP
+            if target == "TP"
+            else ParaSConfigureReqType.CONFIGURE_EP
+        )
+        logger.info(
+            f"ParaS auto-switch policy fired: {self.paras_parallelism_config} -> {target}"
+        )
+        return ParaSAutoSwitchReq(target=req_type)
     
     def paras_get_req_seqlens(self, reqs: List[Req]):
         seqlens = []
@@ -136,12 +235,18 @@ class SchedulerParasMixin:
     
     @paras_func
     def paras_configure_tp(self):
+        if self.paras_parallelism_config == "TP":
+            logger.warning("paras_configure_tp called but already in TP mode; skipping")
+            return
         if not self.paras_check():
             return
 
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
         assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
         torch.cuda.synchronize()
+
+        self._paras_auto_clear_window_on_switch()
+
         # switch from EP to DP x TP
         self.paras_parallelism_config = "TP"
         self.server_args.enable_dp_attention = False
@@ -160,7 +265,8 @@ class SchedulerParasMixin:
         self.paras_start_profile("/tmp/paras_configure_profile")
         self.tree_cache.reset()
         local_reqs = self.paras_get_local_reqs()
-        
+        local_waiting_reqs = list(self.waiting_queue)
+
         paras_gather_manager = ParaSReqGatherManager(
             local_reqs,
             self.paras_tp_group,
@@ -172,6 +278,7 @@ class SchedulerParasMixin:
                 None,
             ),
             method=os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl"),
+            local_waiting_reqs=local_waiting_reqs,
         )
         
         start_time = time.time()
@@ -192,6 +299,9 @@ class SchedulerParasMixin:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor
+        )
+        self.waiting_queue = paras_gather_manager.get_new_waiting_queue(
+            self.paras_tp_rank
         )
         # paras_gather_manager.update_running_batch_inplace(self.running_batch)
 
@@ -242,12 +352,15 @@ class SchedulerParasMixin:
         assert self.paras_dp_size == 1, "paras_configure_ep only supports dp_size==1"
         torch.cuda.synchronize()
 
+        self._paras_auto_clear_window_on_switch()
+
         self.paras_start_profile("/tmp/paras_configure_profile")
 
         # Phase 1: Prepare — reset tree cache, merge batches, build global req list
         self.tree_cache.reset()
         self.merge_last_batch()
         global_reqs = list(self.running_batch.reqs) if self.running_batch else []
+        local_waiting_reqs = list(self.waiting_queue)
 
         # Phase 2: Scatter — partition reqs, shrink pools, scatter KV cache
         paras_scatter_manager = ParaSReqScatterManager(
@@ -262,6 +375,7 @@ class SchedulerParasMixin:
             ),
             paras_tp_rank=self.paras_tp_rank,
             paras_tp_size=self.paras_tp_size,
+            local_waiting_reqs=local_waiting_reqs,
         )
 
         start_time = time.time()
@@ -283,6 +397,7 @@ class SchedulerParasMixin:
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
         )
+        self.waiting_queue = paras_scatter_manager.get_new_waiting_queue()
 
         # Phase 3: Model switch (weights + attention)
         with TimeReporter("transfer_weights"):

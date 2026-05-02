@@ -116,8 +116,10 @@ class ParaSReqGatherManager:
         peer_ctx: Optional[Any] = None,
         method: Optional[str] = None,
         layer_specs: Optional[list] = None,
+        local_waiting_reqs: Optional[List[Req]] = None,
     ):
         self.local_reqs = local_reqs
+        self.local_waiting_reqs = local_waiting_reqs or []
         self.gather_group = gather_group
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -154,6 +156,19 @@ class ParaSReqGatherManager:
             start_index = end_index
             
         self.num_global_tokens = sum(self.global_num_tokens)
+
+        # Gather waiting-queue requests too. They have no KV cache yet — just
+        # plain Python objects — so the same all-gather mechanism preserves
+        # them across the EP->TP switch without any GPU memory transfer.
+        gathered_waiting, _ = paras_tp_group_all_gather_reqs(
+            self.local_waiting_reqs, self.gather_group
+        )
+        self.global_waiting_reqs = gathered_waiting or []
+
+    def get_new_waiting_queue(self, paras_tp_rank: int) -> List[Req]:
+        if paras_tp_rank == 0:
+            return list(self.global_waiting_reqs)
+        return []
         
     def reorchestrate_cache(
         self, 
