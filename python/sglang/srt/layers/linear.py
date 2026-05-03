@@ -1230,13 +1230,22 @@ class QKVParallelLinear(ColumnParallelLinear):
         hs = self.head_size
 
         # Try to use the pre-allocated managed buffer for address stability.
+        # The UMM reserves `qkv_proj.tp_weight` as BF16; if the actual weight is
+        # FP8 (FP8 attention checkpoints) the UMM-backed tp buffer would silently
+        # dtype-convert via `.copy_()` and corrupt the GEMM dispatch.  Fall back
+        # to a fresh row_stack in that case.
         from sglang.srt.paras.paras_memory_manager import (
             get_global_paras_memory_manager,
         )
         mgr = get_global_paras_memory_manager()
         tp_weight_name = f"{self.prefix}.tp_weight" if hasattr(self, "prefix") else None
 
+        use_managed_tp_buffer = False
         if mgr and tp_weight_name and tp_weight_name in mgr._entries:
+            mgr_view = mgr.get_view(tp_weight_name)
+            use_managed_tp_buffer = mgr_view.dtype == full_weight_tensor.dtype
+
+        if use_managed_tp_buffer:
             # Reuse the permanent managed buffer — copy slices into it
             if not hasattr(self, "_paras_tp_weight"):
                 self._paras_tp_weight = torch.nn.Parameter(
