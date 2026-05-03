@@ -112,7 +112,15 @@ class SchedulerParasMixin:
         if len(self.waiting_queue) > 0:
             logger.warning("Waiting queue is not empty, parallelism switch is not allowed.")
             return False
-        
+        if self.running_batch is not None and any(
+            len(req.output_ids) == 0 for req in self.running_batch.reqs
+        ):
+            logger.warning(
+                "Running batch contains a req with no output_ids "
+                "(promoted from waiting but not yet forwarded); "
+                "parallelism switch is not allowed."
+            )
+            return False
         return True
     
     def paras_get_req_seqlens(self, reqs: List[Req]):
