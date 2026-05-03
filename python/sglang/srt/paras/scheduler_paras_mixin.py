@@ -130,9 +130,10 @@ class SchedulerParasMixin:
     def paras_configure_tp(self):
         if not self.paras_check():
             return
-        
+
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
         assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
+        torch.cuda.synchronize()
         # switch from EP to DP x TP
         self.paras_parallelism_config = "TP"
         self.server_args.enable_dp_attention = False
@@ -229,6 +230,7 @@ class SchedulerParasMixin:
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
         assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
         assert self.paras_dp_size == 1, "paras_configure_ep only supports dp_size==1"
+        torch.cuda.synchronize()
 
         self.paras_start_profile("/tmp/paras_configure_profile")
 
