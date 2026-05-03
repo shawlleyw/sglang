@@ -179,8 +179,7 @@ class SWACacheTransfer(CacheTransferBase):
             for local_idx, global_idx in enumerate(my_slice):
                 capped_global_indices.append(global_idx)
                 capped_dst_ranks.append(e)
-                # +1: slot 0 is the padding slot.
-                capped_ep_dst_pos.append(my_s + local_idx + 1)
+                capped_ep_dst_pos.append(my_s + local_idx)
 
         layer_num = len(capped_global_indices)
         if layer_num == 0:
