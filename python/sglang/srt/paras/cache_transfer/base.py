@@ -287,7 +287,7 @@ class CacheTransferBase:
             for local_idx, global_idx in enumerate(my_slice):
                 my_global_indices.append(global_idx)
                 my_dst_ranks.append(e)
-                my_ep_dst_pos.append(my_start + local_idx)
+                my_ep_dst_pos.append(my_start + local_idx + 1)
 
         self._num_my_tokens = len(my_global_indices)
 
