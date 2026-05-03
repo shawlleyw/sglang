@@ -550,13 +550,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        # ParaS integration: same pattern as unquant.py — extract manager,
-        # use get_view() for weights + scale tensors when manager is available.
-        paras_mgr = extra_weight_attrs.pop("paras_memory_manager", None)
-        paras_prefix = extra_weight_attrs.pop("paras_weight_name_prefix", "")
-        use_manager = paras_mgr is not None and paras_mgr.materialized
-
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+
+        # ParaS integration: mirrors unquant.py — pull manager from the global
+        # accessor and look up entries by ``model.layers.{layer_id}.mlp.experts.*``.
+        # Scales are NOT in the UMM (replicated-buffer pattern, see
+        # docs/paras/paras_fp8_support.md), so they always allocate as regular
+        # torch tensors regardless of use_manager.
+        mgr = get_global_paras_memory_manager()
+        layer_id = getattr(layer, "layer_id", None)
+        use_manager = mgr is not None and mgr.materialized and layer_id is not None
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
@@ -584,16 +588,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
 
         # WEIGHTS
-        if use_manager:
-            # Manager-backed FP8 weights: views come pre-shaped from the contiguous buffer.
-            # The buffer was reserved with FP8-specific shapes (non-transposed layout).
+        w13_name = f"model.layers.{layer_id}.mlp.experts.w13_weight" if use_manager else None
+        w2_name = f"model.layers.{layer_id}.mlp.experts.w2_weight" if use_manager else None
+
+        if use_manager and w13_name in mgr._entries:
             w13_weight = torch.nn.Parameter(
-                paras_mgr.get_view(f"{paras_prefix}.w13_weight"),
-                requires_grad=False,
-            )
-            w2_weight = torch.nn.Parameter(
-                paras_mgr.get_view(f"{paras_prefix}.w2_weight"),
-                requires_grad=False,
+                mgr.get_view(w13_name), requires_grad=False,
             )
         elif _is_hip and _use_hip_int4:
             # INT4 MoE weight - INT32 packed
@@ -602,15 +602,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     2 * intermediate_size_per_partition,
                     hidden_size // 8,
-                    dtype=params_dtype,
-                ),
-                requires_grad=False,
-            )
-            w2_weight = torch.nn.Parameter(
-                torch.empty(
-                    num_experts,
-                    hidden_size,
-                    intermediate_size_per_partition // 8,
                     dtype=params_dtype,
                 ),
                 requires_grad=False,
@@ -625,6 +616,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
                 requires_grad=False,
             )
+
+        if use_manager and w2_name in mgr._entries:
+            w2_weight = torch.nn.Parameter(
+                mgr.get_view(w2_name), requires_grad=False,
+            )
+        elif _is_hip and _use_hip_int4:
+            w2_weight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // 8,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+        else:
             w2_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
