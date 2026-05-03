@@ -432,6 +432,15 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         # ParaS: skip EPLB — weights are handled differently
         # (deliberately NOT building routed_experts_weights_of_layer)
 
+        for layer in self.model.layers:
+            mlp = getattr(layer, "mlp", None)
+            if mlp is None:
+                continue
+            if hasattr(mlp, "paras_all_gather_scales"):
+                mlp.paras_all_gather_scales()
+            if hasattr(mlp, "paras_finalize_moe_scale_views"):
+                mlp.paras_finalize_moe_scale_views()
+
         end_loading = time.time()
         torch.cuda.synchronize()
         logger.info(
