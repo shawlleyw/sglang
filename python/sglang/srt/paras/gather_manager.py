@@ -51,10 +51,22 @@ def paras_tp_group_all_gather_reqs(
     num_ranks = group.world_size
     
     # Clean up tensor members to avoid pickle triggering torch device copy, mostly radix cache related stuff
+    import logging as _paras_dbg_logging
+    _paras_dbg_log = _paras_dbg_logging.getLogger("sglang.paras.gather_dbg")
     for req in reqs:
         prune_request(req)
-        print_class_tensor_member(req)
-        # profile_object_members(req)
+        # Log any remaining tensor fields BEFORE pickle (Theory 1 diagnostic).
+        # Uses logger.warning (auto-flushed) instead of print() (stdout-buffered
+        # in subprocess workers, so prints get swallowed).
+        for path, tensor in detect_tensor_in_class(req):
+            _paras_dbg_log.warning(
+                "PARAS_PICKLE_TENSOR rid=%s path=%s shape=%s dtype=%s device=%s",
+                getattr(req, "rid", "?"),
+                path,
+                tuple(tensor.shape),
+                tensor.dtype,
+                tensor.device,
+            )
         
     serialized_data = pickle.dumps(reqs)
     size = len(serialized_data)
