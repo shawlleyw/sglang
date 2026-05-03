@@ -1526,7 +1526,8 @@ class RowParallelLinear(LinearBase):
 
         self.full_weight = self.weight
         full_weight_tensor = self.full_weight.data
-        new_weight_tensor = full_weight_tensor[:, row_start:row_end]
+        # DeepGEMM requires B to be contiguous; column slices are not.
+        new_weight_tensor = full_weight_tensor[:, row_start:row_end].contiguous()
         self.weight = torch.nn.Parameter(new_weight_tensor, requires_grad=False)
         set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
 
@@ -1549,7 +1550,7 @@ class RowParallelLinear(LinearBase):
             blocks_per_part = input_size_per_partition // block_k
             col_start = paras_tp_rank * blocks_per_part
             col_end = (paras_tp_rank + 1) * blocks_per_part
-            tp_scale = full_scale[:, col_start:col_end]
+            tp_scale = full_scale[:, col_start:col_end].contiguous()
             tp_scale_param = torch.nn.Parameter(tp_scale, requires_grad=False)
             setattr(self, scale_attr_name, tp_scale_param)
             self._paras_scale_attr_name = scale_attr_name
