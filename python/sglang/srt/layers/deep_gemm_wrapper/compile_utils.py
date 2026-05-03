@@ -47,6 +47,17 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     elif server_args.chunked_prefill_size > 8192:
         m_max = server_args.chunked_prefill_size * 2
     m_max = min(1024 * 128, m_max)
+
+    # Paras-TP exposes all experts per rank, so the masked-GEMM warmup buffer
+    # (num_groups, m_max, k) at FP8 OOMs at default m_max=65536 with large
+    # num_experts. Clamp to max_prefill_tokens (per-forward routing bound);
+    # runtime M outside the warmup just JIT-compiles on demand (DeepGEMM
+    # `expected_m` is config hint only). Floor 1024 avoids DeepGEMM issue
+    # #268 (incorrect results when max_m<64 on H20).
+    if getattr(server_args, "enable_paras_moe", False):
+        paras_m_max = max(server_args.max_prefill_tokens or 4096, 1024)
+        m_max = min(m_max, paras_m_max)
+
     _BUILTIN_M_LIST = list(range(1, m_max + 1))
 
     _IS_FIRST_RANK_ON_NODE = ServerArgs.base_gpu_id == gpu_id
