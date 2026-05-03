@@ -609,7 +609,7 @@ class ParaSMoeBlockMixin:
                 paras_tp_rank * two_i_blocks_per_tp
                 : (paras_tp_rank + 1) * two_i_blocks_per_tp,
                 :,
-            ]
+            ].contiguous()
         else:
             i_total_blocks = I // B
             gate_start = paras_tp_rank * i_blocks_per_tp
@@ -624,7 +624,7 @@ class ParaSMoeBlockMixin:
                     ],
                 ],
                 dim=1,
-            )
+            ).contiguous()
         tp_w13_param = nn.Parameter(tp_w13_view, requires_grad=False)
         set_weight_attrs(tp_w13_param, self.tp_experts.extra_weight_attrs)
         self.tp_experts.register_parameter(scale_name_w13, tp_w13_param)
@@ -635,7 +635,7 @@ class ParaSMoeBlockMixin:
                 :,
                 paras_tp_rank * i_blocks_per_tp : (paras_tp_rank + 1)
                 * i_blocks_per_tp,
-            ]
+            ].contiguous()
             tp_w2_param = nn.Parameter(tp_w2_view, requires_grad=False)
             set_weight_attrs(tp_w2_param, self.tp_experts.extra_weight_attrs)
             self.tp_experts.register_parameter(scale_name_w2, tp_w2_param)
