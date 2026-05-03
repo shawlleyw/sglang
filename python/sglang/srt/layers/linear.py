@@ -1266,6 +1266,31 @@ class QKVParallelLinear(ColumnParallelLinear):
         if not hasattr(self.weight, "input_dim"):
             set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
 
+        # FP8 block-quant scale (analogous slice on row dim).  hs % block_n == 0
+        # always holds for production checkpoints (head_dim=128 == block_n=128).
+        scale_attr_name = None
+        if hasattr(self, "weight_scale_inv"):
+            scale_attr_name = "weight_scale_inv"
+        elif hasattr(self, "weight_scale") and getattr(self, "weight_scale") is not None and self.weight_scale.dim() >= 2:
+            scale_attr_name = "weight_scale"
+        if scale_attr_name is not None:
+            if not hasattr(self, "full_weight_scale"):
+                self.full_weight_scale = getattr(self, scale_attr_name)
+            full_scale = self.full_weight_scale.data
+            full_qkv_out = self.full_weight.data.shape[0]
+            full_scale_rows = full_scale.shape[0]
+            block_n = full_qkv_out // full_scale_rows
+            assert hs % block_n == 0, f"head_size {hs} not divisible by block_n {block_n}"
+            sb = hs // block_n
+            tp_scale = torch.cat((
+                full_scale[tp_head_start * sb : tp_head_end * sb],
+                full_scale[tp_k_head_start * sb : tp_k_head_end * sb],
+                full_scale[tp_v_head_start * sb : tp_v_head_end * sb],
+            ), dim=0)
+            tp_scale_param = torch.nn.Parameter(tp_scale, requires_grad=False)
+            setattr(self, scale_attr_name, tp_scale_param)
+            self._paras_scale_attr_name = scale_attr_name
+
         self.tp_size = paras_tp_size
         self.tp_rank = paras_tp_rank
 
@@ -1274,6 +1299,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.tp_size = 1
         self.tp_rank = 0
         self.weight = self.full_weight
+        if hasattr(self, "_paras_scale_attr_name"):
+            setattr(self, self._paras_scale_attr_name, self.full_weight_scale)
 
 
 class RowParallelLinear(LinearBase):
@@ -1494,6 +1521,30 @@ class RowParallelLinear(LinearBase):
         self.weight = torch.nn.Parameter(new_weight_tensor, requires_grad=False)
         set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
 
+        # FP8 block-quant scale: TP cuts on input dim => slice scale's last dim.
+        scale_attr_name = None
+        if hasattr(self, "weight_scale_inv"):
+            scale_attr_name = "weight_scale_inv"
+        elif hasattr(self, "weight_scale") and getattr(self, "weight_scale") is not None and self.weight_scale.dim() >= 2:
+            scale_attr_name = "weight_scale"
+        if scale_attr_name is not None:
+            if not hasattr(self, "full_weight_scale"):
+                self.full_weight_scale = getattr(self, scale_attr_name)
+            full_scale = self.full_weight_scale.data
+            full_in = self.full_weight.data.shape[1]
+            full_in_blocks = full_scale.shape[1]
+            block_k = full_in // full_in_blocks
+            assert input_size_per_partition % block_k == 0, (
+                f"input_size_per_partition {input_size_per_partition} not divisible by block_k {block_k}"
+            )
+            blocks_per_part = input_size_per_partition // block_k
+            col_start = paras_tp_rank * blocks_per_part
+            col_end = (paras_tp_rank + 1) * blocks_per_part
+            tp_scale = full_scale[:, col_start:col_end]
+            tp_scale_param = torch.nn.Parameter(tp_scale, requires_grad=False)
+            setattr(self, scale_attr_name, tp_scale_param)
+            self._paras_scale_attr_name = scale_attr_name
+
         if self.bias is not None:
             self.full_bias = self.bias
 
@@ -1505,4 +1556,6 @@ class RowParallelLinear(LinearBase):
         self.tp_size = 1
         self.tp_rank = 0
         self.weight = self.full_weight
+        if hasattr(self, "_paras_scale_attr_name"):
+            setattr(self, self._paras_scale_attr_name, self.full_weight_scale)
         self.bias = self.full_bias if hasattr(self, 'full_bias') and self.full_bias is not None else self.bias
