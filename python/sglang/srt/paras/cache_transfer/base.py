@@ -143,9 +143,9 @@ class CacheTransferBase:
 
         self._tp_rank = dist.get_rank(group=self.group.device_group)
         self._dst_token_start = (
-            sum(self.global_num_tokens[: self._tp_rank])
+            sum(self.global_num_tokens[: self._tp_rank]) + 1
             if self.global_num_tokens
-            else 0
+            else 1
         )
         self._peer_addresses_gpu = torch.tensor(
             peer_addresses, dtype=torch.int64, device="cuda"
