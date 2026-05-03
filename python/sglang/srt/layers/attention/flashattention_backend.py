@@ -362,6 +362,12 @@ class FlashAttentionBackend(AttentionBackend):
             1 if model_runner.server_args.enable_deterministic_inference else 0
         )
 
+    def paras_configure_tp(self, paras_tp_size: int, req_to_token):
+        self.req_to_token = req_to_token
+
+    def paras_configure_ep(self, req_to_token):
+        self.req_to_token = req_to_token
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
