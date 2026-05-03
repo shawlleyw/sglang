@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, MHATokenToKVPool, S
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator, SWATokenToKVPoolAllocator
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.paras.utils import print_class_tensor_member, profile_object_members
+from sglang.srt.paras.utils import print_class_tensor_member, profile_object_members, detect_tensor_in_class
 from sglang.srt.paras.cache_transfer.utils import (
     gather_kv_and_permute,
     permute_and_scatter_kv,
