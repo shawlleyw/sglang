@@ -110,8 +110,20 @@ class ParaSMoeBlockMixin:
             device=ref_scale.device,
         )
 
+    _SCALE_LOADER_PARAM_ATTRS = (
+        "weight_loader",
+        "output_dim",
+        "input_dim",
+        "quant_method",
+        "is_per_block_scale",
+    )
+
     def _install_scale_slice_view(self, full_scale, ep_param_name):
-        """FP8 sibling of ``_install_bias_slice_view``."""
+        """FP8 sibling of ``_install_bias_slice_view``.  Wider attr-copy than
+        the bias path because ``FusedMoE.weight_loader`` dispatches on
+        ``param.quant_method`` for scales (BLOCK / GROUP / TENSOR / CHANNEL);
+        a missing attr lands in the else branch and raises ValueError.
+        """
         old_param = getattr(self.ep_experts, ep_param_name)
         ep_rank = self.ep_experts.moe_ep_rank
         ep_n_local = self.ep_experts.num_local_experts
@@ -121,7 +133,9 @@ class ParaSMoeBlockMixin:
         ep_view = nn.Parameter(
             full_scale[ep_start:ep_end], requires_grad=False
         )
-        self._copy_loader_attrs(old_param, ep_view)
+        for attr in self._SCALE_LOADER_PARAM_ATTRS:
+            if hasattr(old_param, attr):
+                setattr(ep_view, attr, getattr(old_param, attr))
         self.ep_experts.register_parameter(ep_param_name, ep_view)
 
     def paras_init_moe(
