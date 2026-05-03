@@ -248,23 +248,22 @@ class ParaSMoeBlockMixin:
             self._scale_param_name_w13 = "w13_weight_scale"
             self._scale_param_name_w2 = "w2_weight_scale"
         if self._scale_param_name_w13 is not None:
+            assert self._scale_param_name_w2 is not None
+            scale_name_w13 = self._scale_param_name_w13
+            scale_name_w2 = self._scale_param_name_w2
             if (
                 quant_config is not None
                 and getattr(quant_config, "weight_block_size", None)
             ):
                 self._fp8_block_size = quant_config.weight_block_size[0]
             self._full_w13_scale = self._build_full_scale(
-                getattr(self.ep_experts, self._scale_param_name_w13)
+                getattr(self.ep_experts, scale_name_w13)
             )
-            self._install_scale_slice_view(
-                self._full_w13_scale, self._scale_param_name_w13
-            )
+            self._install_scale_slice_view(self._full_w13_scale, scale_name_w13)
             self._full_w2_scale = self._build_full_scale(
-                getattr(self.ep_experts, self._scale_param_name_w2)
+                getattr(self.ep_experts, scale_name_w2)
             )
-            self._install_scale_slice_view(
-                self._full_w2_scale, self._scale_param_name_w2
-            )
+            self._install_scale_slice_view(self._full_w2_scale, scale_name_w2)
 
         # Pre-register TP expert weights using TP alias entries.
         # TP aliases point to slot i (one before EP slot i+1), so after the
@@ -570,6 +569,10 @@ class ParaSMoeBlockMixin:
         """
         if self._full_w13_scale is None or self._fp8_block_size is None:
             return
+        assert self._scale_param_name_w13 is not None
+        assert self._scale_param_name_w2 is not None
+        scale_name_w13 = self._scale_param_name_w13
+        scale_name_w2 = self._scale_param_name_w2
 
         paras_tp_size = get_paras_tp_size()
         paras_tp_rank = get_paras_tp_rank()
@@ -610,9 +613,7 @@ class ParaSMoeBlockMixin:
             )
         tp_w13_param = nn.Parameter(tp_w13_view, requires_grad=False)
         set_weight_attrs(tp_w13_param, self.tp_experts.extra_weight_attrs)
-        self.tp_experts.register_parameter(
-            self._scale_param_name_w13, tp_w13_param
-        )
+        self.tp_experts.register_parameter(scale_name_w13, tp_w13_param)
 
         if self._full_w2_scale is not None:
             tp_w2_view = self._full_w2_scale[
@@ -623,9 +624,7 @@ class ParaSMoeBlockMixin:
             ]
             tp_w2_param = nn.Parameter(tp_w2_view, requires_grad=False)
             set_weight_attrs(tp_w2_param, self.tp_experts.extra_weight_attrs)
-            self.tp_experts.register_parameter(
-                self._scale_param_name_w2, tp_w2_param
-            )
+            self.tp_experts.register_parameter(scale_name_w2, tp_w2_param)
 
     def paras_configure_tp_fused_peer_access_kernel(
         self,
