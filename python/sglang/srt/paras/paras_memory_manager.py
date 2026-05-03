@@ -734,27 +734,8 @@ def plan_qwen_moe_layout(
     for i in range(num_layers):
         lp = f"{prefix}.layers.{i}"
 
-        # -- FP8 scale tensors (if applicable) -----------------------------
-        if is_fp8:
-            elp = f"{lp}.mlp.experts"
-            if fp8_block_size is not None and fp8_block_size > 0:
-                def _ceil(a: int, b: int) -> int:
-                    return (a + b - 1) // b
-                w13_scale_shape = (
-                    ep_local_experts,
-                    _ceil(2 * inter_per_partition, fp8_block_size),
-                    _ceil(hidden_size, fp8_block_size),
-                )
-                w2_scale_shape = (
-                    ep_local_experts,
-                    _ceil(hidden_size, fp8_block_size),
-                    _ceil(inter_per_partition, fp8_block_size),
-                )
-                manager.reserve(f"{elp}.w13_weight_scale", w13_scale_shape, torch.float32)
-                manager.reserve(f"{elp}.w2_weight_scale", w2_scale_shape, torch.float32)
-            else:
-                manager.reserve(f"{elp}.w13_weight_scale", (ep_local_experts, 2), torch.float32)
-                manager.reserve(f"{elp}.w2_weight_scale", (ep_local_experts,), torch.float32)
+        # FP8 weight scales: see docs/paras/paras_fp8_support.md
+        # (replicated full-buffer + EP/TP slice Parameter views, not UMM).
 
         # -- Attention weights ---------------------------------------------
         qkv_out = num_heads * head_dim + 2 * num_kv_heads * head_dim

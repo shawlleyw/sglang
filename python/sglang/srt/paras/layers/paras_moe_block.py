@@ -99,6 +99,31 @@ class ParaSMoeBlockMixin:
         self._copy_loader_attrs(old_param, ep_view)
         self.ep_experts.register_parameter(ep_param_name, ep_view)
 
+    def _build_full_scale(self, ref_scale):
+        """FP8 sibling of ``_build_full_bias``; uses ``ref_scale.shape[1:]``
+        as trailing dims so block-quant 3D and per-tensor 2D both work.
+        """
+        return torch.zeros(
+            self.num_global_experts,
+            *ref_scale.shape[1:],
+            dtype=ref_scale.dtype,
+            device=ref_scale.device,
+        )
+
+    def _install_scale_slice_view(self, full_scale, ep_param_name):
+        """FP8 sibling of ``_install_bias_slice_view``."""
+        old_param = getattr(self.ep_experts, ep_param_name)
+        ep_rank = self.ep_experts.moe_ep_rank
+        ep_n_local = self.ep_experts.num_local_experts
+        ep_start = ep_rank * ep_n_local
+        ep_end = ep_start + ep_n_local
+
+        ep_view = nn.Parameter(
+            full_scale[ep_start:ep_end], requires_grad=False
+        )
+        self._copy_loader_attrs(old_param, ep_view)
+        self.ep_experts.register_parameter(ep_param_name, ep_view)
+
     def paras_init_moe(
         self,
         config,
@@ -207,6 +232,39 @@ class ParaSMoeBlockMixin:
         if ep_with_bias and hasattr(self.ep_experts, "w2_weight_bias"):
             self._full_w2_bias = self._build_full_bias(self.ep_experts.w2_weight_bias)
             self._install_bias_slice_view(self._full_w2_bias, "w2_weight_bias")
+
+        # Replicated FP8 scale strategy (mirrors bias replication above).
+        # Block-quant FP8 registers ``w*_weight_scale_inv``; per-tensor FP8
+        # registers ``w*_weight_scale``.  See docs/paras/paras_fp8_support.md.
+        self._full_w13_scale = None
+        self._full_w2_scale = None
+        self._scale_param_name_w13 = None
+        self._scale_param_name_w2 = None
+        self._fp8_block_size = None
+        if hasattr(self.ep_experts, "w13_weight_scale_inv"):
+            self._scale_param_name_w13 = "w13_weight_scale_inv"
+            self._scale_param_name_w2 = "w2_weight_scale_inv"
+        elif hasattr(self.ep_experts, "w13_weight_scale"):
+            self._scale_param_name_w13 = "w13_weight_scale"
+            self._scale_param_name_w2 = "w2_weight_scale"
+        if self._scale_param_name_w13 is not None:
+            if (
+                quant_config is not None
+                and getattr(quant_config, "weight_block_size", None)
+            ):
+                self._fp8_block_size = quant_config.weight_block_size[0]
+            self._full_w13_scale = self._build_full_scale(
+                getattr(self.ep_experts, self._scale_param_name_w13)
+            )
+            self._install_scale_slice_view(
+                self._full_w13_scale, self._scale_param_name_w13
+            )
+            self._full_w2_scale = self._build_full_scale(
+                getattr(self.ep_experts, self._scale_param_name_w2)
+            )
+            self._install_scale_slice_view(
+                self._full_w2_scale, self._scale_param_name_w2
+            )
 
         # Pre-register TP expert weights using TP alias entries.
         # TP aliases point to slot i (one before EP slot i+1), so after the
@@ -476,6 +534,98 @@ class ParaSMoeBlockMixin:
             tp_w2_param = nn.Parameter(self._full_w2_bias, requires_grad=False)
             set_weight_attrs(tp_w2_param, self.tp_experts.extra_weight_attrs)
             self.tp_experts.register_parameter("w2_weight_bias", tp_w2_param)
+
+    def paras_all_gather_scales(self):
+        """FP8 sibling of ``paras_all_gather_biases``.  Fills non-local
+        slabs of ``self._full_w{13,2}_scale`` from peer ep ranks.
+        """
+        if self._full_w13_scale is None and self._full_w2_scale is None:
+            return
+
+        from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+        ep_group = get_moe_ep_group().device_group
+        ep_rank = self.ep_experts.moe_ep_rank
+        ep_n_local = self.ep_experts.num_local_experts
+        ep_start = ep_rank * ep_n_local
+        ep_end = ep_start + ep_n_local
+
+        for full_scale in (self._full_w13_scale, self._full_w2_scale):
+            if full_scale is None:
+                continue
+            local = full_scale[ep_start:ep_end].clone()
+            dist.all_gather_into_tensor(full_scale, local, group=ep_group)
+
+    def paras_finalize_moe_scale_views(self):
+        """Build the tp_experts FP8 scale views over ``self._full_w{13,2}_scale``.
+
+        The full scales already hold the global tensor (populated by the
+        loader for the local EP slab and ``paras_all_gather_scales`` for
+        the rest).  TP-mode views slice the I-axis blocks to match the
+        TP-mode weight slice; the slice expression depends on whether the
+        w13 layout is concat (Qwen3) or interleaved (GPT-OSS).  The w2
+        scale is sliced on its last dim regardless of layout.
+
+        See docs/paras/paras_fp8_support.md ("TP Slice Layouts").
+        """
+        if self._full_w13_scale is None or self._fp8_block_size is None:
+            return
+
+        paras_tp_size = get_paras_tp_size()
+        paras_tp_rank = get_paras_tp_rank()
+        B = self._fp8_block_size
+        I = self.moe_intermediate_size
+        P = paras_tp_size
+
+        if (I // P) % B != 0:
+            raise ValueError(
+                f"FP8 block alignment failed at layer {self._paras_layer_id}: "
+                f"intermediate_size_per_paras_tp = I/P = {I}/{P} = {I // P} "
+                f"is not a multiple of block_size B = {B}."
+            )
+        i_blocks_per_tp = (I // P) // B
+
+        if self._paras_interleaved_w13:
+            two_i_blocks_per_tp = 2 * i_blocks_per_tp
+            tp_w13_view = self._full_w13_scale[
+                :,
+                paras_tp_rank * two_i_blocks_per_tp
+                : (paras_tp_rank + 1) * two_i_blocks_per_tp,
+                :,
+            ]
+        else:
+            i_total_blocks = I // B
+            gate_start = paras_tp_rank * i_blocks_per_tp
+            up_start = i_total_blocks + paras_tp_rank * i_blocks_per_tp
+            tp_w13_view = torch.cat(
+                [
+                    self._full_w13_scale[
+                        :, gate_start : gate_start + i_blocks_per_tp, :
+                    ],
+                    self._full_w13_scale[
+                        :, up_start : up_start + i_blocks_per_tp, :
+                    ],
+                ],
+                dim=1,
+            )
+        tp_w13_param = nn.Parameter(tp_w13_view, requires_grad=False)
+        set_weight_attrs(tp_w13_param, self.tp_experts.extra_weight_attrs)
+        self.tp_experts.register_parameter(
+            self._scale_param_name_w13, tp_w13_param
+        )
+
+        if self._full_w2_scale is not None:
+            tp_w2_view = self._full_w2_scale[
+                :,
+                :,
+                paras_tp_rank * i_blocks_per_tp : (paras_tp_rank + 1)
+                * i_blocks_per_tp,
+            ]
+            tp_w2_param = nn.Parameter(tp_w2_view, requires_grad=False)
+            set_weight_attrs(tp_w2_param, self.tp_experts.extra_weight_attrs)
+            self.tp_experts.register_parameter(
+                self._scale_param_name_w2, tp_w2_param
+            )
 
     def paras_configure_tp_fused_peer_access_kernel(
         self,

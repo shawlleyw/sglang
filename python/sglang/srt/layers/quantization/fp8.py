@@ -642,37 +642,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
+        # Scales are always allocated as regular torch tensors (never UMM-backed)
+        # so that ParaS can replace them with full-buffer slice views after init.
+        # See docs/paras/paras_fp8_support.md.
         if self.block_quant:
-            if use_manager:
-                # Manager-backed FP8 block scales: the manager reserves scale tensors
-                # alongside weight tensors to keep everything in one contiguous allocation.
-                w13_weight_scale = torch.nn.Parameter(
-                    paras_mgr.get_view(f"{paras_prefix}.w13_weight_scale"),
-                    requires_grad=False,
-                )
-                w2_weight_scale = torch.nn.Parameter(
-                    paras_mgr.get_view(f"{paras_prefix}.w2_weight_scale"),
-                    requires_grad=False,
-                )
-            else:
-                w13_weight_scale = torch.nn.Parameter(
-                    torch.ones(
-                        num_experts,
-                        2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
-                        (hidden_size + block_k - 1) // block_k,
-                        dtype=torch.float32,
-                    ),
-                    requires_grad=False,
-                )
-                w2_weight_scale = torch.nn.Parameter(
-                    torch.ones(
-                        num_experts,
-                        (hidden_size + block_n - 1) // block_n,
-                        (intermediate_size_per_partition + block_k - 1) // block_k,
-                        dtype=torch.float32,
-                    ),
-                    requires_grad=False,
-                )
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                    (hidden_size + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    (hidden_size + block_n - 1) // block_n,
+                    (intermediate_size_per_partition + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
@@ -680,24 +671,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self._ensure_cutlass_buffers_initialized(layer)
 
         else:
-            if use_manager:
-                w13_weight_scale = torch.nn.Parameter(
-                    paras_mgr.get_view(f"{paras_prefix}.w13_weight_scale"),
-                    requires_grad=False,
-                )
-                w2_weight_scale = torch.nn.Parameter(
-                    paras_mgr.get_view(f"{paras_prefix}.w2_weight_scale"),
-                    requires_grad=False,
-                )
-            else:
-                # Allocate 2 scales for w1 and w3 respectively.
-                # They will be combined to a single scale after weight loading.
-                w13_weight_scale = torch.nn.Parameter(
-                    torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
-                )
-                w2_weight_scale = torch.nn.Parameter(
-                    torch.ones(num_experts, dtype=torch.float32), requires_grad=False
-                )
+            # Allocate 2 scales for w1 and w3 respectively.
+            # They will be combined to a single scale after weight loading.
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+            )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
