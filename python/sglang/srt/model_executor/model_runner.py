@@ -1728,12 +1728,18 @@ class ModelRunner:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
+                paras_max_size = (
+                    max_num_reqs * self.server_args.paras_tp_size
+                    if self.server_args.enable_paras_moe
+                    else None
+                )
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    paras_max_size=paras_max_size,
                 )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
