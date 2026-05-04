@@ -319,6 +319,7 @@ def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: str):
         "deepep_mode": runner.deepep_adapter._captured_deepep_mode,
         "graph_memory_pool": get_global_graph_memory_pool(),
         "attn_backend": runner.model_runner.attn_backend.paras_save_cuda_graph_state(),
+        "kv_pool": _paras_save_kv_pool_state(runner.model_runner.token_to_kv_pool),
     }
     for key in _SETTINGS_KEYS:
         state[key] = getattr(runner, key)
@@ -326,10 +327,40 @@ def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: str):
     runner._paras_saved[mode] = state
 
 
+# Per-mode KV pool attributes whose Python tensor objects are referenced
+# by captured graph kernel arg lists. Saving/restoring these per mode
+# prevents the post-switch ``replace_buffers`` call from substituting
+# fresh Python tensor wrappers (with the same data_ptrs but new identities)
+# that confuse the CUDA-graph kernel-arg tracking.
+_PARAS_KV_POOL_ATTRS = (
+    "k_buffer",
+    "v_buffer",
+    "k_data_ptrs",
+    "v_data_ptrs",
+    "data_ptrs",
+    "data_strides",
+    "size",
+    "head_num",
+)
+
+
+def _paras_save_kv_pool_state(pool) -> Dict[str, Any]:
+    return {
+        attr: getattr(pool, attr)
+        for attr in _PARAS_KV_POOL_ATTRS
+        if hasattr(pool, attr)
+    }
+
+
+def _paras_load_kv_pool_state(pool, state: Dict[str, Any]) -> None:
+    for attr, value in state.items():
+        setattr(pool, attr, value)
+
+
 def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: str):
     """Restore graphs, output buffers, DeepEP state, attention-backend
-    cuda-graph state, mode-dependent settings, and the graph memory pool
-    handle for *mode*."""
+    cuda-graph state, mode-dependent settings, the graph memory pool
+    handle, and the KV pool buffer references for *mode*."""
     from sglang.srt.model_executor.cuda_graph_runner import (
         set_global_graph_memory_pool,
     )
@@ -342,6 +373,7 @@ def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: str):
     for key in _SETTINGS_KEYS:
         setattr(runner, key, state[key])
     runner.model_runner.attn_backend.paras_load_cuda_graph_state(state["attn_backend"])
+    _paras_load_kv_pool_state(runner.model_runner.token_to_kv_pool, state["kv_pool"])
 
 
 # ---------------------------------------------------------------------------
