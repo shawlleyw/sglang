@@ -436,10 +436,8 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             mlp = getattr(layer, "mlp", None)
             if mlp is None:
                 continue
-            if hasattr(mlp, "paras_all_gather_scales"):
-                mlp.paras_all_gather_scales()
-            if hasattr(mlp, "paras_finalize_moe_scale_views"):
-                mlp.paras_finalize_moe_scale_views()
+            if hasattr(mlp, "paras_finalize_moe_scales"):
+                mlp.paras_finalize_moe_scales()
 
         if hasattr(self.model, "paras_finalize_attn_views"):
             self.model.paras_finalize_attn_views()

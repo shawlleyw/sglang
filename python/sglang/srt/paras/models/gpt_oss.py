@@ -488,14 +488,12 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
 
         for layer in self.model.layers:
             mlp = getattr(layer, "mlp", None)
-            if mlp is not None and hasattr(mlp, "paras_all_gather_biases"):
-                mlp.paras_all_gather_biases()
-            if mlp is not None and hasattr(mlp, "paras_finalize_moe_bias_views"):
-                mlp.paras_finalize_moe_bias_views()
-            if mlp is not None and hasattr(mlp, "paras_all_gather_scales"):
-                mlp.paras_all_gather_scales()
-            if mlp is not None and hasattr(mlp, "paras_finalize_moe_scale_views"):
-                mlp.paras_finalize_moe_scale_views()
+            if mlp is None:
+                continue
+            if hasattr(mlp, "paras_finalize_moe_biases"):
+                mlp.paras_finalize_moe_biases()
+            if hasattr(mlp, "paras_finalize_moe_scales"):
+                mlp.paras_finalize_moe_scales()
             attn = getattr(layer, "self_attn", None)
             if attn is not None:
                 if hasattr(attn, "paras_finalize_sinks_views"):
