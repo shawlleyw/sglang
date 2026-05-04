@@ -368,6 +368,29 @@ class FlashAttentionBackend(AttentionBackend):
     def paras_configure_ep(self, req_to_token):
         self.req_to_token = req_to_token
 
+    _PARAS_CUDA_GRAPH_DICT_ATTRS = (
+        "decode_cuda_graph_metadata",
+        "target_verify_metadata",
+        "draft_decode_metadata_topk_normal",
+        "draft_decode_metadata_topk_expand",
+        "draft_decode_metadata_topk_swa",
+        "target_verify_metadata_topk_normal",
+        "target_verify_metadata_topk_expand",
+        "target_verify_metadata_topk_swa",
+        "decode_cuda_graph_local_attn_metadata",
+    )
+
+    def paras_save_cuda_graph_state(self):
+        return {
+            attr: getattr(self, attr)
+            for attr in self._PARAS_CUDA_GRAPH_DICT_ATTRS
+            if hasattr(self, attr)
+        }
+
+    def paras_load_cuda_graph_state(self, state):
+        for attr, value in state.items():
+            setattr(self, attr, value)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
