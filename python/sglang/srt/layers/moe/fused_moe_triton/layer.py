@@ -213,12 +213,12 @@ class FusedMoE(torch.nn.Module):
             gemm1_clamp_limit=gemm1_clamp_limit,
         )
 
+        from sglang.srt.layers import deep_gemm_wrapper
+        use_deep_gemm = (self.moe_ep_size > 1 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM)
         self.quant_method: Optional[FusedMoEMethodBase] = None
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix)
         if self.quant_method is None:
-            from sglang.srt.layers import deep_gemm_wrapper
-            use_deep_gemm = (self.moe_ep_size > 1 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM)
             self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels, use_deep_gemm=use_deep_gemm)
 
         self.skip_weights_init = skip_weights_init
