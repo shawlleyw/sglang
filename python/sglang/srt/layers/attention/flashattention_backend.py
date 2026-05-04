@@ -381,15 +381,28 @@ class FlashAttentionBackend(AttentionBackend):
     )
 
     def paras_save_cuda_graph_state(self):
-        return {
-            attr: getattr(self, attr)
-            for attr in self._PARAS_CUDA_GRAPH_DICT_ATTRS
-            if hasattr(self, attr)
-        }
+        snapshot = {}
+        for attr in self._PARAS_CUDA_GRAPH_DICT_ATTRS:
+            if not hasattr(self, attr):
+                continue
+            value = getattr(self, attr)
+            if isinstance(value, dict):
+                snapshot[attr] = dict(value)
+            else:
+                snapshot[attr] = value
+        return snapshot
 
     def paras_load_cuda_graph_state(self, state):
         for attr, value in state.items():
-            setattr(self, attr, value)
+            if isinstance(value, dict):
+                target = getattr(self, attr, None)
+                if isinstance(target, dict):
+                    target.clear()
+                    target.update(value)
+                else:
+                    setattr(self, attr, dict(value))
+            else:
+                setattr(self, attr, value)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
