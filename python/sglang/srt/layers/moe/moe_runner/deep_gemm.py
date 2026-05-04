@@ -419,6 +419,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
 
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            silu_and_mul_masked_fwd,
+        )
+
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
         masked_m = runner_input.masked_m
@@ -458,12 +462,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gate, up = torch.split(gateup_output, n // 2, dim=-1)
             down_input.copy_(torch.silu(gate) * up)
         else:
-            # Mask-aware: skip padded slots. Unmasked silu_and_mul would do
-            # ~8-16x more work at typical decode expected_m (~16-32 / m_max=256).
-            from sglang.srt.layers.moe.ep_moe.kernels import (
-                silu_and_mul_masked_fwd,
-            )
-
             silu_and_mul_masked_fwd(
                 gateup_output,
                 down_input,
