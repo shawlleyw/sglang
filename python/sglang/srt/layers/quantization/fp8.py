@@ -289,14 +289,37 @@ class Fp8LinearMethod(LinearMethodBase):
             else params_dtype
         )
 
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=weight_dtype
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
+        from sglang.srt.paras.paras_memory_manager import (
+            get_global_paras_memory_manager,
         )
+
+        mgr = get_global_paras_memory_manager()
+        prefix = getattr(layer, "prefix", "")
+        entry_name = f"{prefix}.weight" if prefix else None
+
+        if (
+            mgr is not None
+            and mgr.materialized
+            and entry_name is not None
+            and entry_name in mgr._entries
+        ):
+            weight = ModelWeightParameter(
+                data=mgr.get_view(entry_name),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+        else:
+            weight = ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=weight_dtype,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
         layer.register_parameter("weight", weight)
 
         # If checkpoint is serialized fp8, load them.

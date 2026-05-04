@@ -742,21 +742,27 @@ def plan_qwen_moe_layout(
         manager.reserve(
             f"{lp}.self_attn.qkv_proj.weight",
             (qkv_out, hidden_size),
-            torch.bfloat16,
+            weight_dtype,
         )
         manager.reserve(
             f"{lp}.self_attn.o_proj.weight",
             (hidden_size, num_heads * head_dim),
-            torch.bfloat16,
+            weight_dtype,
         )
 
-        # -- QKV TP buffer -------------------------------------------------
+        # -- QKV / O TP buffers -------------------------------------------
         tp_q_size = (num_heads // tp_size) * head_dim
         tp_kv_size = (num_kv_heads // tp_size) * head_dim
+        tp_attn_out = (num_heads // tp_size) * head_dim
         manager.reserve(
             f"{lp}.self_attn.qkv_proj.tp_weight",
             (tp_q_size + 2 * tp_kv_size, hidden_size),
-            torch.bfloat16,
+            weight_dtype,
+        )
+        manager.reserve(
+            f"{lp}.self_attn.o_proj.tp_weight",
+            (hidden_size, tp_attn_out),
+            weight_dtype,
         )
 
     if configure_method != "peer_access":

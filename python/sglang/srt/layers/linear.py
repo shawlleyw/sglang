@@ -1227,14 +1227,39 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         q_rows = tp_num_heads * hs
         kv_rows = tp_num_kv_heads * hs
-        self._paras_tp_weight = torch.nn.Parameter(
-            torch.empty(
-                (q_rows + 2 * kv_rows, full_weight_tensor.shape[1]),
-                dtype=full_weight_tensor.dtype,
-                device=full_weight_tensor.device,
-            ),
-            requires_grad=False,
+
+        from sglang.srt.paras.paras_memory_manager import (
+            get_global_paras_memory_manager,
         )
+
+        mgr = get_global_paras_memory_manager()
+        tp_entry_name = (
+            f"{self.prefix}.tp_weight" if getattr(self, "prefix", "") else None
+        )
+
+        if (
+            mgr is not None
+            and mgr.materialized
+            and tp_entry_name is not None
+            and tp_entry_name in mgr._entries
+        ):
+            tp_weight_data = mgr.get_view(tp_entry_name)
+            assert tp_weight_data.dtype == full_weight_tensor.dtype, (
+                f"UMM-reserved tp_weight dtype {tp_weight_data.dtype} != "
+                f"actual weight dtype {full_weight_tensor.dtype} for {self.prefix}"
+            )
+            self._paras_tp_weight = torch.nn.Parameter(
+                tp_weight_data, requires_grad=False
+            )
+        else:
+            self._paras_tp_weight = torch.nn.Parameter(
+                torch.empty(
+                    (q_rows + 2 * kv_rows, full_weight_tensor.shape[1]),
+                    dtype=full_weight_tensor.dtype,
+                    device=full_weight_tensor.device,
+                ),
+                requires_grad=False,
+            )
         set_weight_attrs(self._paras_tp_weight, {"input_dim": 1, "output_dim": 0})
         self._paras_tp_weight.data[:q_rows].copy_(
             full_weight_tensor[tp_head_start * hs : tp_head_end * hs]
@@ -1520,14 +1545,38 @@ class RowParallelLinear(LinearBase):
         self.full_weight = self.weight
         full_weight_tensor = self.full_weight.data
 
-        self._paras_tp_weight = torch.nn.Parameter(
-            torch.empty(
-                (full_weight_tensor.shape[0], input_size_per_partition),
-                dtype=full_weight_tensor.dtype,
-                device=full_weight_tensor.device,
-            ),
-            requires_grad=False,
+        from sglang.srt.paras.paras_memory_manager import (
+            get_global_paras_memory_manager,
         )
+
+        mgr = get_global_paras_memory_manager()
+        tp_entry_name = (
+            f"{self.prefix}.tp_weight" if getattr(self, "prefix", "") else None
+        )
+
+        if (
+            mgr is not None
+            and mgr.materialized
+            and tp_entry_name is not None
+            and tp_entry_name in mgr._entries
+        ):
+            tp_weight_data = mgr.get_view(tp_entry_name)
+            assert tp_weight_data.dtype == full_weight_tensor.dtype, (
+                f"UMM-reserved tp_weight dtype {tp_weight_data.dtype} != "
+                f"actual weight dtype {full_weight_tensor.dtype} for {self.prefix}"
+            )
+            self._paras_tp_weight = torch.nn.Parameter(
+                tp_weight_data, requires_grad=False
+            )
+        else:
+            self._paras_tp_weight = torch.nn.Parameter(
+                torch.empty(
+                    (full_weight_tensor.shape[0], input_size_per_partition),
+                    dtype=full_weight_tensor.dtype,
+                    device=full_weight_tensor.device,
+                ),
+                requires_grad=False,
+            )
         set_weight_attrs(self._paras_tp_weight, {"input_dim": 1, "output_dim": 0})
         self._paras_tp_weight.data.copy_(full_weight_tensor[:, row_start:row_end])
 
