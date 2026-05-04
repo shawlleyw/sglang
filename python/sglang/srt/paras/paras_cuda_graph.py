@@ -321,6 +321,9 @@ def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: str):
         "attn_backend": runner.model_runner.attn_backend.paras_save_cuda_graph_state(),
         "kv_pool": _paras_save_kv_pool_state(runner.model_runner.token_to_kv_pool),
         "req_pool": _paras_save_req_pool_state(runner.model_runner.req_to_token_pool),
+        "kv_alloc": _paras_save_kv_alloc_state(
+            runner.model_runner.token_to_kv_pool_allocator
+        ),
     }
     for key in _SETTINGS_KEYS:
         state[key] = getattr(runner, key)
@@ -374,6 +377,28 @@ def _paras_load_req_pool_state(pool, state: Dict[str, Any]) -> None:
         setattr(pool, attr, value)
 
 
+_PARAS_KV_ALLOC_ATTRS = (
+    "free_pages",
+    "release_pages",
+    "size",
+    "is_not_in_free_group",
+    "free_group",
+)
+
+
+def _paras_save_kv_alloc_state(allocator) -> Dict[str, Any]:
+    return {
+        attr: getattr(allocator, attr)
+        for attr in _PARAS_KV_ALLOC_ATTRS
+        if hasattr(allocator, attr)
+    }
+
+
+def _paras_load_kv_alloc_state(allocator, state: Dict[str, Any]) -> None:
+    for attr, value in state.items():
+        setattr(allocator, attr, value)
+
+
 def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: str):
     """Restore graphs, output buffers, DeepEP state, attention-backend
     cuda-graph state, mode-dependent settings, the graph memory pool
@@ -392,6 +417,9 @@ def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: str):
     runner.model_runner.attn_backend.paras_load_cuda_graph_state(state["attn_backend"])
     _paras_load_kv_pool_state(runner.model_runner.token_to_kv_pool, state["kv_pool"])
     _paras_load_req_pool_state(runner.model_runner.req_to_token_pool, state["req_pool"])
+    _paras_load_kv_alloc_state(
+        runner.model_runner.token_to_kv_pool_allocator, state["kv_alloc"]
+    )
     runner.model_runner.attn_backend.req_to_token = (
         runner.model_runner.req_to_token_pool.req_to_token
     )
