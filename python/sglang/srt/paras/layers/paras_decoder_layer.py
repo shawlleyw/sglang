@@ -41,6 +41,10 @@ class ParaSDecoderLayerMixin:
     def paras_configure_helper(self):
         pass
 
+    def paras_finalize_attn_views(self, paras_tp_size: int, paras_tp_rank: int):
+        if hasattr(self.self_attn, "paras_finalize_attn_views"):
+            self.self_attn.paras_finalize_attn_views(paras_tp_size, paras_tp_rank)
+
     def paras_configure_tp_attn(self, paras_tp_size: int, paras_tp_rank: int):
         if hasattr(self.self_attn, "paras_configure_tp"):
             self.self_attn.paras_configure_tp(paras_tp_size, paras_tp_rank)

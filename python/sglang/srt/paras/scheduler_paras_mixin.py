@@ -227,6 +227,8 @@ class SchedulerParasMixin:
         self.send_to_detokenizer = self.tp_send_to_detokenizer
         self.recv_from_rpc = self.tp_recv_from_rpc
 
+        torch.cuda.synchronize()
+
     @paras_func
     def paras_configure_ep(self):
         # Entry guards
@@ -323,6 +325,8 @@ class SchedulerParasMixin:
         self.send_to_tokenizer = self.ep_send_to_tokenizer
         self.send_to_detokenizer = self.ep_send_to_detokenizer
         self.recv_from_rpc = self.ep_recv_from_rpc
+
+        torch.cuda.synchronize()
 
     def paras_configure_handle(self, recv_req: ParaSConfigureReqInput):
         if recv_req.type == ParaSConfigureReqType.CONFIGURE_TP:

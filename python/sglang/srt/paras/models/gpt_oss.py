@@ -503,6 +503,9 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
                 if hasattr(attn, "paras_finalize_qkv_bias_views"):
                     attn.paras_finalize_qkv_bias_views()
 
+        if hasattr(self.model, "paras_finalize_attn_views"):
+            self.model.paras_finalize_attn_views()
+
         end_loading = time.time()
         torch.cuda.synchronize()
         logger.info(

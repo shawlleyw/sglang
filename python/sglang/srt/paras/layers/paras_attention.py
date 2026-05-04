@@ -28,6 +28,13 @@ class ParaSAttentionMixin:
         self.num_heads = self.total_num_heads // self.attn_tp_size
         self.num_kv_heads = self.total_num_kv_heads // self.attn_tp_size
     
+    def paras_finalize_attn_views(self, paras_tp_size, paras_tp_rank):
+        """Pre-allocate TP-mode weight/scale Parameters on qkv_proj and o_proj
+        from the loaded EP weights so paras_configure_tp/ep are pointer swaps.
+        """
+        self.qkv_proj.paras_finalize_tp_views(paras_tp_size, paras_tp_rank)
+        self.o_proj.paras_finalize_tp_views(paras_tp_size, paras_tp_rank)
+
     @paras_func
     def paras_configure_tp(self, paras_tp_size, paras_tp_rank):
         """Configure attention for tensor parallelism mode."""

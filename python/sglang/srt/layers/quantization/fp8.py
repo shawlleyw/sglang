@@ -591,12 +591,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w13_name = f"model.layers.{layer_id}.mlp.experts.w13_weight" if use_manager else None
         w2_name = f"model.layers.{layer_id}.mlp.experts.w2_weight" if use_manager else None
 
-        if use_manager and w13_name in mgr._entries:
+        if use_manager and w13_name in mgr._entries and w2_name in mgr._entries:
             w13_weight = torch.nn.Parameter(
                 mgr.get_view(w13_name), requires_grad=False,
             )
+            w2_weight = torch.nn.Parameter(
+                mgr.get_view(w2_name), requires_grad=False,
+            )
         elif _is_hip and _use_hip_int4:
-            # INT4 MoE weight - INT32 packed
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
@@ -606,22 +608,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
                 requires_grad=False,
             )
-        else:
-            w13_weight = torch.nn.Parameter(
-                torch.empty(
-                    num_experts,
-                    2 * intermediate_size_per_partition,
-                    hidden_size,
-                    dtype=params_dtype,
-                ),
-                requires_grad=False,
-            )
-
-        if use_manager and w2_name in mgr._entries:
-            w2_weight = torch.nn.Parameter(
-                mgr.get_view(w2_name), requires_grad=False,
-            )
-        elif _is_hip and _use_hip_int4:
             w2_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
@@ -632,6 +618,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
         else:
+            w13_weight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
             w2_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,

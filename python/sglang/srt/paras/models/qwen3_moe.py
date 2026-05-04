@@ -441,6 +441,9 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             if hasattr(mlp, "paras_finalize_moe_scale_views"):
                 mlp.paras_finalize_moe_scale_views()
 
+        if hasattr(self.model, "paras_finalize_attn_views"):
+            self.model.paras_finalize_attn_views()
+
         end_loading = time.time()
         torch.cuda.synchronize()
         logger.info(

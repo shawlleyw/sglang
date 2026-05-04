@@ -1201,20 +1201,18 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.q_proj_shard_size = self.num_heads * self.head_size
         self.kv_proj_shard_size = self.num_kv_heads * self.head_size
 
-    @paras_func
-    def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
-        """
-        Shard the weights for tensor parallelism.
-        Uses a pre-allocated managed buffer (if available) to ensure
-        the TP weight address is stable across EP↔TP switches, which is
-        required for CUDA graph compatibility.
+    def paras_finalize_tp_views(self, paras_tp_size: int, paras_tp_rank: int):
+        """Pre-allocate and populate the TP-mode weight (and FP8 scale)
+        Parameters from the loaded EP weight. Called once after weight loading
+        so that paras_configure_tp/ep can be pure pointer swaps and the captured
+        TP CUDA graph references stable data_ptrs across all switches.
         """
         assert paras_tp_size <= self.num_kv_heads
         tp_num_heads = self.total_num_heads // paras_tp_size
         tp_num_kv_heads = self.total_num_kv_heads // paras_tp_size
 
         tp_head_start = paras_tp_rank * tp_num_heads
-        tp_head_end = paras_tp_rank * tp_num_heads + tp_num_heads
+        tp_head_end = tp_head_start + tp_num_heads
         tp_k_head_start = self.total_num_heads + paras_tp_rank * tp_num_kv_heads
         tp_k_head_end = tp_k_head_start + tp_num_kv_heads
         tp_v_head_start = (
@@ -1224,82 +1222,73 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_v_head_end = tp_v_head_start + tp_num_kv_heads
 
         self.full_weight = self.weight
-
-        # column major
         full_weight_tensor = self.full_weight.data
         hs = self.head_size
 
-        # Try to use the pre-allocated managed buffer for address stability.
-        # The UMM reserves `qkv_proj.tp_weight` as BF16; if the actual weight is
-        # FP8 (FP8 attention checkpoints) the UMM-backed tp buffer would silently
-        # dtype-convert via `.copy_()` and corrupt the GEMM dispatch.  Fall back
-        # to a fresh row_stack in that case.
-        from sglang.srt.paras.paras_memory_manager import (
-            get_global_paras_memory_manager,
+        q_rows = tp_num_heads * hs
+        kv_rows = tp_num_kv_heads * hs
+        self._paras_tp_weight = torch.nn.Parameter(
+            torch.empty(
+                (q_rows + 2 * kv_rows, full_weight_tensor.shape[1]),
+                dtype=full_weight_tensor.dtype,
+                device=full_weight_tensor.device,
+            ),
+            requires_grad=False,
         )
-        mgr = get_global_paras_memory_manager()
-        tp_weight_name = f"{self.prefix}.tp_weight" if hasattr(self, "prefix") else None
+        set_weight_attrs(self._paras_tp_weight, {"input_dim": 1, "output_dim": 0})
+        self._paras_tp_weight.data[:q_rows].copy_(
+            full_weight_tensor[tp_head_start * hs : tp_head_end * hs]
+        )
+        self._paras_tp_weight.data[q_rows : q_rows + kv_rows].copy_(
+            full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs]
+        )
+        self._paras_tp_weight.data[q_rows + kv_rows : q_rows + 2 * kv_rows].copy_(
+            full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs]
+        )
 
-        use_managed_tp_buffer = False
-        if mgr and tp_weight_name and tp_weight_name in mgr._entries:
-            mgr_view = mgr.get_view(tp_weight_name)
-            use_managed_tp_buffer = mgr_view.dtype == full_weight_tensor.dtype
-
-        if use_managed_tp_buffer:
-            # Reuse the permanent managed buffer — copy slices into it
-            if not hasattr(self, "_paras_tp_weight"):
-                self._paras_tp_weight = torch.nn.Parameter(
-                    mgr.get_view(tp_weight_name), requires_grad=False
-                )
-            new_weight_tensor = self._paras_tp_weight.data
-            q_rows = tp_num_heads * hs
-            kv_rows = tp_num_kv_heads * hs
-            new_weight_tensor[:q_rows].copy_(
-                full_weight_tensor[tp_head_start * hs : tp_head_end * hs]
-            )
-            new_weight_tensor[q_rows : q_rows + kv_rows].copy_(
-                full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs]
-            )
-            new_weight_tensor[q_rows + kv_rows : q_rows + 2 * kv_rows].copy_(
-                full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs]
-            )
-            self.weight = self._paras_tp_weight
-        else:
-            new_weight_tensor = torch.row_stack((
-                full_weight_tensor[tp_head_start * hs : tp_head_end * hs, :],
-                full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs, :],
-                full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs, :],
-            ))
-            self.weight = torch.nn.Parameter(new_weight_tensor, requires_grad=False)
-
-        if not hasattr(self.weight, "input_dim"):
-            set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
-
-        # FP8 block-quant scale (analogous slice on row dim).  hs % block_n == 0
-        # always holds for production checkpoints (head_dim=128 == block_n=128).
         scale_attr_name = None
         if hasattr(self, "weight_scale_inv"):
             scale_attr_name = "weight_scale_inv"
         elif hasattr(self, "weight_scale") and getattr(self, "weight_scale") is not None and self.weight_scale.dim() >= 2:
             scale_attr_name = "weight_scale"
         if scale_attr_name is not None:
-            if not hasattr(self, "full_weight_scale"):
-                self.full_weight_scale = getattr(self, scale_attr_name)
+            self.full_weight_scale = getattr(self, scale_attr_name)
             full_scale = self.full_weight_scale.data
             full_qkv_out = self.full_weight.data.shape[0]
             full_scale_rows = full_scale.shape[0]
             block_n = full_qkv_out // full_scale_rows
             assert hs % block_n == 0, f"head_size {hs} not divisible by block_n {block_n}"
             sb = hs // block_n
-            tp_scale = torch.cat((
-                full_scale[tp_head_start * sb : tp_head_end * sb],
-                full_scale[tp_k_head_start * sb : tp_k_head_end * sb],
-                full_scale[tp_v_head_start * sb : tp_v_head_end * sb],
-            ), dim=0)
-            tp_scale_param = torch.nn.Parameter(tp_scale, requires_grad=False)
-            setattr(self, scale_attr_name, tp_scale_param)
+            q_scale_rows = tp_num_heads * sb
+            kv_scale_rows = tp_num_kv_heads * sb
+            self._paras_tp_scale = torch.nn.Parameter(
+                torch.empty(
+                    (q_scale_rows + 2 * kv_scale_rows,) + tuple(full_scale.shape[1:]),
+                    dtype=full_scale.dtype,
+                    device=full_scale.device,
+                ),
+                requires_grad=False,
+            )
+            self._paras_tp_scale.data[:q_scale_rows].copy_(
+                full_scale[tp_head_start * sb : tp_head_end * sb]
+            )
+            self._paras_tp_scale.data[q_scale_rows : q_scale_rows + kv_scale_rows].copy_(
+                full_scale[tp_k_head_start * sb : tp_k_head_end * sb]
+            )
+            self._paras_tp_scale.data[q_scale_rows + kv_scale_rows :].copy_(
+                full_scale[tp_v_head_start * sb : tp_v_head_end * sb]
+            )
             self._paras_scale_attr_name = scale_attr_name
 
+    @paras_func
+    def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
+        assert hasattr(self, "_paras_tp_weight"), (
+            "paras_finalize_tp_views must be called once after weight loading "
+            "before paras_configure_tp"
+        )
+        self.weight = self._paras_tp_weight
+        if hasattr(self, "_paras_scale_attr_name"):
+            setattr(self, self._paras_scale_attr_name, self._paras_tp_scale)
         self.tp_size = paras_tp_size
         self.tp_rank = paras_tp_rank
 
@@ -1518,28 +1507,37 @@ class RowParallelLinear(LinearBase):
     def paras_configure_helper(self):
         self.input_size_per_partition = divide(self.input_size, self.tp_size)
 
-    @paras_func
-    def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
+    def paras_finalize_tp_views(self, paras_tp_size: int, paras_tp_rank: int):
+        """Pre-allocate and populate the TP-mode weight (and FP8 scale)
+        Parameters from the loaded EP weight. Called once after weight loading
+        so that paras_configure_tp/ep can be pure pointer swaps and the captured
+        TP CUDA graph references stable data_ptrs across all switches.
+        """
         input_size_per_partition = divide(self.input_size, paras_tp_size)
         row_start = paras_tp_rank * input_size_per_partition
         row_end = (paras_tp_rank + 1) * input_size_per_partition
 
         self.full_weight = self.weight
         full_weight_tensor = self.full_weight.data
-        # DeepGEMM requires B to be contiguous; column slices are not.
-        new_weight_tensor = full_weight_tensor[:, row_start:row_end].contiguous()
-        self.weight = torch.nn.Parameter(new_weight_tensor, requires_grad=False)
-        set_weight_attrs(self.weight, {"input_dim": 1, "output_dim": 0})
 
-        # FP8 block-quant scale: TP cuts on input dim => slice scale's last dim.
+        self._paras_tp_weight = torch.nn.Parameter(
+            torch.empty(
+                (full_weight_tensor.shape[0], input_size_per_partition),
+                dtype=full_weight_tensor.dtype,
+                device=full_weight_tensor.device,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self._paras_tp_weight, {"input_dim": 1, "output_dim": 0})
+        self._paras_tp_weight.data.copy_(full_weight_tensor[:, row_start:row_end])
+
         scale_attr_name = None
         if hasattr(self, "weight_scale_inv"):
             scale_attr_name = "weight_scale_inv"
         elif hasattr(self, "weight_scale") and getattr(self, "weight_scale") is not None and self.weight_scale.dim() >= 2:
             scale_attr_name = "weight_scale"
         if scale_attr_name is not None:
-            if not hasattr(self, "full_weight_scale"):
-                self.full_weight_scale = getattr(self, scale_attr_name)
+            self.full_weight_scale = getattr(self, scale_attr_name)
             full_scale = self.full_weight_scale.data
             full_in = self.full_weight.data.shape[1]
             full_in_blocks = full_scale.shape[1]
@@ -1550,14 +1548,29 @@ class RowParallelLinear(LinearBase):
             blocks_per_part = input_size_per_partition // block_k
             col_start = paras_tp_rank * blocks_per_part
             col_end = (paras_tp_rank + 1) * blocks_per_part
-            tp_scale = full_scale[:, col_start:col_end].contiguous()
-            tp_scale_param = torch.nn.Parameter(tp_scale, requires_grad=False)
-            setattr(self, scale_attr_name, tp_scale_param)
+            self._paras_tp_scale = torch.nn.Parameter(
+                torch.empty(
+                    (full_scale.shape[0], blocks_per_part),
+                    dtype=full_scale.dtype,
+                    device=full_scale.device,
+                ),
+                requires_grad=False,
+            )
+            self._paras_tp_scale.data.copy_(full_scale[:, col_start:col_end])
             self._paras_scale_attr_name = scale_attr_name
 
         if self.bias is not None:
             self.full_bias = self.bias
 
+    @paras_func
+    def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
+        assert hasattr(self, "_paras_tp_weight"), (
+            "paras_finalize_tp_views must be called once after weight loading "
+            "before paras_configure_tp"
+        )
+        self.weight = self._paras_tp_weight
+        if hasattr(self, "_paras_scale_attr_name"):
+            setattr(self, self._paras_scale_attr_name, self._paras_tp_scale)
         self.tp_size = paras_tp_size
         self.tp_rank = paras_tp_rank
 

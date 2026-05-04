@@ -370,13 +370,6 @@ class FlashAttentionBackend(AttentionBackend):
 
     _PARAS_CUDA_GRAPH_DICT_ATTRS = (
         "decode_cuda_graph_metadata",
-        "target_verify_metadata",
-        "draft_decode_metadata_topk_normal",
-        "draft_decode_metadata_topk_expand",
-        "draft_decode_metadata_topk_swa",
-        "target_verify_metadata_topk_normal",
-        "target_verify_metadata_topk_expand",
-        "target_verify_metadata_topk_swa",
         "decode_cuda_graph_local_attn_metadata",
     )
 

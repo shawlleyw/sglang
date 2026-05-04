@@ -102,6 +102,24 @@ class ParaSModelMixin:
     def paras_configure_helper(self):
         torch.cuda.synchronize()
 
+    def paras_finalize_attn_views(self):
+        """Pre-allocate TP-mode attention weight/scale Parameters across all
+        decoder layers from loaded EP weights. Must be called once after
+        weight loading; paras_configure_tp/ep on attention linears then
+        become pointer swaps so the captured TP CUDA graph references stable
+        data_ptrs across all switches.
+        """
+        from sglang.srt.paras.paras_parallel_state import (
+            get_paras_tp_rank,
+            get_paras_tp_size,
+        )
+
+        paras_tp_size = get_paras_tp_size()
+        paras_tp_rank = get_paras_tp_rank()
+        for layer in self.layers:
+            if hasattr(layer, "paras_finalize_attn_views"):
+                layer.paras_finalize_attn_views(paras_tp_size, paras_tp_rank)
+
     @paras_func
     def paras_configure_tp(
         self, paras_tp_size: int, paras_tp_rank: int, overlap: bool = False, method: str = None
