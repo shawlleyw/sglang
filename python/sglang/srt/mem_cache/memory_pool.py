@@ -966,7 +966,10 @@ class MHATokenToKVPool(KVCache):
         """
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         self.full_head_num = self.head_num
-        sharded_head_num = self.head_num // paras_tp_size
+        # GQA replication: paras_tp_size may exceed total_num_kv_heads (e.g.
+        # Qwen3-235B has 4 KV heads on 8 ranks). Each rank then holds 1
+        # replicated head. Matches model_config.get_num_kv_heads (L497).
+        sharded_head_num = max(1, self.head_num // paras_tp_size)
 
         mgr = get_global_paras_memory_manager()
         new_k: List[torch.Tensor] = []

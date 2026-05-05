@@ -26,7 +26,10 @@ class ParaSAttentionMixin:
         self.q_size = self.qkv_proj.q_proj_shard_size
         self.kv_size = self.qkv_proj.kv_proj_shard_size
         self.num_heads = self.total_num_heads // self.attn_tp_size
-        self.num_kv_heads = self.total_num_kv_heads // self.attn_tp_size
+        # GQA replication: per-rank KV head count is at least 1 even when
+        # attn_tp_size > total_num_kv_heads. Matches model_config.get_num_kv_heads
+        # (configs/model_config.py L497).
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
     
     def paras_finalize_attn_views(self, paras_tp_size, paras_tp_rank):
         """Pre-allocate TP-mode weight/scale Parameters on qkv_proj and o_proj

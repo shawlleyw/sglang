@@ -1196,8 +1196,16 @@ class QKVParallelLinear(ColumnParallelLinear):
 
     def paras_configure_helper(self):
         self.num_heads = divide(self.total_num_heads, self.tp_size)
-        self.num_kv_heads = divide(self.total_num_kv_heads, self.tp_size)
-        self.num_kv_head_replicas = 1
+        # GQA replication: when tp_size > total_num_kv_heads, KV heads are
+        # replicated across rank groups (mirrors __init__ logic above).
+        if self.tp_size >= self.total_num_kv_heads:
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = divide(
+                self.tp_size, self.total_num_kv_heads
+            )
+        else:
+            self.num_kv_heads = divide(self.total_num_kv_heads, self.tp_size)
+            self.num_kv_head_replicas = 1
         self.q_proj_shard_size = self.num_heads * self.head_size
         self.kv_proj_shard_size = self.num_kv_heads * self.head_size
 
@@ -1207,17 +1215,34 @@ class QKVParallelLinear(ColumnParallelLinear):
         so that paras_configure_tp/ep can be pure pointer swaps and the captured
         TP CUDA graph references stable data_ptrs across all switches.
         """
-        assert paras_tp_size <= self.num_kv_heads
+        # GQA replication: when paras_tp_size > total_num_kv_heads, each KV
+        # head is shared by paras_num_kv_replicas adjacent ranks. Mirrors the
+        # non-paras path in QKVParallelLinear.__init__ (L818-824) and
+        # weight_loader_v3 shard selection (L1149).
+        if paras_tp_size >= self.total_num_kv_heads:
+            assert paras_tp_size % self.total_num_kv_heads == 0, (
+                f"paras_tp_size ({paras_tp_size}) must be divisible by "
+                f"total_num_kv_heads ({self.total_num_kv_heads}) for replication"
+            )
+            tp_num_kv_heads = 1
+            paras_num_kv_replicas = paras_tp_size // self.total_num_kv_heads
+        else:
+            assert self.total_num_kv_heads % paras_tp_size == 0, (
+                f"total_num_kv_heads ({self.total_num_kv_heads}) must be "
+                f"divisible by paras_tp_size ({paras_tp_size})"
+            )
+            tp_num_kv_heads = self.total_num_kv_heads // paras_tp_size
+            paras_num_kv_replicas = 1
         tp_num_heads = self.total_num_heads // paras_tp_size
-        tp_num_kv_heads = self.total_num_kv_heads // paras_tp_size
+        kv_shard_idx = paras_tp_rank // paras_num_kv_replicas
 
         tp_head_start = paras_tp_rank * tp_num_heads
         tp_head_end = tp_head_start + tp_num_heads
-        tp_k_head_start = self.total_num_heads + paras_tp_rank * tp_num_kv_heads
+        tp_k_head_start = self.total_num_heads + kv_shard_idx * tp_num_kv_heads
         tp_k_head_end = tp_k_head_start + tp_num_kv_heads
         tp_v_head_start = (
             self.total_num_heads + self.total_num_kv_heads
-            + paras_tp_rank * tp_num_kv_heads
+            + kv_shard_idx * tp_num_kv_heads
         )
         tp_v_head_end = tp_v_head_start + tp_num_kv_heads
 

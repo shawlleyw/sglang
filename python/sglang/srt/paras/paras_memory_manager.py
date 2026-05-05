@@ -538,7 +538,7 @@ class ParaSMemoryManager:
                     # Fallback: reinterpret EP bytes as TP shape.
                     k_entry = self._entries[k_name]
                     ep_heads = k_entry.shape[1]
-                    tp_heads = ep_heads // tp_size
+                    tp_heads = max(1, ep_heads // tp_size)
                     tp_shape = (
                         self.tp_max_kv_tokens + page_size,
                         tp_heads,
@@ -751,8 +751,11 @@ def plan_qwen_moe_layout(
         )
 
         # -- QKV / O TP buffers -------------------------------------------
+        # GQA replication: when tp_size > num_kv_heads, each rank holds 1 KV
+        # head (replicated across rank groups). Mirrors model_config.get_num_kv_heads
+        # (configs/model_config.py L497) and QKVParallelLinear.__init__ (L818-824).
         tp_q_size = (num_heads // tp_size) * head_dim
-        tp_kv_size = (num_kv_heads // tp_size) * head_dim
+        tp_kv_size = max(1, num_kv_heads // tp_size) * head_dim
         tp_attn_out = (num_heads // tp_size) * head_dim
         manager.reserve(
             f"{lp}.self_attn.qkv_proj.tp_weight",

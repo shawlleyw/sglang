@@ -272,8 +272,13 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             _total_kv_heads * head_dim * _num_layers * 2 * _kv_elem_size
         )
         _ep_max_tokens = max(1, int(_kv_budget_bytes // _ep_cell_bytes))
-        # TP has sharded heads → same bytes per token across tp_size more tokens
-        _tp_max_tokens = _ep_max_tokens * get_paras_tp_size()
+        # TP has sharded heads → same bytes per token across more tokens.
+        # GQA replication: per-rank KV heads are max(1, total // tp_size), so
+        # the token expansion factor is min(tp_size, total_num_kv_heads) — not
+        # tp_size — when tp_size > total_num_kv_heads (e.g. Qwen3-235B 8/4=2x,
+        # not 8x). Matches MHATokenToKVPool.paras_configure_tp's max(1, ...).
+        _tp_token_factor = min(get_paras_tp_size(), _total_kv_heads)
+        _tp_max_tokens = _ep_max_tokens * _tp_token_factor
         logger.info(
             f"ParaS KV budget: avail_now={_avail_now_gib:.3f}GiB  "
             f"total={_total_gpu_bytes/(1<<30):.3f}GiB  "

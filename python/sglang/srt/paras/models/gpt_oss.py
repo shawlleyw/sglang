@@ -156,17 +156,26 @@ class GptOssAttentionParaS(ParaSAttentionMixin, GptOssAttention):
         paras_tp_size = get_paras_tp_size()
         paras_tp_rank = get_paras_tp_rank()
         hs = self.head_dim
+        # GQA replication: mirror QKVParallelLinear.paras_finalize_tp_views
+        # (linear.py L1204+) — when paras_tp_size > total_num_kv_heads each
+        # rank pulls from kv_shard_idx = rank // num_replicas instead of rank.
+        if paras_tp_size >= self.total_num_kv_heads:
+            tp_num_kv_heads = 1
+            paras_num_kv_replicas = paras_tp_size // self.total_num_kv_heads
+        else:
+            tp_num_kv_heads = self.total_num_kv_heads // paras_tp_size
+            paras_num_kv_replicas = 1
         tp_num_heads = self.total_num_heads // paras_tp_size
-        tp_num_kv_heads = self.total_num_kv_heads // paras_tp_size
+        kv_shard_idx = paras_tp_rank // paras_num_kv_replicas
         full_data = self.qkv_proj.bias.data
         q_start = paras_tp_rank * tp_num_heads * hs
         k_start = (
             self.total_num_heads * hs
-            + paras_tp_rank * tp_num_kv_heads * hs
+            + kv_shard_idx * tp_num_kv_heads * hs
         )
         v_start = (
             (self.total_num_heads + self.total_num_kv_heads) * hs
-            + paras_tp_rank * tp_num_kv_heads * hs
+            + kv_shard_idx * tp_num_kv_heads * hs
         )
         self.ep_qkv_bias = self.qkv_proj.bias
         self.tp_qkv_bias = nn.Parameter(
