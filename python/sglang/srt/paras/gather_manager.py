@@ -25,6 +25,7 @@ from sglang.srt.paras.cache_transfer.utils import (
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
 from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
+from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 
 def prune_request(req: Req):
     req.last_host_node = None
@@ -161,21 +162,21 @@ class ParaSReqGatherManager:
         new_cache_size_swa: Optional[int] = None,
     ):
         '''
-        Heads are sharded by group size, 
-        so the size of the request to token pool and the cache need to be multiplied by the group size.
+        Resize request and KV pools to the TP capacities planned by UMM.
         '''
+        mgr = get_global_paras_memory_manager()
         if new_req_pool_size is None:
-            new_req_pool_size = self.req_to_token_pool.size * self.group_size
+            new_req_pool_size = mgr.get_tp_max_num_reqs()
 
         is_swa_alloc = isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         if is_swa_alloc:
             if new_cache_size is None:
-                new_cache_size = self.token_to_kv_pool_allocator.size_full * self.group_size
+                new_cache_size = mgr.get_tp_max_kv_tokens()
             if new_cache_size_swa is None:
-                new_cache_size_swa = self.token_to_kv_pool_allocator.size_swa * self.group_size
+                new_cache_size_swa = mgr.get_tp_max_kv_tokens("swa")
         else:
             if new_cache_size is None:
-                new_cache_size = self.token_to_kv_pool_allocator.size * self.group_size
+                new_cache_size = mgr.get_tp_max_kv_tokens()
         
         assert self.num_global_tokens <= new_cache_size, "The total size of the requests to reorchestrate is greater than the new size of the cache."
         
@@ -261,8 +262,6 @@ class ParaSReqGatherManager:
         # Construct SWA backend (only when hybrid layers present).
         swa_backend = None
         if has_swa:
-            from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
-
             swa_backend = SWACacheTransfer(
                 method=method,
                 direction="gather",
@@ -430,4 +429,3 @@ class ParaSReqGatherManager:
             running_batch,
             model_config.vocab_size,
         )
-

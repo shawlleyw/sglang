@@ -66,6 +66,10 @@ from sglang.srt.paras.paras_parallel_state import (
     paras_comm_configure_tp,
     paras_comm_configure_ep,
 )
+from sglang.srt.paras.paras_memory_manager import (
+    _validate_paras_swa_runtime_scope,
+    get_global_paras_memory_manager,
+)
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.eplb_manager import EPLBManager
@@ -1588,15 +1592,14 @@ class ModelRunner:
 
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
-        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-        _paras_mgr = get_global_paras_memory_manager()
-        if (
-            _paras_mgr is not None
-            and _paras_mgr.materialized
-            and _paras_mgr.ep_max_kv_tokens > 0
-        ):
+        _paras_mgr = (
+            get_global_paras_memory_manager()
+            if self.server_args.enable_paras_moe
+            else None
+        )
+        if self.server_args.enable_paras_moe:
             # Use manager-computed EP token count (budget already accounted for weights)
-            self.max_total_num_tokens = _paras_mgr.ep_max_kv_tokens
+            self.max_total_num_tokens = _paras_mgr.get_ep_max_kv_tokens()
         else:
             self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
         if SGLANG_CI_SMALL_KV_SIZE:
@@ -1728,11 +1731,12 @@ class ModelRunner:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
-                paras_max_size = (
-                    max_num_reqs * self.server_args.paras_tp_size
-                    if self.server_args.enable_paras_moe
-                    else None
-                )
+                paras_max_size = None
+                if self.server_args.enable_paras_moe:
+                    _, paras_max_size = _paras_mgr.plan_req_capacities(
+                        context_len=self.model_config.context_len,
+                        ep_max_num_reqs=max_num_reqs,
+                    )
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
@@ -1823,26 +1827,19 @@ class ModelRunner:
             if self.is_hybrid:
                 _full_ep_k = _full_ep_v = _swa_ep_k = _swa_ep_v = None
                 if self.server_args.enable_paras_moe:
-                    from sglang.srt.paras.paras_memory_manager import (
-                        get_global_paras_memory_manager as _get_paras_mgr_swa,
-                        _validate_paras_swa_runtime_scope,
-                    )
-
                     _validate_paras_swa_runtime_scope(
                         self.server_args, self.model_config
                     )
-                    _paras_swa_mgr = _get_paras_mgr_swa()
                     if (
-                        _paras_swa_mgr is not None
-                        and _paras_swa_mgr.materialized
-                        and _paras_swa_mgr._kv_reserved
+                        _paras_mgr.materialized
+                        and _paras_mgr.has_kv_cache_reserved()
                     ):
-                        _full_ep_k, _full_ep_v = _paras_swa_mgr.get_kv_views(
+                        _full_ep_k, _full_ep_v = _paras_mgr.get_kv_views(
                             num_layers=len(self.model_config.full_attention_layer_ids),
                             mode="ep",
                             layer_ids=self.model_config.full_attention_layer_ids,
                         )
-                        _swa_ep_k, _swa_ep_v = _paras_swa_mgr.get_kv_views(
+                        _swa_ep_k, _swa_ep_v = _paras_mgr.get_kv_views(
                             num_layers=len(self.model_config.swa_attention_layer_ids),
                             mode="ep",
                             layer_ids=self.model_config.swa_attention_layer_ids,
@@ -1892,14 +1889,12 @@ class ModelRunner:
                 )
             else:
                 # Check if ParaS manager can provide KV buffers
-                from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-                _paras_mgr = get_global_paras_memory_manager()
                 _paras_external_k = None
                 _paras_external_v = None
                 if (
-                    _paras_mgr is not None
+                    self.server_args.enable_paras_moe
                     and _paras_mgr.materialized
-                    and _paras_mgr._kv_reserved
+                    and _paras_mgr.has_kv_cache_reserved()
                 ):
                     _paras_external_k, _paras_external_v = _paras_mgr.get_kv_views(
                         num_layers=self.num_effective_layers,
@@ -1949,12 +1944,9 @@ class ModelRunner:
                 if self.page_size == 1:
                     if self.is_hybrid:
                         if self.server_args.enable_paras_moe:
-                            paras_tp_size = self.server_args.paras_tp_size
-                            paras_max_size = (
-                                self.full_max_total_num_tokens * paras_tp_size
-                            )
-                            paras_max_size_swa = (
-                                self.swa_max_total_num_tokens * paras_tp_size
+                            paras_max_size = _paras_mgr.get_tp_max_kv_tokens()
+                            paras_max_size_swa = _paras_mgr.get_tp_max_kv_tokens(
+                                "swa"
                             )
                         else:
                             paras_max_size = None

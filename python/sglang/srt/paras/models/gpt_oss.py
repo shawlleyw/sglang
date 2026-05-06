@@ -429,6 +429,7 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
             tp_max_tokens=_full_max_tokens * _paras_tp_size,
             num_kv_heads=_total_kv_heads,
             head_dim=head_dim,
+            tp_size=_paras_tp_size,
             kv_dtype=_kv_store_dtype,
             page_size=_page_size,
             prefix="model",

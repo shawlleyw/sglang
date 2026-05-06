@@ -20,6 +20,10 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator, SWATokenToKVPoolAllocator
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
+from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
+from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 
 
 # ============================================================
@@ -199,18 +203,19 @@ class ParaSReqScatterManager:
         new_ep_cache_size_swa: Optional[int] = None,
     ):
         """Shrink pools to EP capacity and allocate new EP token indices."""
+        mgr = get_global_paras_memory_manager()
         if new_req_pool_size is None:
-            new_req_pool_size = self.req_to_token_pool.size // self.group_size
+            new_req_pool_size = mgr.get_ep_max_num_reqs()
 
         is_swa_alloc = isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         if is_swa_alloc:
             if new_ep_cache_size is None:
-                new_ep_cache_size = self.token_to_kv_pool_allocator.size_full // self.group_size
+                new_ep_cache_size = mgr.get_ep_max_kv_tokens()
             if new_ep_cache_size_swa is None:
-                new_ep_cache_size_swa = self.token_to_kv_pool_allocator.size_swa // self.group_size
+                new_ep_cache_size_swa = mgr.get_ep_max_kv_tokens("swa")
         else:
             if new_ep_cache_size is None:
-                new_ep_cache_size = self.token_to_kv_pool_allocator.size // self.group_size
+                new_ep_cache_size = mgr.get_ep_max_kv_tokens()
         self.new_cache_size = new_ep_cache_size
 
         num_local_reqs = len(self.local_reqs)
@@ -353,10 +358,6 @@ class ParaSReqScatterManager:
         if self.num_global_tokens == 0:
             return
 
-        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
-        from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
-
         torch.cuda.empty_cache()
         kv_cache = tp_kv_cache
         mgr = get_global_paras_memory_manager()
@@ -386,8 +387,6 @@ class ParaSReqScatterManager:
         # Construct SWA backend (only when hybrid layers present).
         swa_backend = None
         if has_swa:
-            from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
-
             swa_backend = SWACacheTransfer(
                 method=method,
                 direction="scatter",

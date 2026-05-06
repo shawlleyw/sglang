@@ -68,6 +68,23 @@ class LayoutEntry:
         }
 
 
+@dataclass(frozen=True)
+class ParaSKVCapacityPlan:
+    """UMM-owned EP/TP KV cache capacity plan."""
+
+    available_gpu_memory_bytes: int
+    total_gpu_memory_bytes: int
+    dynamic_reserve_bytes: int
+    umm_budget_bytes: int
+    kv_budget_bytes: int
+    ep_max_tokens: int
+    tp_max_tokens: int
+    ep_cell_bytes: int
+    tp_cell_bytes: int
+    ep_kv_heads: int
+    tp_kv_heads: int
+
+
 # ---------------------------------------------------------------------------
 # Supported dtypes
 # ---------------------------------------------------------------------------
@@ -113,7 +130,7 @@ def _validate_paras_swa_runtime_scope(server_args, model_config) -> None:
     if not swa_attention_layer_ids:
         return
 
-    kv_cache_dtype = getattr(server_args, "kv_cache_dtype", None)
+    kv_cache_dtype = server_args.kv_cache_dtype
     if kv_cache_dtype == "fp8":
         raise NotImplementedError(
             "ParaS + SWA + FP8-KV not supported in v1 "
@@ -121,7 +138,7 @@ def _validate_paras_swa_runtime_scope(server_args, model_config) -> None:
             "Disable FP8-KV or use a non-hybrid model."
         )
 
-    speculative_algorithm = getattr(server_args, "speculative_algorithm", None)
+    speculative_algorithm = server_args.speculative_algorithm
     if speculative_algorithm is not None:
         raise NotImplementedError(
             "ParaS + SWA + speculative decoding not supported in v1."
@@ -205,6 +222,10 @@ class ParaSMemoryManager:
         self._buffer_end: int = 0
         self.ep_max_kv_tokens: int = 0
         self.tp_max_kv_tokens: int = 0
+        self.ep_max_kv_tokens_swa: int = 0
+        self.tp_max_kv_tokens_swa: int = 0
+        self.ep_max_num_reqs: int = 0
+        self.tp_max_num_reqs: int = 0
         self._kv_reserved: bool = False
         
 
@@ -265,6 +286,7 @@ class ParaSMemoryManager:
         num_kv_heads: int,
         head_dim: int,
         kv_dtype: torch.dtype,
+        tp_size: int = 1,
         page_size: int = 1,
         prefix: str = "model",
         layer_specs: Optional[list] = None,
@@ -275,16 +297,12 @@ class ParaSMemoryManager:
         Must be called AFTER plan_qwen_moe_layout() and BEFORE materialize().
 
         Layout (per K and V separately):
-          - Total region = max_L + sum(L_i) bytes
-          - TP view for layer i at offset prefix_i = sum(L_j for j<i)
-          - EP view for layer i at offset max_L + prefix_i
-          - L_i = (tokens_cap_ep_i + page) * num_kv_heads_i * head_dim_i * elem_size
-          - max_L = max(L_i)
-
-        EP and TP KV have same total bytes per layer (union layout):
-          ep_tokens * ep_kv_heads * head_dim == tp_tokens * tp_kv_heads * head_dim
-        so each region entry is stored once and callers use get_view_as()
-        for TP access with a different shape.
+          - TP views are packed at the front of the region.
+          - EP views are packed after the smallest gap that keeps every
+            same-layer EP source disjoint from its TP destination.
+          - TP and EP entries have their own UMM-computed shapes, so GQA
+            replication and floor effects are represented explicitly instead
+            of inferred from the other mode's byte count.
 
         Actual LayoutEntry objects are created during materialize() so that
         offsets are computed relative to the end of the weight region.
@@ -296,6 +314,8 @@ class ParaSMemoryManager:
 
         self.ep_max_kv_tokens = ep_max_tokens
         self.tp_max_kv_tokens = tp_max_tokens
+        self.ep_max_kv_tokens_swa = 0
+        self.tp_max_kv_tokens_swa = 0
         self._layer_specs = layer_specs
 
         elem_size = (
@@ -303,38 +323,166 @@ class ParaSMemoryManager:
             if hasattr(kv_dtype, "itemsize")
             else torch.tensor([], dtype=kv_dtype).element_size()
         )
+        tp_kv_heads = max(1, num_kv_heads // tp_size)
 
         if layer_specs is None:
-            per_layer_tokens = ep_max_tokens + page_size
-            per_layer_bytes = per_layer_tokens * num_kv_heads * head_dim * elem_size
+            ep_per_layer_tokens = ep_max_tokens + page_size
+            tp_per_layer_tokens = tp_max_tokens + page_size
+            ep_per_layer_bytes = (
+                ep_per_layer_tokens * num_kv_heads * head_dim * elem_size
+            )
+            tp_per_layer_bytes = (
+                tp_per_layer_tokens * tp_kv_heads * head_dim * elem_size
+            )
             layer_ep_shapes = [
-                (per_layer_tokens, num_kv_heads, head_dim)
+                (ep_per_layer_tokens, num_kv_heads, head_dim)
             ] * num_layers
-            layer_bytes = [per_layer_bytes] * num_layers
+            layer_tp_shapes = [
+                (tp_per_layer_tokens, tp_kv_heads, head_dim)
+            ] * num_layers
+            layer_ep_bytes = [ep_per_layer_bytes] * num_layers
+            layer_tp_bytes = [tp_per_layer_bytes] * num_layers
         else:
             layer_ep_shapes = [
                 (s.tokens_cap_ep + page_size, s.num_kv_heads, s.head_dim)
                 for s in layer_specs
             ]
-            layer_bytes = [
+            layer_tp_shapes = [
+                (
+                    s.tokens_cap_tp + page_size,
+                    max(1, s.num_kv_heads // tp_size),
+                    s.head_dim,
+                )
+                for s in layer_specs
+            ]
+            layer_ep_bytes = [
                 (s.tokens_cap_ep + page_size)
                 * s.num_kv_heads
                 * s.head_dim
                 * elem_size
                 for s in layer_specs
             ]
+            layer_tp_bytes = [
+                (s.tokens_cap_tp + page_size)
+                * max(1, s.num_kv_heads // tp_size)
+                * s.head_dim
+                * elem_size
+                for s in layer_specs
+            ]
+            full_specs = [s for s in layer_specs if s.kind == "full"]
+            swa_specs = [s for s in layer_specs if s.kind == "swa"]
+            if full_specs:
+                self.ep_max_kv_tokens = max(s.tokens_cap_ep for s in full_specs)
+                self.tp_max_kv_tokens = max(s.tokens_cap_tp for s in full_specs)
+            if swa_specs:
+                self.ep_max_kv_tokens_swa = max(s.tokens_cap_ep for s in swa_specs)
+                self.tp_max_kv_tokens_swa = max(s.tokens_cap_tp for s in swa_specs)
 
         # Save metadata for _create_kv_layout (called from materialize).
         self._paras_kv_pending = {
             "num_layers": num_layers,
             "prefix": prefix,
-            "layer_bytes": layer_bytes,
+            "layer_ep_bytes": layer_ep_bytes,
+            "layer_tp_bytes": layer_tp_bytes,
             "layer_ep_shapes": layer_ep_shapes,
-            "max_L": max(layer_bytes) if num_layers > 0 else 0,
+            "layer_tp_shapes": layer_tp_shapes,
             "kv_dtype": kv_dtype,
         }
 
         self._kv_reserved = True
+
+    def plan_mha_kv_capacity(
+        self,
+        *,
+        available_gpu_memory_bytes: int,
+        total_gpu_memory_bytes: int,
+        mem_fraction_static: float,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+        tp_size: int,
+        kv_dtype: torch.dtype,
+    ) -> ParaSKVCapacityPlan:
+        """Compute EP and TP KV token capacities from the UMM budget."""
+        elem_size = (
+            kv_dtype.itemsize
+            if hasattr(kv_dtype, "itemsize")
+            else torch.tensor([], dtype=kv_dtype).element_size()
+        )
+        dynamic_reserve_bytes = int(
+            total_gpu_memory_bytes * (1.0 - mem_fraction_static)
+        )
+        umm_budget_bytes = max(0, available_gpu_memory_bytes - dynamic_reserve_bytes)
+        kv_budget_bytes = max(0, umm_budget_bytes - self.weights_only_bytes)
+
+        ep_kv_heads = num_kv_heads
+        tp_kv_heads = max(1, num_kv_heads // tp_size)
+        ep_cell_bytes = ep_kv_heads * head_dim * num_layers * 2 * elem_size
+        tp_cell_bytes = tp_kv_heads * head_dim * num_layers * 2 * elem_size
+        ep_max_tokens = max(1, int(kv_budget_bytes // ep_cell_bytes))
+        tp_max_tokens = max(1, int(kv_budget_bytes // tp_cell_bytes))
+
+        self.ep_max_kv_tokens = ep_max_tokens
+        self.tp_max_kv_tokens = tp_max_tokens
+
+        return ParaSKVCapacityPlan(
+            available_gpu_memory_bytes=available_gpu_memory_bytes,
+            total_gpu_memory_bytes=total_gpu_memory_bytes,
+            dynamic_reserve_bytes=dynamic_reserve_bytes,
+            umm_budget_bytes=umm_budget_bytes,
+            kv_budget_bytes=kv_budget_bytes,
+            ep_max_tokens=ep_max_tokens,
+            tp_max_tokens=tp_max_tokens,
+            ep_cell_bytes=ep_cell_bytes,
+            tp_cell_bytes=tp_cell_bytes,
+            ep_kv_heads=ep_kv_heads,
+            tp_kv_heads=tp_kv_heads,
+        )
+
+    def plan_req_capacities(
+        self,
+        *,
+        context_len: int,
+        ep_max_num_reqs: Optional[int] = None,
+    ) -> Tuple[int, int]:
+        """Compute EP and TP request pool capacities from UMM token budgets."""
+
+        def _default_num_reqs(max_tokens: int) -> int:
+            return min(max(int(max_tokens / context_len * 512), 2048), 4096)
+
+        ep_num_reqs = (
+            ep_max_num_reqs
+            if ep_max_num_reqs is not None
+            else _default_num_reqs(self.ep_max_kv_tokens)
+        )
+        tp_num_reqs = max(ep_num_reqs, _default_num_reqs(self.tp_max_kv_tokens))
+
+        self.ep_max_num_reqs = ep_num_reqs
+        self.tp_max_num_reqs = tp_num_reqs
+        return ep_num_reqs, tp_num_reqs
+
+    def get_ep_max_num_reqs(self) -> int:
+        return self.ep_max_num_reqs
+
+    def get_tp_max_num_reqs(self) -> int:
+        return self.tp_max_num_reqs
+
+    def get_ep_max_kv_tokens(self, kind: str = "full") -> int:
+        if kind == "full":
+            return self.ep_max_kv_tokens
+        if kind == "swa":
+            return self.ep_max_kv_tokens_swa
+        raise ValueError(f"Unknown KV token capacity kind: {kind}")
+
+    def get_tp_max_kv_tokens(self, kind: str = "full") -> int:
+        if kind == "full":
+            return self.tp_max_kv_tokens
+        if kind == "swa":
+            return self.tp_max_kv_tokens_swa
+        raise ValueError(f"Unknown KV token capacity kind: {kind}")
+
+    def has_kv_cache_reserved(self) -> bool:
+        return self._kv_reserved
 
     # ----- materialization ------------------------------------------------
 
@@ -388,9 +536,10 @@ class ParaSMemoryManager:
         *,
         num_layers: int,
         prefix: str,
-        layer_bytes: List[int],
+        layer_ep_bytes: List[int],
+        layer_tp_bytes: List[int],
         layer_ep_shapes: List[Tuple[int, ...]],
-        max_L: int,
+        layer_tp_shapes: List[Tuple[int, ...]],
         kv_dtype: torch.dtype,
     ) -> int:
         """Create per-layer TP and EP LayoutEntry objects at computed offsets.
@@ -405,7 +554,15 @@ class ParaSMemoryManager:
             if hasattr(kv_dtype, "itemsize")
             else torch.tensor([], dtype=kv_dtype).element_size()
         )
-        kv_region_bytes = max_L + sum(layer_bytes)
+        tp_prefix = 0
+        ep_prefix = 0
+        overlap_gap = 0
+        for tp_bytes, ep_bytes in zip(layer_tp_bytes, layer_ep_bytes):
+            overlap_gap = max(overlap_gap, tp_prefix + tp_bytes - ep_prefix)
+            tp_prefix += tp_bytes
+            ep_prefix += ep_bytes
+
+        kv_region_bytes = max(sum(layer_tp_bytes), overlap_gap + sum(layer_ep_bytes))
 
         k_region_start = self._align_up(offset, self.ALIGNMENT)
         v_region_start = self._align_up(
@@ -413,14 +570,18 @@ class ParaSMemoryManager:
         )
 
         for side, region_start in [("k", k_region_start), ("v", v_region_start)]:
-            prefix_bytes = 0
+            tp_prefix = 0
+            ep_prefix = 0
             for i in range(num_layers):
-                li_bytes = layer_bytes[i]
                 ep_shape = layer_ep_shapes[i]
+                tp_shape = layer_tp_shapes[i]
+                ep_bytes = layer_ep_bytes[i]
+                tp_bytes = layer_tp_bytes[i]
                 ep_numel = ep_shape[0] * ep_shape[1] * ep_shape[2]
+                tp_numel = tp_shape[0] * tp_shape[1] * tp_shape[2]
 
-                tp_offset = region_start + prefix_bytes
-                ep_offset = region_start + max_L + prefix_bytes
+                tp_offset = region_start + tp_prefix
+                ep_offset = region_start + overlap_gap + ep_prefix
 
                 ep_entry = LayoutEntry(
                     name=f"{prefix}.layers.{i}.kv.ep.{side}",
@@ -428,7 +589,7 @@ class ParaSMemoryManager:
                     dtype=kv_dtype,
                     numel=ep_numel,
                     element_size=elem_size,
-                    size_bytes=li_bytes,
+                    size_bytes=ep_bytes,
                     offset_bytes=ep_offset,
                 )
                 self._entries[f"{prefix}.layers.{i}.kv.ep.{side}"] = ep_entry
@@ -436,15 +597,16 @@ class ParaSMemoryManager:
 
                 self._entries[f"{prefix}.layers.{i}.kv.tp.{side}"] = LayoutEntry(
                     name=f"{prefix}.layers.{i}.kv.tp.{side}",
-                    shape=ep_shape,
+                    shape=tp_shape,
                     dtype=kv_dtype,
-                    numel=ep_numel,
+                    numel=tp_numel,
                     element_size=elem_size,
-                    size_bytes=li_bytes,
+                    size_bytes=tp_bytes,
                     offset_bytes=tp_offset,
                 )
 
-                prefix_bytes += li_bytes
+                tp_prefix += tp_bytes
+                ep_prefix += ep_bytes
 
         return v_region_start + kv_region_bytes
 
@@ -509,9 +671,9 @@ class ParaSMemoryManager:
         """
         Return k_buffers and v_buffers for the KV pool in the given mode.
 
-        EP mode: returns views with (ep_tokens + page, total_kv_heads, head_dim)
-        TP mode: returns views with (tp_tokens + page, total_kv_heads//tp_size, head_dim)
-                 using get_view_as to reinterpret the same bytes.
+        EP mode: returns UMM-planned EP views.
+        TP mode: returns UMM-planned TP views when available, falling back to
+        reinterpreting EP bytes only for legacy layouts.
 
         When *layer_ids* is provided, iterate over those specific layer
         indices instead of ``range(num_layers)``.
@@ -876,6 +1038,3 @@ def create_paras_moe_aliases(
         manager.alias(f"{prefix}.layers.{i}.mlp.ep_experts.w2_weight", f"paras.moe_slot.{i+1}.w2")
         manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w13_weight", f"paras.moe_slot.{i}.w13")
         manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w2_weight", f"paras.moe_slot.{i}.w2")
-
-
-
