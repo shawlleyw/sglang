@@ -14,6 +14,10 @@
 #                        CUDA_GRAPH_MAX_BS→8 (gpt-oss ParaS canonical = cuda-graph dual capture).
 #                        Drops --disable-hybrid-swa-memory (gpt-oss ParaS uses dual full+SWA memory pools).
 #                        Adds --disable-overlap-schedule + PARAS_* env vars.
+#   PARAS_AUTO_SWITCH=0  When ENABLE_PARAS=1, disable load-driven EP↔TP autoswitch by passing
+#                        --no-paras-auto-switch. Use this when driving manual switches via
+#                        /paras_configure_tp and /paras_configure_ep HTTP endpoints. Default 1
+#                        keeps the canonical autoswitch behavior.
 #   ENABLE_CUDA_GRAPH=0  Pass --disable-cuda-graph (default 1).
 #   CUDA_GRAPH_MAX_BS=N  Pass --cuda-graph-max-bs N (only honored when ENABLE_CUDA_GRAPH=1).
 
@@ -61,6 +65,9 @@ if [ "$ENABLE_PARAS" = "1" ]; then
         --paras-tp-size "$NUM_GPUS"
         --disable-overlap-schedule
     )
+    if [ "${PARAS_AUTO_SWITCH:-1}" = "0" ]; then
+        PARAS_FLAGS+=(--no-paras-auto-switch)
+    fi
     HYBRID_SWA_FLAGS=()
 fi
 
