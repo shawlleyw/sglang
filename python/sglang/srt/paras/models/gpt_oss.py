@@ -156,17 +156,26 @@ class GptOssAttentionParaS(ParaSAttentionMixin, GptOssAttention):
         paras_tp_size = get_paras_tp_size()
         paras_tp_rank = get_paras_tp_rank()
         hs = self.head_dim
+        # GQA replication: mirror QKVParallelLinear.paras_finalize_tp_views
+        # (linear.py L1204+) — when paras_tp_size > total_num_kv_heads each
+        # rank pulls from kv_shard_idx = rank // num_replicas instead of rank.
+        if paras_tp_size >= self.total_num_kv_heads:
+            tp_num_kv_heads = 1
+            paras_num_kv_replicas = paras_tp_size // self.total_num_kv_heads
+        else:
+            tp_num_kv_heads = self.total_num_kv_heads // paras_tp_size
+            paras_num_kv_replicas = 1
         tp_num_heads = self.total_num_heads // paras_tp_size
-        tp_num_kv_heads = self.total_num_kv_heads // paras_tp_size
+        kv_shard_idx = paras_tp_rank // paras_num_kv_replicas
         full_data = self.qkv_proj.bias.data
         q_start = paras_tp_rank * tp_num_heads * hs
         k_start = (
             self.total_num_heads * hs
-            + paras_tp_rank * tp_num_kv_heads * hs
+            + kv_shard_idx * tp_num_kv_heads * hs
         )
         v_start = (
             (self.total_num_heads + self.total_num_kv_heads) * hs
-            + paras_tp_rank * tp_num_kv_heads * hs
+            + kv_shard_idx * tp_num_kv_heads * hs
         )
         self.ep_qkv_bias = self.qkv_proj.bias
         self.tp_qkv_bias = nn.Parameter(
@@ -420,6 +429,7 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
             tp_max_tokens=_full_max_tokens * _paras_tp_size,
             num_kv_heads=_total_kv_heads,
             head_dim=head_dim,
+            tp_size=_paras_tp_size,
             kv_dtype=_kv_store_dtype,
             page_size=_page_size,
             prefix="model",
@@ -488,16 +498,21 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
 
         for layer in self.model.layers:
             mlp = getattr(layer, "mlp", None)
-            if mlp is not None and hasattr(mlp, "paras_all_gather_biases"):
-                mlp.paras_all_gather_biases()
-            if mlp is not None and hasattr(mlp, "paras_finalize_moe_bias_views"):
-                mlp.paras_finalize_moe_bias_views()
+            if mlp is None:
+                continue
+            if hasattr(mlp, "paras_finalize_moe_biases"):
+                mlp.paras_finalize_moe_biases()
+            if hasattr(mlp, "paras_finalize_moe_scales"):
+                mlp.paras_finalize_moe_scales()
             attn = getattr(layer, "self_attn", None)
             if attn is not None:
                 if hasattr(attn, "paras_finalize_sinks_views"):
                     attn.paras_finalize_sinks_views()
                 if hasattr(attn, "paras_finalize_qkv_bias_views"):
                     attn.paras_finalize_qkv_bias_views()
+
+        if hasattr(self.model, "paras_finalize_attn_views"):
+            self.model.paras_finalize_attn_views()
 
         end_loading = time.time()
         torch.cuda.synchronize()

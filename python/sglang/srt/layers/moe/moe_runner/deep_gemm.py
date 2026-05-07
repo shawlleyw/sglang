@@ -419,6 +419,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
 
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            silu_and_mul_masked_fwd,
+        )
+
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
         masked_m = runner_input.masked_m
@@ -458,9 +462,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gate, up = torch.split(gateup_output, n // 2, dim=-1)
             down_input.copy_(torch.silu(gate) * up)
         else:
-            silu_and_mul(
-                gateup_output.view(-1, n),
-                down_input.view(-1, n // 2),
+            silu_and_mul_masked_fwd(
+                gateup_output,
+                down_input,
+                masked_m,
             )
         del gateup_output
 

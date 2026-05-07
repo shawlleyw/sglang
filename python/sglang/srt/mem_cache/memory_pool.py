@@ -87,6 +87,7 @@ class ReqToTokenPool:
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
+        paras_max_size: Optional[int] = None,
     ):
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -96,10 +97,19 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
+        # ParaS may resize this pool at runtime via paras_resize_and_clear
+        # when EP<->TP swaps change the per-rank req count. The captured FA
+        # CUDA graph kernels reference req_to_token by data_ptr, so re-binding
+        # to a fresh tensor on every swap invalidates the graph. Pre-allocate
+        # at the maximum size paras will need and slice the active view from
+        # this stable buffer; the slice's data_ptr matches the buffer's,
+        # which keeps every captured kernel valid across swaps.
+        buffer_size = paras_max_size if paras_max_size is not None else size
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            self.req_to_token = torch.zeros(
-                (size, max_context_len), dtype=torch.int32, device=device
+            self._req_to_token_buffer = torch.zeros(
+                (buffer_size, max_context_len), dtype=torch.int32, device=device
             )
+        self.req_to_token = self._req_to_token_buffer[:size]
 
         self.free_slots = list(range(size))
 
@@ -129,12 +139,18 @@ class ReqToTokenPool:
 
     def paras_resize_and_clear(self, new_size: int):
         """
-        Resize and clear the pool for ParaS.
+        Resize and clear the pool for ParaS. The active view is rebound to
+        ``self._req_to_token_buffer[:new_size]`` so its data_ptr stays equal
+        to the buffer's, keeping captured FA CUDA graph kernels valid.
         """
-        self.size = new_size
-        self.req_to_token = torch.zeros(
-            (new_size, self.max_context_len), dtype=torch.int32, device=self.device
+        assert new_size <= self._req_to_token_buffer.shape[0], (
+            f"paras_resize_and_clear: new_size={new_size} exceeds preallocated "
+            f"buffer size={self._req_to_token_buffer.shape[0]}; pass a larger "
+            f"paras_max_size to ReqToTokenPool"
         )
+        self.size = new_size
+        self.req_to_token = self._req_to_token_buffer[:new_size]
+        self.req_to_token.zero_()
         self.free_slots = list(range(new_size))
 
 
@@ -950,7 +966,10 @@ class MHATokenToKVPool(KVCache):
         """
         from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
         self.full_head_num = self.head_num
-        sharded_head_num = self.head_num // paras_tp_size
+        # GQA replication: paras_tp_size may exceed total_num_kv_heads (e.g.
+        # Qwen3-235B has 4 KV heads on 8 ranks). Each rank then holds 1
+        # replicated head. Matches model_config.get_num_kv_heads (L497).
+        sharded_head_num = max(1, self.head_num // paras_tp_size)
 
         mgr = get_global_paras_memory_manager()
         new_k: List[torch.Tensor] = []

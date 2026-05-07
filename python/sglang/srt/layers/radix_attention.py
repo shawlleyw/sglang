@@ -105,8 +105,11 @@ class RadixAttention(nn.Module):
         self.ep_v_head_num = self.tp_v_head_num
 
         self.tp_q_head_num = self.tp_q_head_num // paras_tp_size
-        self.tp_k_head_num = self.tp_k_head_num // paras_tp_size
-        self.tp_v_head_num = self.tp_v_head_num // paras_tp_size
+        # GQA replication: when paras_tp_size > total_num_kv_heads, each rank
+        # sees 1 replicated KV head. Matches model_config.get_num_kv_heads
+        # (configs/model_config.py L497) used by Triton/FlashInfer backends.
+        self.tp_k_head_num = max(1, self.tp_k_head_num // paras_tp_size)
+        self.tp_v_head_num = max(1, self.tp_v_head_num // paras_tp_size)
 
     @paras_func
     def paras_configure_ep(self):

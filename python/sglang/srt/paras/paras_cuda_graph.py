@@ -328,8 +328,18 @@ def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: str):
 
 def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: str):
     """Restore graphs, output buffers, DeepEP state, attention-backend
-    cuda-graph state, mode-dependent settings, and the graph memory pool
-    handle for *mode*."""
+    cuda-graph state, mode-dependent settings, the graph memory pool
+    handle for *mode*.
+
+    Note: req_to_token_pool and token_to_kv_pool_allocator state are NOT
+    saved/restored here. The runtime gather/scatter manager has already
+    called paras_resize_and_clear + alloc + writes by the time this load
+    runs; restoring init-time state would wipe those mutations and double-
+    count slots in both free_pages and tree_cache.evictable. The
+    req_to_token tensor's data_ptr stability is now guaranteed by the
+    pre-allocated _req_to_token_buffer pattern in ReqToTokenPool, so
+    captured FA CUDA graph kernels stay valid without save/restore.
+    """
     from sglang.srt.model_executor.cuda_graph_runner import (
         set_global_graph_memory_pool,
     )

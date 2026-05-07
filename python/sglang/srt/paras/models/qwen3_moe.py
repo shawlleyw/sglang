@@ -256,41 +256,39 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         )
         _avail_now_bytes = int(_avail_now_gib * (1 << 30))
 
-        # UMM budget = avail_now - dynamic_reserve
-        # dynamic_reserve = total × (1 - mem_fraction_static)
-        _dynamic_reserve_bytes = int(_total_gpu_bytes * (1.0 - _mem_fraction))
-        _umm_budget_bytes = max(0, _avail_now_bytes - _dynamic_reserve_bytes)
-
-        # KV budget = UMM budget - (weights + any staging already reserved)
-        _kv_budget_bytes = max(0, _umm_budget_bytes - manager.weights_only_bytes)
-
-        # Per-token KV cost for EP mode (all heads per rank)
         _num_layers = config.num_hidden_layers
         _total_kv_heads = config.num_key_value_heads
-        _kv_elem_size = torch.tensor([], dtype=_kv_store_dtype).element_size()
-        _ep_cell_bytes = (
-            _total_kv_heads * head_dim * _num_layers * 2 * _kv_elem_size
+        _capacity = manager.plan_mha_kv_capacity(
+            available_gpu_memory_bytes=_avail_now_bytes,
+            total_gpu_memory_bytes=_total_gpu_bytes,
+            mem_fraction_static=_mem_fraction,
+            num_layers=_num_layers,
+            num_kv_heads=_total_kv_heads,
+            head_dim=head_dim,
+            tp_size=get_paras_tp_size(),
+            kv_dtype=_kv_store_dtype,
         )
-        _ep_max_tokens = max(1, int(_kv_budget_bytes // _ep_cell_bytes))
-        # TP has sharded heads → same bytes per token across tp_size more tokens
-        _tp_max_tokens = _ep_max_tokens * get_paras_tp_size()
         logger.info(
             f"ParaS KV budget: avail_now={_avail_now_gib:.3f}GiB  "
             f"total={_total_gpu_bytes/(1<<30):.3f}GiB  "
-            f"dynamic_reserve={_dynamic_reserve_bytes/(1<<30):.3f}GiB  "
-            f"umm_budget={_umm_budget_bytes/(1<<30):.3f}GiB  "
+            f"dynamic_reserve={_capacity.dynamic_reserve_bytes/(1<<30):.3f}GiB  "
+            f"umm_budget={_capacity.umm_budget_bytes/(1<<30):.3f}GiB  "
             f"weights_only={manager.weights_only_bytes/(1<<30):.3f}GiB  "
-            f"kv_budget={_kv_budget_bytes/(1<<30):.3f}GiB  "
-            f"ep_max_tokens={_ep_max_tokens}"
+            f"kv_budget={_capacity.kv_budget_bytes/(1<<30):.3f}GiB  "
+            f"ep_max_tokens={_capacity.ep_max_tokens}  "
+            f"tp_max_tokens={_capacity.tp_max_tokens}  "
+            f"ep_kv_heads={_capacity.ep_kv_heads}  "
+            f"tp_kv_heads={_capacity.tp_kv_heads}"
         )
 
         # Reserve KV in manager (union layout: same bytes in both modes)
         manager.reserve_kv_cache(
             num_layers=_num_layers,
-            ep_max_tokens=_ep_max_tokens,
-            tp_max_tokens=_tp_max_tokens,
+            ep_max_tokens=_capacity.ep_max_tokens,
+            tp_max_tokens=_capacity.tp_max_tokens,
             num_kv_heads=_total_kv_heads,
             head_dim=head_dim,
+            tp_size=get_paras_tp_size(),
             kv_dtype=_kv_store_dtype,
             page_size=_page_size,
             prefix="model",
@@ -431,6 +429,16 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
 
         # ParaS: skip EPLB — weights are handled differently
         # (deliberately NOT building routed_experts_weights_of_layer)
+
+        for layer in self.model.layers:
+            mlp = getattr(layer, "mlp", None)
+            if mlp is None:
+                continue
+            if hasattr(mlp, "paras_finalize_moe_scales"):
+                mlp.paras_finalize_moe_scales()
+
+        if hasattr(self.model, "paras_finalize_attn_views"):
+            self.model.paras_finalize_attn_views()
 
         end_loading = time.time()
         torch.cuda.synchronize()

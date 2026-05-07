@@ -454,8 +454,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_tokens_per_expert=num_tokens_per_expert,
         )
         
-        self.send_shape = x.shape
-        self.recv_shape = recv_x.shape
+        self.send_shape = (x[0].shape if isinstance(x, tuple) else x.shape)
+        self.recv_shape = (recv_x[0].shape if isinstance(recv_x, tuple) else recv_x.shape)
 
         return (
             recv_x,

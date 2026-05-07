@@ -112,7 +112,15 @@ class SchedulerParasMixin:
         if len(self.waiting_queue) > 0:
             logger.warning("Waiting queue is not empty, parallelism switch is not allowed.")
             return False
-        
+        if self.running_batch is not None and any(
+            len(req.output_ids) == 0 for req in self.running_batch.reqs
+        ):
+            logger.warning(
+                "Running batch contains a req with no output_ids "
+                "(promoted from waiting but not yet forwarded); "
+                "parallelism switch is not allowed."
+            )
+            return False
         return True
     
     def paras_get_req_seqlens(self, reqs: List[Req]):
@@ -130,9 +138,10 @@ class SchedulerParasMixin:
     def paras_configure_tp(self):
         if not self.paras_check():
             return
-        
+
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
         assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
+        torch.cuda.synchronize()
         # switch from EP to DP x TP
         self.paras_parallelism_config = "TP"
         self.server_args.enable_dp_attention = False
@@ -218,6 +227,8 @@ class SchedulerParasMixin:
         self.send_to_detokenizer = self.tp_send_to_detokenizer
         self.recv_from_rpc = self.tp_recv_from_rpc
 
+        torch.cuda.synchronize()
+
     @paras_func
     def paras_configure_ep(self):
         # Entry guards
@@ -229,6 +240,7 @@ class SchedulerParasMixin:
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
         assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
         assert self.paras_dp_size == 1, "paras_configure_ep only supports dp_size==1"
+        torch.cuda.synchronize()
 
         self.paras_start_profile("/tmp/paras_configure_profile")
 
@@ -313,6 +325,8 @@ class SchedulerParasMixin:
         self.send_to_tokenizer = self.ep_send_to_tokenizer
         self.send_to_detokenizer = self.ep_send_to_detokenizer
         self.recv_from_rpc = self.ep_recv_from_rpc
+
+        torch.cuda.synchronize()
 
     def paras_configure_handle(self, recv_req: ParaSConfigureReqInput):
         if recv_req.type == ParaSConfigureReqType.CONFIGURE_TP:
