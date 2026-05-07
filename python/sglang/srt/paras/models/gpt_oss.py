@@ -441,6 +441,7 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
         create_paras_moe_aliases(manager, config.num_hidden_layers, prefix="model")
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
+        self.paras_layer_specs = _layer_specs
 
         # Set global so create_weights() can find the manager
         set_global_paras_memory_manager(manager)

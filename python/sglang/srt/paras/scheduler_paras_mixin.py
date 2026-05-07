@@ -279,6 +279,11 @@ class SchedulerParasMixin:
             ),
             method=os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl"),
             local_waiting_reqs=local_waiting_reqs,
+            layer_specs=getattr(
+                self.tp_worker.model_runner.model,
+                'paras_layer_specs',
+                None,
+            ),
         )
         
         start_time = time.time()
@@ -376,6 +381,11 @@ class SchedulerParasMixin:
             paras_tp_rank=self.paras_tp_rank,
             paras_tp_size=self.paras_tp_size,
             local_waiting_reqs=local_waiting_reqs,
+            layer_specs=getattr(
+                self.tp_worker.model_runner.model,
+                'paras_layer_specs',
+                None,
+            ),
         )
 
         start_time = time.time()
