@@ -244,6 +244,19 @@ class ParaSReqScatterManager:
             f"Local reqs {num_local_reqs} exceed EP req pool {new_req_pool_size}"
         )
 
+        # Snapshot the source-mode (TP) full_to_swa_index_mapping BEFORE resize.
+        # paras_resize_and_clear zero-fills this mapping; without a snapshot,
+        # SWACacheTransfer.scatter_one_layer's lookup on TP-side source
+        # positions would resolve to slot 0 (padding), causing all SWA layers'
+        # K/V to read from / write to the padding slot and producing uniformly
+        # noisy decode output post-switch. Consumed via _full_to_swa_source.
+        if is_swa_alloc:
+            self.source_full_to_swa_mapping = (
+                self.token_to_kv_pool_allocator.full_to_swa_index_mapping.clone()
+            )
+        else:
+            self.source_full_to_swa_mapping = None
+
         # Resize and clear allocators.
         self.req_to_token_pool.paras_resize_and_clear(new_req_pool_size)
         if is_swa_alloc:
@@ -422,6 +435,7 @@ class ParaSReqScatterManager:
                 ep_dst_positions=self.ep_dst_positions,
                 paras_tp_rank=self.paras_tp_rank,
                 paras_tp_size=self.paras_tp_size,
+                source_full_to_swa_mapping=getattr(self, "source_full_to_swa_mapping", None),
             )
 
         # Per-layer dispatch in REVERSE order (preserves N+1 slot invariant).

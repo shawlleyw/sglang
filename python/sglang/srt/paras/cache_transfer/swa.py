@@ -74,7 +74,14 @@ class SWACacheTransfer(CacheTransferBase):
             )
 
     def _full_to_swa(self, full_indices: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """Translate full-pool indices to SWA-pool indices.
+        """Translate full-pool indices to SWA-pool indices using the LIVE mapping.
+
+        Use ONLY for destination-side positions (post-resize, post-alloc state).
+        For source-side positions (TP for scatter, EP for gather) call
+        ``_full_to_swa_source`` instead; the live mapping was wiped by
+        ``paras_resize_and_clear`` before this backend was constructed and now
+        only contains entries for the destination mode's freshly-allocated
+        slots.
 
         Preserves the caller's input dtype.  The peer-access CUDA bindings
         (see ``csrc/binding.cpp``) read token-index tensors as ``int32*`` via
@@ -89,6 +96,26 @@ class SWACacheTransfer(CacheTransferBase):
             return full_indices
         original_dtype = full_indices.dtype
         return self._full_to_swa_mapping[full_indices.to(torch.int64)].to(original_dtype)
+
+    def _full_to_swa_source(self, full_indices: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Translate source-side full-pool indices via the pre-resize snapshot.
+
+        For scatter the source mode is TP; for gather it is EP. In both cases
+        the source-mode ``full_to_swa_index_mapping`` was zero-filled by
+        ``{ParaSReq*Manager}.reorchestrate_cache``'s ``paras_resize_and_clear``
+        before scatter_cache / gather_cache constructs this backend. Without a
+        snapshot, every source-side lookup returns 0 (padding slot) and SWA
+        layers' transport produces uniformly noisy post-switch decode output.
+        ``source_full_to_swa_mapping`` is the snapshot taken just before the
+        resize wiped the live mapping.
+        """
+        if full_indices is None or full_indices.numel() == 0:
+            return full_indices
+        snapshot = self.source_full_to_swa_mapping
+        if snapshot is None:
+            return self._full_to_swa(full_indices)
+        original_dtype = full_indices.dtype
+        return snapshot[full_indices.to(torch.int64)].to(original_dtype)
 
     def _compute_swa_scatter_splits_nccl(
         self, cap: int,
@@ -220,13 +247,16 @@ class SWACacheTransfer(CacheTransferBase):
         )
 
         # P3 fix: translate local EP indices from full-pool to SWA-pool space
-        # before reading from the SWA k/v buffers.
-        swa_local = self._full_to_swa(local_indices)
+        # before reading from the SWA k/v buffers. EP is the source mode for
+        # gather, so use the pre-resize snapshot (reorchestrate_cache wipes the
+        # live mapping then re-populates it for the destination TP slots only).
+        swa_local = self._full_to_swa_source(local_indices)
 
         # P3 fix: build per-rank capped global_token_indices, then translate.
         # self.global_token_indices is the flat concatenation of all EP ranks'
         # tokens (uncapped).  We must slice each rank's chunk to
-        # layer_global_num[i] entries before translation.
+        # layer_global_num[i] entries before translation. These are EP-source
+        # positions, so use the snapshot mapping.
         if self.global_token_indices is not None and num_global > 0:
             start = 0
             capped_parts = []
@@ -235,7 +265,7 @@ class SWACacheTransfer(CacheTransferBase):
                 capped_parts.append(self.global_token_indices[start:start + take])
                 start += n_full
             global_indices_full_capped = torch.cat(capped_parts)
-            swa_global = self._full_to_swa(global_indices_full_capped)
+            swa_global = self._full_to_swa_source(global_indices_full_capped)
         else:
             swa_global = self.global_token_indices
 
@@ -291,7 +321,7 @@ class SWACacheTransfer(CacheTransferBase):
             (sorted_tp_indices_full, total_send_tokens, input_split_sizes,
              recv_full_capped, output_split_sizes, total_recv_elems,
              ) = self._compute_swa_scatter_splits_nccl(cap)
-            sorted_tp_indices_swa = self._full_to_swa(sorted_tp_indices_full)
+            sorted_tp_indices_swa = self._full_to_swa_source(sorted_tp_indices_full)
             if self.ep_dst_positions is not None and recv_full_capped > 0:
                 ep_dst_pos_swa = self._full_to_swa(
                     self.ep_dst_positions[:recv_full_capped])
@@ -331,7 +361,7 @@ class SWACacheTransfer(CacheTransferBase):
                 self._compute_swa_scatter_slices_peer_access(cap)
             if layer_num == 0:
                 return
-            tp_positions_swa = self._full_to_swa(tp_positions_full)
+            tp_positions_swa = self._full_to_swa_source(tp_positions_full)
             ep_dst_pos_swa = self._full_to_swa(ep_dst_pos_full)
             do_scatter_one_layer_peer_access(
                 self._local_buffer_ptr,

@@ -109,6 +109,7 @@ class CacheTransferBase:
         ep_dst_positions: Optional[torch.Tensor] = None,
         paras_tp_rank: int = 0,
         paras_tp_size: int = 1,
+        source_full_to_swa_mapping: Optional[torch.Tensor] = None,
     ):
         self.method = method
         self.direction = direction
@@ -127,6 +128,7 @@ class CacheTransferBase:
         self.paras_tp_rank = paras_tp_rank
         self.paras_tp_size = paras_tp_size
         self.group_size = group.world_size
+        self.source_full_to_swa_mapping = source_full_to_swa_mapping
 
         if direction == "gather":
             self._precompute_gather(peer_addresses)

@@ -202,10 +202,19 @@ class ParaSReqGatherManager:
         assert num_reqs <= new_req_pool_size, "The number of requests to reorchestrate is greater than the new size of the request to token pool."
         self.req_to_token_pool.paras_resize_and_clear(new_req_pool_size)
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
-        
+
+        # Snapshot the source-mode (EP) full_to_swa_index_mapping BEFORE resize.
+        # paras_resize_and_clear zero-fills this mapping; without a snapshot,
+        # SWACacheTransfer.gather_one_layer's lookup on EP-side source positions
+        # would resolve to slot 0 (padding), corrupting SWA layer K/V transport
+        # on the EP->TP direction. Consumed via _full_to_swa_source.
         if is_swa_alloc:
+            self.source_full_to_swa_mapping = (
+                self.token_to_kv_pool_allocator.full_to_swa_index_mapping.clone()
+            )
             self.token_to_kv_pool_allocator.paras_resize_and_clear(new_cache_size, new_cache_size_swa)
         else:
+            self.source_full_to_swa_mapping = None
             self.token_to_kv_pool_allocator.paras_resize_and_clear(new_cache_size)
 
         if self.num_global_tokens > 0:        
@@ -290,6 +299,7 @@ class ParaSReqGatherManager:
                 global_num_tokens=self.global_num_tokens,
                 layer_specs=self.layer_specs,
                 peer_addresses=peer_addresses,
+                source_full_to_swa_mapping=getattr(self, "source_full_to_swa_mapping", None),
             )
 
         # Per-layer dispatch.
