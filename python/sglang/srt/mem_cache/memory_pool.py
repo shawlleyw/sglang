@@ -943,6 +943,19 @@ class MHATokenToKVPool(KVCache):
         )
 
     def paras_configure_helper(self):
+        # TODO(shaoyuw): check for ParaS, the data ptrs now remains the same
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer + self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
         self.size = self.k_buffer[0].shape[0] - self.page_size
 
     @paras_func
