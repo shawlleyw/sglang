@@ -1,6 +1,6 @@
 ---
 name: paras-test-qwen3
-description: Test ParaS EP↔TP configure on Qwen3-30B-A3B with 4 GPUs. Use to verify ParaS works after code changes.
+description: Test ParaS EP↔TP configure on Qwen3-30B-A3B with 4 GPUs. Use to verify ParaS works after code changes. Drives the canonical 14-step procedure via the helper scripts in scripts/paras/eval/paras_cmd/.
 ---
 
 # Test ParaS with Qwen3-30B-A3B
@@ -8,25 +8,50 @@ description: Test ParaS EP↔TP configure on Qwen3-30B-A3B with 4 GPUs. Use to v
 ## Prerequisites
 
 - **Conda env**: `sgl_paras`
-- **GPUs**: 4x A100-80GB (use either CUDA_VISIBLE_DEVICES=0,1,2,3 or 4,5,6,7)
+- **GPUs**: 4× A100-80GB (use either `CUDA_VISIBLE_DEVICES=0,1,2,3` or `4,5,6,7`)
 - **Model**: `/data/shaoyuw/models/Qwen3-30B-A3B`
-- **Working dir**: `/home/shaoyuw/sglang`
+- **Working dir**: `/home/shaoyuw/sglang_paras_fp8`
+- **Helper scripts**: [`scripts/paras/eval/paras_cmd/`](file:///home/shaoyuw/sglang_paras_fp8/scripts/paras/eval/paras_cmd) — every step below maps to a one-line invocation. See [`lib.sh`](file:///home/shaoyuw/sglang_paras_fp8/scripts/paras/eval/paras_cmd/lib.sh) for shared env-var overrides (`HOST`, `PORT`, `MODEL_NAME`, `LOG_FILE`, `PRINT_CHARS`, `INFLIGHT_DELAY`, `INFLIGHT_MAX_TOKENS`, `TIMEOUT_TRIES`, `SLEEP_BETWEEN`).
 
-## Test Procedure
+## Quick Start
+
+The canonical four-call flow. Defaults baked into `lib.sh` (`MODEL_NAME=Qwen3-30B-A3B`, `LOG_FILE=/tmp/sglang_paras_test.log`, `HOST=127.0.0.1`, `PORT=30000`) match the qwen3 launch script — no env overrides required.
+
+```bash
+conda activate sgl_paras
+cd /home/shaoyuw/sglang_paras_fp8
+pip install -e python/ -q --no-deps
+
+bash scripts/paras/eval/paras_cmd/kill.sh                       # step 1
+
+ENABLE_PARAS=1 NUM_GPUS=4 \
+    bash scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh \
+    2>&1 | tee /tmp/sglang_paras_test.log &                     # step 2
+
+bash scripts/paras/eval/paras_cmd/e2e_test.sh                   # steps 3-13
+
+bash scripts/paras/eval/paras_cmd/kill.sh                       # step 14
+```
+
+`e2e_test.sh` orchestrates steps 3–13 in order and stops on the first non-zero return. Run individual steps below for partial reruns or debugging.
+
+## Detailed Procedure
 
 ### 1. Kill any existing sglang processes
 
+`kill.sh` does `pkill -9 -f sglang`, sleeps 3s, removes `$LOG_FILE`.
+
 ```bash
-pkill -9 -f "sglang" 2>/dev/null; sleep 3; rm -f /tmp/sglang_paras_test.log
+bash scripts/paras/eval/paras_cmd/kill.sh
 ```
 
 ### 2. Install and launch server
 
-Use tmux for the server process. Log to a file for inspection.
+The launch is intentionally **not** wrapped by `e2e_test.sh` — the launch script and log path are model-specific, and the launch is long-lived (must be backgrounded or run in tmux).
 
 ```bash
 conda activate sgl_paras
-cd /home/shaoyuw/sglang
+cd /home/shaoyuw/sglang_paras_fp8
 pip install -e python/ -q --no-deps
 
 ENABLE_PARAS=1 NUM_GPUS=4 \
@@ -34,69 +59,49 @@ ENABLE_PARAS=1 NUM_GPUS=4 \
     2>&1 | tee /tmp/sglang_paras_test.log
 ```
 
-The launch script ([`scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh`](file:///home/shaoyuw/sglang/scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh)) detects `ENABLE_PARAS=1` and shifts the canonical defaults: `MEM_FRACTION_STATIC=0.6`, `MAX_RUNNING_REQUESTS=1024`, `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`, `SGLANG_ATTN_MAX_BS=256`, `PARAS_CONFIGURE_METHOD=peer_access`, `ENABLE_CUDA_GRAPH=0` (eager, qwen ParaS canonical). It also adds `--enable-paras-moe --paras-tp-size $NUM_GPUS --disable-overlap-schedule --chunked-prefill-size -1 --max-prefill-tokens 32000`. `CUDA_VISIBLE_DEVICES` defaults to `0,1,2,3` for `NUM_GPUS=4`. Override any of these by setting the env var on the same line.
+The launch script ([`scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh`](file:///home/shaoyuw/sglang_paras_fp8/scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh)) detects `ENABLE_PARAS=1` and shifts the canonical defaults: `MEM_FRACTION_STATIC=0.6`, `MAX_RUNNING_REQUESTS=1024`, `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`, `SGLANG_ATTN_MAX_BS=256`, `PARAS_CONFIGURE_METHOD=peer_access`, `ENABLE_CUDA_GRAPH=0` (eager, qwen ParaS canonical). It also adds `--enable-paras-moe --paras-tp-size $NUM_GPUS --disable-overlap-schedule --chunked-prefill-size -1 --max-prefill-tokens 32000`. `CUDA_VISIBLE_DEVICES` defaults to `0,1,2,3` for `NUM_GPUS=4`. Override any of these by setting the env var on the same line.
 
 ### 3. Wait for server ready
 
-Poll until "Application startup complete" appears in the log. Typically ~35-40 seconds.
+`wait_ready.sh` polls `$LOG_FILE` for "Application startup complete" — typically ~35–40s for qwen3. Default ceiling is 24×5s = 120s.
 
 ```bash
-for i in $(seq 1 24); do
-    sleep 5
-    if grep -q "Application startup complete" /tmp/sglang_paras_test.log 2>/dev/null; then
-        echo "READY after ${i}x5s"; break
-    fi
-    echo "Waiting ${i}/24: $(tail -1 /tmp/sglang_paras_test.log 2>/dev/null | cut -c1-80)"
-done
+bash scripts/paras/eval/paras_cmd/wait_ready.sh
 ```
 
 ### 4. Verify server is up and model type is correct
 
-```bash
-curl -s --max-time 5 http://localhost:30000/health
-# Should return 200 (empty body)
+`health.sh` checks HTTP /health is 200 and parses the model type from `Load weight end ... type=...` in the log. Must show `Qwen3MoeForCausalLMParaS` (NOT `Qwen3MoeForCausalLM`).
 
-grep "Load weight end" /tmp/sglang_paras_test.log | head -1
-# Should show type=Qwen3MoeForCausalLMParaS (not Qwen3MoeForCausalLM)
+```bash
+bash scripts/paras/eval/paras_cmd/health.sh
 ```
 
 ### 5. Send requests in EP mode (before ParaS switch)
 
-Use longer prompts (200 tokens) to stress-test decode correctness — short responses can appear correct even with partially corrupted weights.
+`send_prompts.sh <LABEL>` sends three canonical 200/150/200-token prompts (binary search / train math / TCP-vs-UDP) sequentially. Long prompts stress-test multi-step reasoning — short responses can mask partially corrupted weights post-switch.
 
 ```bash
-# Prompt 1: code generation — tests multi-step coherent reasoning
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"Write a Python function that implements binary search on a sorted list, with docstring and edge case handling.","max_tokens":200,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP P1]', d['choices'][0]['text'][:300])"
-
-# Prompt 2: step-by-step math — tests chain-of-thought
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"A train leaves city A at 60mph. Another train leaves city B (300 miles away) at 80mph heading toward A. When do they meet? Show your work step by step.","max_tokens":150,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP P2]', d['choices'][0]['text'][:300])"
-
-# Prompt 3: structured explanation — stress-tests long decode
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"Explain the difference between TCP and UDP protocols. Include: connection setup, reliability, use cases.","max_tokens":200,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP P3]', d['choices'][0]['text'][:300])"
+bash scripts/paras/eval/paras_cmd/send_prompts.sh EP
 ```
 
 **Expected**: All three responses are coherent multi-sentence text with no repetition or garbage. Save for comparison.
 
 ### 6. Trigger ParaS EP→TP switch
 
+`configure.sh tp` hits `/paras_configure_tp` and prints elapsed ms + the server's response.
+
 ```bash
-curl -s --max-time 10 http://localhost:30000/paras_configure_tp
-# Expected: "ParaS TP parallelism configured."
+bash scripts/paras/eval/paras_cmd/configure.sh tp
+# Expected response: "ParaS TP parallelism configured."
 ```
 
 ### 7. Check timing
 
+`check_log.sh timing` greps `transfer_weights` and `Time taken to configure {TP,EP}` from the log.
+
 ```bash
-grep "Time taken to configure TP\|transfer_weights" /tmp/sglang_paras_test.log
+bash scripts/paras/eval/paras_cmd/check_log.sh timing
 ```
 
 **Baseline performance** (mem-fraction-static=0.6, 4×A100-80GB, measured 2026-04-10):
@@ -109,23 +114,7 @@ grep "Time taken to configure TP\|transfer_weights" /tmp/sglang_paras_test.log
 ### 8. Send same requests in TP mode (after switch)
 
 ```bash
-# Prompt 1: binary search
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"Write a Python function that implements binary search on a sorted list, with docstring and edge case handling.","max_tokens":200,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[TP P1]', d['choices'][0]['text'][:300])"
-
-# Prompt 2: train problem
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"A train leaves city A at 60mph. Another train leaves city B (300 miles away) at 80mph heading toward A. When do they meet? Show your work step by step.","max_tokens":150,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[TP P2]', d['choices'][0]['text'][:300])"
-
-# Prompt 3: TCP vs UDP
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"Explain the difference between TCP and UDP protocols. Include: connection setup, reliability, use cases.","max_tokens":200,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[TP P3]', d['choices'][0]['text'][:300])"
+bash scripts/paras/eval/paras_cmd/send_prompts.sh TP
 ```
 
 **Expected**:
@@ -138,91 +127,51 @@ curl -s --max-time 60 http://localhost:30000/v1/completions \
 ### 9. Trigger ParaS TP→EP switch (round-trip)
 
 ```bash
-curl -s --max-time 60 http://localhost:30000/paras_configure_ep
-# Expected: "ParaS EP parallelism configured."
+bash scripts/paras/eval/paras_cmd/configure.sh ep
+# Expected response: "ParaS EP parallelism configured."
 ```
 
 ### 10. Send requests in EP mode (after round-trip)
 
 ```bash
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"Write a Python function that implements binary search on a sorted list, with docstring and edge case handling.","max_tokens":200,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP-RT P1]', d['choices'][0]['text'][:300])"
+bash scripts/paras/eval/paras_cmd/send_prompts.sh EP-RT
 ```
 
 **Expected**: Coherent output, same quality as original EP mode. May have minor wording differences due to BF16 precision.
 
 ### 11. Test KV cache coherence: in-flight EP→TP switch
 
-Server is in EP mode after step 10. Requests started in EP must survive the switch to TP.
+`inflight_switch.sh tp` kicks off two concurrent 500-token completions (hash table, photosynthesis), waits `INFLIGHT_DELAY=4s` for them to enter decode, then triggers `/paras_configure_tp`. Both responses must survive the switch.
 
 ```bash
-# Start requests in EP mode (background)
-curl -s --max-time 120 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"Explain how a hash table works, including collision resolution strategies like chaining and open addressing.","max_tokens":500,"temperature":0}' > /tmp/r1.json &
-PID1=$!
-
-curl -s --max-time 120 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"Describe the process of photosynthesis in plants, including the light-dependent and light-independent reactions.","max_tokens":500,"temperature":0}' > /tmp/r2.json &
-PID2=$!
-
-sleep 4
-
-# Switch EP→TP mid-generation
-curl -s --max-time 60 http://localhost:30000/paras_configure_tp
-
-wait $PID1 $PID2
-
-python3 -c "import json; d=json.load(open('/tmp/r1.json')); print('[EP→TP R1]', d['choices'][0]['text'][:300])"
-python3 -c "import json; d=json.load(open('/tmp/r2.json')); print('[EP→TP R2]', d['choices'][0]['text'][:300])"
+bash scripts/paras/eval/paras_cmd/inflight_switch.sh tp
 ```
 
-**Expected**: Both outputs are coherent. R1 should discuss hash functions, collision resolution. R2 should discuss light reactions, Calvin cycle, chloroplasts.
+**Expected**: Both outputs are coherent. R1 should discuss hash functions and collision resolution. R2 should discuss light reactions, Calvin cycle, chloroplasts.
 
 ### 12. Test KV cache coherence: in-flight TP→EP switch
 
-Server is in TP mode after step 11. Requests started in TP must survive the switch to EP.
+Same shape, different prompts (primes, recursive fibonacci with memoization).
 
 ```bash
-# Start requests in TP mode (background)
-curl -s --max-time 120 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"List the first 10 prime numbers and explain why each is prime.","max_tokens":500,"temperature":0}' > /tmp/r3.json &
-PID3=$!
-
-curl -s --max-time 120 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"Qwen3-30B-A3B","prompt":"Write a recursive Fibonacci function in Python with memoization.","max_tokens":500,"temperature":0}' > /tmp/r4.json &
-PID4=$!
-
-sleep 4
-
-# Switch TP→EP mid-generation
-curl -s --max-time 60 http://localhost:30000/paras_configure_ep
-
-wait $PID3 $PID4
-
-python3 -c "import json; d=json.load(open('/tmp/r3.json')); print('[TP→EP R3]', d['choices'][0]['text'][:300])"
-python3 -c "import json; d=json.load(open('/tmp/r4.json')); print('[TP→EP R4]', d['choices'][0]['text'][:300])"
+bash scripts/paras/eval/paras_cmd/inflight_switch.sh ep
 ```
 
 **Expected**: Both outputs are coherent multi-sentence text. No degeneration, no garbage, no repeated tokens.
 
 ### 13. Verify no errors
 
+`check_log.sh errors` greps for `error|exception` and filters out known benign warnings (`opentelemetry`, `WARNING`, `UserWarning`, `warn_only`, `Config file`, `import error`).
+
 ```bash
-grep -i "error\|exception" /tmp/sglang_paras_test.log | grep -v "import error\|Config file\|opentelemetry\|WARNING"
-# Expected: empty
+bash scripts/paras/eval/paras_cmd/check_log.sh errors
+# OK: no unexpected errors
 ```
 
 ### 14. Cleanup
 
 ```bash
-pkill -9 -f "sglang" 2>/dev/null
-rm -f /tmp/sglang_paras_test.log
+bash scripts/paras/eval/paras_cmd/kill.sh
 ```
 
 ## Pass/Fail Criteria
@@ -241,7 +190,7 @@ rm -f /tmp/sglang_paras_test.log
 
 ## Optional: CUDA-Graph-Enabled Variant
 
-The default procedure runs with `ENABLE_CUDA_GRAPH=0` (eager) for a clean path. To exercise the per-mode CUDA graph state preservation hooks (`paras_save_cuda_graph_state` / `paras_load_cuda_graph_state` on `AttentionBackend`) introduced for gpt-oss but applicable to qwen3+FlashInfer too, override the cuda-graph defaults:
+The default procedure runs with `ENABLE_CUDA_GRAPH=0` (eager) for a clean path. To exercise the per-mode CUDA graph state preservation hooks (`paras_save_cuda_graph_state` / `paras_load_cuda_graph_state` on `AttentionBackend`) introduced for gpt-oss but applicable to qwen3+FlashInfer too, override the cuda-graph defaults at launch:
 
 ```bash
 ENABLE_PARAS=1 NUM_GPUS=4 ENABLE_CUDA_GRAPH=1 CUDA_GRAPH_MAX_BS=8 \
@@ -249,20 +198,22 @@ ENABLE_PARAS=1 NUM_GPUS=4 ENABLE_CUDA_GRAPH=1 CUDA_GRAPH_MAX_BS=8 \
     2>&1 | tee /tmp/sglang_paras_test.log
 ```
 
-Then run the same 14-step procedure. After step 2, also verify dual capture happened:
+Then run `e2e_test.sh` as usual. After step 4, also verify dual capture happened:
 
 ```bash
-grep -E "ParaS: dual capture complete|saving EP graphs|capturing TP graphs|TP capture done" /tmp/sglang_paras_test.log
+bash scripts/paras/eval/paras_cmd/check_log.sh cuda_graph
 # Should show 4 lines per phase (one per DP rank), ending in:
-# "ParaS: dual capture complete avail=...GB  #EP graphs=4  #TP graphs=4"
-# and "TP capture done (..., pools_differ=True, ...)" — pools_differ=True confirms each mode owns its own buffer set.
+#   "ParaS: dual capture complete avail=...GB  #EP graphs=4  #TP graphs=4"
+#   "TP capture done (..., pools_differ=True, ...)" — pools_differ=True confirms each mode owns its own buffer set.
 ```
 
 Pass criteria: same as eager run, plus `pools_differ=True` and `#EP graphs=4 #TP graphs=4` after dual capture.
 
 ## See Also
 
-- `.skills/paras-test-gpt-oss/SKILL.md` — parallel test skill for gpt-oss-120b-bf16. The gpt-oss path always runs with CUDA graphs enabled and uses Triton attention; runs both eager (FlashInfer) and Triton+graph paths gives full coverage of the ParaS attention-backend matrix.
+- [`.skills/paras-test-gpt-oss/SKILL.md`](file:///home/shaoyuw/sglang_paras_fp8/.skills/paras-test-gpt-oss/SKILL.md) — parallel test skill for gpt-oss-120b-bf16. The gpt-oss path always runs with CUDA graphs enabled and uses Triton attention; running both eager (FlashInfer) and Triton+graph paths gives full coverage of the ParaS attention-backend matrix.
+- [`scripts/paras/eval/README.md`](file:///home/shaoyuw/sglang_paras_fp8/scripts/paras/eval/README.md) — overview of every script under `scripts/paras/eval/`.
+- [`scripts/paras/eval/paras_cmd/`](file:///home/shaoyuw/sglang_paras_fp8/scripts/paras/eval/paras_cmd) — per-step helper scripts and `e2e_test.sh` orchestrator. Each script's header comment documents its env-var overrides.
 
 ## Important Notes
 

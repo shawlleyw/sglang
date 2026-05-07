@@ -1,6 +1,6 @@
 ---
 name: paras-test-gpt-oss
-description: Test ParaS EP↔TP configure on gpt-oss-120b-bf16 with 4 GPUs. Use to verify ParaS works after code changes — exercises the Triton attention backend, hybrid (full+SWA) attention, fused MoE checkpoints, and CUDA-graph dual capture path.
+description: Test ParaS EP↔TP configure on gpt-oss-120b-bf16 with 4 GPUs. Use to verify ParaS works after code changes — exercises the Triton attention backend, hybrid (full+SWA) attention, fused MoE checkpoints, and CUDA-graph dual capture path. Drives the canonical 14-step procedure via the helper scripts in scripts/paras/eval/paras_cmd/.
 ---
 
 # Test ParaS with gpt-oss-120b-bf16
@@ -24,29 +24,67 @@ The gpt-oss test thus covers a different code matrix from qwen3 — both should 
 - **Conda env**: `sgl_paras`
 - **GPUs**: 4× A100-80GB (use `CUDA_VISIBLE_DEVICES=0,1,2,3` or `4,5,6,7`)
 - **Model**: `/data/shaoyuw/models/gpt-oss-120b-BF16-unsloth` (genuine BF16; downloaded from [`unsloth/gpt-oss-120b-BF16`](https://huggingface.co/unsloth/gpt-oss-120b-BF16) — see "Model selection" below)
-- **Working dir**: `/home/shaoyuw/sglang`
+- **Working dir**: `/home/shaoyuw/sglang_paras_fp8`
+- **Helper scripts**: [`scripts/paras/eval/paras_cmd/`](file:///home/shaoyuw/sglang_paras_fp8/scripts/paras/eval/paras_cmd) — every step below maps to a one-line invocation. See [`lib.sh`](file:///home/shaoyuw/sglang_paras_fp8/scripts/paras/eval/paras_cmd/lib.sh) for shared env-var overrides.
+
+### Required env-var overrides
+
+The scripts default to qwen3-shape values. For gpt-oss, export these once at the top of your shell, then every script picks them up automatically:
+
+```bash
+export MODEL_NAME=gpt-oss-120b-BF16-unsloth
+export LOG_FILE=/tmp/sglang_paras_gptoss.log
+export TIMEOUT_TRIES=60        # 60 × 10s = 10 min wait_ready ceiling (gpt-oss takes 3-4 min)
+export SLEEP_BETWEEN=10
+```
+
+Or prefix individual invocations with `MODEL_NAME=... LOG_FILE=...`. The detailed steps below assume the exports are set.
 
 ### Model selection
 
 Use the **unsloth** BF16 weights, not the older `/data/shaoyuw/models/gpt-oss-120b-bf16` directory. The older directory is mislabeled — its name says "bf16" but its MoE expert weights (`mlp.experts.gate_up_proj`, `mlp.experts.down_proj`) are stored in `torch.float8_e5m2`, while only the bias and non-MoE tensors are BF16. Loading it through sglang's standard (non-mxfp4) path forces a per-tensor FP8→BF16 cross-dtype cross-device copy, which adds ~3 minutes to load time on 4×A100 with no functional benefit.
 
-The unsloth release at `unsloth/gpt-oss-120b-BF16` ([HF link](https://huggingface.co/unsloth/gpt-oss-120b-BF16)) stores **every** tensor in BF16 (verified: `experts.gate_up_proj.dtype == torch.bfloat16`). 73 shards, 218 GB on disk, declared `torch_dtype: bfloat16` in `config.json`. The eval scripts under [`scripts/paras/eval/a100/gptoss/`](file:///home/shaoyuw/sglang/scripts/paras/eval/a100/gptoss) default to this path; override `MODEL_PATH=...` only if your local layout differs.
+The unsloth release at `unsloth/gpt-oss-120b-BF16` ([HF link](https://huggingface.co/unsloth/gpt-oss-120b-BF16)) stores **every** tensor in BF16 (verified: `experts.gate_up_proj.dtype == torch.bfloat16`). 73 shards, 218 GB on disk, declared `torch_dtype: bfloat16` in `config.json`. The eval scripts under [`scripts/paras/eval/a100/gptoss/`](file:///home/shaoyuw/sglang_paras_fp8/scripts/paras/eval/a100/gptoss) default to this path; override `MODEL_PATH=...` only if your local layout differs.
 
-## Test Procedure
+## Quick Start
+
+```bash
+conda activate sgl_paras
+cd /home/shaoyuw/sglang_paras_fp8
+pip install -e python/ -q --no-deps
+
+# Set the gpt-oss-specific env once.
+export MODEL_NAME=gpt-oss-120b-BF16-unsloth
+export LOG_FILE=/tmp/sglang_paras_gptoss.log
+export TIMEOUT_TRIES=60
+export SLEEP_BETWEEN=10
+
+# Then the canonical four-call flow:
+bash scripts/paras/eval/paras_cmd/kill.sh                       # step 1
+ENABLE_PARAS=1 NUM_GPUS=4 \
+    bash scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh \
+    2>&1 | tee "$LOG_FILE" &                                    # step 2
+bash scripts/paras/eval/paras_cmd/e2e_test.sh                   # steps 3-13
+bash scripts/paras/eval/paras_cmd/kill.sh                       # step 14
+```
+
+## Detailed Procedure
+
+> All commands assume the gpt-oss env exports above are set in your shell. To run a single step in isolation, prefix with `MODEL_NAME=gpt-oss-120b-BF16-unsloth LOG_FILE=/tmp/sglang_paras_gptoss.log`.
 
 ### 1. Kill any existing sglang processes
 
 ```bash
-pkill -9 -f "sglang" 2>/dev/null; sleep 5; rm -f /tmp/sglang_paras_gptoss.log
+bash scripts/paras/eval/paras_cmd/kill.sh
 ```
 
 ### 2. Install and launch server
 
-Use tmux for the server process. Log to a file for inspection.
+The launch is intentionally **not** wrapped by `e2e_test.sh` — the launch script and log path are model-specific, and the launch is long-lived (must be backgrounded or run in tmux).
 
 ```bash
 conda activate sgl_paras
-cd /home/shaoyuw/sglang
+cd /home/shaoyuw/sglang_paras_fp8
 pip install -e python/ -q --no-deps
 
 ENABLE_PARAS=1 NUM_GPUS=4 \
@@ -54,67 +92,36 @@ ENABLE_PARAS=1 NUM_GPUS=4 \
     2>&1 | tee /tmp/sglang_paras_gptoss.log
 ```
 
-The launch script ([`scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh`](file:///home/shaoyuw/sglang/scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh)) detects `ENABLE_PARAS=1` and shifts the canonical defaults: `MEM_FRACTION_STATIC=0.8`, `MAX_RUNNING_REQUESTS=1024`, `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`, `SGLANG_ATTN_MAX_BS=256`, `PARAS_CONFIGURE_METHOD=peer_access`, `PARAS_KV_TRANSFER_METHOD=peer_access`, `PARAS_DISABLE_PEER_ACCESS=0`, `CUDA_GRAPH_MAX_BS=8` (gpt-oss ParaS canonical = dual capture). It drops `--disable-hybrid-swa-memory` (gpt-oss ParaS uses dual full+SWA pools) and adds `--enable-paras-moe --paras-tp-size $NUM_GPUS --disable-overlap-schedule`. `CUDA_VISIBLE_DEVICES` defaults to `0,1,2,3` for `NUM_GPUS=4`. Override any of these by setting the env var on the same line.
+The launch script ([`scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh`](file:///home/shaoyuw/sglang_paras_fp8/scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh)) detects `ENABLE_PARAS=1` and shifts the canonical defaults: `MEM_FRACTION_STATIC=0.8`, `MAX_RUNNING_REQUESTS=1024`, `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`, `SGLANG_ATTN_MAX_BS=256`, `PARAS_CONFIGURE_METHOD=peer_access`, `PARAS_KV_TRANSFER_METHOD=peer_access`, `PARAS_DISABLE_PEER_ACCESS=0`, `CUDA_GRAPH_MAX_BS=8` (gpt-oss ParaS canonical = dual capture). It drops `--disable-hybrid-swa-memory` (gpt-oss ParaS uses dual full+SWA pools) and adds `--enable-paras-moe --paras-tp-size $NUM_GPUS --disable-overlap-schedule`. `CUDA_VISIBLE_DEVICES` defaults to `0,1,2,3` for `NUM_GPUS=4`. Override any of these by setting the env var on the same line.
 
 Note: `MAX_RUNNING_REQUESTS=1024` is the canonical value. Pre-redesign (commits before `098b8a37a`) this required `256` to dodge OOM during dual capture; the state-preservation redesign recovered ~3 GB and removed that workaround.
 
 ### 3. Wait for server ready
 
-Polling typically takes ~3–4 minutes (model weights ~63 GB, dual capture, JIT compile of MoE + attention kernels).
+Polling typically takes ~3–4 minutes (model weights ~63 GB, dual capture, JIT compile of MoE + attention kernels). The default 24×5s ceiling is too short for gpt-oss — that's why `TIMEOUT_TRIES=60 SLEEP_BETWEEN=10` is in the env exports.
 
 ```bash
-for i in $(seq 1 60); do
-    sleep 10
-    STATUS=$(curl -s --max-time 3 http://localhost:30000/health -o /dev/null -w "%{http_code}" 2>/dev/null)
-    if [ "$STATUS" = "200" ]; then
-        echo "READY after ${i}x10s"; break
-    fi
-    TAIL=$(tail -1 /tmp/sglang_paras_gptoss.log 2>/dev/null | cut -c1-100)
-    if echo "$TAIL" | grep -qE "OutOfMemoryError|CUDA error|Traceback|RuntimeError"; then
-        echo "ERROR: $TAIL"; break
-    fi
-    echo "[$i/60] HTTP=$STATUS - $TAIL"
-done
+bash scripts/paras/eval/paras_cmd/wait_ready.sh
 ```
 
 ### 4. Verify server is up, model type, and dual capture happened
 
 ```bash
-# HTTP health
-curl -s --max-time 5 http://localhost:30000/health -o /dev/null -w "HTTP %{http_code}\n"
-# Should return 200
+bash scripts/paras/eval/paras_cmd/health.sh
+# Expects: HTTP 200 + type=GptOssForCausalLMParaS
 
-# Model type
-grep "Load weight end" /tmp/sglang_paras_gptoss.log | head -1
-# Should show type=GptOssForCausalLMParaS (not GptOssForCausalLM)
-
-# Dual CUDA graph capture
-grep -E "ParaS: dual capture complete|saving EP graphs|capturing TP graphs|TP capture done" /tmp/sglang_paras_gptoss.log
-# Should show 4 lines per phase (one per DP rank), ending in:
+bash scripts/paras/eval/paras_cmd/check_log.sh cuda_graph
+# Expects 4 lines per phase, ending with:
 #   "ParaS: dual capture complete avail=...GB  #EP graphs=4  #TP graphs=4"
-# and "TP capture done (..., pools_differ=True, ...)" — pools_differ=True confirms each mode owns its own buffer set.
+#   "TP capture done (..., pools_differ=True, ...)" — pools_differ=True confirms each mode owns its own buffer set.
 ```
 
 ### 5. Send requests in EP mode (before ParaS switch)
 
+`send_prompts.sh <LABEL>` reuses the qwen3-style prompt set (binary search / train math / TCP-vs-UDP); these are domain-neutral and exercise the same multi-step decode coherence properties on gpt-oss.
+
 ```bash
-# Prompt 1: Roman history — long-context narrative
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Tell me about the history of Rome. The Roman Empire","max_tokens":200,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP P1]', d['choices'][0]['text'][:300])"
-
-# Prompt 2: data structures — technical multi-step
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Explain how a hash table works.","max_tokens":200,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP P2]', d['choices'][0]['text'][:300])"
-
-# Prompt 3: code generation — chain-of-thought
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Write a Python recursive Fibonacci function.","max_tokens":200,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP P3]', d['choices'][0]['text'][:300])"
+bash scripts/paras/eval/paras_cmd/send_prompts.sh EP
 ```
 
 **Expected**: All three responses are coherent multi-sentence text with no repetition or garbage. Save for comparison.
@@ -122,14 +129,14 @@ curl -s --max-time 60 http://localhost:30000/v1/completions \
 ### 6. Trigger ParaS EP→TP switch
 
 ```bash
-curl -s --max-time 10 http://localhost:30000/paras_configure_tp
-# Expected: "ParaS TP parallelism configured."
+bash scripts/paras/eval/paras_cmd/configure.sh tp
+# Expected response: "ParaS TP parallelism configured."
 ```
 
 ### 7. Check timing
 
 ```bash
-grep -E "Time taken to configure TP|transfer_weights|gather_cache" /tmp/sglang_paras_gptoss.log | tail -10
+bash scripts/paras/eval/paras_cmd/check_log.sh timing
 ```
 
 **Baseline performance** (4×A100-80GB, peer_access weights + peer_access KV, measured 2026-04-26):
@@ -147,102 +154,58 @@ Peer-access is ~2.2-3.4× faster than the older naive NCCL all-to-all baseline (
 ### 8. Send same requests in TP mode (after switch)
 
 ```bash
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Tell me about the history of Rome. The Roman Empire","max_tokens":200,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[TP P1]', d['choices'][0]['text'][:300])"
-
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Explain how a hash table works.","max_tokens":200,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[TP P2]', d['choices'][0]['text'][:300])"
-
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Write a Python recursive Fibonacci function.","max_tokens":200,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[TP P3]', d['choices'][0]['text'][:300])"
+bash scripts/paras/eval/paras_cmd/send_prompts.sh TP
 ```
-
-**Expected**:
-- P1: Coherent narrative about Augustus, Roman Empire timeline
-- P2: Technical explanation of hash table (separate chaining, open addressing, time complexities)
-- P3: Recursive Python Fibonacci function with base cases
 
 **Critical check**: All responses must be coherent multi-token text with no degeneration (repeated tokens, garbage like `1990. 1990. 1990.`, or topic drift). The distinct gpt-oss failure mode the redesign closed was a Bug 6 silent garbage / out-of-bounds index from stale captured `kv_indptr` after dual capture.
 
 ### 9. Trigger ParaS TP→EP switch (round-trip)
 
 ```bash
-curl -s --max-time 60 http://localhost:30000/paras_configure_ep
-# Expected: "ParaS EP parallelism configured."
+bash scripts/paras/eval/paras_cmd/configure.sh ep
 ```
 
-### 10. Send a request in EP mode (after round-trip)
+### 10. Send requests in EP mode (after round-trip)
 
 ```bash
-curl -s --max-time 60 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Tell me about the history of Rome. The Roman Empire","max_tokens":200,"temperature":0}' \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print('[EP-RT P1]', d['choices'][0]['text'][:300])"
+bash scripts/paras/eval/paras_cmd/send_prompts.sh EP-RT
 ```
 
 **Expected**: Coherent output, same quality as original EP mode. May have minor wording differences due to BF16 precision and CUDA graph autotune choosing slightly different configs across captures.
 
 ### 11. Test KV cache coherence: in-flight EP→TP switch
 
-Server is in EP mode after step 10. Requests started in EP must survive the switch to TP.
+Server is in EP mode after step 10:
 
 ```bash
-# Start request in EP mode (background) with a long prompt
-curl -s --max-time 180 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Tell me about the history of Rome. The Roman Empire","max_tokens":300,"temperature":0}' > /tmp/gptoss_r1.json &
-PID1=$!
-
-sleep 1
-
-# Switch EP→TP mid-generation
-curl -s --max-time 30 http://localhost:30000/paras_configure_tp
-
-wait $PID1
-python3 -c "import json; d=json.load(open('/tmp/gptoss_r1.json')); print('[EP→TP R1]', d['choices'][0]['text'][:400])"
+bash scripts/paras/eval/paras_cmd/inflight_switch.sh tp
 ```
 
-**Expected**: Coherent narrative about Roman Empire continuing through the switch boundary.
+**Expected**: Both backgrounded requests return coherent text continuing across the switch boundary.
 
 ### 12. Test KV cache coherence: in-flight TP→EP switch
 
-Server is in TP mode after step 11.
+Server is in TP mode after step 11:
 
 ```bash
-curl -s --max-time 180 http://localhost:30000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"gpt-oss-120b-BF16-unsloth","prompt":"Describe photosynthesis in plants step by step.","max_tokens":300,"temperature":0}' > /tmp/gptoss_r2.json &
-PID2=$!
-
-sleep 1
-
-curl -s --max-time 30 http://localhost:30000/paras_configure_ep
-
-wait $PID2
-python3 -c "import json; d=json.load(open('/tmp/gptoss_r2.json')); print('[TP→EP R2]', d['choices'][0]['text'][:400])"
+bash scripts/paras/eval/paras_cmd/inflight_switch.sh ep
 ```
 
-**Expected**: Coherent multi-paragraph explanation of photosynthesis (light-dependent reactions, Calvin cycle, ATP/NADPH).
+**Expected**: Both outputs are coherent multi-paragraph text. No degeneration, no repeated tokens.
 
 ### 13. Verify no errors
 
 ```bash
-grep -iE "error|exception|traceback|assert" /tmp/sglang_paras_gptoss.log \
-    | grep -v "WARNING server_args\|opentelemetry\|opted out\|FastAPIDeprecationWarning\|orjson\|Application startup\|already free\|Config file\|deprecated\|MoE kernel\|tokenizer"
-# Expected: empty
+bash scripts/paras/eval/paras_cmd/check_log.sh errors
 ```
+
+Note: the script's filter (`opentelemetry`, `WARNING`, `UserWarning`, `warn_only`, `import error`, `Config file`) catches the most common benign output. If you see false-positive flags from gpt-oss-specific log lines (`opted out`, `FastAPIDeprecationWarning`, `orjson`, `Application startup`, `already free`, `deprecated`, `MoE kernel`, `tokenizer`), grep them out manually or extend `check_log.sh`.
 
 ### 14. Cleanup
 
 ```bash
-pkill -9 -f "sglang" 2>/dev/null
-rm -f /tmp/sglang_paras_gptoss.log /tmp/gptoss_r*.json
+bash scripts/paras/eval/paras_cmd/kill.sh
+rm -f /tmp/inflight_*.json
 ```
 
 ## Pass/Fail Criteria
@@ -252,7 +215,7 @@ rm -f /tmp/sglang_paras_gptoss.log /tmp/gptoss_r*.json
 | Model type | `GptOssForCausalLMParaS` | `GptOssForCausalLM` |
 | Dual capture log | `pools_differ=True`, `#EP graphs=4 #TP graphs=4` | Missing or `pools_differ=False` |
 | EP requests (3 prompts) | All coherent, ~150–200 tokens | Error, timeout, or garbage |
-| EP→TP switch | Returns in < 2.5 s (naive) | Timeout or OOM |
+| EP→TP switch | Returns in < 2.5 s | Timeout or OOM |
 | TP requests (3 prompts) | Coherent, same quality as EP | Garbage, repeated tokens, topic drift |
 | TP→EP switch | Returns in < 2.5 s | Timeout or error |
 | EP requests after round-trip | Coherent (may differ in wording from original due to BF16) | Garbage or completely off-topic |
@@ -271,7 +234,13 @@ rm -f /tmp/sglang_paras_gptoss.log /tmp/gptoss_r*.json
 
 ## Companion Unit Tests
 
-For weight-transfer and CUDA graph correctness in isolation (no end-to-end inference required), run:
+For weight-transfer and CUDA graph correctness in isolation (no end-to-end inference required), run via the eval test runner:
+
+```bash
+ONLY=gpt-oss-cuda-graph bash scripts/paras/eval/run_paras_tests.sh
+```
+
+Or directly:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 -m pytest \
@@ -296,6 +265,8 @@ This file covers:
 
 ## See Also
 
-- `.skills/paras-test-qwen3/SKILL.md` — parallel test for qwen3-30B-A3B (FlashInfer attention; also has an optional cuda-graph-enabled variant)
-- `.skills/paras-test-peer-access/SKILL.md` — unit test skill for KV transfer + weight transfer + request partition
+- [`.skills/paras-test-qwen3/SKILL.md`](file:///home/shaoyuw/sglang_paras_fp8/.skills/paras-test-qwen3/SKILL.md) — parallel test for qwen3-30B-A3B (FlashInfer attention; also has an optional cuda-graph-enabled variant)
+- [`.skills/paras-test-peer-access/SKILL.md`](file:///home/shaoyuw/sglang_paras_fp8/.skills/paras-test-peer-access/SKILL.md) — unit test skill for KV transfer + weight transfer + request partition
+- [`scripts/paras/eval/README.md`](file:///home/shaoyuw/sglang_paras_fp8/scripts/paras/eval/README.md) — overview of every script under `scripts/paras/eval/`
+- [`scripts/paras/eval/paras_cmd/`](file:///home/shaoyuw/sglang_paras_fp8/scripts/paras/eval/paras_cmd) — per-step scripts and `e2e_test.sh` orchestrator
 - `docs/paras/gpt_oss_support.md` — full gpt-oss design + Bug chronicle (Bug 5/6 sections explain why this skill exists in the form it does)
