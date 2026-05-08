@@ -55,6 +55,8 @@ wait "${pids[@]}"
 
 if ! paras_cmd_burst_verify "$TMPDIR" "$TAG"; then
     paras_cmd_print_completion_file "${TAG} P1 (sample)" "$TMPDIR/burst_1.json"
+    echo "[${TAG}] preserving response files at ${TMPDIR} for inspection"
+    trap '' EXIT
     exit 1
 fi
 

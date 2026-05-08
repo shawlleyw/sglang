@@ -66,7 +66,7 @@ bash scripts/paras/eval/paras_cmd/e2e_test.sh                        # steps 3-1
 bash scripts/paras/eval/paras_cmd/kill.sh                            # step 14
 ```
 
-## Quick Start (gpt-oss-120b-bf16)
+## Quick Start (gpt-oss-120b-bf16, 4×A100)
 
 ```bash
 conda activate sgl_paras
@@ -81,7 +81,8 @@ export SLEEP_BETWEEN=10
 
 bash scripts/paras/eval/paras_cmd/kill.sh                            # step 1
 
-ENABLE_PARAS=1 NUM_GPUS=4 MEM_FRACTION_STATIC=0.7 \
+# 4-GPU config: bump MEM_FRACTION_STATIC to 0.8 (per-rank weights ≈ 57 GiB)
+ENABLE_PARAS=1 NUM_GPUS=4 MEM_FRACTION_STATIC=0.8 \
     bash scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh \
     2>&1 | tee "$LOG_FILE" &                                         # step 2
 
@@ -90,8 +91,17 @@ bash scripts/paras/eval/paras_cmd/e2e_test.sh                        # steps 3-1
 bash scripts/paras/eval/paras_cmd/kill.sh                            # step 14
 ```
 
-For 8×A100 gpt-oss, set `NUM_GPUS=8 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` on
-the launch line.
+## Quick Start (gpt-oss-120b-bf16, 8×A100 — canonical deployment)
+
+Same as above except the launch line uses 8 GPUs and `MEM_FRACTION_STATIC=0.7`
+(per-rank weight footprint halves with TP=8, so 0.7 is sufficient and matches
+the qwen3 baseline):
+
+```bash
+ENABLE_PARAS=1 NUM_GPUS=8 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MEM_FRACTION_STATIC=0.7 \
+    bash scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh \
+    2>&1 | tee "$LOG_FILE" &
+```
 
 ## Detailed Procedure
 
@@ -285,9 +295,20 @@ bash scripts/paras/eval/paras_cmd/kill.sh
 
 ## Important Notes
 
-- **`MEM_FRACTION_STATIC=0.7` is the canonical test value** for both models;
-  override it explicitly on every launch invocation. Don't rely on the launch
-  script's `ENABLE_PARAS=1` defaults (which differ by model).
+- **`MEM_FRACTION_STATIC` depends on (model, GPU count)** — always override
+  it explicitly on the launch line. The launch script's `ENABLE_PARAS=1`
+  defaults differ by model and don't track these constraints. The matrix:
+
+  | Model | GPUs | `MEM_FRACTION_STATIC` |
+  |---|---|---|
+  | Qwen3-30B-A3B | 4 | **0.7** |
+  | Qwen3-30B-A3B | 8 | 0.7 |
+  | gpt-oss-120b-bf16 | 4 | **0.8** (model weights ≈ 57 GiB/rank; at 0.7 the static budget = 55.5 GiB → kv_budget = 0) |
+  | gpt-oss-120b-bf16 | 8 | **0.7** (per-rank weight footprint halves; 0.7 leaves enough headroom) |
+
+  Symptom of an undersized fraction: server boots, loads all weight shards,
+  then dies during `init_memory_pool` with `RuntimeError: Not enough memory`
+  and `kv_budget=0.000GiB` in the ParaS GPT-OSS KV budget log line.
 - **`--chunked-prefill-size -1` is baked into both launch scripts** (and into
   `ServerArgs._check_paras_config` as a fail-fast assertion). ParaS migration
   cannot preserve mid-chunked-prefill state — `chunked_req` is not part of

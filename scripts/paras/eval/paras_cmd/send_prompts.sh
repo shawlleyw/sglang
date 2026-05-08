@@ -36,6 +36,8 @@ wait "${pids[@]}"
 
 if ! paras_cmd_burst_verify "$TMPDIR" "$LABEL"; then
     paras_cmd_print_completion_file "${LABEL} P1 (sample)" "$TMPDIR/burst_1.json"
+    echo "[${LABEL}] preserving response files at ${TMPDIR} for inspection"
+    trap '' EXIT
     exit 1
 fi
 

@@ -56,12 +56,13 @@ verify_light() {
     local label=$2
     LIGHT_FILE="$file" LABEL="$label" python3 -c '
 import json, os, re, sys
+label = os.environ["LABEL"]
 text = json.load(open(os.environ["LIGHT_FILE"]))["choices"][0]["text"]
 if re.search(r"(\b\w+\b)(\s+\1){5,}", text):
-    print(f"  [{os.environ[\"LABEL\"]}] DEGENERATE")
+    print(f"  [{label}] DEGENERATE")
     sys.exit(1)
 if len(text.strip()) < 10:
-    print(f"  [{os.environ[\"LABEL\"]}] EMPTY/short response (chars={len(text)})")
+    print(f"  [{label}] EMPTY/short response (chars={len(text)})")
     sys.exit(1)
 '
 }
@@ -90,6 +91,8 @@ echo
 echo "================ phase 4: verify burst responses ================"
 if ! paras_cmd_burst_verify "$TMPDIR" "burst"; then
     echo "FAIL: burst responses contain degeneration."
+    echo "preserving response files at ${TMPDIR} for inspection"
+    trap '' EXIT
     exit 1
 fi
 

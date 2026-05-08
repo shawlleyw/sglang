@@ -92,7 +92,7 @@ bash scripts/paras/eval/paras_cmd/kill.sh
 flags above tune the thresholds. Without these flags the launch picks
 defaults that may not fire reliably with `BURST_SIZE=32`.)
 
-## Quick Start (gpt-oss-120b-bf16)
+## Quick Start (gpt-oss-120b-bf16, 4×A100)
 
 ```bash
 conda activate sgl_paras
@@ -106,7 +106,8 @@ export SLEEP_BETWEEN=10
 
 bash scripts/paras/eval/paras_cmd/kill.sh
 
-ENABLE_PARAS=1 NUM_GPUS=4 MEM_FRACTION_STATIC=0.7 \
+# 4-GPU: MEM_FRACTION_STATIC=0.8 (per-rank weights ≈ 57 GiB at TP=4)
+ENABLE_PARAS=1 NUM_GPUS=4 MEM_FRACTION_STATIC=0.8 \
     bash scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh \
     --paras-auto-switch-low 2 \
     --paras-auto-switch-high 8 \
@@ -121,8 +122,19 @@ bash scripts/paras/eval/paras_cmd/autoswitch_test.sh
 bash scripts/paras/eval/paras_cmd/kill.sh
 ```
 
-For 8×A100 gpt-oss canonical deployment, set
-`NUM_GPUS=8 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` on the launch line.
+## Quick Start (gpt-oss-120b-bf16, 8×A100 — canonical deployment)
+
+Same as above except for the launch line:
+
+```bash
+ENABLE_PARAS=1 NUM_GPUS=8 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MEM_FRACTION_STATIC=0.7 \
+    bash scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh \
+    --paras-auto-switch-low 2 \
+    --paras-auto-switch-high 8 \
+    --paras-auto-switch-window 4 \
+    --paras-auto-switch-cooldown-sec 15 \
+    2>&1 | tee "$LOG_FILE" &
+```
 
 ## Detailed Procedure
 
@@ -195,8 +207,17 @@ expected light-load and burst-load values.
 
 ## Important Notes
 
-- **`MEM_FRACTION_STATIC=0.7`** — same canonical test value as manual
-  switch. Override on every launch invocation.
+- **`MEM_FRACTION_STATIC` depends on (model, GPU count)** — same matrix as
+  paras-test-manual-switch. Override on every launch invocation:
+
+  | Model | GPUs | `MEM_FRACTION_STATIC` |
+  |---|---|---|
+  | Qwen3-30B-A3B | 4 or 8 | 0.7 |
+  | gpt-oss-120b-bf16 | 4 | 0.8 |
+  | gpt-oss-120b-bf16 | 8 | 0.7 |
+
+  At an undersized fraction, the server boots through weight load and then
+  dies in `init_memory_pool` with `kv_budget=0.000GiB`.
 - **`--chunked-prefill-size -1` is mandatory** (baked into both launch
   scripts and enforced by the ParaS init assertion). Same constraint as
   manual switch: ParaS migration cannot preserve mid-chunked-prefill state.
