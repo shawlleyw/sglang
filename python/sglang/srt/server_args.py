@@ -1509,6 +1509,18 @@ class ServerArgs:
             assert self.enable_dp_attention, "enable_dp_attention must be set when enable_paras_moe is set"
             assert self.paras_tp_size <= 8 and self.paras_tp_size > 0, "paras_tp_size must be positive when enable_paras_moe is set"
             assert self.tp_size == self.dp_size, "paras moe requires tp_size == dp_size, which means attn tp size is 1"
+            assert not self.disable_radix_cache, (
+                "ParaS migration requires radix cache (it relies on tree_cache.reset() "
+                "to clear stale per-Req references across switches; ChunkCache has no "
+                "equivalent reset semantics). Drop --disable-radix-cache when "
+                "--enable-paras-moe is set."
+            )
+            assert self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0, (
+                "ParaS migration cannot preserve mid-chunked-prefill state "
+                "(chunked_req is not part of the gather/scatter set, and per-token "
+                "kv_indices in req.prefix_indices reference the pre-resize slot "
+                "layout). Pass --chunked-prefill-size -1 when --enable-paras-moe is set."
+            )
             if self.paras_auto_switch:
                 assert 0 < self.paras_auto_switch_low < self.paras_auto_switch_high, (
                     "require 0 < --paras-auto-switch-low < --paras-auto-switch-high"

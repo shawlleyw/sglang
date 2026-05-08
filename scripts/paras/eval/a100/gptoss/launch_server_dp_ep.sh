@@ -84,6 +84,7 @@ python -m sglang.launch_server \
     --enable-dp-attention --enable-dp-lm-head \
     --moe-a2a-backend deepep --deepep-mode auto \
     --max-running-requests "$MAX_RUNNING_REQUESTS" \
+    --chunked-prefill-size -1 \
     "${HYBRID_SWA_FLAGS[@]}" \
     "${CUDA_GRAPH_FLAGS[@]}" \
     "${PARAS_FLAGS[@]}" \

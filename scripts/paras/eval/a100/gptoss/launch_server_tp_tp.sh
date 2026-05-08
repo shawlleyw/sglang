@@ -39,4 +39,5 @@ python -m sglang.launch_server \
     --disable-hybrid-swa-memory \
     --tp-size "$NUM_GPUS" \
     --max-running-requests "$MAX_RUNNING_REQUESTS" \
+    --chunked-prefill-size -1 \
     "${CUDA_GRAPH_FLAGS[@]}"

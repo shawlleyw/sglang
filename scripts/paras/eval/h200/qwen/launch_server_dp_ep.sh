@@ -57,7 +57,6 @@ if [ "$ENABLE_PARAS" = "1" ]; then
         --enable-paras-moe
         --paras-tp-size "$NUM_GPUS"
         --disable-overlap-schedule
-        --chunked-prefill-size -1
         --max-prefill-tokens 32000
     )
 fi
@@ -73,5 +72,7 @@ python -m sglang.launch_server \
     --enable-dp-attention --enable-dp-lm-head \
     --moe-a2a-backend deepep --deepep-mode auto \
     --max-running-requests "$MAX_RUNNING_REQUESTS" \
+    --chunked-prefill-size -1 \
     "${CUDA_GRAPH_FLAGS[@]}" \
-    "${PARAS_FLAGS[@]}"
+    "${PARAS_FLAGS[@]}" \
+    "$@"
