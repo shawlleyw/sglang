@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-to-end ParaS server test: drives steps 3-13 of paras-test-qwen3 / paras-test-gpt-oss.
+# End-to-end ParaS server test: drives steps 3-13 of paras-test-manual-switch.
 # The CALLER is responsible for steps 1 (pkill old server), 2 (launch via
 # launch_server_dp_ep.sh ENABLE_PARAS=1 ...), and 14 (final cleanup).
 #

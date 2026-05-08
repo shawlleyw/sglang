@@ -126,7 +126,7 @@ bash scripts/paras/eval/paras_cmd/e2e_test.sh
 bash scripts/paras/eval/paras_cmd/kill.sh
 ```
 
-Full walkthrough in [`.skills/paras-test-qwen3/SKILL.md`](../../../.skills/paras-test-qwen3/SKILL.md) and [`.skills/paras-test-gpt-oss/SKILL.md`](../../../.skills/paras-test-gpt-oss/SKILL.md).
+Full walkthrough in [`.skills/paras-test-manual-switch/SKILL.md`](../../../.skills/paras-test-manual-switch/SKILL.md) (covers both qwen3 and gpt-oss). Companion skill [`.skills/paras-test-auto-switch/SKILL.md`](../../../.skills/paras-test-auto-switch/SKILL.md) tests the load-driven autoswitch policy.
 
 ## Per-Hardware Launch + Bench Scripts
 
@@ -229,7 +229,7 @@ bash scripts/paras/eval/paras_cmd/e2e_test.sh
 bash scripts/paras/eval/paras_cmd/kill.sh
 ```
 
-See [`.skills/paras-test-qwen3/SKILL.md`](../../../.skills/paras-test-qwen3/SKILL.md) for full walkthrough, expected baselines, and known failure modes.
+See [`.skills/paras-test-manual-switch/SKILL.md`](../../../.skills/paras-test-manual-switch/SKILL.md) for the full walkthrough, expected baselines, and known failure modes (covers both qwen3 and gpt-oss).
 
 ### 3. Microbench one batch (qwen3 dp_ep)
 
@@ -254,8 +254,8 @@ python -m sglang.bench_serving --backend sglang \
 
 ## See Also
 
-- [`.skills/paras-test-qwen3/SKILL.md`](../../../.skills/paras-test-qwen3/SKILL.md) — qwen3 ParaS smoke test (FlashInfer, eager)
-- [`.skills/paras-test-gpt-oss/SKILL.md`](../../../.skills/paras-test-gpt-oss/SKILL.md) — gpt-oss ParaS smoke test (Triton, dual capture)
+- [`.skills/paras-test-manual-switch/SKILL.md`](../../../.skills/paras-test-manual-switch/SKILL.md) — manual `/paras_configure_*` switch test (covers qwen3 FlashInfer-eager and gpt-oss Triton-dual-capture)
+- [`.skills/paras-test-auto-switch/SKILL.md`](../../../.skills/paras-test-auto-switch/SKILL.md) — load-driven autoswitch policy test (cycle 1 light + cooldown + 32-burst + cycle 3 light + assert autoswitch fired)
 - [`.skills/paras-test-peer-access/SKILL.md`](../../../.skills/paras-test-peer-access/SKILL.md) — unit-test skill for KV transfer + weight transfer + request partition
 - `docs/paras/gpt_oss_support.md` — gpt-oss design doc + bug chronicle
 - `test/srt/paras/` — Python test sources driven by `run_paras_tests.sh`

@@ -1,0 +1,32 @@
+Explain photosynthesis: light reactions, Calvin cycle, ATP synthase, chlorophyll. 200 words.
+Describe the French Revolution: causes, key events, reign of terror, Napoleon. 200 words.
+How does TCP/IP work: layers, three-way handshake, IP addressing, routing. 200 words.
+Explain quantum entanglement: Bell states, EPR paradox, QKD. 200 words.
+Describe DNA replication: helicase, primase, polymerase, lagging strand. 200 words.
+How does the brain process visual information: retina to V1, V2, V4, IT cortex. 200 words.
+Explain Einstein's general relativity: spacetime curvature, geodesics, black holes. 200 words.
+Describe the immune system: innate vs adaptive, T cells, B cells, antibodies. 200 words.
+How does a Linux kernel scheduler work: CFS, runqueues, time slices. 200 words.
+Explain plate tectonics: convection, subduction, ridges, hotspots. 200 words.
+Describe the Krebs cycle: substrates, intermediates, NADH/FADH2 production. 200 words.
+How does HTTPS/TLS work: handshake, certificates, key exchange, AES. 200 words.
+Explain the Big Bang: inflation, nucleosynthesis, recombination, CMB. 200 words.
+Describe protein folding: primary, secondary, tertiary, quaternary structures. 200 words.
+How do GPS satellites work: trilateration, atomic clocks, relativistic correction. 200 words.
+Explain neurotransmission: action potential, synaptic cleft, receptor binding. 200 words.
+Describe the carbon cycle: photosynthesis, respiration, ocean exchange, geology. 200 words.
+How does a CPU pipeline work: fetch, decode, execute, memory, writeback. 200 words.
+Explain mitosis vs meiosis: phases, chromosome behavior, end results. 200 words.
+Describe the periodic table organization: groups, periods, electron shells. 200 words.
+How does a transformer architecture work: attention, multi-head, layer norm. 200 words.
+Explain the water cycle: evaporation, condensation, precipitation, runoff. 200 words.
+Describe the fall of the Roman Empire: economic, military, political factors. 200 words.
+How do vaccines work: antigen presentation, memory cells, herd immunity. 200 words.
+Explain genetic mutations: point, frameshift, deletion, insertion, effects. 200 words.
+Describe the Renaissance: humanism, art, science, key figures. 200 words.
+How does machine learning differ from deep learning: features, layers, scale. 200 words.
+Explain enzyme kinetics: Michaelis-Menten, Vmax, Km, inhibition. 200 words.
+Describe how compilers work: lexer, parser, IR, optimizer, codegen. 200 words.
+Explain galaxy formation: dark matter, gas collapse, mergers, types. 200 words.
+Describe cellular respiration: glycolysis, Krebs, electron transport, ATP yield. 200 words.
+How does the stock market work: orders, market makers, indices, volatility. 200 words.
