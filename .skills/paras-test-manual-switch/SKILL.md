@@ -378,6 +378,19 @@ No HTTP runtime toggle exists; the toggle is server-startup-only.
 
 ### gpt-oss-specific notes
 
+- **Test harness uses `/v1/chat/completions`** (not `/v1/completions`). gpt-oss
+  is a reasoning model that requires the harmony chat template to emit
+  `<|return|>` (id 200002) as its EOS. With raw `/v1/completions`, gpt-oss
+  is OOD: it never produces `<|return|>`, runs to `max_tokens`, and the tail
+  decays into chat-completion overrun loops that the regex falsely flags as
+  ParaS bugs. `lib.sh` (paras_cmd_send_completion / paras_cmd_burst_send)
+  was switched to `/v1/chat/completions` and reads the response from
+  `choices[0].message.reasoning_content + choices[0].message.content` (in
+  generation order). The default reasoning effort is `medium` (per
+  `chat_template.jinja`), which means at `max_tokens=200` the model often
+  cuts off mid-`<|channel|>analysis` rather than reaching the final
+  channel — that's intentional and OK for the regex check (cut-off by
+  length without a single-word loop is CLEAN by design).
 - **Use the unsloth BF16 weights**, not `/data/shaoyuw/models/gpt-oss-120b-bf16`
   (older, mislabeled — its MoE expert weights are stored in `float8_e5m2`,
   forcing a slow per-tensor FP8→BF16 conversion). The unsloth release stores
@@ -431,6 +444,14 @@ No HTTP runtime toggle exists; the toggle is server-startup-only.
    pre-redesign Bug 6 symptom — captured EP graph reading freed `kv_indptr`
    memory after dual capture reallocated it. Confirm HEAD is at or after
    `098b8a37a` (per-mode state preservation).
+9. **Single-word loop tails like `It It It It...` or `The The The...`
+   (gpt-oss)**: NOT a ParaS bug — `/v1/completions` endpoint artifact. The
+   model is OOD without the harmony chat template, never emits `<|return|>`,
+   runs to `max_tokens`, tail decays into chat-completion overrun loops that
+   the verify regex flags. Fix: ensure `lib.sh` is using
+   `/v1/chat/completions` (it does as of commit `099705271`). If you see
+   this on a fresh clone, verify by `grep '/v1/chat/completions' lib.sh`
+   and `grep '/v1/completions' lib.sh` — only the chat URL should appear.
 
 ## Companion Skills
 
@@ -451,9 +472,16 @@ No HTTP runtime toggle exists; the toggle is server-startup-only.
   `paras_cmd_send_completion`, `paras_cmd_print_completion_file`.
 - [`scripts/paras/eval/paras_cmd/prompts_diverse.txt`](file:///home/shaoyuw/sglang/scripts/paras/eval/paras_cmd/prompts_diverse.txt) —
   32 distinct technical prompts used by `send_prompts.sh` and
-  `inflight_switch.sh`. Replaces the older 3-fixed-prompts set; diverse
-  prompts avoid the gpt-oss attractor basin (`"Topic N: Write 200 words."`
-  produces ~37 % deterministic degeneration at temperature=0 — methodology
-  artifact, not a correctness bug).
+  `inflight_switch.sh`. Replaces the older 3-fixed-prompts set. (Note: the
+  previously documented "~37% deterministic degeneration on `Topic N`" is
+  now resolved via the `/v1/chat/completions` switch — see "gpt-oss-specific
+  notes" above. The prompts_diverse.txt set is still the recommended default
+  for diversity.)
 - `docs/paras/gpt_oss_support.md` — full gpt-oss design + Bug chronicle.
+- [`test/srt/paras/test_swa_cache_transfer_metadata.py`](file:///home/shaoyuw/sglang/test/srt/paras/test_swa_cache_transfer_metadata.py) —
+  unit-level regression gate for the SWA cache transfer source/destination
+  invariants on both NCCL and peer-access paths. Run via
+  `pytest test/srt/paras/test_swa_cache_transfer_metadata.py` (4 tests, ~2s).
+  Must be 4/4 PASS before any PR touching `cache_transfer/swa.py`,
+  `gather_manager.py`, or `scatter_manager.py`.
 - `test/srt/paras/` — Python unit tests driven by `run_paras_tests.sh`.

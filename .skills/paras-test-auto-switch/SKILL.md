@@ -290,10 +290,21 @@ expected light-load and burst-load values.
   shared helpers used by autoswitch_test.sh:
   `paras_cmd_load_prompts`, `paras_cmd_burst_send`, `paras_cmd_burst_verify`.
 - [`scripts/paras/eval/paras_cmd/prompts_diverse.txt`](file:///home/shaoyuw/sglang/scripts/paras/eval/paras_cmd/prompts_diverse.txt) —
-  32 distinct technical prompts. Diversity matters here even more than for
-  manual switch: gpt-oss has a known prompt-template attractor on
-  `"Topic N: Write 200 words."` that produces ~37% deterministic
-  degeneration at temperature=0, masquerading as a switch-induced bug.
+  32 distinct technical prompts. (Note: the previously documented "~37%
+  deterministic degeneration on `Topic N`" was a `/v1/completions` endpoint
+  artifact specific to gpt-oss — the model is OOD without the harmony chat
+  template and never emits `<|return|>` EOS, producing chat-completion
+  overrun loops the regex falsely flagged. `lib.sh` now uses
+  `/v1/chat/completions` which auto-applies the harmony template; the
+  attractor pattern is no longer reproducible. The diverse-prompt set is
+  still the recommended default.)
+- **Endpoint and response shape**: helpers in `lib.sh`
+  (`paras_cmd_burst_send`, `paras_cmd_burst_verify`) now post to
+  `/v1/chat/completions` with `messages=[{"role": "user", "content": ...}]`
+  and read responses from
+  `choices[0].message.reasoning_content + choices[0].message.content`
+  (generation-order concatenation). The autoswitch_test.sh inherits this
+  automatically; no per-test changes needed.
 - `python/sglang/srt/paras/scheduler_paras_mixin.py` — autoswitch policy
   implementation (search for `paras_auto_switch`, `_paras_auto_switch_step`).
 - `docs/paras/automatic_parallelism_switching.md` — autoswitch policy design
