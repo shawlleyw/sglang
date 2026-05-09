@@ -283,12 +283,38 @@ class ParaSReqScatterManager:
                     start_index = end_index
 
                 self.ep_dst_positions = ep_token_indices
+
+                self._tighten_swa_pool_to_in_window()
             else:
                 for req, rpi in zip(self.local_reqs, req_pool_indices):
                     req.req_pool_idx = rpi
                 self.ep_dst_positions = None
         else:
             self.ep_dst_positions = None
+
+    def _tighten_swa_pool_to_in_window(self) -> None:
+        if not isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+            return
+        if self.layer_specs is None:
+            return
+        sliding_window_size = next(
+            (s.sliding_window_size for s in self.layer_specs
+             if s.kind == "swa" and s.sliding_window_size is not None),
+            None,
+        )
+        if sliding_window_size is None:
+            return
+        for req in self.local_reqs:
+            seqlen_no_last = req.seqlen - 1
+            in_window_start = max(
+                req.swa_evicted_seqlen, seqlen_no_last - sliding_window_size
+            )
+            if in_window_start > 0:
+                oow_full_slots = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, 0:in_window_start
+                ]
+                self.token_to_kv_pool_allocator.free_swa(oow_full_slots)
+                req.swa_evicted_seqlen = in_window_start
 
     def get_new_waiting_queue(self) -> List[Req]:
         return list(self.local_waiting_reqs_after_partition)

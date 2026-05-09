@@ -235,3 +235,99 @@ def test_source_mapping_falls_back_to_live_mapping_when_snapshot_is_absent():
 
     assert result.dtype == torch.int32
     assert result.tolist() == [11, 14]
+
+
+def test_gather_translates_phase_c_freed_destinations_to_padding_slot(monkeypatch):
+    import sglang.srt.paras.cache_transfer.swa as swa_mod
+
+    source_mapping = torch.zeros(64, dtype=torch.int64)
+    live_mapping = torch.zeros(64, dtype=torch.int64)
+
+    source_mapping[5] = 105
+    source_mapping[6] = 106
+
+    live_mapping[20] = 0
+    live_mapping[21] = 0
+    live_mapping[22] = 7
+    live_mapping[23] = 8
+
+    backend = SWACacheTransfer.__new__(SWACacheTransfer)
+    backend.method = "nccl"
+    backend.kv_cache = _KVCache()
+    backend.mgr = _Mgr()
+    backend.group = object()
+    backend.group_size = 1
+    backend.num_local_tokens = 2
+    backend.local_token_indices = torch.tensor([5, 6], dtype=torch.int64)
+    backend.global_num_tokens = [4]
+    backend.global_token_indices = torch.tensor(
+        [20, 21, 22, 23], dtype=torch.int64
+    )
+    backend._full_to_swa_mapping = live_mapping
+    backend.source_full_to_swa_mapping = source_mapping
+
+    captured = {}
+
+    def fake_gather_nccl(
+        k_buffer,
+        v_buffer,
+        num_local_tokens,
+        num_global_tokens,
+        local_token_indices,
+        global_token_indices,
+        global_num_tokens,
+        *args,
+    ):
+        captured["global_token_indices"] = global_token_indices
+
+    monkeypatch.setattr(swa_mod, "do_gather_one_layer_nccl", fake_gather_nccl)
+
+    backend.gather_one_layer(_spec(cap=4))
+
+    assert captured["global_token_indices"].tolist() == [0, 0, 7, 8]
+
+
+def test_scatter_translates_phase_c_freed_destinations_to_padding_slot(monkeypatch):
+    import sglang.srt.paras.cache_transfer.swa as swa_mod
+
+    source_mapping = torch.zeros(64, dtype=torch.int64)
+    live_mapping = torch.zeros(64, dtype=torch.int64)
+
+    for full_idx in [5, 6, 7, 8]:
+        source_mapping[full_idx] = full_idx + 100
+
+    live_mapping[20] = 0
+    live_mapping[21] = 3
+
+    backend = SWACacheTransfer.__new__(SWACacheTransfer)
+    backend.method = "nccl"
+    backend.kv_cache = _KVCache()
+    backend.mgr = _Mgr()
+    backend.group = object()
+    backend.group_size = 2
+    backend.token_partition = [[0, 1], [2, 3]]
+    backend.global_token_indices = torch.tensor([5, 6, 7, 8], dtype=torch.int64)
+    backend.ep_dst_positions = torch.tensor([20, 21], dtype=torch.int64)
+    backend._intra_rank = 0
+    backend._replication_factor = 1
+    backend._per_token_elems = 16
+    backend._recv_full_count = 2
+    backend._num_kv_heads = 4
+    backend._heads_per_rank = 1
+    backend._head_dim = 8
+    backend._total_global_tokens = 4
+    backend._reassembly_groups = 2
+    backend.ep_head_num = 4
+    backend._full_to_swa_mapping = live_mapping
+    backend.source_full_to_swa_mapping = source_mapping
+
+    captured = {}
+
+    def fake_scatter_nccl(*args, **kwargs):
+        captured["ep_dst_positions"] = args[9]
+
+    monkeypatch.setattr(swa_mod, "do_scatter_one_layer_nccl", fake_scatter_nccl)
+
+    backend.scatter_one_layer(_spec(cap=10))
+
+    assert captured["ep_dst_positions"].tolist() == [0, 3]
