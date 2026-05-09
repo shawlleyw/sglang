@@ -329,7 +329,10 @@ def alloc_for_extend(
         req_pool_indices: request pool indices as list
     """
     # free out-of-window swa tokens
-    if isinstance(batch.tree_cache, SWAChunkCache):
+    if (
+        isinstance(batch.tree_cache, SWAChunkCache)
+        and batch.model_config.attention_chunk_size is not None
+    ):
         for req, pre_len in zip(batch.reqs, batch.prefix_lens):
             batch.tree_cache.evict_swa(
                 req, pre_len, batch.model_config.attention_chunk_size
@@ -424,7 +427,10 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     Returns:
         out_cache_loc: allocated cache locations
     """
-    if isinstance(batch.tree_cache, SWAChunkCache):
+    if (
+        isinstance(batch.tree_cache, SWAChunkCache)
+        and batch.model_config.attention_chunk_size is not None
+    ):
         for req in batch.reqs:
             batch.tree_cache.evict_swa(
                 req, req.seqlen - 1, batch.model_config.attention_chunk_size

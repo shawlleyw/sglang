@@ -38,8 +38,12 @@ def recover_request(
     tree_cache: BasePrefixCache,
     tokenizer: Any,
 ):
-    req.last_host_node = tree_cache.root_node
-    req.last_node = tree_cache.root_node
+    if tree_cache.disable:
+        req.last_host_node = None
+        req.last_node = None
+    else:
+        req.last_host_node = tree_cache.root_node
+        req.last_node = tree_cache.root_node
     req.prefix_indices = []
     req.tokenizer = tokenizer
 
@@ -428,8 +432,12 @@ class ParaSReqGatherManager:
         running_batch.return_hidden_states = any(req.return_hidden_states for req in self.global_reqs)
         running_batch.chunked_req = None
         
+        if running_batch.tree_cache.disable:
+            last_node = None
+        else:
+            last_node = running_batch.tree_cache.root_node
         for req in running_batch.reqs:
-            req.last_node = running_batch.tree_cache.root_node
+            req.last_node = last_node
         
         # Get the last token from each request (for decode input)
         input_ids_list = []
