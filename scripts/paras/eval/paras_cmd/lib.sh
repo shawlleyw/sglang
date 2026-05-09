@@ -21,7 +21,11 @@ PRINT_CHARS=${PRINT_CHARS:-300}
 BURST_SIZE=${BURST_SIZE:-32}
 MAX_TOKENS=${MAX_TOKENS:-200}
 
-# Send a /v1/completions request and print "[label] <text>" with the response.
+# Send a /v1/chat/completions request and print "[label] <text>" with the response.
+# gpt-oss requires the harmony chat template (auto-applied by /v1/chat/completions);
+# raw /v1/completions skips it and the model never emits <|return|> EOS, so use
+# the chat endpoint exclusively. Response field is choices[0].message.content
+# (which contains the raw harmony output without a reasoning-parser configured).
 # Usage: paras_cmd_send_completion <label> <prompt> [max_tokens=200] [timeout=60] [save_path=]
 # If save_path is set, also writes the raw JSON response to that file.
 paras_cmd_send_completion() {
@@ -36,14 +40,14 @@ paras_cmd_send_completion() {
 import os, json
 print(json.dumps({
     "model": os.environ["MODEL_NAME"],
-    "prompt": os.environ["PROMPT"],
+    "messages": [{"role": "user", "content": os.environ["PROMPT"]}],
     "max_tokens": int(os.environ["MAX_TOKENS"]),
     "temperature": 0,
 }))
 ')
 
     local resp
-    resp=$(curl -s --max-time "$timeout" "http://${HOST}:${PORT}/v1/completions" \
+    resp=$(curl -s --max-time "$timeout" "http://${HOST}:${PORT}/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -d "$payload")
     local rc=$?
@@ -62,7 +66,9 @@ label = os.environ["LABEL"]
 n = int(os.environ["PRINT_CHARS"])
 try:
     d = json.loads(os.environ["RESP"])
-    print(f"[{label}]", d["choices"][0]["text"][:n])
+    msg = d["choices"][0].get("message", {})
+    text = (msg.get("reasoning_content") or "") + (msg.get("content") or "")
+    print(f"[{label}]", text[:n])
 except Exception as e:
     print(f"[{label}] PARSE_ERROR:", e, file=sys.stderr)
     print(os.environ["RESP"][:500], file=sys.stderr)
@@ -77,7 +83,7 @@ paras_cmd_build_payload() {
 import os, json
 print(json.dumps({
     "model": os.environ["MODEL_NAME"],
-    "prompt": os.environ["PROMPT"],
+    "messages": [{"role": "user", "content": os.environ["PROMPT"]}],
     "max_tokens": int(os.environ["MAX_TOKENS"]),
     "temperature": 0,
 }))
@@ -85,7 +91,8 @@ print(json.dumps({
 }
 
 # Print the [label] text for a JSON file. Use after a `wait` on a backgrounded
-# curl that wrote its response to <json_path>.
+# curl that wrote its response to <json_path>. Reads chat-completions response
+# shape: choices[0].message.content (+ reasoning_content if parser is enabled).
 # Usage: paras_cmd_print_completion_file <label> <json_path>
 paras_cmd_print_completion_file() {
     local label=$1
@@ -96,7 +103,9 @@ label = os.environ["LABEL"]
 n = int(os.environ["PRINT_CHARS"])
 try:
     d = json.load(open(os.environ["PATH_"]))
-    print(f"[{label}]", d["choices"][0]["text"][:n])
+    msg = d["choices"][0].get("message", {})
+    text = (msg.get("reasoning_content") or "") + (msg.get("content") or "")
+    print(f"[{label}]", text[:n])
 except Exception as e:
     print(f"[{label}] PARSE_ERROR:", e, file=sys.stderr)
     sys.exit(2)
@@ -138,7 +147,7 @@ paras_cmd_burst_send() {
     for _i in "${!_prompts_ref[@]}"; do
         _payload=$(paras_cmd_build_payload "${_prompts_ref[$_i]}" "$_max_tokens")
         _n=$((_i + 1))
-        curl -s --max-time "$_timeout" "http://${HOST}:${PORT}/v1/completions" \
+        curl -s --max-time "$_timeout" "http://${HOST}:${PORT}/v1/chat/completions" \
             -H "Content-Type: application/json" -d "$_payload" \
             > "$_tmpdir/burst_${_n}.json" &
         _pids_ref+=("$!")
@@ -159,7 +168,8 @@ paras_cmd_burst_verify() {
 import json, re, sys
 try:
     d = json.load(open('$_f'))
-    text = d['choices'][0]['text']
+    msg = d['choices'][0].get('message', {})
+    text = (msg.get('reasoning_content') or '') + (msg.get('content') or '')
     sys.exit(0 if re.search(r'(\b\w+\b)(\s+\1){5,}', text) else 1)
 except Exception:
     sys.exit(2)

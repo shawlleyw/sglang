@@ -111,7 +111,7 @@ class SWACacheTransfer(CacheTransferBase):
         """
         if full_indices is None or full_indices.numel() == 0:
             return full_indices
-        snapshot = self.source_full_to_swa_mapping
+        snapshot = getattr(self, "source_full_to_swa_mapping", None)
         if snapshot is None:
             return self._full_to_swa(full_indices)
         original_dtype = full_indices.dtype
@@ -253,10 +253,10 @@ class SWACacheTransfer(CacheTransferBase):
         swa_local = self._full_to_swa_source(local_indices)
 
         # P3 fix: build per-rank capped global_token_indices, then translate.
-        # self.global_token_indices is the flat concatenation of all EP ranks'
-        # tokens (uncapped).  We must slice each rank's chunk to
-        # layer_global_num[i] entries before translation. These are EP-source
-        # positions, so use the snapshot mapping.
+        # self.global_token_indices is the flat concatenation of destination TP
+        # token slots (uncapped).  We must slice each rank's chunk to
+        # layer_global_num[i] entries before translation. These are destination
+        # positions, so use the live post-resize mapping.
         if self.global_token_indices is not None and num_global > 0:
             start = 0
             capped_parts = []
@@ -265,7 +265,7 @@ class SWACacheTransfer(CacheTransferBase):
                 capped_parts.append(self.global_token_indices[start:start + take])
                 start += n_full
             global_indices_full_capped = torch.cat(capped_parts)
-            swa_global = self._full_to_swa_source(global_indices_full_capped)
+            swa_global = self._full_to_swa(global_indices_full_capped)
         else:
             swa_global = self.global_token_indices
 
@@ -362,7 +362,27 @@ class SWACacheTransfer(CacheTransferBase):
             if layer_num == 0:
                 return
             tp_positions_swa = self._full_to_swa_source(tp_positions_full)
-            ep_dst_pos_swa = self._full_to_swa(ep_dst_pos_full)
+            # Peer-access writes directly into remote EP buffers. Pass
+            # ep_dst_pos_full WITHOUT translation. Applying the local rank's
+            # live full->SWA mapping to remote-rank positions would turn valid
+            # remote slots into padding slot 0 (the local mapping only
+            # describes THIS rank's freshly allocated EP slots).
+            #
+            # Structural [1..N] guarantee — three invariants from
+            # ParaSReqScatterManager.reorchestrate_cache:
+            #   (1) paras_resize_and_clear resets each rank's full and SWA
+            #       sub-allocators to free_pages = arange(1, new_size+1).
+            #   (2) Exactly ONE alloc(num_local_tokens) follows on each rank,
+            #       advancing both inner allocators in lockstep so
+            #       full_to_swa_index_mapping[i] == i for i in [1..N].
+            #   (3) token_partition is built from the same local_reqs ordering
+            #       on every rank.
+            # Together these guarantee that for token j on destination rank e:
+            #   full_slot_e[j] == swa_slot_e[j] == my_s + local_idx + 1
+            # so the inferred remote full destination position equals the
+            # remote SWA position bit-for-bit. No mapping lookup is needed
+            # and the kernel can index the remote rank's SWA pool directly.
+            ep_dst_pos_swa = ep_dst_pos_full
             do_scatter_one_layer_peer_access(
                 self._local_buffer_ptr,
                 self._peer_buffer_ptrs,

@@ -57,14 +57,22 @@ pip install -e python/ -q --no-deps
 # qwen3 defaults in lib.sh match — no env overrides needed.
 bash scripts/paras/eval/paras_cmd/kill.sh                            # step 1
 
-ENABLE_PARAS=1 NUM_GPUS=4 MEM_FRACTION_STATIC=0.7 \
+# PARAS_AUTO_SWITCH=0 disables load-driven autoswitch so the test exercises
+# manual /paras_configure_* endpoints only. See "Disabling autoswitch" below.
+ENABLE_PARAS=1 PARAS_AUTO_SWITCH=0 NUM_GPUS=4 MEM_FRACTION_STATIC=0.7 \
     bash scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh \
+    --no-paras-auto-switch \
     2>&1 | tee /tmp/sglang_paras_test.log &                          # step 2
 
 bash scripts/paras/eval/paras_cmd/e2e_test.sh                        # steps 3-13
 
 bash scripts/paras/eval/paras_cmd/kill.sh                            # step 14
 ```
+
+> Note: `PARAS_AUTO_SWITCH=0` is wired in the gpt-oss launch script (lines 68-70)
+> but **not** in the qwen3 launch script as of this writing — pass
+> `--no-paras-auto-switch` directly via `"$@"` for qwen3 until the qwen launch
+> script gains the same toggle.
 
 ## Quick Start (gpt-oss-120b-bf16, 4×A100)
 
@@ -81,8 +89,10 @@ export SLEEP_BETWEEN=10
 
 bash scripts/paras/eval/paras_cmd/kill.sh                            # step 1
 
-# 4-GPU config: bump MEM_FRACTION_STATIC to 0.8 (per-rank weights ≈ 57 GiB)
-ENABLE_PARAS=1 NUM_GPUS=4 MEM_FRACTION_STATIC=0.8 \
+# 4-GPU config: bump MEM_FRACTION_STATIC to 0.8 (per-rank weights ≈ 57 GiB).
+# PARAS_AUTO_SWITCH=0 disables load-driven autoswitch — REQUIRED for any
+# manual-switch correctness test. See "Disabling autoswitch" below.
+ENABLE_PARAS=1 PARAS_AUTO_SWITCH=0 NUM_GPUS=4 MEM_FRACTION_STATIC=0.8 \
     bash scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh \
     2>&1 | tee "$LOG_FILE" &                                         # step 2
 
@@ -98,10 +108,29 @@ Same as above except the launch line uses 8 GPUs and `MEM_FRACTION_STATIC=0.7`
 the qwen3 baseline):
 
 ```bash
-ENABLE_PARAS=1 NUM_GPUS=8 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MEM_FRACTION_STATIC=0.7 \
+ENABLE_PARAS=1 PARAS_AUTO_SWITCH=0 NUM_GPUS=8 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MEM_FRACTION_STATIC=0.7 \
     bash scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh \
     2>&1 | tee "$LOG_FILE" &
 ```
+
+### MHA-only path (`--disable-hybrid-swa-memory`)
+
+To force gpt-oss into MHA-only mode (no separate SWA sub-pool — every layer's
+KV cache lives in the full pool), pass `--disable-hybrid-swa-memory` after the
+launch script's `"$@"` forwarding:
+
+```bash
+ENABLE_PARAS=1 PARAS_AUTO_SWITCH=0 NUM_GPUS=8 MEM_FRACTION_STATIC=0.7 \
+    bash scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh \
+    --disable-hybrid-swa-memory \
+    2>&1 | tee "$LOG_FILE" &
+```
+
+This routes ALL 36 gpt-oss layers (full + SWA-classified) through the MHA
+cache transfer backend at switch time. Use this configuration to isolate
+SWA-cache-transfer-specific bugs from upstream-of-cache-transfer bugs (e.g.,
+to confirm whether a bug lives in `SWACacheTransfer` or in shared scheduler /
+req-metadata / cuda-graph code).
 
 ## Detailed Procedure
 
@@ -292,6 +321,24 @@ bash scripts/paras/eval/paras_cmd/kill.sh
 | inflight_switch tp (step 11) | 0/32 degenerate after migration | any degenerate response or crash |
 | inflight_switch ep (step 12) | 0/32 degenerate after migration | any degenerate response or crash |
 | Server errors (step 13) | None | any scheduler exception, NVLink IPC error, or CUDA error |
+
+### Disabling autoswitch
+
+`paras_auto_switch=True` is the server default — under load the policy fires
+EP↔TP switches automatically, which contaminates manual-switch correctness
+tests. ALWAYS disable it for manual-switch tests:
+
+| Mechanism | Where | Notes |
+|---|---|---|
+| `PARAS_AUTO_SWITCH=0` env var | gpt-oss launch script (lines 68-70) | Translated to `--no-paras-auto-switch` automatically. |
+| `--no-paras-auto-switch` CLI flag | sglang server | Direct; works for any model. Pass via `"$@"` to the launch script. |
+
+Confirmed by code audit: setting either reliably stops ALL automatic switches.
+The flag results in `_paras_auto_policy = None` in
+`scheduler_paras_mixin.init_paras_config()`, and every access path
+(`paras_auto_observe`, `paras_auto_pick_signal`,
+`_paras_auto_clear_window_on_switch`) returns early when the policy is `None`.
+No HTTP runtime toggle exists; the toggle is server-startup-only.
 
 ## Important Notes
 

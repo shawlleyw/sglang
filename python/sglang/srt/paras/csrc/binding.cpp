@@ -239,6 +239,16 @@ void launch_peer_access_kv_transfer_py(
 ) {
     TORCH_CHECK(peer_buffer_ptrs.is_cuda(), "peer_buffer_ptrs must be on GPU");
     TORCH_CHECK(local_token_indices.is_cuda(), "local_token_indices must be on GPU");
+    TORCH_CHECK(
+        (head_dim * elem_size) % 16 == 0,
+        "launch_peer_access_kv_transfer: head_dim * elem_size must be a "
+        "multiple of 16 for the int4-vectorized inner loop "
+        "(int4_per_head = (head_dim * elem_size) >> 4 in peer_access_transfer.cu). "
+        "Got head_dim=", head_dim, ", elem_size=", elem_size,
+        ", product=", head_dim * elem_size,
+        ", trailing bytes=", (head_dim * elem_size) % 16,
+        " would be silently truncated per head."
+    );
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_peer_access_kv_transfer(
         local_buffer_ptr,
@@ -282,6 +292,16 @@ void launch_peer_access_kv_scatter_py(
     TORCH_CHECK(tp_token_positions.is_cuda(), "tp_token_positions must be on GPU");
     TORCH_CHECK(token_to_rank.is_cuda(), "token_to_rank must be on GPU");
     TORCH_CHECK(ep_dst_positions.is_cuda(), "ep_dst_positions must be on GPU");
+    TORCH_CHECK(
+        (head_dim * elem_size) % 16 == 0,
+        "launch_peer_access_kv_scatter: head_dim * elem_size must be a "
+        "multiple of 16 for the int4-vectorized inner loop "
+        "(int4_per_head = (head_dim * elem_size) >> 4 in peer_access_transfer.cu). "
+        "Got head_dim=", head_dim, ", elem_size=", elem_size,
+        ", product=", head_dim * elem_size,
+        ", trailing bytes=", (head_dim * elem_size) % 16,
+        " would be silently truncated per head."
+    );
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_peer_access_kv_scatter(
         local_buffer_ptr,

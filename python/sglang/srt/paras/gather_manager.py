@@ -248,20 +248,22 @@ class ParaSReqGatherManager:
         mgr = get_global_paras_memory_manager()
         method = self.method
 
-        has_swa = self.layer_specs is not None and any(
+        # `has_swa` requires BOTH that layer_specs labels some layers "swa"
+        # AND that the allocator is a hybrid SWAKVPool. In --disable-hybrid-swa-memory
+        # mode the model's `paras_layer_specs` may still label some layers SWA
+        # (gpt_oss.py builds the full classification unconditionally), but the
+        # allocator is a flat MHATokenToKVPool with no inner swa_kv_pool — so
+        # SWACacheTransfer cannot run. Fall back to routing every layer
+        # (including SWA-classified ones) through MHACacheTransfer.
+        specs_have_swa = self.layer_specs is not None and any(
             s.kind == "swa" for s in self.layer_specs
         )
-        if has_swa:
-            assert isinstance(kv_cache, SWAKVPool), (
-                f"Hybrid model (layer_specs contains SWA) requires SWAKVPool, "
-                f"got {type(kv_cache).__name__}. SWAKVPool holds both inner "
-                f"full_kv_pool and swa_kv_pool needed for per-layer dispatch."
-            )
-        else:
-            assert isinstance(kv_cache, (MHATokenToKVPool, SWAKVPool)), (
-                f"Expected MHATokenToKVPool or SWAKVPool, "
-                f"got {type(kv_cache).__name__}."
-            )
+        pool_is_swa = isinstance(kv_cache, SWAKVPool)
+        has_swa = specs_have_swa and pool_is_swa
+        assert isinstance(kv_cache, (MHATokenToKVPool, SWAKVPool)), (
+            f"Expected MHATokenToKVPool or SWAKVPool, "
+            f"got {type(kv_cache).__name__}."
+        )
         peer_addresses = (
             self.peer_ctx.peer_addresses
             if method == "peer_access" and self.peer_ctx
@@ -322,7 +324,13 @@ class ParaSReqGatherManager:
                     sliding_window_size=None,
                 )
 
-            backend = swa_backend if spec.kind == "swa" else mha_backend
+            # Route SWA-classified layers to swa_backend ONLY when it exists
+            # (SWAKVPool present). Under --disable-hybrid-swa-memory the
+            # SWA-classified layers fall back to mha_backend.
+            backend = (
+                swa_backend if (spec.kind == "swa" and swa_backend is not None)
+                else mha_backend
+            )
             backend.gather_one_layer(spec)
 
             # peer_access path needs per-layer barrier (ALL ranks participate).
