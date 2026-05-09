@@ -338,6 +338,8 @@ def alloc_for_extend(
                 req, pre_len, batch.model_config.attention_chunk_size
             )
 
+    batch.maybe_evict_swa()
+
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
@@ -435,6 +437,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             batch.tree_cache.evict_swa(
                 req, req.seqlen - 1, batch.model_config.attention_chunk_size
             )
+
+    batch.maybe_evict_swa()
 
     bs = batch.seq_lens.shape[0]
 

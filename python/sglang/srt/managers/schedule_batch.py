@@ -485,6 +485,10 @@ class Req:
         # The length of KV that have been removed in local attention chunked prefill
         self.evicted_seqlen_local = 0
 
+        # The length of leading SWA-pool slots that have been freed for this request
+        # by ScheduleBatch._evict_swa during sliding-window decode-time eviction.
+        self.swa_evicted_seqlen = 0
+
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
 
@@ -1565,6 +1569,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_v2_eagle(self):
         # FIXME: finally deprecate is_v2_eagle
         return self.enable_overlap and self.spec_algorithm.is_eagle()
+
+    def maybe_evict_swa(self):
+        if not self.forward_mode.is_decode():
+            return
+        sliding_window_size = getattr(self.tree_cache, "sliding_window_size", None)
+        if sliding_window_size is None:
+            return
+        for req in self.reqs:
+            self._evict_swa(req, req.seqlen - 1, sliding_window_size)
+
+    def _evict_swa(self, req: Req, pre_len: int, sliding_window_size: int):
+        new_swa_evicted_seqlen = max(
+            req.swa_evicted_seqlen, pre_len - sliding_window_size
+        )
+        if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
+            free_slots = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx,
+                req.swa_evicted_seqlen : new_swa_evicted_seqlen,
+            ]
+            self.token_to_kv_pool_allocator.free_swa(free_slots)
+            req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
