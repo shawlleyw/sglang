@@ -234,12 +234,30 @@ Unlimited round-trips are supported without explicit state caching:
 | `nvlink_peer_access_guielines.md` | NVLink store optimization guidelines (grid config, vectorization, alignment) |
 | `exploration_notes_kv_cache_peer_access.md` | Development notes: bugs found, CUDA IPC analysis, design tradeoffs |
 
+## Unsupported Features (hard constraints)
+
+ParaS migration interacts with several scheduler subsystems in ways that are not currently safe. The following features must be **disabled** when `--enable-paras-moe` is set; the relevant assertions live in [`server_args._check_paras_config`](file:///home/shaoyuw/sglang/python/sglang/srt/server_args.py) and [`scheduler_paras_mixin`](file:///home/shaoyuw/sglang/python/sglang/srt/paras/scheduler_paras_mixin.py).
+
+| Feature | Required flag | Why |
+|---|---|---|
+| Radix cache | `--disable-radix-cache` | ParaS uses `ChunkCache` / `SWAChunkCache`. The radix cache's tree state (lock_refs, tombstones, LRU lists) would not survive `tree.reset()` at switch boundaries, and prefix sharing is not a project priority for ParaS. |
+| Chunked prefill | `--chunked-prefill-size -1` | ParaS migration cannot preserve mid-chunked-prefill state: `chunked_req` is not part of the gather/scatter request set, and per-token `kv_indices` in `req.prefix_indices` reference the pre-resize slot layout that paras_resize_and_clear destroys. |
+| Overlap scheduler | `--disable-overlap-schedule` | The overlap scheduler runs the next forward pass while the previous result is still being processed. Switching mode mid-overlap would require migrating an in-flight forward's intermediate state, which is not modeled by the gather/scatter contract. Asserted at runtime in `SchedulerParasMixin.paras_configure_*`. |
+
+In addition, ParaS asserts these positive requirements at startup:
+
+- `--enable-dp-attention` and `--enable-dp-lm-head` (DP attention is the EP-mode shape).
+- `0 < --paras-tp-size <= 8`.
+- `--tp-size == --dp-size` (i.e., `attn_tp_size == 1`).
+
+Both launch scripts under [`scripts/paras/eval/`](file:///home/shaoyuw/sglang/scripts/paras/eval/) bake all of the above into `PARAS_FLAGS` automatically when `ENABLE_PARAS=1`.
+
 ## Limitations and Future Work
 
 1. **Head replication under SWA remains rare**: MHA replication is fully tested. Hybrid SWA replication is validated at replication factor 2 by the dedicated SWA cache-transfer suite, but production GPT-OSS / Gemma configs usually satisfy `num_kv_heads >= paras_tp_size`, so `SWACacheTransfer` emits a warning when replication is active to encourage end-to-end validation of the rare configuration.
 
 2. **`dp_size > 1`**: Currently only `paras_dp_size == 1` is supported.
 
-3. **Dynamic switching**: Both directions are triggered manually via HTTP. An automatic policy that monitors batch size and switches at the crossover point would enable fully adaptive serving.
+3. **FP8 support**: Kernels and memory manager support FP8 weights but FP8 KV cache is not yet wired through.
 
-4. **FP8 support**: Kernels and memory manager support FP8 weights but FP8 KV cache is not yet wired through.
+4. **Cross-request prefix sharing**: not available for ParaS (we run with `--disable-radix-cache`). Re-enabling would require porting tombstone-aware insert from PR #17220 to the ParaS path. Not on the roadmap.
