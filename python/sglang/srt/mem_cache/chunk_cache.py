@@ -42,7 +42,7 @@ class ChunkCache(BasePrefixCache):
         return True
 
     def reset(self):
-        pass
+        self.protected_size_ = 0
 
     def match_prefix(self, **unused_kwargs) -> MatchResult:
         return MatchResult(
