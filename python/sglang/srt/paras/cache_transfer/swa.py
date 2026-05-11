@@ -5,7 +5,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.paras.cache_transfer.base import CacheTransferBase, LayerCacheSpec
+from sglang.srt.paras.cache_transfer.base import CacheTransferBase
+from sglang.srt.paras.layers.utils import LayerCacheSpec
 from sglang.srt.paras.cache_transfer.utils import (
     do_gather_one_layer_nccl,
     do_gather_one_layer_peer_access,

@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator, SWATokenToKVPoolAllocator
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+from sglang.srt.paras.layers.utils import LayerCacheSpec
 from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
 from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager

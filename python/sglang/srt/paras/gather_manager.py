@@ -23,7 +23,7 @@ from sglang.srt.paras.cache_transfer.utils import (
 )
 
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+from sglang.srt.paras.layers.utils import LayerCacheSpec
 from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
 from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 
