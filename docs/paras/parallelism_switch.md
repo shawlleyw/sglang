@@ -207,9 +207,23 @@ Three invariants together ensure correctness when user requests, control message
 
 For the auto-switch path, the policy-emitted `ParaSAutoSwitchReq` is sent **directly** from the scheduler to TokenizerManager via `send_to_tokenizer` (PUSH bound to `tokenizer_ipc_name`, where TokenizerManager PULLs). It does **not** transit DetokenizerManager. The full round-trip is four ZMQ hops: scheduler → TM (signal), TM → DPC (configure dispatch), DPC → scheduler (configure delivery), scheduler → TM (configure response). At ~30-50 µs per local ZMQ hop, the entire control-plane overhead is on the order of 200 µs — negligible against the ≈88-163 ms gather/scatter cost of the switch itself.
 
-### Known Limitations
+### Concurrent Control RPC Guard
 
-- **Concurrent control RPCs are unsafe during a switch.** `paras_configure_tp/ep` overwrites `comm._fan_out` on every TokenizerManager communicator (all 18, not just the configure communicator). Any in-flight control RPC — `flush_cache`, `update_weights_*`, `get_internal_state`, profile, etc. — that is awaiting `_result_event` when the switch fires will see its expected response count change under it, returning prematurely with truncated results and crashing TM when late responses arrive at a cleared `_result_values`. Serialize control RPCs externally during periods when switches may fire. This is a pre-existing property of the HTTP-triggered path; the auto-switch path widens the window because timing is no longer human-controlled.
+`paras_configure_tp/ep` overwrites `comm._fan_out` on every TokenizerManager communicator (all 18, not just the configure communicator). If any other control RPC — `flush_cache`, `update_weights_*`, `get_internal_state`, profile, etc. — were in flight at the moment of the mutation, its expected response count would change under it, leading to premature event firing with truncated results, or a hang followed by `AttributeError` when late responses arrive at a cleared `_result_values`.
+
+The guard is bi-directional and enforced at runtime by two shared counters wired through `_Communicator`:
+
+- `_control_rpc_in_flight_counter` — every non-paras communicator increments on `__call__` entry and decrements in `finally`. `paras_configure_tp/ep` checks this counter at entry: if non-zero, it raises `RuntimeError` because the global `_fan_out` mutation would corrupt the in-flight call's accounting.
+- `_paras_switch_counter` — `paras_configure_tp/ep` increments on entry and decrements in `finally`. Every non-paras `_Communicator.__call__` checks this counter at entry: if non-zero, it raises `RuntimeError` because the switch is mid-mutation.
+
+`paras_configure_communicator` is exempt from both counters — it is the communicator that legitimately fires during a switch. Duplicate `ParaSAutoSwitchReq` signals from concurrent DP ranks still serialize cleanly via the existing `_ready_queue` on this communicator, and each duplicate task sees the same target (so the additional increments of `_paras_switch_counter` are correctly bracketed by their own `finally`).
+
+The counter design (rather than a boolean flag) is required because duplicate auto-switch tasks can nest: with a boolean, the first task's `finally` would clear the guard while the second task is still mid-switch. Counters increment/decrement symmetrically so the guard stays raised until all concurrent switches complete.
+
+Both guards raise `RuntimeError` rather than `assert`, so they survive `-O` interpreter flags. The application is expected to serialize control RPCs around switches; the guard is defensive and should never fire in correctly-coordinated code.
+
+### Other Known Limitations
+
 - **Pathological policy configuration can wedge the communicator queue.** With `paras_auto_switch_cooldown_sec=0` and `paras_auto_switch_window=1`, a TP→EP fire can land immediately after an EP→TP switch completes and overwrite `_fan_out` while queued duplicate tasks from the prior signal are still waiting on their responses, hanging the communicator. The default settings (`cooldown_sec=60`, `window=32`) make this physically impossible because the minimum inter-fire interval exceeds the maximum switch latency by more than two orders of magnitude.
 
 ## Round-Trip Support (EP→TP→EP→TP...)
