@@ -10,9 +10,10 @@ The implementation lives in:
 - `python/sglang/srt/paras/scheduler_paras_mixin.py` — `ParasAutoSwitchPolicy` class, `paras_auto_observe`, `paras_auto_pick_signal`
 - `python/sglang/srt/managers/io_struct.py` — `ParaSAutoSwitchReq` message type
 - `python/sglang/srt/managers/scheduler.py` — observe + signal-emit hook in `event_loop_normal`
-- `python/sglang/srt/managers/detokenizer_manager.py` — pass-through forwarder
-- `python/sglang/srt/managers/tokenizer_communicator_mixin.py` — handler that calls existing `paras_configure_tp/ep`
+- `python/sglang/srt/managers/tokenizer_manager.py` — `_handle_paras_auto_switch_req` (dispatcher entry); calls existing `paras_configure_tp/ep`
 - `python/sglang/srt/paras/gather_manager.py` and `scatter_manager.py` — extended to preserve `waiting_queue` across the switch
+
+See [`parallelism_switch.md`](parallelism_switch.md) for the underlying EP↔TP switch primitive — including the unified memory manager, gather/scatter, weight transfer, control-plane wiring, and the **race-safety invariants** that govern interleaved user-request / configure dispatch (those invariants apply to both this auto-switch path and the HTTP-triggered path).
 
 ## 2. When to Switch — Policy Definition
 
@@ -75,7 +76,7 @@ Two side-effects of this design — duplicate signals from concurrent fires acro
 
 ## 3. How to Trigger — Control-Plane Flow
 
-The auto-switch reuses the existing HTTP path's control plane verbatim. Both flows converge at `TokenizerManager.paras_configure_tp/ep`, which is the single source of truth for adjusting `_fan_out`, the DataParallelController worker list, and the per-scheduler `paras_configure_tp/ep` execution.
+The auto-switch reuses the existing HTTP path's control plane verbatim. Both flows converge at `TokenizerManager.paras_configure_tp/ep`, which is the single source of truth for adjusting `_fan_out`, the DataParallelController worker list, and the per-scheduler `paras_configure_tp/ep` execution. The race-safety invariants that govern this convergence (TM→DPC ZMQ FIFO, per-iteration sequencing in the scheduler, idempotent fan-out across duplicate signals) are documented in [`parallelism_switch.md` § Control Plane](parallelism_switch.md#control-plane); this section describes only the policy-specific additions on top of that primitive.
 
 ### 3.1 Side-by-side comparison
 
@@ -90,10 +91,7 @@ GET /paras_configure_tp                   Scheduler rank N decodes
                                           ↓
                                           send_to_tokenizer.send_output(
                                             ParaSAutoSwitchReq(target=...))
-                                          ↓
-                                          DetokenizerManager
-                                            (pass-through forwarder)
-                                          ↓
+                                          ↓  (direct PUSH to tokenizer_ipc_name)
         TokenizerManager.paras_configure_tp() ← both paths converge here
                                           ↓
                                           adjust comm._fan_out
@@ -118,7 +116,7 @@ GET /paras_configure_tp                   Scheduler rank N decodes
                                           paras_configure_tp/ep
 ```
 
-The new `ParaSAutoSwitchReq` is the only added message type. Its handler in `TokenizerManager._result_dispatcher` is a two-line dispatch:
+The `ParaSAutoSwitchReq` is the only new message type added by this policy. The scheduler emits it via `send_to_tokenizer`, which is a PUSH socket bound to `tokenizer_ipc_name` — the same socket TokenizerManager PULLs from for scheduler-feedback messages. The signal goes **directly** to TokenizerManager; there is no DetokenizerManager hop on this path. Its handler in `TokenizerManager._result_dispatcher` is a two-line dispatch:
 
 ```python
 def _handle_paras_auto_switch_req(self, req):
@@ -128,21 +126,9 @@ def _handle_paras_auto_switch_req(self, req):
         asyncio.create_task(self.paras_configure_ep())
 ```
 
-This is intentional: the auto path adds *one* hop in front of the HTTP entrypoint, leaving everything downstream unchanged.
+The auto path adds *one* asyncio task in front of the HTTP entrypoint, leaving everything downstream unchanged. See [`parallelism_switch.md` § Signal Path and Latency](parallelism_switch.md#signal-path-and-latency) for the full hop breakdown and ~200 µs control-plane overhead estimate.
 
-### 3.2 Why route through the TokenizerManager
-
-A naive auto-switch could shortcut by injecting `ParaSConfigureReqInput` directly into the scheduler-side broadcast. That implementation **breaks correctness**: TokenizerManager still has `_fan_out = dp_size` and DataParallelController still has the EP worker list. After the schedulers swap to TP, new requests would continue to be load-balanced to all `dp_size` ranks instead of being directed to TP rank 0. Sub-rank-0 ranks would queue requests they no longer process, and the TP forward pass would deadlock waiting for collective participation from ranks that have nothing to contribute.
-
-Routing through TokenizerManager preserves the three coordinated state changes the HTTP path performs:
-
-| Component | What it changes |
-|---|---|
-| TokenizerManager | `comm._fan_out` (1 in TP, `dp_size` in EP) — controls how many ranks receive future requests. |
-| DataParallelController | `self.workers` slice (`paras_tp_workers` = every Nth, `paras_ep_workers` = all). |
-| Schedulers | `paras_parallelism_config`, `tp_size`, `tp_group`, `attn_tp_*`, KV pool, attention backend, weight layout, CUDA graph set. |
-
-### 3.3 Where the signal is emitted
+### 3.2 Where the signal is emitted
 
 The signal-emit site is in `event_loop_normal` immediately after `process_batch_result`:
 

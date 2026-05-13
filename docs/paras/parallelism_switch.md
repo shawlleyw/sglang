@@ -175,6 +175,43 @@ The request propagates: HTTP → TokenizerManager (adjusts fan_out) → DataPara
 
 No changes to tokenizer or detokenizer code are needed.
 
+An in-process policy can also drive the switch automatically without HTTP triggering. The policy decision and ZMQ signaling live in [`parallelism_switch_policy.md`](parallelism_switch_policy.md); the **control-plane safety properties** documented below apply uniformly to both the HTTP and the auto-switch paths because they converge on the same `TokenizerManager.paras_configure_tp/ep` entry point.
+
+### Why Tokenizer-First (not Scheduler-First)
+
+Three pieces of state must change in lockstep for a mode switch to be globally consistent:
+
+| Component | What it owns |
+|---|---|
+| TokenizerManager | `comm._fan_out` for each of the 18 control-message communicators (how many `*ReqOutput` responses to expect). |
+| DataParallelController | `self.workers` (the active subset of scheduler sockets) and `control_message_step` (stride for control fan-out). |
+| Schedulers | `paras_parallelism_config`, `tp_size`, `tp_group`, `attn_tp_*`, KV pool, attention backend, weight layout, CUDA graph set. |
+
+The control plane funnels through TokenizerManager because both HTTP and policy-triggered paths land in `paras_configure_tp/ep`, which adjusts `_fan_out`, then dispatches `ParaSConfigureReqInput` to DataParallelController, which routes it to all current workers and then swaps `self.workers` to the post-switch set. A scheduler-first design would orphan in-flight user requests in dead workers' ZMQ buffers (because DPC's `self.workers` still indexes the pre-switch set) and break `_fan_out` accounting on any concurrent control RPC. The tokenizer-first design is **architecturally required**, not merely convenient.
+
+### Race-Safety Invariants
+
+Three invariants together ensure correctness when user requests, control messages, and mode-switch requests interleave:
+
+1. **TokenizerManager → DataParallelController ZMQ FIFO.** Both user requests (`TokenizedGenerateReqInput`, `BatchTokenizedGenerateReqInput`) and the configure request travel over the **same** PUSH socket from TM to DPC. DPC's `event_loop` is a single-threaded synchronous Python loop that pulls messages in FIFO order, dispatches each via `_request_dispatcher` to the current `self.workers`, then — and only after dispatch completes — swaps `self.workers` for `ParaSConfigureReqInput`. User requests sent before the configure go to OLD workers; user requests sent after go to NEW workers. No window where a request can be misrouted.
+
+2. **Per-iteration sequencing in the scheduler.** `process_input_requests` iterates the drained ZMQ batch sequentially. `paras_configure_handle` is synchronous (no `await`, no task creation), so the switch executes to completion before the next request in the batch is processed. With DP attention enabled (always true for ParaS), `recv_requests` splits incoming messages into `work_reqs` (user request types) and `control_reqs` (everything else, including `ParaSConfigureReqInput`) and reassembles them work-first; mixed batches like `[TokReq_A, ParaSConfigureReqInput, TokReq_B]` are reordered to `[TokReq_A, TokReq_B, ParaSConfigureReqInput]`, so both user requests are queued in OLD mode and the configure migrates the entire `waiting_queue` (plus `running_batch`) via the gather/scatter managers. The migration captures all queued and running requests regardless of their original arrival order within the batch.
+
+3. **Idempotent fan-out across duplicate signals.** In EP mode every DP rank's policy runs independently and may fire `ParaSAutoSwitchReq` for the same target in the same iteration; TokenizerManager spawns one `asyncio.create_task` per signal. `_Communicator.queueing_call` serializes them: the first task wins the communicator and runs the switch; subsequent tasks queue on `_ready_queue` and execute after the first completes, finding `paras_parallelism_config` already at the target and short-circuiting at the idempotency guard in `paras_configure_tp/ep`. Because all duplicate signals carry the same target, `_fan_out` is written with the same value across all tasks, so response accounting stays consistent.
+
+### Forward-Pass Boundary
+
+`recv_requests` and `process_input_requests` run at the top of `event_loop_normal`, before `run_batch`. `ParaSConfigureReqInput` arriving at the ZMQ socket during a forward pass sits in the kernel buffer until the next iteration; it cannot interrupt an in-flight forward. After the switch returns, `self.last_batch = None` invalidates the pre-switch batch reference (its `req_pool_idx` points into the destroyed pool layout) so `get_next_batch_to_run` starts the new mode with a clean slate.
+
+### Signal Path and Latency
+
+For the auto-switch path, the policy-emitted `ParaSAutoSwitchReq` is sent **directly** from the scheduler to TokenizerManager via `send_to_tokenizer` (PUSH bound to `tokenizer_ipc_name`, where TokenizerManager PULLs). It does **not** transit DetokenizerManager. The full round-trip is four ZMQ hops: scheduler → TM (signal), TM → DPC (configure dispatch), DPC → scheduler (configure delivery), scheduler → TM (configure response). At ~30-50 µs per local ZMQ hop, the entire control-plane overhead is on the order of 200 µs — negligible against the ≈88-163 ms gather/scatter cost of the switch itself.
+
+### Known Limitations
+
+- **Concurrent control RPCs are unsafe during a switch.** `paras_configure_tp/ep` overwrites `comm._fan_out` on every TokenizerManager communicator (all 18, not just the configure communicator). Any in-flight control RPC — `flush_cache`, `update_weights_*`, `get_internal_state`, profile, etc. — that is awaiting `_result_event` when the switch fires will see its expected response count change under it, returning prematurely with truncated results and crashing TM when late responses arrive at a cleared `_result_values`. Serialize control RPCs externally during periods when switches may fire. This is a pre-existing property of the HTTP-triggered path; the auto-switch path widens the window because timing is no longer human-controlled.
+- **Pathological policy configuration can wedge the communicator queue.** With `paras_auto_switch_cooldown_sec=0` and `paras_auto_switch_window=1`, a TP→EP fire can land immediately after an EP→TP switch completes and overwrite `_fan_out` while queued duplicate tasks from the prior signal are still waiting on their responses, hanging the communicator. The default settings (`cooldown_sec=60`, `window=32`) make this physically impossible because the minimum inter-fire interval exceeds the maximum switch latency by more than two orders of magnitude.
+
 ## Round-Trip Support (EP→TP→EP→TP...)
 
 Unlimited round-trips are supported without explicit state caching:
@@ -240,6 +277,4 @@ Unlimited round-trips are supported without explicit state caching:
 
 2. **`dp_size > 1`**: Currently only `paras_dp_size == 1` is supported.
 
-3. **Dynamic switching**: Both directions are triggered manually via HTTP. An automatic policy that monitors batch size and switches at the crossover point would enable fully adaptive serving.
-
-4. **FP8 support**: Kernels and memory manager support FP8 weights but FP8 KV cache is not yet wired through.
+3. **FP8 support**: Kernels and memory manager support FP8 weights but FP8 KV cache is not yet wired through.
