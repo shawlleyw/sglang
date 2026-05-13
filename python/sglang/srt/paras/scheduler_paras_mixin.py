@@ -90,9 +90,13 @@ class SchedulerParasMixin:
     token_to_kv_pool_allocator: TokenToKVPoolAllocator
     
     def init_paras_config(self):
+        # Always initialize so non-ParaS schedulers can no-op the event-loop hook
+        # with a single `if self._paras_auto_policy is not None:` check.
+        self._paras_auto_policy: Optional[ParasAutoSwitchPolicy] = None
+
         if not self.server_args.enable_paras_moe:
             return
-        
+
         # ParaS config
         self.paras_tp_size = self.server_args.paras_tp_size
         self.paras_tp_rank = self.tp_rank % self.paras_tp_size
@@ -139,8 +143,6 @@ class SchedulerParasMixin:
                 window=sa.paras_auto_switch_window,
                 cooldown_sec=sa.paras_auto_switch_cooldown_sec,
             )
-        else:
-            self._paras_auto_policy = None
 
     def paras_configure_helper(self):
         (
@@ -178,36 +180,29 @@ class SchedulerParasMixin:
             )
         return True
 
-    def paras_auto_observe(self, batch) -> None:
-        policy = getattr(self, "_paras_auto_policy", None)
-        if policy is None or batch is None:
+    def paras_auto_observe(self, batch: Optional[ScheduleBatch]) -> None:
+        assert self._paras_auto_policy is not None
+        if batch is None or not batch.forward_mode.is_decode():
             return
-        forward_mode = getattr(batch, "forward_mode", None)
-        if forward_mode is None or not forward_mode.is_decode():
-            return
-        gnt = getattr(batch, "global_num_tokens", None)
-        if gnt:
-            global_batch = int(sum(gnt))
+        if batch.global_num_tokens:
+            global_batch = int(sum(batch.global_num_tokens))
         else:
-            global_batch = len(getattr(batch, "reqs", []))
+            global_batch = len(batch.reqs)
         if global_batch <= 0:
             return
-        policy.observe(global_batch, time.time())
+        self._paras_auto_policy.observe(global_batch, time.time())
 
     def _paras_auto_clear_window_on_switch(self) -> None:
-        policy = getattr(self, "_paras_auto_policy", None)
-        if policy is None:
-            return
+        assert self._paras_auto_policy is not None
+        policy = self._paras_auto_policy
         policy.window.clear()
         policy.cooldown_until = max(
             policy.cooldown_until, time.time() + policy.cooldown_sec
         )
 
     def paras_auto_pick_signal(self) -> Optional[ParaSAutoSwitchReq]:
-        policy = getattr(self, "_paras_auto_policy", None)
-        if policy is None:
-            return None
-        target = policy.pick_target(
+        assert self._paras_auto_policy is not None
+        target = self._paras_auto_policy.pick_target(
             self.paras_parallelism_config, time.time()
         )
         if target is None:
@@ -245,7 +240,8 @@ class SchedulerParasMixin:
         assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
         torch.cuda.synchronize()
 
-        self._paras_auto_clear_window_on_switch()
+        if self._paras_auto_policy is not None:
+            self._paras_auto_clear_window_on_switch()
 
         # switch from EP to DP x TP
         self.paras_parallelism_config = "TP"
@@ -342,6 +338,10 @@ class SchedulerParasMixin:
         self.send_to_detokenizer = self.tp_send_to_detokenizer
         self.recv_from_rpc = self.tp_recv_from_rpc
 
+        # Drop the pre-switch batch reference: its req_pool_idx points into the
+        # destroyed EP pool layout, and merge_last_batch already absorbed its
+        # reqs into the new TP running_batch via paras_get_local_reqs().
+        self.last_batch = None
         torch.cuda.synchronize()
 
     @paras_func
@@ -357,7 +357,8 @@ class SchedulerParasMixin:
         assert self.paras_dp_size == 1, "paras_configure_ep only supports dp_size==1"
         torch.cuda.synchronize()
 
-        self._paras_auto_clear_window_on_switch()
+        if self._paras_auto_policy is not None:
+            self._paras_auto_clear_window_on_switch()
 
         self.paras_start_profile("/tmp/paras_configure_profile")
 
@@ -451,6 +452,8 @@ class SchedulerParasMixin:
         self.send_to_detokenizer = self.ep_send_to_detokenizer
         self.recv_from_rpc = self.ep_recv_from_rpc
 
+        # See paras_configure_tp's matching reset: drop pre-switch batch ref.
+        self.last_batch = None
         torch.cuda.synchronize()
 
     def paras_configure_handle(self, recv_req: ParaSConfigureReqInput):

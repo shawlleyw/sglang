@@ -955,10 +955,11 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
-                self.paras_auto_observe(batch)
-                signal = self.paras_auto_pick_signal()
-                if signal is not None:
-                    self.send_to_tokenizer.send_output(signal)
+                if self._paras_auto_policy is not None:
+                    self.paras_auto_observe(batch)
+                    signal = self.paras_auto_pick_signal()
+                    if signal is not None:
+                        self.send_to_tokenizer.send_output(signal)
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
