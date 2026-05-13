@@ -82,6 +82,13 @@ class ParasAutoSwitchPolicy(abc.ABC):
         elif current_mode == "TP" and avg > self.threshold:
             target = "EP"
         if target is not None:
+            logger.info(
+                f"ParaS [{type(self).__name__}] policy fired: "
+                f"{current_mode} -> {target} at t={now:.3f} | "
+                f"observations={list(self.window)} avg={avg:.2f} "
+                f"threshold={self.threshold} window_maxlen={self.window.maxlen} "
+                f"cooldown_sec={self.cooldown_sec}"
+            )
             self.cooldown_until = now + self.cooldown_sec
             self.window.clear()
         return target

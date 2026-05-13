@@ -1,6 +1,6 @@
 ---
 name: paras-test-auto-switch
-description: Test ParaS load-driven autoswitch policy. Launch with autoswitch enabled and tuned thresholds (low=2 high=8 for the canonical 32-burst load), then drive scripts/paras/eval/paras_cmd/autoswitch_test.sh: light pre-burst prompt (verify clean baseline), 18s cooldown, 32-burst diverse prompts (load triggers EP↔TP autoswitch mid-burst), light post-burst prompt (verify state coherent post-autoswitch), assert ≥1 'ParaS auto-switch policy fired' event in server log, scan errors. Use after touching paras/ scheduler or autoswitch policy code, complementary to paras-test-manual-switch which exercises the manual /paras_configure_* HTTP path.
+description: Test ParaS load-driven autoswitch policy. Launch with autoswitch enabled and a tuned threshold (decode policy with threshold=8 for the canonical 32-burst load), then drive scripts/paras/eval/paras_cmd/autoswitch_test.sh: light pre-burst prompt (verify clean baseline), 18s cooldown, 32-burst diverse prompts (load triggers EP↔TP autoswitch mid-burst), light post-burst prompt (verify state coherent post-autoswitch), assert ≥1 'ParaS auto-switch policy fired' event in server log, scan errors. Use after touching paras/ scheduler or autoswitch policy code, complementary to paras-test-manual-switch which exercises the manual /paras_configure_* HTTP path.
 ---
 
 # Test ParaS Load-Driven Autoswitch
@@ -31,32 +31,26 @@ is model-agnostic.
 
 ## Autoswitch threshold tuning (CRITICAL)
 
-The autoswitch policy fires when load crosses configured thresholds. The
-test must pick thresholds that **reliably fire** with the test's burst size,
-otherwise the test is meaningless (autoswitch never triggers).
+The autoswitch policy fires when the sliding-window average crosses a single threshold. The test must pick a threshold that **reliably straddles** the test's light load (~1 decode req) and burst load (~32 decode reqs), otherwise the test is meaningless (autoswitch never triggers).
 
-The canonical thresholds for the default `BURST_SIZE=32` test are:
+The canonical settings for the default `BURST_SIZE=32` test on the `decode` policy:
 
 ```
---paras-auto-switch-low 2 \
---paras-auto-switch-high 8 \
+--paras-auto-switch-policy decode \
+--paras-auto-switch-threshold 8 \
 --paras-auto-switch-window 4 \
 --paras-auto-switch-cooldown-sec 15
 ```
 
 **Rationale**:
-- `low=2`: the pre-burst light prompt has load=1, which is `< low`, so the
-  low-side policy fires (typically EP→TP).
-- `high=8`: the 32-burst has load=32, which is `> high`, so the high-side
-  policy fires (typically TP→EP) during the burst.
-- `window=4`: short load-sampling window so the policy reacts quickly to
-  burst onset within the test's runtime budget.
-- `cooldown-sec=15`: short enough that the post-burst light prompt can
-  trigger another switch if the policy decides; long enough to avoid
-  thrashing during the burst.
+- `policy=decode`: observes pure-decode iterations only; metric is global decode batch size (= request count).
+- `threshold=8`: light load avg ~1 is `< 8` (fires EP→TP); 32-burst avg ~32 is `> 8` (fires TP→EP). The threshold sits in the middle of the test's load range with a 4× safety margin on both sides.
+- `window=4`: short load-sampling window so the policy reacts quickly to burst onset within the test's runtime budget.
+- `cooldown-sec=15`: short enough that the post-burst light prompt can trigger another switch if the policy decides; long enough to avoid thrashing during the burst.
 
-If you change `BURST_SIZE`, scale `--paras-auto-switch-high` accordingly:
-the burst load must exceed `high` for the high-side policy to fire.
+If you change `BURST_SIZE`, scale `--paras-auto-switch-threshold` so that `BURST_SIZE > threshold > light_load`. With `BURST_SIZE=32` and `light=1`, `threshold=8` gives 4× margin on each side.
+
+For the `prefill` policy (not exercised in this test by default), the metric is global prefill tokens; the default threshold scales differently (1024 × world_size). To test prefill, use prompts long enough that summed token count exceeds your chosen threshold within the window.
 
 ## Prerequisites
 
@@ -75,8 +69,8 @@ bash scripts/paras/eval/paras_cmd/kill.sh
 
 ENABLE_PARAS=1 NUM_GPUS=4 MEM_FRACTION_STATIC=0.7 \
     bash scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh \
-    --paras-auto-switch-low 2 \
-    --paras-auto-switch-high 8 \
+    --paras-auto-switch-policy decode \
+    --paras-auto-switch-threshold 8 \
     --paras-auto-switch-window 4 \
     --paras-auto-switch-cooldown-sec 15 \
     2>&1 | tee /tmp/sglang_paras_test.log &
@@ -88,9 +82,7 @@ bash scripts/paras/eval/paras_cmd/autoswitch_test.sh
 bash scripts/paras/eval/paras_cmd/kill.sh
 ```
 
-(Autoswitch is **enabled by default** when `--enable-paras-moe` is set; the
-flags above tune the thresholds. Without these flags the launch picks
-defaults that may not fire reliably with `BURST_SIZE=32`.)
+(Autoswitch is **enabled by default** when `--enable-paras-moe` is set; `--paras-auto-switch-policy decode` is also the server default. The threshold/window/cooldown flags above override the policy's larger defaults — for production decode policy uses `threshold=64*world_size`, `window=32`, `cooldown=60s`, which would not fire within this test's runtime budget.)
 
 ## Quick Start (gpt-oss-120b-bf16, 4×A100)
 
@@ -109,8 +101,8 @@ bash scripts/paras/eval/paras_cmd/kill.sh
 # 4-GPU: MEM_FRACTION_STATIC=0.8 (per-rank weights ≈ 57 GiB at TP=4)
 ENABLE_PARAS=1 NUM_GPUS=4 MEM_FRACTION_STATIC=0.8 \
     bash scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh \
-    --paras-auto-switch-low 2 \
-    --paras-auto-switch-high 8 \
+    --paras-auto-switch-policy decode \
+    --paras-auto-switch-threshold 8 \
     --paras-auto-switch-window 4 \
     --paras-auto-switch-cooldown-sec 15 \
     2>&1 | tee "$LOG_FILE" &
@@ -129,8 +121,8 @@ Same as above except for the launch line:
 ```bash
 ENABLE_PARAS=1 NUM_GPUS=8 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MEM_FRACTION_STATIC=0.7 \
     bash scripts/paras/eval/a100/gptoss/launch_server_dp_ep.sh \
-    --paras-auto-switch-low 2 \
-    --paras-auto-switch-high 8 \
+    --paras-auto-switch-policy decode \
+    --paras-auto-switch-threshold 8 \
     --paras-auto-switch-window 4 \
     --paras-auto-switch-cooldown-sec 15 \
     2>&1 | tee "$LOG_FILE" &
@@ -152,9 +144,9 @@ bash scripts/paras/eval/paras_cmd/kill.sh
 ### 2. Launch with autoswitch tuned
 
 See Quick Start blocks above. The launch must pass
-`--paras-auto-switch-low 2 --paras-auto-switch-high 8` (or otherwise scaled
-to your `BURST_SIZE`) and tee its log to `$LOG_FILE` so phase 6 can grep for
-autoswitch events.
+`--paras-auto-switch-policy decode --paras-auto-switch-threshold 8` (or
+otherwise scaled to your `BURST_SIZE`) and tee its log to `$LOG_FILE` so
+phase 6 can grep for autoswitch events.
 
 ### 3. Wait for server ready and verify health
 
@@ -178,7 +170,7 @@ Internal phases:
 |---|---|---|
 | 1 | Send a single short prompt ("List three primary colors and one example object for each.", `LIGHT_MAX_TOKENS=80`) and verify the response is non-empty + non-degenerate. | Coherent response (≥10 chars, no `(\b\w+\b)(\s+\1){5,}` attractor). Establishes a clean baseline before any autoswitch fires. |
 | 2 | 18 s cooldown (configurable via `COOLDOWN_SEC`). | Lets any spurious post-phase-1 autoswitch settle. With `--paras-auto-switch-cooldown-sec 15`, the next switch is unblocked. |
-| 3 | Fire `BURST_SIZE=32` parallel diverse prompts (max_tokens=200 each). Load=32 should exceed `--paras-auto-switch-high=8` and trigger the high-side autoswitch policy. | All requests return; none time out. |
+| 3 | Fire `BURST_SIZE=32` parallel diverse prompts (max_tokens=200 each). Load=32 should exceed `--paras-auto-switch-threshold=8` and trigger a TP→EP switch (after the policy enters TP at phase 1). | All requests return; none time out. |
 | 4 | Run `paras_cmd_burst_verify` on the burst responses. | 0 / 32 degenerate (no response matches the attractor regex). Catches mid-burst KV cache corruption from migration during autoswitch. |
 | 5 | Sleep 3 s to let any post-burst autoswitch settle, then send another light prompt and verify coherence. | Coherent response. Catches state corruption that survives the autoswitch event but only manifests on subsequent fresh prompts (e.g., stale weights, broken graph metadata). |
 | 6 | Grep `$LOG_FILE` for `"ParaS auto-switch policy fired"`. | At least 1 event found. If none, autoswitch never fired and the test is meaningless — phases 3-5 didn't actually exercise the switch path. Most common cause: thresholds set too high for the burst load. |
@@ -202,8 +194,8 @@ bash scripts/paras/eval/paras_cmd/kill.sh
 
 A run with 0 burst degeneration but 0 autoswitch events is a **failed test
 configuration**, not a passing test — `autoswitch_test.sh` returns non-zero
-to surface this. Tune `--paras-auto-switch-low/high` so they straddle your
-expected light-load and burst-load values.
+to surface this. Tune `--paras-auto-switch-threshold` so it sits between
+your expected light-load and burst-load values.
 
 ## Important Notes
 
@@ -222,10 +214,10 @@ expected light-load and burst-load values.
   scripts and enforced by the ParaS init assertion). Same constraint as
   manual switch: ParaS migration cannot preserve mid-chunked-prefill state.
 - **Burst size and threshold tuning interact**: `BURST_SIZE` must be
-  comfortably greater than `--paras-auto-switch-high` for the high-side
-  policy to fire. With `BURST_SIZE=32` and `high=8`, there's a 4× margin —
-  safe. If you reduce `BURST_SIZE` (e.g., for memory-constrained smoke
-  tests), reduce `high` proportionally.
+  comfortably greater than `--paras-auto-switch-threshold` for the TP→EP
+  direction to fire on the burst. With `BURST_SIZE=32` and `threshold=8`,
+  there's a 4× margin — safe. If you reduce `BURST_SIZE` (e.g., for
+  memory-constrained smoke tests), reduce `threshold` proportionally.
 - **The pre-burst light prompt purpose**: catches boot-time correctness
   issues independently. If the model is broken at boot (before any switch),
   phase 1 fails and the test stops. This separates "boot is broken" from
@@ -243,13 +235,17 @@ expected light-load and burst-load values.
 ## Known Failure Modes
 
 1. **Phase 6 fails: "no 'ParaS auto-switch policy fired' events"**:
-   - Most common: launch flags missing or thresholds set too high. Confirm
-     `--paras-auto-switch-low 2 --paras-auto-switch-high 8` are on the
-     launch line and `BURST_SIZE >= 16`.
+   - Most common: launch flags missing or threshold set too high. Confirm
+     `--paras-auto-switch-policy decode --paras-auto-switch-threshold 8`
+     are on the launch line and `BURST_SIZE >= 16`.
    - LOG_FILE path mismatch: the launch script's `tee` target must match
      `$LOG_FILE` env var the helpers see. Check with `cat $LOG_FILE | head`.
    - Autoswitch globally disabled: check launch did NOT pass
      `--no-paras-auto-switch`.
+
+For per-fire verbose diagnostics (window observations, avg, threshold,
+class name), grep the launch log for `"ParaS ["` — every policy fire emits
+a line like `ParaS [DecodeAutoSwitchPolicy] policy fired: EP -> TP at t=... | observations=[1,1,1,1] avg=1.00 threshold=8 window_maxlen=4 cooldown_sec=15.0`. This is the source of truth for verifying the policy made the right decision.
 
 2. **Phase 4 fails (burst degenerate) while phase 1 / phase 5 pass**:
    The autoswitch fired and corrupted in-flight req state. Likely culprits:
