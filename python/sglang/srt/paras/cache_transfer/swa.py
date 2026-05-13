@@ -34,8 +34,14 @@ class SWACacheTransfer(CacheTransferBase):
     padding slot).  This is harmless by design.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(
+        self,
+        *,
+        source_full_to_swa_mapping: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
+        self.source_full_to_swa_mapping = source_full_to_swa_mapping
         self._warn_if_head_replication()
         # SWAKVPool.full_to_swa_index_mapping is set by
         # SWATokenToKVPoolAllocator.__init__ (allocator.py:224) and kept in
@@ -111,7 +117,7 @@ class SWACacheTransfer(CacheTransferBase):
         """
         if full_indices is None or full_indices.numel() == 0:
             return full_indices
-        snapshot = getattr(self, "source_full_to_swa_mapping", None)
+        snapshot = self.source_full_to_swa_mapping
         if snapshot is None:
             return self._full_to_swa(full_indices)
         original_dtype = full_indices.dtype

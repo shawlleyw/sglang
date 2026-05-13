@@ -131,6 +131,8 @@ class ParaSReqGatherManager:
         self.local_no_reqs = len(local_reqs) == 0
         self.local_seqlens_list = [req.seqlen for req in local_reqs]
         self.num_local_tokens = sum(self.local_seqlens_list) - len(local_reqs) # the last output token is not stored in kv cache
+
+        self.source_full_to_swa_mapping: Optional[torch.Tensor] = None
         
         if self.local_no_reqs:
             self.local_token_indices = None
@@ -301,7 +303,7 @@ class ParaSReqGatherManager:
                 global_num_tokens=self.global_num_tokens,
                 layer_specs=self.layer_specs,
                 peer_addresses=peer_addresses,
-                source_full_to_swa_mapping=getattr(self, "source_full_to_swa_mapping", None),
+                source_full_to_swa_mapping=self.source_full_to_swa_mapping,
             )
 
         # Per-layer dispatch.
