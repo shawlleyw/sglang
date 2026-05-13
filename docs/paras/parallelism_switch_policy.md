@@ -17,49 +17,59 @@ See [`parallelism_switch.md`](parallelism_switch.md) for the underlying EP↔TP 
 
 ## 2. When to Switch — Policy Definition
 
-The policy is a sliding-window hysteresis controller with a wall-clock cooldown.
+The policy is a sliding-window controller with a single threshold and a wall-clock cooldown. Three policy variants observe different iteration types and ship with different default thresholds, windows, and cooldowns.
 
-### 2.1 Inputs and tunables
+### 2.1 Policy variants
+
+| Policy | Iteration filter | Metric | Default threshold | Default window | Default cooldown |
+|---|---|---|---|---|---|
+| `decode` *(default)* | `ForwardMode.DECODE` | global decode batch size (= request count) | `64 * world_size` | `32` | `60 s` |
+| `prefill` | `ForwardMode.EXTEND` | global prefill token count | `1024 * world_size` | `8` | `10 s` |
+| `hybrid` | (mixed prefill+decode) | n/a | n/a | n/a | n/a |
+
+The decode and prefill defaults follow from the EP/TP crossover band measured in `parallelism_switch.md`. Threshold scales with `world_size` (= `tp_size`) so the per-GPU work that justifies a switch is constant. Prefill iterations are larger and rarer than decode, so the prefill policy uses a shorter window and shorter cooldown to stay reactive.
+
+`hybrid` is **not implemented** — picking it raises `NotImplementedError` at startup. ParaS disables chunked prefill, so `ForwardMode.MIXED` should not occur in practice; if a mixed workload becomes relevant, this is where to add a multi-metric policy.
+
+### 2.2 Inputs and tunables
 
 | CLI flag | Field | Default | Meaning |
 |---|---|---|---|
 | `--paras-auto-switch` | `paras_auto_switch` | `True` (when `--enable-paras-moe`) | Master enable. |
-| `--paras-auto-switch-low` | `paras_auto_switch_low` | `256` | Switch **EP→TP** when sliding-window avg global batch < this. |
-| `--paras-auto-switch-high` | `paras_auto_switch_high` | `1024` | Switch **TP→EP** when sliding-window avg global batch > this. |
-| `--paras-auto-switch-window` | `paras_auto_switch_window` | `32` | Sliding-window size (decode iterations). |
-| `--paras-auto-switch-cooldown-sec` | `paras_auto_switch_cooldown_sec` | `60.0` | Wall-clock seconds between successive switches. |
+| `--paras-auto-switch-policy` | `paras_auto_switch_policy` | `decode` | Policy variant: `decode`, `prefill`, or `hybrid`. |
+| `--paras-auto-switch-threshold` | `paras_auto_switch_threshold` | per-policy magic × `world_size` | Single switch threshold (no hysteresis). Override the policy magic by passing this. |
+| `--paras-auto-switch-window` | `paras_auto_switch_window` | per-policy default | Sliding-window size (iterations). |
+| `--paras-auto-switch-cooldown-sec` | `paras_auto_switch_cooldown_sec` | per-policy default | Wall-clock seconds between successive switches. |
 
-The defaults match the crossover band documented in `parallelism_switch.md` (TP wins ≤ 512, EP wins ≥ 1024 on 8×A100). Validation requires `0 < low < high`, `window > 0`, `cooldown_sec >= 0`, and the flags only apply when `--enable-paras-moe` is set.
+Defaults resolve at startup inside `ServerArgs._handle_paras_auto_switch`. Any CLI-provided value wins over the policy default. Validation requires `threshold > 0`, `window > 0`, `cooldown_sec >= 0`, and the flags only apply when `--enable-paras-moe` is set.
 
-### 2.2 Per-iteration observation
+### 2.3 Per-iteration observation
 
-After each forward iteration that results in `process_batch_result(batch, result)`, the scheduler calls `paras_auto_observe(batch)`. The observation logic:
+After each forward iteration that results in `process_batch_result(batch, result)`, the scheduler calls `paras_auto_observe(batch)`, which dispatches to the active policy's `observation_for_batch(batch)`:
 
-1. Skip if no policy is initialized.
-2. Skip if `batch.forward_mode` is not decode (prefill iterations are not counted).
-3. Compute the **global batch size**:
-   - If `batch.global_num_tokens` is set (EP mode under DP attention, populated by `prepare_mlp_sync_batch_raw`), use `sum(batch.global_num_tokens)`.
-   - Otherwise (TP mode, where `dp_size=1` skips the all-gather), use `len(batch.reqs)`. In TP mode the local batch *is* the global batch since all ranks hold the same request set.
-4. Skip if the global batch is non-positive.
-5. Append to the policy's `deque` (capped at `window`).
+- `DecodeAutoSwitchPolicy.observation_for_batch` — returns `None` unless `batch.forward_mode.is_decode()`. Metric is `sum(batch.global_num_tokens)` in EP mode (DP attention populates it; each decode iteration contributes one token per request, so the sum equals the global decode batch size) and `len(batch.reqs)` in TP mode (no `prepare_mlp_sync_batch`; all ranks hold the replicated set).
+- `PrefillAutoSwitchPolicy.observation_for_batch` — returns `None` unless `batch.forward_mode == ForwardMode.EXTEND`. Metric is `sum(batch.global_num_tokens)` in EP mode and `sum(req.seqlen for req in batch.reqs)` in TP mode.
+- `HybridAutoSwitchPolicy.__init__` raises before any observation can happen.
 
-### 2.3 Decision evaluation
+Non-positive metric values are silently skipped. Otherwise the value is appended to the policy's `deque` (capped at `window`).
 
-After `paras_auto_observe`, the scheduler calls `paras_auto_pick_signal()`. Algorithm:
+### 2.4 Decision evaluation
+
+After `paras_auto_observe`, the scheduler calls `paras_auto_pick_signal()`. Algorithm (single threshold, no hysteresis):
 
 ```
 if now < cooldown_until: return None
 if len(window) < window.maxlen: return None       # window not yet full
 avg = sum(window) / len(window)
-if mode == "EP" and avg < low:  target = "TP"
-elif mode == "TP" and avg > high: target = "EP"
+if mode == "EP" and avg < threshold:  target = "TP"
+elif mode == "TP" and avg > threshold: target = "EP"
 else: return None
 cooldown_until = now + cooldown_sec
 window.clear()
 return target
 ```
 
-Hysteresis (low ≠ high) guarantees that batches in `[low, high]` produce no switch — the controller is stable in the dead zone. The cooldown bounds switch frequency to once per `cooldown_sec` in the worst case, capping the cost of false positives at `≤ switch_latency / cooldown_sec` (e.g., `300 ms / 60 s = 0.5 %` overhead).
+The cooldown bounds switch frequency to once per `cooldown_sec` in the worst case, capping the cost of false positives at `≤ switch_latency / cooldown_sec` (e.g., for the decode policy: `300 ms / 60 s ≈ 0.5 %` overhead; for the prefill policy: `300 ms / 10 s ≈ 3 %` peak overhead — acceptable because prefill bursts are infrequent and the policy is sized to react before the workload pattern dissipates).
 
 ### 2.4 Where the policy lives — every rank
 

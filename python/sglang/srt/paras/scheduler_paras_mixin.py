@@ -1,3 +1,4 @@
+import abc
 from collections import deque
 from types import SimpleNamespace
 from typing import List, Any, Optional
@@ -19,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info, get_attention_tp_group
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, MHATokenToKVPool
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 
 from sglang.srt.paras.utils import paras_func, paras_profile_func
@@ -44,24 +46,29 @@ class TimeReporter:
         cost_ms = (end_time - self.start_time) * 1000
         logger.info(f"Time taken to {self.op_name}: {cost_ms} ms")
 
-class ParasAutoSwitchPolicy:
-    def __init__(
-        self,
-        low: int,
-        high: int,
-        window: int,
-        cooldown_sec: float,
-    ):
-        self.low = low
-        self.high = high
+class ParasAutoSwitchPolicy(abc.ABC):
+    """Base class for ParaS auto-switch policies.
+
+    Subclasses define `observation_for_batch` to (a) filter iterations the
+    policy cares about and (b) compute the per-iteration global metric value.
+    The base handles windowing, cooldown, and the cross-threshold decision.
+    """
+
+    def __init__(self, threshold: int, window: int, cooldown_sec: float):
+        self.threshold = threshold
         self.window: deque = deque(maxlen=window)
         self.cooldown_sec = cooldown_sec
         self.cooldown_until: float = 0.0
 
-    def observe(self, global_batch: int, now: float) -> None:
-        if global_batch <= 0:
+    @abc.abstractmethod
+    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
+        """Return this iteration's global metric, or None to skip the iteration."""
+
+    def observe(self, batch: ScheduleBatch, now: float) -> None:
+        value = self.observation_for_batch(batch)
+        if value is None or value <= 0:
             return
-        self.window.append(global_batch)
+        self.window.append(value)
 
     def pick_target(self, current_mode: str, now: float) -> Optional[str]:
         if now < self.cooldown_until:
@@ -70,14 +77,57 @@ class ParasAutoSwitchPolicy:
             return None
         avg = sum(self.window) / len(self.window)
         target: Optional[str] = None
-        if current_mode == "EP" and avg < self.low:
+        if current_mode == "EP" and avg < self.threshold:
             target = "TP"
-        elif current_mode == "TP" and avg > self.high:
+        elif current_mode == "TP" and avg > self.threshold:
             target = "EP"
         if target is not None:
             self.cooldown_until = now + self.cooldown_sec
             self.window.clear()
         return target
+
+
+class PrefillAutoSwitchPolicy(ParasAutoSwitchPolicy):
+    """Observes pure prefill (EXTEND) iterations; metric is global prefill tokens."""
+
+    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
+        if batch.forward_mode != ForwardMode.EXTEND:
+            return None
+        if batch.global_num_tokens:
+            return int(sum(batch.global_num_tokens))
+        return sum(req.seqlen for req in batch.reqs)
+
+
+class DecodeAutoSwitchPolicy(ParasAutoSwitchPolicy):
+    """Observes pure decode iterations; metric is global decode batch size."""
+
+    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
+        if not batch.forward_mode.is_decode():
+            return None
+        if batch.global_num_tokens:
+            return int(sum(batch.global_num_tokens))
+        return len(batch.reqs)
+
+
+class HybridAutoSwitchPolicy(ParasAutoSwitchPolicy):
+    """Mixed prefill+decode batches. Not yet implemented; raises at construction."""
+
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Hybrid (mixed prefill+decode) auto-switch policy is not implemented. "
+            "Use 'prefill' or 'decode'. ParaS disables chunked prefill so "
+            "ForwardMode.MIXED should not occur in practice."
+        )
+
+    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
+        raise NotImplementedError  # unreachable: __init__ raises
+
+
+_PARAS_AUTO_SWITCH_POLICY_CLASSES = {
+    "prefill": PrefillAutoSwitchPolicy,
+    "decode": DecodeAutoSwitchPolicy,
+    "hybrid": HybridAutoSwitchPolicy,
+}
 
 
 class SchedulerParasMixin:
@@ -137,9 +187,9 @@ class SchedulerParasMixin:
 
         sa = self.server_args
         if sa.paras_auto_switch:
-            self._paras_auto_policy = ParasAutoSwitchPolicy(
-                low=sa.paras_auto_switch_low,
-                high=sa.paras_auto_switch_high,
+            policy_cls = _PARAS_AUTO_SWITCH_POLICY_CLASSES[sa.paras_auto_switch_policy]
+            self._paras_auto_policy = policy_cls(
+                threshold=sa.paras_auto_switch_threshold,
                 window=sa.paras_auto_switch_window,
                 cooldown_sec=sa.paras_auto_switch_cooldown_sec,
             )
@@ -182,15 +232,9 @@ class SchedulerParasMixin:
 
     def paras_auto_observe(self, batch: Optional[ScheduleBatch]) -> None:
         assert self._paras_auto_policy is not None
-        if batch is None or not batch.forward_mode.is_decode():
+        if batch is None:
             return
-        if batch.global_num_tokens:
-            global_batch = int(sum(batch.global_num_tokens))
-        else:
-            global_batch = len(batch.reqs)
-        if global_batch <= 0:
-            return
-        self._paras_auto_policy.observe(global_batch, time.time())
+        self._paras_auto_policy.observe(batch, time.time())
 
     def _paras_auto_clear_window_on_switch(self) -> None:
         assert self._paras_auto_policy is not None
