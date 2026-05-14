@@ -1016,6 +1016,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    # ParaS: globally aggregated per-DP-rank state, populated by
+    # prepare_mlp_sync_batch_raw and consumed by RolloutAutoSwitchPolicy
+    # and ParasMetricsSampler.
+    global_running_reqs: Optional[List[int]] = None
+    global_waiting_reqs: Optional[List[int]] = None
+    global_total_decode_tokens: Optional[List[int]] = None
+    global_total_prefill_tokens: Optional[List[int]] = None
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None

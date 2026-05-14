@@ -47,6 +47,8 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        self.total_prefill_tokens_lifetime += batch.extend_num_tokens or 0
+
         skip_stream_req = None
 
         if self.is_generation:
@@ -303,6 +305,7 @@ class SchedulerOutputProcessorMixin:
             accept_lens_list = result.accept_lens.tolist()
 
         self.num_generated_tokens += len(batch.reqs)
+        self.total_decode_tokens_lifetime += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
