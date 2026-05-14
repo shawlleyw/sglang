@@ -25,6 +25,7 @@ set -euo pipefail
 NUM_REQUESTS=${NUM_REQUESTS:-2000}
 GROUP_SIZE=${GROUP_SIZE:-1}
 SPEC_MODE=${SPEC_MODE:-0}
+MAX_COMPLETION_TOKENS_CAP=${MAX_COMPLETION_TOKENS_CAP:-32768}
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-30000}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
@@ -106,6 +107,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
         --output-dir "$OUTPUT_DIR"
         --host "$HOST"
         --port "$PORT"
+        --max-completion-tokens-cap "$MAX_COMPLETION_TOKENS_CAP"
     )
     if [[ "$SPEC_MODE" == "1" ]]; then
         BENCH_ARGS+=(--spec-mode)
@@ -154,6 +156,7 @@ BENCH_ARGS=(
     --output-dir "$OUTPUT_DIR"
     --host "$HOST"
     --port "$PORT"
+    --max-completion-tokens-cap "$MAX_COMPLETION_TOKENS_CAP"
 )
 if [[ "$SPEC_MODE" == "1" ]]; then
     BENCH_ARGS+=(--spec-mode)

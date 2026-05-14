@@ -20,10 +20,11 @@ intentionally only records *client-observed* quantities.
 Two modes:
   * non-spec (default): every request runs with ``max_completion_tokens =
     --max-completion-tokens-cap`` and ``ignore_eos=False``.
-  * spec mode (``--spec-mode``): ``max_completion_tokens`` is taken from each
-    JSONL row's ``output_len`` field and ``ignore_eos=True`` so the server
-    decodes exactly that many tokens (used for reproducible decode-bound
-    micro-benchmarks).
+  * spec mode (``--spec-mode``): ``max_completion_tokens`` is
+    ``min(row["output_len"], --max-completion-tokens-cap)`` with
+    ``ignore_eos=True``. The cap clips overly long spec rows so a
+    smoke/matrix run stays in a tractable wall-clock budget; set the cap
+    to the spec ceiling (e.g. 32768) to disable clipping.
 
 GRPO simulation: ``--group-size G`` replicates each unique prompt ``G`` times,
 mimicking the "n samples per prompt" pattern.  Replicas are sent as fully
@@ -186,7 +187,7 @@ def build_request_specs(
                     f"--spec-mode set but JSONL row {src_idx} has no "
                     f"'output_len' field."
                 )
-            max_new_tokens = int(row["output_len"])
+            max_new_tokens = min(int(row["output_len"]), max_completion_tokens_cap)
             ignore_eos = True
         else:
             max_new_tokens = max_completion_tokens_cap
@@ -568,7 +569,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--max-completion-tokens-cap",
         type=int,
         default=32768,
-        help="Cap on max_completion_tokens (non-spec mode only).",
+        help=(
+            "Cap on max_completion_tokens. In non-spec mode this is the "
+            "fixed budget per request; in spec mode it clips each row's "
+            "output_len from above (use 32768 to disable clipping)."
+        ),
     )
     parser.add_argument(
         "--timeout-sec",
