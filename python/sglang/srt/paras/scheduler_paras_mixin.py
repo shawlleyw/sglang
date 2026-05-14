@@ -70,6 +70,13 @@ class ParasAutoSwitchPolicy(abc.ABC):
             return
         self.window.append(value)
 
+    def observe_value(self, value: Optional[int], now: float) -> None:
+        if value is None:
+            return
+        if value <= 0:
+            return
+        self.window.append(value)
+
     def pick_target(self, current_mode: str, now: float) -> Optional[str]:
         if now < self.cooldown_until:
             return None
@@ -139,24 +146,18 @@ class HybridAutoSwitchPolicy(ParasAutoSwitchPolicy):
 
 
 class RolloutAutoSwitchPolicy(ParasAutoSwitchPolicy):
-    """Observes every iteration; metric is global running+waiting request count.
-    Tuned for synchronous rollout: small window, low threshold."""
+    """Observes every iteration; metric is total pending request count.
+
+    The scheduler feeds this policy via `observe_value(running + waiting)` read
+    directly from `running_batch.reqs` and `waiting_queue`. The batch-based
+    `observation_for_batch` path is not used: after an EP->TP switch the
+    MLP-sync all-gather populates batch.global_* unreliably (see the
+    matching workaround in ParasMetricsSampler), so we cannot depend on it
+    here either or the policy would go blind in TP mode and never fire back.
+    """
 
     def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
-        """Return total pending request count (running + waiting) across DP ranks.
-        
-        Mode-agnostic: works for prefill, decode, and idle iterations.
-        The metric is monotonically decreasing in a synchronous rollout
-        (no new arrivals after t=0), naturally implementing one-shot
-        EP→TP behavior without an explicit flag.
-        """
-        if batch is None:
-            return None
-        if batch.global_running_reqs is None or batch.global_waiting_reqs is None:
-            return None
-        running = int(sum(batch.global_running_reqs))
-        waiting = int(sum(batch.global_waiting_reqs))
-        return running + waiting
+        return None
 
 
 _PARAS_AUTO_SWITCH_POLICY_CLASSES = {
@@ -269,6 +270,27 @@ class SchedulerParasMixin:
 
     def paras_auto_observe(self, batch: Optional[ScheduleBatch]) -> None:
         assert self._paras_auto_policy is not None
+        if isinstance(self._paras_auto_policy, RolloutAutoSwitchPolicy):
+            if self.paras_parallelism_config == "EP":
+                # EP mode: rank 0 holds only its DP slice. Use the all-gather
+                # output (sum across DP ranks) for the true global count.
+                # Skip when the gather hasn't populated yet (idle / boot).
+                if batch is None:
+                    return
+                running_field = batch.global_running_reqs
+                waiting_field = batch.global_waiting_reqs
+                if running_field is None or waiting_field is None:
+                    return
+                running = int(sum(running_field))
+                waiting = int(sum(waiting_field))
+            else:
+                # TP mode: unified data plane, every rank holds the same
+                # running_batch; rank 0's local view IS the global view.
+                rb = self.running_batch
+                running = len(rb.reqs) if rb is not None else 0
+                waiting = len(self.waiting_queue)
+            self._paras_auto_policy.observe_value(running + waiting, time.time())
+            return
         if batch is None:
             return
         self._paras_auto_policy.observe(batch, time.time())

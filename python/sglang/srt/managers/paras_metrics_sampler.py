@@ -96,31 +96,27 @@ class ParasMetricsSampler:
     def _sample_once(self) -> None:
         scheduler = self.scheduler
         batch = getattr(scheduler, "last_batch", None)
+        mode = getattr(scheduler, "paras_parallelism_config", "UNK") or "UNK"
 
-        # Primary: read live state directly from the scheduler. This is always
-        # available (no dependency on the MLP-sync all-gather having populated
-        # fields on the most recent batch object) and matches reality in TP
-        # mode where the data plane is unified across DP ranks. In EP mode it
-        # under-reports by a factor of dp_size; we upgrade to the gathered
-        # global view below when the fields are present.
-        rb = getattr(scheduler, "running_batch", None)
-        running = len(rb.reqs) if rb is not None else 0
-        waiting = len(getattr(scheduler, "waiting_queue", []) or [])
-        decode_total = getattr(scheduler, "total_decode_tokens_lifetime", 0) or 0
-        prefill_total = getattr(scheduler, "total_prefill_tokens_lifetime", 0) or 0
-
-        if batch is not None and getattr(batch, "global_running_reqs", None):
+        # Source selection mirrors paras_auto_observe in scheduler_paras_mixin:
+        # EP mode -> rank 0 holds only its DP slice, so sum the all-gather output;
+        # TP mode -> unified data plane, rank 0's local view IS the global view.
+        if mode == "EP" and batch is not None and getattr(batch, "global_running_reqs", None):
             running = int(sum(batch.global_running_reqs))
             waiting = int(sum(batch.global_waiting_reqs))
             decode_total = int(sum(batch.global_total_decode_tokens))
             prefill_total = int(sum(batch.global_total_prefill_tokens))
+        else:
+            rb = getattr(scheduler, "running_batch", None)
+            running = len(rb.reqs) if rb is not None else 0
+            waiting = len(getattr(scheduler, "waiting_queue", []) or [])
+            decode_total = getattr(scheduler, "total_decode_tokens_lifetime", 0) or 0
+            prefill_total = getattr(scheduler, "total_prefill_tokens_lifetime", 0) or 0
 
         decode_delta = decode_total - self._prev_decode_total
         prefill_delta = prefill_total - self._prev_prefill_total
         decode_tps = decode_delta / self.interval_sec if decode_delta > 0 else 0.0
         prefill_tps = prefill_delta / self.interval_sec if prefill_delta > 0 else 0.0
-
-        mode = getattr(scheduler, "paras_parallelism_config", "UNK") or "UNK"
 
         now = time.time()
         row = [
