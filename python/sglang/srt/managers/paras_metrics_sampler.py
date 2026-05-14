@@ -97,13 +97,19 @@ class ParasMetricsSampler:
         scheduler = self.scheduler
         batch = getattr(scheduler, "last_batch", None)
 
-        if batch is None or getattr(batch, "global_running_reqs", None) is None:
-            # No data yet -- emit a row with zeros to keep timeline contiguous.
-            running = 0
-            waiting = 0
-            decode_total = self._prev_decode_total
-            prefill_total = self._prev_prefill_total
-        else:
+        # Primary: read live state directly from the scheduler. This is always
+        # available (no dependency on the MLP-sync all-gather having populated
+        # fields on the most recent batch object) and matches reality in TP
+        # mode where the data plane is unified across DP ranks. In EP mode it
+        # under-reports by a factor of dp_size; we upgrade to the gathered
+        # global view below when the fields are present.
+        rb = getattr(scheduler, "running_batch", None)
+        running = len(rb.reqs) if rb is not None else 0
+        waiting = len(getattr(scheduler, "waiting_queue", []) or [])
+        decode_total = getattr(scheduler, "total_decode_tokens_lifetime", 0) or 0
+        prefill_total = getattr(scheduler, "total_prefill_tokens_lifetime", 0) or 0
+
+        if batch is not None and getattr(batch, "global_running_reqs", None):
             running = int(sum(batch.global_running_reqs))
             waiting = int(sum(batch.global_waiting_reqs))
             decode_total = int(sum(batch.global_total_decode_tokens))
