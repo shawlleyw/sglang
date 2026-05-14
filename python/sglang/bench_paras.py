@@ -358,7 +358,7 @@ async def run_benchmark(
 ) -> List[RequestRecord]:
     """Submit all requests via ``asyncio.gather`` and return per-request records."""
     connector = aiohttp.TCPConnector(limit=4096)
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    timeout = aiohttp.ClientTimeout(total=None if timeout_sec <= 0 else timeout_sec)
     # One RNG per call so jitter is reproducible.  Each task gets a private
     # RNG seeded from the master seed so concurrency doesn't reorder samples.
     master_rng = random.Random(seed)
@@ -573,8 +573,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--timeout-sec",
         type=float,
-        default=600.0,
-        help="Per-request HTTP timeout in seconds.",
+        default=0.0,
+        help="Per-request HTTP timeout in seconds. 0 or negative disables the timeout (recommended for large batches where queue wait can exceed any reasonable bound).",
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="RNG seed for shuffle + jitter."
@@ -640,7 +640,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     url = f"http://{args.host}:{args.port}/v1/chat/completions"
-    logger.info("submitting to %s with timeout=%.0fs", url, args.timeout_sec)
+    timeout_label = "none" if args.timeout_sec <= 0 else f"{args.timeout_sec:.0f}s"
+    logger.info("submitting to %s with timeout=%s", url, timeout_label)
 
     records = asyncio.run(
         run_benchmark(
