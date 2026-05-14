@@ -520,6 +520,15 @@ class Scheduler(
         # Init ParaS configuration
         self.init_paras_config()
 
+        self._paras_metrics_sampler = None
+        if server_args.paras_metrics_file:
+            from sglang.srt.managers.paras_metrics_sampler import ParasMetricsSampler
+
+            self._paras_metrics_sampler = ParasMetricsSampler(
+                self, server_args.paras_metrics_file
+            )
+            self._paras_metrics_sampler.start()
+
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 

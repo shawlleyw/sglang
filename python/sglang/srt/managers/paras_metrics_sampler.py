@@ -1,0 +1,132 @@
+"""Per-second metrics sampler for ParaS rollout benchmarking.
+
+Spawns a daemon thread on tp_rank==0 that samples the scheduler's
+gathered state every 1.0s and writes one CSV row per sample.
+
+Columns:
+    timestamp_iso, elapsed_s, mode, running_reqs, waiting_reqs,
+    decode_tokens_per_sec, prefill_tokens_per_sec
+
+mode is 'EP' or 'TP' (read from scheduler.paras_parallelism_config).
+Throughput is computed from deltas of the monotonic lifetime counters
+exposed on scheduler.last_batch.global_total_*_tokens.
+
+Activated by passing --paras-metrics-file <path> to the SGLang server.
+On non-zero ranks, start() is a no-op (only rank 0 writes).
+"""
+
+from __future__ import annotations
+
+import atexit
+import csv
+import logging
+import os
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class ParasMetricsSampler:
+    CSV_HEADER = [
+        "timestamp_iso",
+        "elapsed_s",
+        "mode",
+        "running_reqs",
+        "waiting_reqs",
+        "decode_tokens_per_sec",
+        "prefill_tokens_per_sec",
+    ]
+
+    def __init__(self, scheduler, output_path: str, interval_sec: float = 1.0):
+        self.scheduler = scheduler
+        self.output_path = output_path
+        self.interval_sec = interval_sec
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._t0 = time.time()
+        self._prev_decode_total = 0
+        self._prev_prefill_total = 0
+        self._fh: Any = None
+        self._writer: Any = None
+
+    def start(self) -> None:
+        # Distributed-correctness gate: only rank 0 writes the metrics file.
+        if getattr(self.scheduler, "tp_rank", 0) != 0:
+            logger.debug("ParasMetricsSampler: tp_rank != 0, no-op")
+            return
+
+        out_dir = os.path.dirname(self.output_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        self._fh = open(self.output_path, "w", buffering=1)  # buffering=1 => line-buffered
+        self._writer = csv.writer(self._fh)
+        self._writer.writerow(self.CSV_HEADER)
+
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="ParasMetricsSampler"
+        )
+        self._thread.start()
+        atexit.register(self.stop)
+        logger.info(f"ParasMetricsSampler started: writing to {self.output_path}")
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+        logger.info(f"ParasMetricsSampler stopped: {self.output_path}")
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval_sec):
+            try:
+                self._sample_once()
+            except Exception:
+                # Daemon-thread isolation: never let a sampler bug kill the scheduler.
+                logger.exception("ParasMetricsSampler: sample failed")
+
+    def _sample_once(self) -> None:
+        scheduler = self.scheduler
+        batch = getattr(scheduler, "last_batch", None)
+
+        if batch is None or getattr(batch, "global_running_reqs", None) is None:
+            # No data yet -- emit a row with zeros to keep timeline contiguous.
+            running = 0
+            waiting = 0
+            decode_total = self._prev_decode_total
+            prefill_total = self._prev_prefill_total
+        else:
+            running = int(sum(batch.global_running_reqs))
+            waiting = int(sum(batch.global_waiting_reqs))
+            decode_total = int(sum(batch.global_total_decode_tokens))
+            prefill_total = int(sum(batch.global_total_prefill_tokens))
+
+        decode_delta = decode_total - self._prev_decode_total
+        prefill_delta = prefill_total - self._prev_prefill_total
+        decode_tps = decode_delta / self.interval_sec if decode_delta > 0 else 0.0
+        prefill_tps = prefill_delta / self.interval_sec if prefill_delta > 0 else 0.0
+
+        mode = getattr(scheduler, "paras_parallelism_config", "UNK") or "UNK"
+
+        now = time.time()
+        row = [
+            datetime.now(timezone.utc).isoformat(),
+            f"{now - self._t0:.3f}",
+            mode,
+            running,
+            waiting,
+            f"{decode_tps:.2f}",
+            f"{prefill_tps:.2f}",
+        ]
+        self._writer.writerow(row)
+
+        self._prev_decode_total = decode_total
+        self._prev_prefill_total = prefill_total

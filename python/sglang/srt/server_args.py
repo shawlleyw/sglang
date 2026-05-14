@@ -448,6 +448,7 @@ class ServerArgs:
     paras_auto_switch_threshold: Optional[int] = None
     paras_auto_switch_window: Optional[int] = None
     paras_auto_switch_cooldown_sec: Optional[float] = None
+    paras_metrics_file: Optional[str] = None
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -3140,6 +3141,12 @@ class ServerArgs:
                 "When unset, defaults to the policy's value (see "
                 "--paras-auto-switch-policy)."
             ),
+        )
+        parser.add_argument(
+            "--paras-metrics-file",
+            type=str,
+            default=ServerArgs.paras_metrics_file,
+            help="CSV path for per-second ParaS metrics (mode, running, waiting, throughput). Only tp_rank 0 writes.",
         )
         parser.add_argument(
             "--elastic-ep-backend",
