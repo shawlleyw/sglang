@@ -106,11 +106,19 @@ class PrefillAutoSwitchPolicy(ParasAutoSwitchPolicy):
 
 
 class DecodeAutoSwitchPolicy(ParasAutoSwitchPolicy):
-    """Observes pure decode iterations; metric is global decode batch size."""
+    """Observes every iteration; metric is global in-flight token / request count.
+
+    The metric is `sum(batch.global_num_tokens)` in EP+DP-attention mode (the
+    all-gathered per-DP token count, summed across all DP ranks) and
+    `len(batch.reqs)` in TP-only mode. Forward mode is intentionally NOT
+    filtered: rank 0 may run an idle batch (`forward_mode = IDLE`) when other
+    DP ranks hold the work, but its `batch.global_num_tokens` still carries
+    the true global state via the MLP all-gather. Skipping idle batches would
+    silently strand the policy whenever round-robin routes light-load
+    requests to a non-zero DP rank.
+    """
 
     def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
-        if not batch.forward_mode.is_decode():
-            return None
         if batch.global_num_tokens:
             return int(sum(batch.global_num_tokens))
         return len(batch.reqs)

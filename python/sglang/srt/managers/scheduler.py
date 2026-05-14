@@ -955,7 +955,7 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
-                if self._paras_auto_policy is not None:
+                if self._paras_auto_policy is not None and self.tp_rank == 0:
                     self.paras_auto_observe(batch)
                     signal = self.paras_auto_pick_signal()
                     if signal is not None:
