@@ -166,6 +166,31 @@ MOE_RUNNER_BACKEND_CHOICES = [
 
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
+@dataclasses.dataclass(frozen=True)
+class ParasAutoSwitchDefaults:
+    """Per-policy defaults for the ParaS auto-switch knobs.
+
+    `threshold_per_gpu` is multiplied by world_size at resolution time so the
+    per-GPU work that justifies switching is constant. `window` and
+    `cooldown_sec` are absolute. Prefill iterations are larger and rarer than
+    decode, so the prefill policy uses a shorter window and shorter cooldown
+    to stay reactive.
+    """
+
+    threshold_per_gpu: int
+    window: int
+    cooldown_sec: float
+
+
+PARAS_AUTO_SWITCH_POLICY_DEFAULTS: Dict[str, ParasAutoSwitchDefaults] = {
+    "prefill": ParasAutoSwitchDefaults(threshold_per_gpu=1024, window=8, cooldown_sec=10.0),
+    "decode": ParasAutoSwitchDefaults(threshold_per_gpu=64, window=32, cooldown_sec=60.0),
+}
+# "hybrid" is intentionally absent from the defaults dict; _handle_paras_auto_switch
+# raises NotImplementedError for it. Keep it in the CLI choices so the error fires
+# at startup rather than as an "unknown value" later.
+PARAS_AUTO_SWITCH_POLICY_CHOICES = list(PARAS_AUTO_SWITCH_POLICY_DEFAULTS) + ["hybrid"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -418,10 +443,10 @@ class ServerArgs:
     paras_tp_cuda_graph_max_bs: Optional[int] = None
     paras_tp_cuda_graph_bs: Optional[List[int]] = None
     paras_auto_switch: bool = True
-    paras_auto_switch_low: int = 256
-    paras_auto_switch_high: int = 1024
-    paras_auto_switch_window: int = 32
-    paras_auto_switch_cooldown_sec: float = 60.0
+    paras_auto_switch_policy: str = "decode"
+    paras_auto_switch_threshold: Optional[int] = None
+    paras_auto_switch_window: Optional[int] = None
+    paras_auto_switch_cooldown_sec: Optional[float] = None
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -618,6 +643,7 @@ class ServerArgs:
         self._handle_a2a_moe()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
+        self._handle_paras_auto_switch()
         self._check_paras_config()
 
         # Handle pipeline parallelism.
@@ -1503,6 +1529,45 @@ class ServerArgs:
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
     
+    def _handle_paras_auto_switch(self):
+        """Resolve the auto-switch knobs from the selected policy's defaults.
+
+        Threshold scales with `tp_size`; window and cooldown are absolute. Any
+        knob the user explicitly passed via CLI overrides the policy default.
+        Called from __post_init__ before _check_paras_config so the rest of
+        the paras checks see fully-resolved values.
+        """
+        if not self.enable_paras_moe or not self.paras_auto_switch:
+            return
+        assert self.paras_auto_switch_policy in PARAS_AUTO_SWITCH_POLICY_CHOICES, (
+            f"--paras-auto-switch-policy must be one of "
+            f"{PARAS_AUTO_SWITCH_POLICY_CHOICES}, got "
+            f"{self.paras_auto_switch_policy!r}"
+        )
+        if self.paras_auto_switch_policy == "hybrid":
+            raise NotImplementedError(
+                "Hybrid (mixed prefill+decode) auto-switch policy is not implemented. "
+                "Use 'prefill' or 'decode'."
+            )
+        defaults = PARAS_AUTO_SWITCH_POLICY_DEFAULTS[self.paras_auto_switch_policy]
+        if self.paras_auto_switch_threshold is None:
+            self.paras_auto_switch_threshold = (
+                defaults.threshold_per_gpu * self.tp_size
+            )
+        if self.paras_auto_switch_window is None:
+            self.paras_auto_switch_window = defaults.window
+        if self.paras_auto_switch_cooldown_sec is None:
+            self.paras_auto_switch_cooldown_sec = defaults.cooldown_sec
+        assert self.paras_auto_switch_threshold > 0, (
+            "--paras-auto-switch-threshold must be positive"
+        )
+        assert self.paras_auto_switch_window > 0, (
+            "--paras-auto-switch-window must be positive"
+        )
+        assert self.paras_auto_switch_cooldown_sec >= 0, (
+            "--paras-auto-switch-cooldown-sec must be non-negative"
+        )
+
     def _check_paras_config(self):
         if self.enable_paras_moe:
             assert self.enable_dp_lm_head, "enable_dp_lm_head must be set when enable_paras_moe is set"
@@ -1521,16 +1586,6 @@ class ServerArgs:
                 "kv_indices in req.prefix_indices reference the pre-resize slot "
                 "layout). Pass --chunked-prefill-size -1 when --enable-paras-moe is set."
             )
-            if self.paras_auto_switch:
-                assert 0 < self.paras_auto_switch_low < self.paras_auto_switch_high, (
-                    "require 0 < --paras-auto-switch-low < --paras-auto-switch-high"
-                )
-                assert self.paras_auto_switch_window > 0, (
-                    "--paras-auto-switch-window must be positive"
-                )
-                assert self.paras_auto_switch_cooldown_sec >= 0, (
-                    "--paras-auto-switch-cooldown-sec must be non-negative"
-                )
         else:
             assert self.paras_tp_cuda_graph_max_bs is None, (
                 "--paras-tp-cuda-graph-max-bs requires --enable-paras-moe"
@@ -3043,28 +3098,47 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
-            "--paras-auto-switch-low",
-            type=int,
-            default=ServerArgs.paras_auto_switch_low,
-            help="Switch EP->TP when sliding-window avg global batch < this.",
+            "--paras-auto-switch-policy",
+            type=str,
+            default=ServerArgs.paras_auto_switch_policy,
+            choices=PARAS_AUTO_SWITCH_POLICY_CHOICES,
+            help=(
+                "Auto-switch policy variant. 'decode' fires on the global "
+                "decode batch (default threshold 64 * world_size, window 32, "
+                "cooldown 60s). 'prefill' fires on global prefill tokens "
+                "(default threshold 1024 * world_size, window 8, cooldown "
+                "10s). 'hybrid' is not implemented and raises at startup."
+            ),
         )
         parser.add_argument(
-            "--paras-auto-switch-high",
+            "--paras-auto-switch-threshold",
             type=int,
-            default=ServerArgs.paras_auto_switch_high,
-            help="Switch TP->EP when sliding-window avg global batch > this.",
+            default=ServerArgs.paras_auto_switch_threshold,
+            help=(
+                "Single switch threshold for the auto-switch policy. When "
+                "unset, defaults to the policy's per-GPU magic number times "
+                "world_size (see --paras-auto-switch-policy)."
+            ),
         )
         parser.add_argument(
             "--paras-auto-switch-window",
             type=int,
             default=ServerArgs.paras_auto_switch_window,
-            help="Sliding-window size (decode iterations) for the auto-switch policy.",
+            help=(
+                "Sliding-window size (iterations) for the auto-switch policy. "
+                "When unset, defaults to the policy's value (see "
+                "--paras-auto-switch-policy)."
+            ),
         )
         parser.add_argument(
             "--paras-auto-switch-cooldown-sec",
             type=float,
             default=ServerArgs.paras_auto_switch_cooldown_sec,
-            help="Wall-clock seconds between successive auto-switch decisions.",
+            help=(
+                "Wall-clock seconds between successive auto-switch decisions. "
+                "When unset, defaults to the policy's value (see "
+                "--paras-auto-switch-policy)."
+            ),
         )
         parser.add_argument(
             "--elastic-ep-backend",

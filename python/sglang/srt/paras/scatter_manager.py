@@ -153,6 +153,7 @@ class ParaSReqScatterManager:
         self.token_partition: Optional[List[List[int]]] = None
         self.ep_dst_positions: Optional[torch.Tensor] = None
         self.new_cache_size: Optional[int] = None
+        self.source_full_to_swa_mapping: Optional[torch.Tensor] = None
 
         # In TP mode all ranks have identical req_to_token_pool entries.
         self.global_seqlens_list = [req.seqlen for req in global_reqs]
@@ -463,7 +464,7 @@ class ParaSReqScatterManager:
                 ep_dst_positions=self.ep_dst_positions,
                 paras_tp_rank=self.paras_tp_rank,
                 paras_tp_size=self.paras_tp_size,
-                source_full_to_swa_mapping=getattr(self, "source_full_to_swa_mapping", None),
+                source_full_to_swa_mapping=self.source_full_to_swa_mapping,
             )
 
         # Per-layer dispatch in REVERSE order (preserves N+1 slot invariant).

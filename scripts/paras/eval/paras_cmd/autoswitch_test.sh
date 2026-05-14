@@ -16,11 +16,11 @@
 # Usage: bash autoswitch_test.sh
 #
 # Required at launch time (caller's responsibility):
-#   --paras-auto-switch-low 2 --paras-auto-switch-high 8
-#   --paras-auto-switch-window 4 --paras-auto-switch-cooldown-sec 15
-# These thresholds reliably fire BOTH directions with BURST_SIZE=32:
-#   light prompt (load=1) < low=2  -> low-side policy fires (EP->TP)
-#   32-burst   (load=32) > high=8  -> high-side policy fires (TP->EP)
+#   --paras-auto-switch-policy decode  --paras-auto-switch-threshold 8
+#   --paras-auto-switch-window 4       --paras-auto-switch-cooldown-sec 15
+# The threshold reliably fires BOTH directions with BURST_SIZE=32:
+#   light prompt (load=1) < threshold=8  -> EP->TP
+#   32-burst   (load=32) > threshold=8   -> TP->EP
 #
 # Env overrides (see lib.sh):
 #   BURST_SIZE          parallel concurrency for phase 3 (default 32)
@@ -47,7 +47,7 @@ send_light() {
     local out=$1
     local payload
     payload=$(paras_cmd_build_payload "$LIGHT_PROMPT" "$LIGHT_MAX_TOKENS")
-    curl -s --max-time 60 "http://${HOST}:${PORT}/v1/completions" \
+    curl -s --max-time 60 "http://${HOST}:${PORT}/v1/chat/completions" \
         -H "Content-Type: application/json" -d "$payload" > "$out"
 }
 
@@ -57,7 +57,8 @@ verify_light() {
     LIGHT_FILE="$file" LABEL="$label" python3 -c '
 import json, os, re, sys
 label = os.environ["LABEL"]
-text = json.load(open(os.environ["LIGHT_FILE"]))["choices"][0]["text"]
+msg = json.load(open(os.environ["LIGHT_FILE"]))["choices"][0]["message"]
+text = (msg.get("reasoning_content") or "") + (msg.get("content") or "")
 if re.search(r"(\b\w+\b)(\s+\1){5,}", text):
     print(f"  [{label}] DEGENERATE")
     sys.exit(1)
@@ -84,7 +85,7 @@ echo
 echo "================ phase 3: ${BURST_SIZE}-burst (triggers autoswitch) ================"
 paras_cmd_load_prompts prompts || exit $?
 paras_cmd_burst_send prompts pids "$TMPDIR" "$MAX_TOKENS"
-echo "  spawned ${#pids[@]} concurrent completions; load=${#pids[@]} should exceed --paras-auto-switch-high"
+echo "  spawned ${#pids[@]} concurrent completions; load=${#pids[@]} should exceed --paras-auto-switch-threshold"
 wait "${pids[@]}"
 
 echo
@@ -115,9 +116,9 @@ if [ -f "$LOG_FILE" ] && grep -q "ParaS auto-switch policy fired" "$LOG_FILE"; t
     grep "ParaS auto-switch policy fired" "$LOG_FILE" | head -10 | sed 's/^/    /'
 else
     echo "  FAIL: no 'ParaS auto-switch policy fired' events in ${LOG_FILE}"
-    echo "  Autoswitch never fired. Check: (a) launch passes --paras-auto-switch-low/high,"
-    echo "    (b) BURST_SIZE > --paras-auto-switch-high (default 8), (c) LOG_FILE path matches"
-    echo "    where the launch script is teeing the server log."
+    echo "  Autoswitch never fired. Check: (a) launch passes --paras-auto-switch-policy"
+    echo "    and --paras-auto-switch-threshold, (b) BURST_SIZE > --paras-auto-switch-threshold,"
+    echo "    (c) LOG_FILE path matches where the launch script is teeing the server log."
     exit 1
 fi
 

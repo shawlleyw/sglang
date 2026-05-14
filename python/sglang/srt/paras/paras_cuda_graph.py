@@ -463,17 +463,11 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     #     same global workload, so TP graphs typically need a wider
     #     range. The runner's input/output buffers were sized for
     #     max(ep_bs, tp_bs) at __init__ so all TP captures fit.
-    #     ``capture_bs``/``compile_bs`` are now in _SETTINGS_KEYS, so
-    #     each mode's value is saved with its state and restored on
-    #     ``paras_swap_cuda_graphs``. No manual restore needed here.
-    sa = model_runner.server_args
+    #     ``capture_bs`` is in _SETTINGS_KEYS, so each mode's value is
+    #     saved with its state and restored on ``paras_swap_cuda_graphs``.
+    #     ``compile_bs`` likewise — no recompute needed here.
     if getattr(gr, "_paras_tp_capture_bs", None):
         gr.capture_bs = list(gr._paras_tp_capture_bs)
-        gr.compile_bs = (
-            [bs for bs in gr.capture_bs if bs <= sa.torch_compile_max_bs]
-            if sa.enable_torch_compile
-            else []
-        )
 
     logger.info(
         f"ParaS: capturing TP graphs (ep-captured bs={ep_graph_keys}, "
