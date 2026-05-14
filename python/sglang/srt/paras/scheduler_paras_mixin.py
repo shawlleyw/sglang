@@ -138,10 +138,20 @@ class HybridAutoSwitchPolicy(ParasAutoSwitchPolicy):
         raise NotImplementedError  # unreachable: __init__ raises
 
 
+class RolloutAutoSwitchPolicy(ParasAutoSwitchPolicy):
+    """Observes every iteration; metric is global running+waiting request count.
+    Tuned for synchronous rollout: small window, low threshold."""
+
+    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
+        # Placeholder; wired in next commit (C3)
+        return None
+
+
 _PARAS_AUTO_SWITCH_POLICY_CLASSES = {
     "prefill": PrefillAutoSwitchPolicy,
     "decode": DecodeAutoSwitchPolicy,
     "hybrid": HybridAutoSwitchPolicy,
+    "rollout": RolloutAutoSwitchPolicy,
 }
 
 
