@@ -27,10 +27,9 @@ from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 
 from sglang.srt.paras.paras_memory_manager import (
-    ParaSMemoryManager,
     create_paras_moe_aliases,
+    get_global_paras_memory_manager,
     plan_qwen_moe_layout,
-    set_global_paras_memory_manager,
 )
 from sglang.srt.paras.paras_parallel_state import get_paras_dp_size, get_paras_tp_group, get_paras_tp_size
 from sglang.srt.paras.utils import paras_func
@@ -139,16 +138,13 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         self.config = config
         self.quant_config = quant_config
 
-        # ---- ParaS Memory Manager ----
-        # Create the static weight buffer BEFORE building the model so that
-        # create_weights() can allocate from it via the global accessor.
-        #
-        # Flow:
-        #   1. Create manager + plan layout (reserves all tensor slots)
-        #   2. Materialize (allocates one big GPU buffer)
-        #   3. Set global manager (checked by create_weights in unquant.py)
-        #   4. Build model (create_weights allocates from managed buffer)
-        manager = ParaSMemoryManager()
+        # The UMM was constructed by model_runner.load_model() before this
+        # model was instantiated; pull it via the global accessor.
+        manager = get_global_paras_memory_manager()
+        assert manager is not None, (
+            "ParaS UMM not constructed: model_runner.load_model() should have "
+            "created it before get_model() under enable_paras_moe."
+        )
 
         quant_name = None
         fp8_block_size = None
@@ -189,119 +185,28 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             prefix="model",
         )
 
-        # --- Compute KV token budgets -----------------------------------------
-        # Mirror the baseline budget semantics (model_runner.profile_max_num_token,
-        # model_runner.py:1358-1363). Baseline treats mem_fraction_static as the
-        # fraction of total GPU memory reserved for the STATIC footprint (weights +
-        # KV + any overhead already consumed by torch/NCCL/cuBLAS/CUDA context).
-        # The DYNAMIC reserve (1 - mem_fraction_static) × total is kept free for
-        # activations, KV allocator metadata, CUDA graph input buffers, and late
-        # NCCL/DeepEP/nvshmem allocations that appear after model init.
-        #
-        # Baseline formula:
-        #   rest_memory = avail_now - total × (1 - mem_fraction_static)
-        #   where avail_now is measured AFTER weights are loaded.
-        #
-        # ParaS UMM holds weights + KV in one buffer, allocated up-front. So we
-        # measure avail_now BEFORE any UMM allocation and compute:
-        #   umm_budget = avail_now - total × (1 - mem_fraction_static)
-        #   kv_budget  = umm_budget - weights_only_bytes
-        #
-        # This keeps ParaS's static footprint bounded by the same budget as
-        # baseline, preventing the UMM from stealing memory that baseline would
-        # leave free for dynamic allocations (which in turn let ParaS size its
-        # KV cache ~1.7 GiB larger than baseline — unwanted).
-        from sglang.srt.utils.common import get_available_gpu_memory
-
-        _server_args = get_global_server_args()
-        _mem_fraction = _server_args.mem_fraction_static
-        _page_size = getattr(_server_args, "page_size", 1)
-
-        # kv_cache_dtype: "auto" means use model dtype; fp8 stores as float8_e4m3fn
-        _kv_dtype_str = _server_args.kv_cache_dtype
-        if _kv_dtype_str == "auto":
-            _kv_store_dtype = torch.bfloat16
-        elif _kv_dtype_str in ("fp8", "fp8_e4m3fn"):
-            _kv_store_dtype = torch.float8_e4m3fn
-        else:
-            _kv_store_dtype = torch.bfloat16
-
-        # Total GPU memory (bytes)
-        _total_gpu_bytes = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).total_memory
-
-        # Available GPU memory RIGHT NOW (bytes), before any UMM allocation.
-        # This captures pre-existing usage (torch/CUDA context, NCCL comms, cuBLAS
-        # workspace) that baseline would account for implicitly via avail_now.
-        # empty_cache=True ensures torch's caching allocator isn't hiding free
-        # blocks.
-        #
-        # CRITICAL: distributed=True — every rank must agree on the same
-        # ep_max_tokens, otherwise UMM KV slot sizes diverge across ranks and
-        # peer-access transfers / TP-mode attention collectives will hit shape
-        # mismatches. Mirrors baseline profile_max_num_token at
-        # model_runner.py:1301-1307 which uses distributed=True with an
-        # all_reduce(MIN). Per-rank NVLink topology causes ~70 MB variance in
-        # raw mem_get_info even at identical lifecycle points, which would
-        # translate to ~760-token KV pool divergence per GPU without this.
-        from sglang.srt.distributed import get_world_group
-        _world = get_world_group()
-        _avail_now_gib = get_available_gpu_memory(
-            "cuda",
-            torch.cuda.current_device(),
-            distributed=_world.world_size > 1,
-            cpu_group=_world.cpu_group,
-            empty_cache=True,
-        )
-        _avail_now_bytes = int(_avail_now_gib * (1 << 30))
-
-        _num_layers = config.num_hidden_layers
-        _total_kv_heads = config.num_key_value_heads
-        _capacity = manager.plan_mha_kv_capacity(
-            available_gpu_memory_bytes=_avail_now_bytes,
-            total_gpu_memory_bytes=_total_gpu_bytes,
-            mem_fraction_static=_mem_fraction,
-            num_layers=_num_layers,
-            num_kv_heads=_total_kv_heads,
-            head_dim=head_dim,
+        plan = manager.plan_mha_kv_capacity(
+            config=config,
             tp_size=get_paras_tp_size(),
-            kv_dtype=_kv_store_dtype,
-        )
-        logger.info(
-            f"ParaS KV budget: avail_now={_avail_now_gib:.3f}GiB  "
-            f"total={_total_gpu_bytes/(1<<30):.3f}GiB  "
-            f"dynamic_reserve={_capacity.dynamic_reserve_bytes/(1<<30):.3f}GiB  "
-            f"umm_budget={_capacity.umm_budget_bytes/(1<<30):.3f}GiB  "
-            f"weights_only={manager.weights_only_bytes/(1<<30):.3f}GiB  "
-            f"kv_budget={_capacity.kv_budget_bytes/(1<<30):.3f}GiB  "
-            f"ep_max_tokens={_capacity.ep_max_tokens}  "
-            f"tp_max_tokens={_capacity.tp_max_tokens}  "
-            f"ep_kv_heads={_capacity.ep_kv_heads}  "
-            f"tp_kv_heads={_capacity.tp_kv_heads}"
+            head_dim=head_dim,
         )
 
-        # Reserve KV in manager (union layout: same bytes in both modes)
         manager.reserve_kv_cache(
-            num_layers=_num_layers,
-            ep_max_tokens=_capacity.ep_max_tokens,
-            tp_max_tokens=_capacity.tp_max_tokens,
-            num_kv_heads=_total_kv_heads,
+            num_layers=config.num_hidden_layers,
+            ep_max_tokens=plan.ep_max_tokens,
+            tp_max_tokens=plan.tp_max_tokens,
+            num_kv_heads=config.num_key_value_heads,
             head_dim=head_dim,
             tp_size=get_paras_tp_size(),
-            kv_dtype=_kv_store_dtype,
-            page_size=_page_size,
+            kv_dtype=plan.kv_dtype,
+            page_size=getattr(get_global_server_args(), "page_size", 1),
             prefix="model",
         )
-        # --- End KV budget computation ----------------------------------------
 
-        total_bytes = manager.materialize()
+        manager.materialize()
         create_paras_moe_aliases(manager, config.num_hidden_layers, prefix="model")
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
-
-        # Set global so create_weights() can find the manager
-        set_global_paras_memory_manager(manager)
 
         # Pre-initialize NVLink peer access during model init to avoid overhead at switch time.
         # cudaIpcOpenMemHandle() is slow on first call (~6s for NVLink connection setup).

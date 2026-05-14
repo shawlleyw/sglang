@@ -23,7 +23,7 @@ from sglang.srt.paras.cache_transfer.utils import (
 )
 
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+from sglang.srt.paras.layers.utils import LayerCacheSpec
 from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
 from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 
@@ -38,8 +38,12 @@ def recover_request(
     tree_cache: BasePrefixCache,
     tokenizer: Any,
 ):
-    req.last_host_node = tree_cache.root_node
-    req.last_node = tree_cache.root_node
+    if tree_cache.disable:
+        req.last_host_node = None
+        req.last_node = None
+    else:
+        req.last_host_node = tree_cache.root_node
+        req.last_node = tree_cache.root_node
     req.prefix_indices = []
     req.tokenizer = tokenizer
 
@@ -116,8 +120,10 @@ class ParaSReqGatherManager:
         peer_ctx: Optional[Any] = None,
         method: Optional[str] = None,
         layer_specs: Optional[list] = None,
+        local_waiting_reqs: Optional[List[Req]] = None,
     ):
         self.local_reqs = local_reqs
+        self.local_waiting_reqs = local_waiting_reqs or []
         self.gather_group = gather_group
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -129,6 +135,8 @@ class ParaSReqGatherManager:
         self.local_no_reqs = len(local_reqs) == 0
         self.local_seqlens_list = [req.seqlen for req in local_reqs]
         self.num_local_tokens = sum(self.local_seqlens_list) - len(local_reqs) # the last output token is not stored in kv cache
+
+        self.source_full_to_swa_mapping: Optional[torch.Tensor] = None
         
         if self.local_no_reqs:
             self.local_token_indices = None
@@ -154,6 +162,19 @@ class ParaSReqGatherManager:
             start_index = end_index
             
         self.num_global_tokens = sum(self.global_num_tokens)
+
+        # Gather waiting-queue requests too. They have no KV cache yet — just
+        # plain Python objects — so the same all-gather mechanism preserves
+        # them across the EP->TP switch without any GPU memory transfer.
+        gathered_waiting, _ = paras_tp_group_all_gather_reqs(
+            self.local_waiting_reqs, self.gather_group
+        )
+        self.global_waiting_reqs = gathered_waiting or []
+
+    def get_new_waiting_queue(self, paras_tp_rank: int) -> List[Req]:
+        if paras_tp_rank == 0:
+            return list(self.global_waiting_reqs)
+        return []
         
     def reorchestrate_cache(
         self, 
@@ -187,10 +208,19 @@ class ParaSReqGatherManager:
         assert num_reqs <= new_req_pool_size, "The number of requests to reorchestrate is greater than the new size of the request to token pool."
         self.req_to_token_pool.paras_resize_and_clear(new_req_pool_size)
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
-        
+
+        # Snapshot the source-mode (EP) full_to_swa_index_mapping BEFORE resize.
+        # paras_resize_and_clear zero-fills this mapping; without a snapshot,
+        # SWACacheTransfer.gather_one_layer's lookup on EP-side source positions
+        # would resolve to slot 0 (padding), corrupting SWA layer K/V transport
+        # on the EP->TP direction. Consumed via _full_to_swa_source.
         if is_swa_alloc:
+            self.source_full_to_swa_mapping = (
+                self.token_to_kv_pool_allocator.full_to_swa_index_mapping.clone()
+            )
             self.token_to_kv_pool_allocator.paras_resize_and_clear(new_cache_size, new_cache_size_swa)
         else:
+            self.source_full_to_swa_mapping = None
             self.token_to_kv_pool_allocator.paras_resize_and_clear(new_cache_size)
 
         if self.num_global_tokens > 0:        
@@ -206,8 +236,34 @@ class ParaSReqGatherManager:
                 
             self.global_token_indices = global_token_indices
             assert self.global_token_indices.shape[0] == self.num_global_tokens, "The number of global tokens is not equal to the number of tokens in the global requests."
+
+            self._tighten_swa_pool_to_in_window()
         else:
             self.global_token_indices = None
+
+    def _tighten_swa_pool_to_in_window(self) -> None:
+        if not isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+            return
+        if self.layer_specs is None:
+            return
+        sliding_window_size = next(
+            (s.sliding_window_size for s in self.layer_specs
+             if s.kind == "swa" and s.sliding_window_size is not None),
+            None,
+        )
+        if sliding_window_size is None:
+            return
+        for req in self.global_reqs:
+            seqlen_no_last = req.seqlen - 1
+            in_window_start = max(
+                req.swa_evicted_seqlen, seqlen_no_last - sliding_window_size
+            )
+            if in_window_start > 0:
+                oow_full_slots = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, 0:in_window_start
+                ]
+                self.token_to_kv_pool_allocator.free_swa(oow_full_slots)
+                req.swa_evicted_seqlen = in_window_start
 
     def gather_cache(self) -> None:
         """Transfer KV cache from EP layout to TP layout.
@@ -224,20 +280,22 @@ class ParaSReqGatherManager:
         mgr = get_global_paras_memory_manager()
         method = self.method
 
-        has_swa = self.layer_specs is not None and any(
+        # `has_swa` requires BOTH that layer_specs labels some layers "swa"
+        # AND that the allocator is a hybrid SWAKVPool. In --disable-hybrid-swa-memory
+        # mode the model's `paras_layer_specs` may still label some layers SWA
+        # (gpt_oss.py builds the full classification unconditionally), but the
+        # allocator is a flat MHATokenToKVPool with no inner swa_kv_pool — so
+        # SWACacheTransfer cannot run. Fall back to routing every layer
+        # (including SWA-classified ones) through MHACacheTransfer.
+        specs_have_swa = self.layer_specs is not None and any(
             s.kind == "swa" for s in self.layer_specs
         )
-        if has_swa:
-            assert isinstance(kv_cache, SWAKVPool), (
-                f"Hybrid model (layer_specs contains SWA) requires SWAKVPool, "
-                f"got {type(kv_cache).__name__}. SWAKVPool holds both inner "
-                f"full_kv_pool and swa_kv_pool needed for per-layer dispatch."
-            )
-        else:
-            assert isinstance(kv_cache, (MHATokenToKVPool, SWAKVPool)), (
-                f"Expected MHATokenToKVPool or SWAKVPool, "
-                f"got {type(kv_cache).__name__}."
-            )
+        pool_is_swa = isinstance(kv_cache, SWAKVPool)
+        has_swa = specs_have_swa and pool_is_swa
+        assert isinstance(kv_cache, (MHATokenToKVPool, SWAKVPool)), (
+            f"Expected MHATokenToKVPool or SWAKVPool, "
+            f"got {type(kv_cache).__name__}."
+        )
         peer_addresses = (
             self.peer_ctx.peer_addresses
             if method == "peer_access" and self.peer_ctx
@@ -275,6 +333,7 @@ class ParaSReqGatherManager:
                 global_num_tokens=self.global_num_tokens,
                 layer_specs=self.layer_specs,
                 peer_addresses=peer_addresses,
+                source_full_to_swa_mapping=self.source_full_to_swa_mapping,
             )
 
         # Per-layer dispatch.
@@ -297,7 +356,13 @@ class ParaSReqGatherManager:
                     sliding_window_size=None,
                 )
 
-            backend = swa_backend if spec.kind == "swa" else mha_backend
+            # Route SWA-classified layers to swa_backend ONLY when it exists
+            # (SWAKVPool present). Under --disable-hybrid-swa-memory the
+            # SWA-classified layers fall back to mha_backend.
+            backend = (
+                swa_backend if (spec.kind == "swa" and swa_backend is not None)
+                else mha_backend
+            )
             backend.gather_one_layer(spec)
 
             # peer_access path needs per-layer barrier (ALL ranks participate).
@@ -395,8 +460,12 @@ class ParaSReqGatherManager:
         running_batch.return_hidden_states = any(req.return_hidden_states for req in self.global_reqs)
         running_batch.chunked_req = None
         
+        if running_batch.tree_cache.disable:
+            last_node = None
+        else:
+            last_node = running_batch.tree_cache.root_node
         for req in running_batch.reqs:
-            req.last_node = running_batch.tree_cache.root_node
+            req.last_node = last_node
         
         # Get the last token from each request (for decode input)
         input_ids_list = []

@@ -275,6 +275,8 @@ _SETTINGS_KEYS = (
     "attn_tp_rank",
     "tp_size",
     "dp_size",
+    "capture_bs",
+    "compile_bs",
 )
 
 
@@ -456,8 +458,20 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     #    ``set_global_graph_memory_pool``.
     set_global_graph_memory_pool(None)
 
+    # 4b. Swap to TP-specific capture batch sizes if configured. The
+    #     TP per-rank batch is paras_tp_size x larger than EP for the
+    #     same global workload, so TP graphs typically need a wider
+    #     range. The runner's input/output buffers were sized for
+    #     max(ep_bs, tp_bs) at __init__ so all TP captures fit.
+    #     ``capture_bs`` is in _SETTINGS_KEYS, so each mode's value is
+    #     saved with its state and restored on ``paras_swap_cuda_graphs``.
+    #     ``compile_bs`` likewise — no recompute needed here.
+    if getattr(gr, "_paras_tp_capture_bs", None):
+        gr.capture_bs = list(gr._paras_tp_capture_bs)
+
     logger.info(
-        f"ParaS: capturing TP graphs (ep-captured bs={ep_graph_keys})"
+        f"ParaS: capturing TP graphs (ep-captured bs={ep_graph_keys}, "
+        f"tp-target bs={gr.capture_bs})"
     )
 
     # 5. Refresh settings for TP mode, then capture. The per-capture

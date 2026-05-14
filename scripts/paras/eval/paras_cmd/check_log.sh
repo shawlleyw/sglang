@@ -20,6 +20,7 @@ check_timing() {
 check_errors() {
     echo "=== errors ==="
     out=$(grep -iE "error|exception" "$LOG_FILE" \
+        | grep -v "input_text=" \
         | grep -viE "import error|Config file|opentelemetry|WARNING|warn_only|warnings\.warn|UserWarning" || true)
     if [ -z "$out" ]; then
         echo "OK: no unexpected errors"

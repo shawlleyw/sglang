@@ -20,10 +20,11 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator, SWATokenToKVPoolAllocator
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+from sglang.srt.paras.layers.utils import LayerCacheSpec
 from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
 from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+from sglang.srt.paras.gather_manager import paras_tp_group_all_gather_reqs
 
 
 # ============================================================
@@ -122,6 +123,7 @@ class ParaSReqScatterManager:
         paras_tp_rank: int = 0,
         paras_tp_size: int = 1,
         layer_specs: Optional[list] = None,
+        local_waiting_reqs: Optional[List[Req]] = None,
     ):
         self.global_reqs = global_reqs
         self.scatter_group = scatter_group
@@ -134,12 +136,24 @@ class ParaSReqScatterManager:
         self.method = os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl")
         self.layer_specs = layer_specs
 
+        # Only rank 0 receives requests in TP mode, so only rank 0 has a
+        # populated waiting_queue. Broadcast to all ranks via all-gather
+        # (other ranks send []) so every rank can deterministically run the
+        # same partition algorithm.
+        local_waiting_reqs = local_waiting_reqs or []
+        gathered_waiting, _ = paras_tp_group_all_gather_reqs(
+            local_waiting_reqs, scatter_group
+        )
+        self.global_waiting_reqs: List[Req] = gathered_waiting or []
+        self.local_waiting_reqs_after_partition: List[Req] = []
+
         self.local_reqs: List[Req] = []
         self.local_seqlens_list: List[int] = []
         self.num_local_tokens: int = 0
         self.token_partition: Optional[List[List[int]]] = None
         self.ep_dst_positions: Optional[torch.Tensor] = None
         self.new_cache_size: Optional[int] = None
+        self.source_full_to_swa_mapping: Optional[torch.Tensor] = None
 
         # In TP mode all ranks have identical req_to_token_pool entries.
         self.global_seqlens_list = [req.seqlen for req in global_reqs]
@@ -174,6 +188,11 @@ class ParaSReqScatterManager:
         self.local_reqs = partitions[self.paras_tp_rank]
         self.local_seqlens_list = [req.seqlen for req in self.local_reqs]
         self.num_local_tokens = sum(s - 1 for s in self.local_seqlens_list)
+
+        waiting_partitions = partition_requests_for_ep(
+            self.global_waiting_reqs, self.paras_tp_size
+        )
+        self.local_waiting_reqs_after_partition = waiting_partitions[self.paras_tp_rank]
 
         # Map each request to its global-token-index range.
         req_to_offset: dict = {}
@@ -226,6 +245,19 @@ class ParaSReqScatterManager:
             f"Local reqs {num_local_reqs} exceed EP req pool {new_req_pool_size}"
         )
 
+        # Snapshot the source-mode (TP) full_to_swa_index_mapping BEFORE resize.
+        # paras_resize_and_clear zero-fills this mapping; without a snapshot,
+        # SWACacheTransfer.scatter_one_layer's lookup on TP-side source
+        # positions would resolve to slot 0 (padding), causing all SWA layers'
+        # K/V to read from / write to the padding slot and producing uniformly
+        # noisy decode output post-switch. Consumed via _full_to_swa_source.
+        if is_swa_alloc:
+            self.source_full_to_swa_mapping = (
+                self.token_to_kv_pool_allocator.full_to_swa_index_mapping.clone()
+            )
+        else:
+            self.source_full_to_swa_mapping = None
+
         # Resize and clear allocators.
         self.req_to_token_pool.paras_resize_and_clear(new_req_pool_size)
         if is_swa_alloc:
@@ -252,12 +284,41 @@ class ParaSReqScatterManager:
                     start_index = end_index
 
                 self.ep_dst_positions = ep_token_indices
+
+                self._tighten_swa_pool_to_in_window()
             else:
                 for req, rpi in zip(self.local_reqs, req_pool_indices):
                     req.req_pool_idx = rpi
                 self.ep_dst_positions = None
         else:
             self.ep_dst_positions = None
+
+    def _tighten_swa_pool_to_in_window(self) -> None:
+        if not isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+            return
+        if self.layer_specs is None:
+            return
+        sliding_window_size = next(
+            (s.sliding_window_size for s in self.layer_specs
+             if s.kind == "swa" and s.sliding_window_size is not None),
+            None,
+        )
+        if sliding_window_size is None:
+            return
+        for req in self.local_reqs:
+            seqlen_no_last = req.seqlen - 1
+            in_window_start = max(
+                req.swa_evicted_seqlen, seqlen_no_last - sliding_window_size
+            )
+            if in_window_start > 0:
+                oow_full_slots = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, 0:in_window_start
+                ]
+                self.token_to_kv_pool_allocator.free_swa(oow_full_slots)
+                req.swa_evicted_seqlen = in_window_start
+
+    def get_new_waiting_queue(self) -> List[Req]:
+        return list(self.local_waiting_reqs_after_partition)
 
     # ------------------------------------------------------------------
     # Step 3: build running batch from local partition
@@ -337,20 +398,22 @@ class ParaSReqScatterManager:
         if tp_kv_cache is None:
             tp_kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
 
-        has_swa = self.layer_specs is not None and any(
+        # `has_swa` requires BOTH that layer_specs labels some layers "swa"
+        # AND that the allocator is a hybrid SWAKVPool. In --disable-hybrid-swa-memory
+        # mode the model's `paras_layer_specs` may still label some layers SWA
+        # (gpt_oss.py builds the full classification unconditionally), but the
+        # allocator is a flat MHATokenToKVPool with no inner swa_kv_pool — so
+        # SWACacheTransfer cannot run. Fall back to routing every layer
+        # (including SWA-classified ones) through MHACacheTransfer.
+        specs_have_swa = self.layer_specs is not None and any(
             s.kind == "swa" for s in self.layer_specs
         )
-        if has_swa:
-            assert isinstance(tp_kv_cache, SWAKVPool), (
-                f"Hybrid model (layer_specs contains SWA) requires SWAKVPool, "
-                f"got {type(tp_kv_cache).__name__}. SWAKVPool holds both inner "
-                f"full_kv_pool and swa_kv_pool needed for per-layer dispatch."
-            )
-        else:
-            assert isinstance(tp_kv_cache, (MHATokenToKVPool, SWAKVPool)), (
-                f"Expected MHATokenToKVPool or SWAKVPool, "
-                f"got {type(tp_kv_cache).__name__}."
-            )
+        pool_is_swa = isinstance(tp_kv_cache, SWAKVPool)
+        has_swa = specs_have_swa and pool_is_swa
+        assert isinstance(tp_kv_cache, (MHATokenToKVPool, SWAKVPool)), (
+            f"Expected MHATokenToKVPool or SWAKVPool, "
+            f"got {type(tp_kv_cache).__name__}."
+        )
 
         if ep_head_num is None:
             ep_head_num = tp_kv_cache.full_head_num
@@ -401,6 +464,7 @@ class ParaSReqScatterManager:
                 ep_dst_positions=self.ep_dst_positions,
                 paras_tp_rank=self.paras_tp_rank,
                 paras_tp_size=self.paras_tp_size,
+                source_full_to_swa_mapping=self.source_full_to_swa_mapping,
             )
 
         # Per-layer dispatch in REVERSE order (preserves N+1 slot invariant).
@@ -423,7 +487,13 @@ class ParaSReqScatterManager:
                     sliding_window_size=None,
                 )
 
-            backend = swa_backend if spec.kind == "swa" else mha_backend
+            # Route SWA-classified layers to swa_backend ONLY when it exists
+            # (SWAKVPool present). Under --disable-hybrid-swa-memory the
+            # SWA-classified layers fall back to mha_backend.
+            backend = (
+                swa_backend if (spec.kind == "swa" and swa_backend is not None)
+                else mha_backend
+            )
             backend.scatter_one_layer(spec)
 
             # peer_access path needs per-layer barrier (ALL ranks participate).

@@ -687,14 +687,18 @@ class Scheduler(
             and server_args.disable_radix_cache
         ):
             if self.is_hybrid:
-                ChunkCacheClass = SWAChunkCache
+                self.tree_cache = SWAChunkCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                    sliding_window_size=self.sliding_window_size,
+                )
             else:
-                ChunkCacheClass = ChunkCache
-            self.tree_cache = ChunkCacheClass(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-            )
+                self.tree_cache = ChunkCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                )
         else:
             if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
                 # lazy import to avoid JIT overhead
@@ -955,6 +959,11 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                if self._paras_auto_policy is not None and self.tp_rank == 0:
+                    self.paras_auto_observe(batch)
+                    signal = self.paras_auto_pick_signal()
+                    if signal is not None:
+                        self.send_to_tokenizer.send_output(signal)
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()

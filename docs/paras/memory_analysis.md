@@ -302,6 +302,7 @@ python -m sglang.launch_server \
     --model /scratch1/wangshao/models/Qwen3-30B-A3B-Instruct-2507 \
     --trust-remote-code \
     --chunked-prefill-size -1 --max-prefill-tokens 32000 \
+    --disable-radix-cache \
     --mem-fraction-static 0.6 \
     --tp-size 4 --dp-size 4 --ep-size 4 \
     --enable-dp-attention --enable-dp-lm-head \

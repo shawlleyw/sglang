@@ -749,5 +749,149 @@ def test_gpt_oss_w13_peer_access_layout_interleaved():
     _run_peer_access_layout_semantics_test(interleaved_w13=True)
 
 
+def _make_paras_server_args(**overrides):
+    from sglang.srt.server_args import ServerArgs
+
+    base = dict(
+        model_path="/data/shaoyuw/models/gpt-oss-120b-BF16-unsloth",
+        enable_paras_moe=True,
+        paras_tp_size=4,
+        enable_dp_attention=True,
+        enable_dp_lm_head=True,
+        tp_size=4,
+        dp_size=4,
+        cuda_graph_max_bs=8,
+        mem_fraction_static=0.8,
+    )
+    base.update(overrides)
+    return ServerArgs(**base)
+
+
+def test_paras_tp_cuda_graph_bs_default_scaling():
+    sa = _make_paras_server_args()
+    assert sa.paras_tp_cuda_graph_max_bs == sa.cuda_graph_max_bs * sa.paras_tp_size
+    assert sa.paras_tp_cuda_graph_bs is not None
+    assert max(sa.paras_tp_cuda_graph_bs) == sa.paras_tp_cuda_graph_max_bs
+    assert max(sa.paras_tp_cuda_graph_bs) > max(sa.cuda_graph_bs)
+
+
+def test_paras_tp_cuda_graph_bs_explicit_override():
+    sa = _make_paras_server_args(paras_tp_cuda_graph_max_bs=64)
+    assert sa.paras_tp_cuda_graph_max_bs == 64
+    assert max(sa.paras_tp_cuda_graph_bs) == 64
+    assert sa.cuda_graph_max_bs == 8
+
+
+def test_paras_tp_cuda_graph_bs_rejected_without_paras():
+    from sglang.srt.server_args import ServerArgs
+
+    with pytest.raises(
+        AssertionError, match="--paras-tp-cuda-graph-max-bs requires --enable-paras-moe"
+    ):
+        ServerArgs(
+            model_path="/data/shaoyuw/models/gpt-oss-120b-BF16-unsloth",
+            enable_paras_moe=False,
+            paras_tp_cuda_graph_max_bs=64,
+        )
+
+
+def test_paras_tp_cuda_graph_bs_unset_when_paras_off():
+    from sglang.srt.server_args import ServerArgs
+
+    sa = ServerArgs(
+        model_path="/data/shaoyuw/models/gpt-oss-120b-BF16-unsloth",
+        enable_paras_moe=False,
+    )
+    assert sa.paras_tp_cuda_graph_max_bs is None
+    assert sa.paras_tp_cuda_graph_bs is None
+
+
+def test_paras_auto_switch_defaults():
+    sa = _make_paras_server_args()
+    assert sa.paras_auto_switch is True
+    assert sa.paras_auto_switch_low == 256
+    assert sa.paras_auto_switch_high == 1024
+    assert sa.paras_auto_switch_window == 32
+    assert sa.paras_auto_switch_cooldown_sec == 60.0
+
+
+def test_paras_auto_switch_validation_low_lt_high():
+    with pytest.raises(AssertionError, match="paras-auto-switch-low.*paras-auto-switch-high"):
+        _make_paras_server_args(paras_auto_switch_low=1024, paras_auto_switch_high=256)
+
+
+def test_paras_auto_switch_validation_window_positive():
+    with pytest.raises(AssertionError, match="paras-auto-switch-window"):
+        _make_paras_server_args(paras_auto_switch_window=0)
+
+
+def test_paras_auto_switch_validation_cooldown_nonneg():
+    with pytest.raises(AssertionError, match="paras-auto-switch-cooldown-sec"):
+        _make_paras_server_args(paras_auto_switch_cooldown_sec=-1.0)
+
+
+def _make_policy(low=4, high=16, window=4, cooldown=0.0):
+    from sglang.srt.paras.scheduler_paras_mixin import ParasAutoSwitchPolicy
+    return ParasAutoSwitchPolicy(low=low, high=high, window=window, cooldown_sec=cooldown)
+
+
+def test_policy_switches_ep_to_tp_when_avg_below_low():
+    p = _make_policy()
+    for v in [3, 3, 3, 3]:
+        p.observe(v, now=0.0)
+    assert p.pick_target("EP", now=0.0) == "TP"
+
+
+def test_policy_switches_tp_to_ep_when_avg_above_high():
+    p = _make_policy()
+    for v in [20, 20, 20, 20]:
+        p.observe(v, now=0.0)
+    assert p.pick_target("TP", now=0.0) == "EP"
+
+
+def test_policy_no_switch_in_dead_zone():
+    p = _make_policy(low=4, high=16, window=4)
+    for v in [10, 10, 10, 10]:
+        p.observe(v, now=0.0)
+    assert p.pick_target("EP", now=0.0) is None
+    assert p.pick_target("TP", now=0.0) is None
+
+
+def test_policy_no_switch_until_window_full():
+    p = _make_policy(window=4)
+    for v in [3, 3, 3]:
+        p.observe(v, now=0.0)
+    assert p.pick_target("EP", now=0.0) is None
+
+
+def test_policy_cooldown_blocks_immediate_reswitch():
+    p = _make_policy(cooldown=10.0)
+    for v in [3, 3, 3, 3]:
+        p.observe(v, now=0.0)
+    assert p.pick_target("EP", now=0.0) == "TP"
+    for v in [20, 20, 20, 20]:
+        p.observe(v, now=1.0)
+    assert p.pick_target("TP", now=1.0) is None
+    assert p.pick_target("TP", now=9.9) is None
+    assert p.pick_target("TP", now=10.1) == "EP"
+
+
+def test_policy_zero_global_batch_ignored():
+    p = _make_policy(window=4)
+    for v in [0, 0, 0, 3, 3, 3, 3]:
+        p.observe(v, now=0.0)
+    assert p.pick_target("EP", now=0.0) == "TP"
+
+
+def test_policy_window_clears_after_switch():
+    p = _make_policy(cooldown=0.0)
+    for v in [3, 3, 3, 3]:
+        p.observe(v, now=0.0)
+    p.pick_target("EP", now=0.0)
+    for v in [3]:
+        p.observe(v, now=0.0)
+    assert p.pick_target("TP", now=0.0) is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

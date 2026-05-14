@@ -258,6 +258,18 @@ class CudaGraphRunner:
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
+
+        sa = model_runner.server_args
+        if sa.enable_paras_moe and sa.paras_tp_cuda_graph_bs:
+            self._paras_tp_capture_bs = sorted(
+                {bs for bs in sa.paras_tp_cuda_graph_bs if bs > 0}
+            )
+            log_info_on_rank0(
+                logger,
+                f"ParaS TP-mode cuda graph bs {self._paras_tp_capture_bs}",
+            )
+        else:
+            self._paras_tp_capture_bs = None
         if KTRANSFORMERS_AVAILABLE:
             AMXMoEWrapper.set_capture_batch_sizes(self.capture_bs)
         self.capture_forward_mode = ForwardMode.DECODE
@@ -281,7 +293,10 @@ class CudaGraphRunner:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
-        self.max_bs = max(self.capture_bs)
+        if self._paras_tp_capture_bs:
+            self.max_bs = max(max(self.capture_bs), max(self._paras_tp_capture_bs))
+        else:
+            self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
         self.model_runner.attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token

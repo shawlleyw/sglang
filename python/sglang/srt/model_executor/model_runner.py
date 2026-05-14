@@ -67,8 +67,10 @@ from sglang.srt.paras.paras_parallel_state import (
     paras_comm_configure_ep,
 )
 from sglang.srt.paras.paras_memory_manager import (
+    ParaSMemoryManager,
     _validate_paras_swa_runtime_scope,
     get_global_paras_memory_manager,
+    set_global_paras_memory_manager,
 )
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -785,6 +787,22 @@ class ModelRunner:
                     ),
                 )
                 t.start()
+
+        # Construct the ParaS unified memory manager BEFORE the model is built
+        # so that create_weights() inside the model class can pull tensor views
+        # from the manager via the global accessor. The manager owns its own
+        # device/gpu_id/server_args/cpu_group state, which is the input that
+        # plan_mha_kv_capacity / plan_hybrid_swa_kv_capacity will later read.
+        if self.server_args.enable_paras_moe:
+            paras_world = get_world_group()
+            paras_manager = ParaSMemoryManager(
+                device=self.device,
+                gpu_id=self.gpu_id,
+                server_args=self.server_args,
+                cpu_group=paras_world.cpu_group if paras_world.world_size > 1 else None,
+                world_size=paras_world.world_size,
+            )
+            set_global_paras_memory_manager(paras_manager)
 
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm

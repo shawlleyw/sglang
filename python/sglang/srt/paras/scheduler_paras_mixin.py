@@ -1,3 +1,5 @@
+import abc
+from collections import deque
 from types import SimpleNamespace
 from typing import List, Any, Optional
 import torch
@@ -5,7 +7,12 @@ import logging
 import time
 import os
 
-from sglang.srt.managers.io_struct import ParaSConfigureReqInput, ParaSConfigureReqType, ParaSConfigureReqOutput
+from sglang.srt.managers.io_struct import (
+    ParaSAutoSwitchReq,
+    ParaSConfigureReqInput,
+    ParaSConfigureReqOutput,
+    ParaSConfigureReqType,
+)
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -13,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info, get_attention_tp_group
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, MHATokenToKVPool
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 
 from sglang.srt.paras.utils import paras_func, paras_profile_func
@@ -38,6 +46,105 @@ class TimeReporter:
         cost_ms = (end_time - self.start_time) * 1000
         logger.info(f"Time taken to {self.op_name}: {cost_ms} ms")
 
+class ParasAutoSwitchPolicy(abc.ABC):
+    """Base class for ParaS auto-switch policies.
+
+    Subclasses define `observation_for_batch` to (a) filter iterations the
+    policy cares about and (b) compute the per-iteration global metric value.
+    The base handles windowing, cooldown, and the cross-threshold decision.
+    """
+
+    def __init__(self, threshold: int, window: int, cooldown_sec: float):
+        self.threshold = threshold
+        self.window: deque = deque(maxlen=window)
+        self.cooldown_sec = cooldown_sec
+        self.cooldown_until: float = 0.0
+
+    @abc.abstractmethod
+    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
+        """Return this iteration's global metric, or None to skip the iteration."""
+
+    def observe(self, batch: ScheduleBatch, now: float) -> None:
+        value = self.observation_for_batch(batch)
+        if value is None or value <= 0:
+            return
+        self.window.append(value)
+
+    def pick_target(self, current_mode: str, now: float) -> Optional[str]:
+        if now < self.cooldown_until:
+            return None
+        if len(self.window) < self.window.maxlen:
+            return None
+        avg = sum(self.window) / len(self.window)
+        target: Optional[str] = None
+        if current_mode == "EP" and avg < self.threshold:
+            target = "TP"
+        elif current_mode == "TP" and avg > self.threshold:
+            target = "EP"
+        if target is not None:
+            logger.info(
+                f"ParaS [{type(self).__name__}] policy fired: "
+                f"{current_mode} -> {target} at t={now:.3f} | "
+                f"observations={list(self.window)} avg={avg:.2f} "
+                f"threshold={self.threshold} window_maxlen={self.window.maxlen} "
+                f"cooldown_sec={self.cooldown_sec}"
+            )
+            self.cooldown_until = now + self.cooldown_sec
+            self.window.clear()
+        return target
+
+
+class PrefillAutoSwitchPolicy(ParasAutoSwitchPolicy):
+    """Observes pure prefill (EXTEND) iterations; metric is global prefill tokens."""
+
+    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
+        if batch.forward_mode != ForwardMode.EXTEND:
+            return None
+        if batch.global_num_tokens:
+            return int(sum(batch.global_num_tokens))
+        return sum(req.seqlen for req in batch.reqs)
+
+
+class DecodeAutoSwitchPolicy(ParasAutoSwitchPolicy):
+    """Observes every iteration; metric is global in-flight token / request count.
+
+    The metric is `sum(batch.global_num_tokens)` in EP+DP-attention mode (the
+    all-gathered per-DP token count, summed across all DP ranks) and
+    `len(batch.reqs)` in TP-only mode. Forward mode is intentionally NOT
+    filtered: rank 0 may run an idle batch (`forward_mode = IDLE`) when other
+    DP ranks hold the work, but its `batch.global_num_tokens` still carries
+    the true global state via the MLP all-gather. Skipping idle batches would
+    silently strand the policy whenever round-robin routes light-load
+    requests to a non-zero DP rank.
+    """
+
+    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
+        if batch.global_num_tokens:
+            return int(sum(batch.global_num_tokens))
+        return len(batch.reqs)
+
+
+class HybridAutoSwitchPolicy(ParasAutoSwitchPolicy):
+    """Mixed prefill+decode batches. Not yet implemented; raises at construction."""
+
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Hybrid (mixed prefill+decode) auto-switch policy is not implemented. "
+            "Use 'prefill' or 'decode'. ParaS disables chunked prefill so "
+            "ForwardMode.MIXED should not occur in practice."
+        )
+
+    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
+        raise NotImplementedError  # unreachable: __init__ raises
+
+
+_PARAS_AUTO_SWITCH_POLICY_CLASSES = {
+    "prefill": PrefillAutoSwitchPolicy,
+    "decode": DecodeAutoSwitchPolicy,
+    "hybrid": HybridAutoSwitchPolicy,
+}
+
+
 class SchedulerParasMixin:
     """
     This class implements the parallel configuration logic for Scheduler.
@@ -48,9 +155,13 @@ class SchedulerParasMixin:
     token_to_kv_pool_allocator: TokenToKVPoolAllocator
     
     def init_paras_config(self):
+        # Always initialize so non-ParaS schedulers can no-op the event-loop hook
+        # with a single `if self._paras_auto_policy is not None:` check.
+        self._paras_auto_policy: Optional[ParasAutoSwitchPolicy] = None
+
         if not self.server_args.enable_paras_moe:
             return
-        
+
         # ParaS config
         self.paras_tp_size = self.server_args.paras_tp_size
         self.paras_tp_rank = self.tp_rank % self.paras_tp_size
@@ -89,6 +200,15 @@ class SchedulerParasMixin:
 
         self.paras_parallelism_config = "EP"
 
+        sa = self.server_args
+        if sa.paras_auto_switch:
+            policy_cls = _PARAS_AUTO_SWITCH_POLICY_CLASSES[sa.paras_auto_switch_policy]
+            self._paras_auto_policy = policy_cls(
+                threshold=sa.paras_auto_switch_threshold,
+                window=sa.paras_auto_switch_window,
+                cooldown_sec=sa.paras_auto_switch_cooldown_sec,
+            )
+
     def paras_configure_helper(self):
         (
             self.max_total_num_tokens,
@@ -109,19 +229,52 @@ class SchedulerParasMixin:
             )
         
     def paras_check(self):
-        if len(self.waiting_queue) > 0:
-            logger.warning("Waiting queue is not empty, parallelism switch is not allowed.")
-            return False
+        # Canary: log if running_batch ever contains a req with output_ids=[].
+        # This state was thought unreachable in normal mode (all reqs entering
+        # running_batch traverse last_batch first; process_batch_result populates
+        # output_ids before last_batch is set). The previous guard from
+        # b6d0b9665 inspected this state. If this log fires in production, the
+        # guard was needed and should be reinstated.
         if self.running_batch is not None and any(
             len(req.output_ids) == 0 for req in self.running_batch.reqs
         ):
             logger.warning(
-                "Running batch contains a req with no output_ids "
-                "(promoted from waiting but not yet forwarded); "
-                "parallelism switch is not allowed."
+                "paras_check: running_batch contains a req with output_ids=[] "
+                "(thought unreachable in normal mode); investigate before "
+                "relying on this assumption"
             )
-            return False
         return True
+
+    def paras_auto_observe(self, batch: Optional[ScheduleBatch]) -> None:
+        assert self._paras_auto_policy is not None
+        if batch is None:
+            return
+        self._paras_auto_policy.observe(batch, time.time())
+
+    def _paras_auto_clear_window_on_switch(self) -> None:
+        assert self._paras_auto_policy is not None
+        policy = self._paras_auto_policy
+        policy.window.clear()
+        policy.cooldown_until = max(
+            policy.cooldown_until, time.time() + policy.cooldown_sec
+        )
+
+    def paras_auto_pick_signal(self) -> Optional[ParaSAutoSwitchReq]:
+        assert self._paras_auto_policy is not None
+        target = self._paras_auto_policy.pick_target(
+            self.paras_parallelism_config, time.time()
+        )
+        if target is None:
+            return None
+        req_type = (
+            ParaSConfigureReqType.CONFIGURE_TP
+            if target == "TP"
+            else ParaSConfigureReqType.CONFIGURE_EP
+        )
+        logger.info(
+            f"ParaS auto-switch policy fired: {self.paras_parallelism_config} -> {target}"
+        )
+        return ParaSAutoSwitchReq(target=req_type)
     
     def paras_get_req_seqlens(self, reqs: List[Req]):
         seqlens = []
@@ -136,12 +289,19 @@ class SchedulerParasMixin:
     
     @paras_func
     def paras_configure_tp(self):
+        if self.paras_parallelism_config == "TP":
+            logger.warning("paras_configure_tp called but already in TP mode; skipping")
+            return
         if not self.paras_check():
             return
 
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
         assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
         torch.cuda.synchronize()
+
+        if self._paras_auto_policy is not None:
+            self._paras_auto_clear_window_on_switch()
+
         # switch from EP to DP x TP
         self.paras_parallelism_config = "TP"
         self.server_args.enable_dp_attention = False
@@ -160,7 +320,8 @@ class SchedulerParasMixin:
         self.paras_start_profile("/tmp/paras_configure_profile")
         self.tree_cache.reset()
         local_reqs = self.paras_get_local_reqs()
-        
+        local_waiting_reqs = list(self.waiting_queue)
+
         paras_gather_manager = ParaSReqGatherManager(
             local_reqs,
             self.paras_tp_group,
@@ -172,6 +333,12 @@ class SchedulerParasMixin:
                 None,
             ),
             method=os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl"),
+            local_waiting_reqs=local_waiting_reqs,
+            layer_specs=getattr(
+                self.tp_worker.model_runner.model,
+                'paras_layer_specs',
+                None,
+            ),
         )
         
         start_time = time.time()
@@ -192,6 +359,9 @@ class SchedulerParasMixin:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor
+        )
+        self.waiting_queue = paras_gather_manager.get_new_waiting_queue(
+            self.paras_tp_rank
         )
         # paras_gather_manager.update_running_batch_inplace(self.running_batch)
 
@@ -227,6 +397,10 @@ class SchedulerParasMixin:
         self.send_to_detokenizer = self.tp_send_to_detokenizer
         self.recv_from_rpc = self.tp_recv_from_rpc
 
+        # Drop the pre-switch batch reference: its req_pool_idx points into the
+        # destroyed EP pool layout, and merge_last_batch already absorbed its
+        # reqs into the new TP running_batch via paras_get_local_reqs().
+        self.last_batch = None
         torch.cuda.synchronize()
 
     @paras_func
@@ -242,12 +416,16 @@ class SchedulerParasMixin:
         assert self.paras_dp_size == 1, "paras_configure_ep only supports dp_size==1"
         torch.cuda.synchronize()
 
+        if self._paras_auto_policy is not None:
+            self._paras_auto_clear_window_on_switch()
+
         self.paras_start_profile("/tmp/paras_configure_profile")
 
         # Phase 1: Prepare — reset tree cache, merge batches, build global req list
         self.tree_cache.reset()
         self.merge_last_batch()
         global_reqs = list(self.running_batch.reqs) if self.running_batch else []
+        local_waiting_reqs = list(self.waiting_queue)
 
         # Phase 2: Scatter — partition reqs, shrink pools, scatter KV cache
         paras_scatter_manager = ParaSReqScatterManager(
@@ -262,6 +440,12 @@ class SchedulerParasMixin:
             ),
             paras_tp_rank=self.paras_tp_rank,
             paras_tp_size=self.paras_tp_size,
+            local_waiting_reqs=local_waiting_reqs,
+            layer_specs=getattr(
+                self.tp_worker.model_runner.model,
+                'paras_layer_specs',
+                None,
+            ),
         )
 
         start_time = time.time()
@@ -283,6 +467,7 @@ class SchedulerParasMixin:
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
         )
+        self.waiting_queue = paras_scatter_manager.get_new_waiting_queue()
 
         # Phase 3: Model switch (weights + attention)
         with TimeReporter("transfer_weights"):
@@ -326,6 +511,8 @@ class SchedulerParasMixin:
         self.send_to_detokenizer = self.ep_send_to_detokenizer
         self.recv_from_rpc = self.ep_recv_from_rpc
 
+        # See paras_configure_tp's matching reset: drop pre-switch batch ref.
+        self.last_batch = None
         torch.cuda.synchronize()
 
     def paras_configure_handle(self, recv_req: ParaSConfigureReqInput):

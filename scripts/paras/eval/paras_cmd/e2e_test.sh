@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-to-end ParaS server test: drives steps 3-13 of paras-test-qwen3 / paras-test-gpt-oss.
+# End-to-end ParaS server test: drives steps 3-13 of paras-test-manual-switch.
 # The CALLER is responsible for steps 1 (pkill old server), 2 (launch via
 # launch_server_dp_ep.sh ENABLE_PARAS=1 ...), and 14 (final cleanup).
 #
@@ -15,6 +15,9 @@ set -uo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 source "$SCRIPT_DIR/lib.sh"
 
+FAIL_COUNT=0
+FAILED_STEPS=()
+
 run_step() {
     local n=$1; shift
     local desc=$1; shift
@@ -24,8 +27,10 @@ run_step() {
     local rc=$?
     if [ $rc -ne 0 ]; then
         echo "step ${n} FAILED (rc=$rc)"
-        return $rc
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        FAILED_STEPS+=("${n}")
     fi
+    return $rc
 }
 
 run_step 3  "wait for server ready"            bash "$SCRIPT_DIR/wait_ready.sh"
@@ -41,4 +46,10 @@ run_step 12 "in-flight TP→EP switch"           bash "$SCRIPT_DIR/inflight_swit
 run_step 13 "verify no errors"                 bash "$SCRIPT_DIR/check_log.sh"   "errors"
 
 echo
-echo "================ e2e PASS ================"
+if [ "$FAIL_COUNT" -eq 0 ]; then
+    echo "================ e2e PASS ================"
+    exit 0
+else
+    echo "================ e2e FAIL: ${FAIL_COUNT} step(s) failed: ${FAILED_STEPS[*]} ================"
+    exit 1
+fi

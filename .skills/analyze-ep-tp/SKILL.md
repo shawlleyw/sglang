@@ -26,6 +26,31 @@ SGLang supports all four combinations of {attention: TP | DP} × {experts: TP | 
 
 **What decides the winner**: each config makes a different trade-off along 3 axes below. The dominant axis changes with batch size, GPU count, and model shape.
 
+## Bundled Scripts (`.skills/analyze-ep-tp/scripts/`)
+
+End-to-end tooling. Each takes CLI args (no hardcoded paths). Activate `sgl_paras` first.
+
+| Script | Purpose | Input | Output |
+|---|---|---|---|
+| [`run_sweep.sh`](file:///home/shaoyuw/sglang/.skills/analyze-ep-tp/scripts/run_sweep.sh) | Drive a 4-way sweep via `bench_one_batch_*.sh` (cold+warm pairs) | env: `BENCH_DIR`, `OUTDIR`, `MODEL_PATH`, `NUM_GPUS`, `TP_BS_UNIQ`, `DP_BS_UNIQ` | `<OUTDIR>/results.jsonl` + `<OUTDIR>/logs/` |
+| [`format_bench.py`](file:///home/shaoyuw/sglang/.skills/analyze-ep-tp/scripts/format_bench.py) | Pretty-print raw `bench_one_batch` JSONL (all passes) | `results.jsonl` (or stdin) | text/CSV table with eq_bs + system_tps columns |
+| [`analyze.py`](file:///home/shaoyuw/sglang/.skills/analyze-ep-tp/scripts/analyze.py) | Per-metric best-of-N + system-throughput tables | `results.jsonl` | stdout tables + `<results>.report.md` |
+| [`plot.py`](file:///home/shaoyuw/sglang/.skills/analyze-ep-tp/scripts/plot.py) | 2-subplot figure (Prefill \| Decode) vs equiv batch (log-x, linear-y) | `results.jsonl` | PNG + PDF |
+| [`analyze_traces.py`](file:///home/shaoyuw/sglang/.skills/analyze-ep-tp/scripts/analyze_traces.py) | Per-rank kernel breakdown from torch.profiler traces (no CUDA graphs) | dir of `*_rank<R>_batch<B>_..._<stage>.trace.json.gz` | per-rank tables + CV% per category |
+| [`analyze_nsys.py`](file:///home/shaoyuw/sglang/.skills/analyze-ep-tp/scripts/analyze_nsys.py) | Effective latency + axis decomposition from nsys traces (CUDA-graph-aware) | dir of `<config>_bs<N>_<stage>[_<suffix>].nsys-rep` | markdown report + JSON |
+
+**Typical workflow**:
+
+```bash
+cd <some-output-dir>
+bash $SGLANG_REPO/.skills/analyze-ep-tp/scripts/run_sweep.sh all
+python $SGLANG_REPO/.skills/analyze-ep-tp/scripts/analyze.py results.jsonl
+python $SGLANG_REPO/.skills/analyze-ep-tp/scripts/plot.py results.jsonl
+python $SGLANG_REPO/.skills/analyze-ep-tp/scripts/format_bench.py results.jsonl   # for raw inspection
+```
+
+For deep root-cause analysis, additionally capture profiles via `ENABLE_TORCH_PROFILE=1` or `ENABLE_NSYS=1` (see Step 2/3 below) and run `analyze_traces.py` / `analyze_nsys.py` against the trace directory.
+
 ## Mental Model: The 3 Performance Axes
 
 ### Axis 1: Communication Pattern
@@ -285,9 +310,9 @@ Consequence: **the kernel-level effective-latency ratio measured under nsys (1.2
 
 ### Step 4: Analyze Traces
 
-Use `analyze_multirank.py` (in `~/qwen-30b-analysis/`) or `analyze_traces.py` (in `~/sglang_profile_ep_tp/`).
+Use the bundled [`analyze_traces.py`](file:///home/shaoyuw/sglang/.skills/analyze-ep-tp/scripts/analyze_traces.py) for torch.profiler trace dirs (no CUDA graphs) or [`analyze_nsys.py`](file:///home/shaoyuw/sglang/.skills/analyze-ep-tp/scripts/analyze_nsys.py) for nsys trace dirs (CUDA-graph-aware). Both auto-discover `(config, batch, stage)` from filenames, classify kernels using the rules below, and emit per-rank tables + effective latency + CV% per category.
 
-Kernel classification rules:
+Kernel classification rules (encoded in both scripts; barrier kernels split out per the caveat below):
 - **Attention**: flashinfer kernels, `_fwd_kernel`, `_fwd_grouped_kernel_stage*`, cutlass/ampere GEMMs (QKV/O projections), RoPE (`BatchQKApplyRotary*`)
 - **Communication (data movement)**: `cross_device_reduce`, `ncclDevKernel_AllReduce`, `ncclDevKernel_AllGather`, `deep_ep::intranode::dispatch`, `deep_ep::intranode::combine` (prefill), `deep_ep::internode_ll::dispatch`, `deep_ep::internode_ll::combine` (decode)
 - **Communication (sync/notify barriers)** — these are NOT data-movement kernels; they're cross-rank barriers: `deep_ep::intranode::cached_notify_combine` (prefill, dominant cost — see caveat in §Analysis Methodology), `deep_ep::intranode::notify_dispatch`. Treat per-kernel duration with care — see "barrier kernels" caveat below.

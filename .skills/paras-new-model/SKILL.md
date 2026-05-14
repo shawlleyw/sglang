@@ -120,6 +120,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
     --enable-dp-attention --enable-dp-lm-head \
     --moe-a2a-backend deepep --deepep-mode auto \
     --disable-cuda-graph --disable-overlap-schedule \
+    --disable-radix-cache --chunked-prefill-size -1 \
     --enable-paras-moe --paras-tp-size 4
 
 # After server is up:

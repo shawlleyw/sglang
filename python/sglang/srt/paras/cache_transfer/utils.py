@@ -176,14 +176,29 @@ def do_gather_one_layer_nccl(
                 .repeat_interleave(replication_factor, dim=0)
                 .flatten()
             )
+        empty_rank_slot = -1
     else:
-        permuted_local_kvcache = torch.empty(
-            (0,), dtype=store_dtype, device=device,
+        # NCCL all_to_all_single rejects NULL data_ptr() (which torch.empty(0)
+        # produces) AND requires sum(input_split_sizes) == input.numel().
+        # Workaround: allocate a 1-element placeholder and route it self->self
+        # via input_split_sizes[my_rank]=1 + output_split_sizes[my_rank]+=1.
+        # Other ranks are unaffected (their output_split_sizes for this rank
+        # is computed from global_num_tokens[this_rank]=0). The placeholder
+        # element is sliced out of gathered_kvcache before scatter.
+        my_rank = dist.get_rank(group=gather_group.device_group)
+        permuted_local_kvcache = torch.zeros(
+            1, dtype=store_dtype, device=device,
         )
+        input_split_sizes = [0] * group_size
+        input_split_sizes[my_rank] = 1
+        output_split_sizes = list(output_split_sizes)
+        output_split_sizes[my_rank] += 1
+        empty_rank_slot = my_rank
 
-    if num_global_tokens > 0:
+    if num_global_tokens > 0 or empty_rank_slot >= 0:
+        gathered_size = sum(output_split_sizes)
         gathered_kvcache = torch.empty(
-            2 * num_global_tokens * splited_size_per_token,
+            gathered_size,
             dtype=permuted_local_kvcache.dtype,
             device=permuted_local_kvcache.device,
         )
@@ -194,6 +209,16 @@ def do_gather_one_layer_nccl(
             input_split_sizes,
             group=gather_group.device_group,
         )
+
+        if num_global_tokens == 0:
+            return  # nothing to scatter (only placeholder was exchanged)
+
+        if empty_rank_slot >= 0:
+            placeholder_offset = sum(output_split_sizes[:empty_rank_slot])
+            gathered_kvcache = torch.cat([
+                gathered_kvcache[:placeholder_offset],
+                gathered_kvcache[placeholder_offset + 1:],
+            ])
 
         tp_k_name = f"model.layers.{layer_id}.kv.tp.k"
         tp_v_name = f"model.layers.{layer_id}.kv.tp.v"
@@ -295,14 +320,22 @@ def do_scatter_one_layer_nccl(
             k_buf, v_buf, sorted_tp_indices,
             num_kv_heads, heads_per_rank, head_dim, group_size,
         )
+        empty_rank_slot = -1
     else:
-        send_buf = torch.empty(
-            0, dtype=kv_cache.store_dtype, device=kv_cache.device
+        my_rank = dist.get_rank(group=gather_group.device_group)
+        send_buf = torch.zeros(
+            1, dtype=kv_cache.store_dtype, device=kv_cache.device,
         )
+        input_split_sizes = [0] * group_size
+        input_split_sizes[my_rank] = 1
+        output_split_sizes = list(output_split_sizes)
+        output_split_sizes[my_rank] += 1
+        empty_rank_slot = my_rank
 
-    if total_global_tokens > 0:
+    if total_global_tokens > 0 or empty_rank_slot >= 0:
+        recv_size = sum(output_split_sizes)
         recv_buf = torch.empty(
-            total_recv_elems,
+            recv_size,
             dtype=kv_cache.store_dtype,
             device=kv_cache.device,
         )
@@ -311,6 +344,16 @@ def do_scatter_one_layer_nccl(
             output_split_sizes, input_split_sizes,
             group=gather_group.device_group,
         )
+
+        if total_global_tokens == 0:
+            return
+
+        if empty_rank_slot >= 0:
+            placeholder_offset = sum(output_split_sizes[:empty_rank_slot])
+            recv_buf = torch.cat([
+                recv_buf[:placeholder_offset],
+                recv_buf[placeholder_offset + 1:],
+            ])
 
         if recv_full_count > 0:
             ep_k_name = f"model.layers.{layer_id}.kv.ep.k"

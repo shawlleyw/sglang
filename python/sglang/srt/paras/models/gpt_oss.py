@@ -48,17 +48,14 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.paras.cache_transfer import classify_layers_from_config
 from sglang.srt.paras.layers.paras_attention import ParaSAttentionMixin
 from sglang.srt.paras.layers.paras_decoder_layer import ParaSDecoderLayerMixin
 from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 from sglang.srt.paras.paras_memory_manager import (
-    ParaSMemoryManager,
     create_paras_moe_aliases,
+    get_global_paras_memory_manager,
     plan_gpt_oss_moe_layout,
-    plan_hybrid_kv_budget,
-    set_global_paras_memory_manager,
 )
 from sglang.srt.paras.paras_parallel_state import (
     get_paras_dp_size,
@@ -281,8 +278,13 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
         if not hasattr(config, "moe_intermediate_size"):
             config.moe_intermediate_size = config.intermediate_size
 
-        # ---- ParaS Memory Manager ----
-        manager = ParaSMemoryManager()
+        # The UMM was constructed by model_runner.load_model() before this
+        # model was instantiated; pull it via the global accessor.
+        manager = get_global_paras_memory_manager()
+        assert manager is not None, (
+            "ParaS UMM not constructed: model_runner.load_model() should have "
+            "created it before get_model() under enable_paras_moe."
+        )
 
         quant_name = None
         fp8_block_size = None
@@ -325,125 +327,30 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
             prefix="model",
         )
 
-        # --- Compute heterogeneous KV token budgets -----------------------
-        # GPT-OSS has full-attention and sliding-window layers with
-        # different KV capacity requirements.  Mirrors the baseline budget
-        # semantics from model_runner.py and splits the budget via
-        # plan_hybrid_kv_budget.
-        from sglang.srt.utils.common import get_available_gpu_memory
-
-        _server_args = get_global_server_args()
-        _mem_fraction = _server_args.mem_fraction_static
-        _page_size = getattr(_server_args, "page_size", 1)
-
-        _kv_dtype_str = _server_args.kv_cache_dtype
-        if _kv_dtype_str == "auto":
-            _kv_store_dtype = torch.bfloat16
-        elif _kv_dtype_str in ("fp8", "fp8_e4m3fn"):
-            _kv_store_dtype = torch.float8_e4m3fn
-        else:
-            _kv_store_dtype = torch.bfloat16
-
-        _total_gpu_bytes = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).total_memory
-
-        from sglang.srt.distributed import get_world_group
-
-        _world = get_world_group()
-        _avail_now_gib = get_available_gpu_memory(
-            "cuda",
-            torch.cuda.current_device(),
-            distributed=_world.world_size > 1,
-            cpu_group=_world.cpu_group,
-            empty_cache=True,
-        )
-        _avail_now_bytes = int(_avail_now_gib * (1 << 30))
-
-        _dynamic_reserve_bytes = int(_total_gpu_bytes * (1.0 - _mem_fraction))
-        _umm_budget_bytes = max(0, _avail_now_bytes - _dynamic_reserve_bytes)
-        _kv_budget_bytes = max(0, _umm_budget_bytes - manager.weights_only_bytes)
-
-        _num_layers = config.num_hidden_layers
-        _total_kv_heads = config.num_key_value_heads
-        _kv_elem_size = torch.tensor([], dtype=_kv_store_dtype).element_size()
-
-        # Classify layers as full or SWA
-        _layer_types = getattr(config, "layer_types", None) or (
-            ["full_attention"] * _num_layers
-        )
-        _n_full = sum(1 for t in _layer_types if t == "full_attention")
-        _n_swa = sum(1 for t in _layer_types if t == "sliding_attention")
-
-        # Per-token-per-layer KV cost (K + V, same for full and SWA)
-        _cell_bytes = _total_kv_heads * head_dim * 2 * _kv_elem_size
-        _total_token_layers = max(1, int(_kv_budget_bytes // _cell_bytes))
-
-        _paras_tp_size = get_paras_tp_size()
-
-        if _n_swa > 0:
-            _swa_ratio = getattr(_server_args, "swa_full_tokens_ratio", 0.5)
-            _full_max_tokens, _swa_max_tokens = plan_hybrid_kv_budget(
-                _total_token_layers,
-                _n_full,
-                _n_swa,
-                _swa_ratio,
-            )
-        else:
-            _full_max_tokens = max(1, _total_token_layers // _num_layers)
-            _swa_max_tokens = 0
-
-        logger.info(
-            "ParaS GPT-OSS KV budget: avail_now=%.3fGiB  "
-            "total=%.3fGiB  dynamic_reserve=%.3fGiB  "
-            "umm_budget=%.3fGiB  weights_only=%.3fGiB  "
-            "kv_budget=%.3fGiB  full_max_tokens=%d  swa_max_tokens=%d  "
-            "layers=%d (full=%d swa=%d)",
-            _avail_now_gib,
-            _total_gpu_bytes / (1 << 30),
-            _dynamic_reserve_bytes / (1 << 30),
-            _umm_budget_bytes / (1 << 30),
-            manager.weights_only_bytes / (1 << 30),
-            _kv_budget_bytes / (1 << 30),
-            _full_max_tokens,
-            _swa_max_tokens,
-            _num_layers,
-            _n_full,
-            _n_swa,
-        )
-
-        # Build per-layer LayerCacheSpec with heterogeneous budgets
-        _layer_specs = classify_layers_from_config(
-            config,
-            tp_size=_paras_tp_size,
-            ep_tokens_full=_full_max_tokens,
-            tp_tokens_full=_full_max_tokens * _paras_tp_size,
-            ep_tokens_swa=_swa_max_tokens,
-            tp_tokens_swa=_swa_max_tokens * _paras_tp_size,
-        )
-
-        # Reserve KV in manager (union layout, heterogeneous per-layer sizes)
-        manager.reserve_kv_cache(
-            num_layers=_num_layers,
-            ep_max_tokens=_full_max_tokens,
-            tp_max_tokens=_full_max_tokens * _paras_tp_size,
-            num_kv_heads=_total_kv_heads,
+        plan = manager.plan_hybrid_swa_kv_capacity(
+            config=config,
+            tp_size=get_paras_tp_size(),
             head_dim=head_dim,
-            tp_size=_paras_tp_size,
-            kv_dtype=_kv_store_dtype,
-            page_size=_page_size,
-            prefix="model",
-            layer_specs=_layer_specs,
         )
-        # --- End KV budget computation ------------------------------------
 
-        total_bytes = manager.materialize()
+        manager.reserve_kv_cache(
+            num_layers=config.num_hidden_layers,
+            ep_max_tokens=plan.ep_max_tokens,
+            tp_max_tokens=plan.tp_max_tokens,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=head_dim,
+            tp_size=get_paras_tp_size(),
+            kv_dtype=plan.kv_dtype,
+            page_size=getattr(get_global_server_args(), "page_size", 1),
+            prefix="model",
+            layer_specs=plan.layer_specs,
+        )
+
+        manager.materialize()
         create_paras_moe_aliases(manager, config.num_hidden_layers, prefix="model")
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
-
-        # Set global so create_weights() can find the manager
-        set_global_paras_memory_manager(manager)
+        self.paras_layer_specs = plan.layer_specs
 
         # Skip peer access pre-init when using NCCL transfer (no benefit
         # and seems to interact badly with NCCL on A100).  Set
