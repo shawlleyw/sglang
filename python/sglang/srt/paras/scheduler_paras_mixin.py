@@ -143,8 +143,20 @@ class RolloutAutoSwitchPolicy(ParasAutoSwitchPolicy):
     Tuned for synchronous rollout: small window, low threshold."""
 
     def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
-        # Placeholder; wired in next commit (C3)
-        return None
+        """Return total pending request count (running + waiting) across DP ranks.
+        
+        Mode-agnostic: works for prefill, decode, and idle iterations.
+        The metric is monotonically decreasing in a synchronous rollout
+        (no new arrivals after t=0), naturally implementing one-shot
+        EP→TP behavior without an explicit flag.
+        """
+        if batch is None:
+            return None
+        if batch.global_running_reqs is None or batch.global_waiting_reqs is None:
+            return None
+        running = int(sum(batch.global_running_reqs))
+        waiting = int(sum(batch.global_waiting_reqs))
+        return running + waiting
 
 
 _PARAS_AUTO_SWITCH_POLICY_CLASSES = {
