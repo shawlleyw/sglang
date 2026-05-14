@@ -1574,11 +1574,11 @@ class ServerArgs:
             assert self.enable_dp_attention, "enable_dp_attention must be set when enable_paras_moe is set"
             assert self.paras_tp_size <= 8 and self.paras_tp_size > 0, "paras_tp_size must be positive when enable_paras_moe is set"
             assert self.tp_size == self.dp_size, "paras moe requires tp_size == dp_size, which means attn tp size is 1"
-            assert not self.disable_radix_cache, (
-                "ParaS migration requires radix cache (it relies on tree_cache.reset() "
-                "to clear stale per-Req references across switches; ChunkCache has no "
-                "equivalent reset semantics). Drop --disable-radix-cache when "
-                "--enable-paras-moe is set."
+            assert self.disable_radix_cache, (
+                "ParaS requires --disable-radix-cache (uses ChunkCache / SWAChunkCache). "
+                "Prefix sharing is not used by ParaS, and the radix cache's tree state "
+                "would not survive EP<->TP switches anyway. Pass --disable-radix-cache "
+                "when --enable-paras-moe is set."
             )
             assert self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0, (
                 "ParaS migration cannot preserve mid-chunked-prefill state "

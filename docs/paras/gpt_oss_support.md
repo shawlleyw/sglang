@@ -748,6 +748,66 @@ Open question:
 The current default sidesteps all three for the NCCL transfer path
 that production deployments use.
 
+## Recent Updates: ParaS Switched to ChunkCache (May 2026)
+
+After Chronicle 2 stabilized in-flight switch correctness on
+`SWARadixCache`, the ParaS branch was updated to require
+`--disable-radix-cache` instead of forbidding it
+(`server_args._check_paras_config` line 1512+, assertion flipped). ParaS
+now runs exclusively with `ChunkCache` (MHA-only models like Qwen3-MoE)
+or `SWAChunkCache` (hybrid SWA models like gpt-oss). Cross-request prefix
+sharing is unavailable in this configuration; the trade-off is justified
+by ParaS's lack of demand for prefix sharing weighed against the
+complexity of migrating radix-tree state across EP↔TP switches.
+
+Three additions to the SWA pool lifecycle were introduced for gpt-oss:
+
+1. **Runtime SWA pool eviction**
+   (`ScheduleBatch.maybe_evict_swa` / `_evict_swa`,
+   `schedule_batch.py:1573` / `:1582`). Fires every decode step. For
+   each Req, computes `new_swa_evicted_seqlen = max(swa_evicted_seqlen,
+   pre_len - W)` and frees `req_to_token[idx,
+   swa_evicted_seqlen:new_swa_evicted_seqlen]` from the SWA pool via
+   `allocator.free_swa(...)`. Keeps SWA pool occupancy bounded at
+   `min(W, P) + decode_steps_within_window` per request — empirically
+   validated on gpt-oss-120b at ~3% of `swa_max_tokens` capacity during
+   8-req heavy decode. Inspired by upstream PR sgl-project/sglang#17220
+   but without tombstone tracking (no tree to coordinate with under
+   `SWAChunkCache`).
+2. **Per-Req `swa_evicted_seqlen` carrying through gather/scatter**.
+   Pickle preserves the field automatically: `prune_request`
+   (`gather_manager.py:30`) only nulls 4 specific tensor-bearing fields,
+   not the int field. No code change required; validated implicitly by
+   in-flight switch tests passing 0/32 degenerate post-switch.
+3. **Destination-side SWA pool tightening at switch boundary**
+   (`ParaSReqGatherManager._tighten_swa_pool_to_in_window`,
+   `gather_manager.py:242`, with the scatter mirror in
+   `scatter_manager.py`). After lockstep alloc + `req_to_token`
+   write-back, computes `in_window_start = max(req.swa_evicted_seqlen,
+   seqlen-1-W)` per migrated Req and frees the OOW destination SWA slots
+   via `allocator.free_swa(...)`. Achieves immediate post-switch
+   convergence: destination SWA pool footprint drops from `seqlen` to
+   `min(W, seqlen-1-evicted)` per migrated Req at the switch boundary,
+   eliminating the up-to-W-step convergence delay that would otherwise
+   apply.
+
+The radix-cache-specific Bug 3 symptom in Chronicle 2 (`AssertionError:
+This request holds the node from another tree` in
+`radix_cache.dec_lock_ref`) is no longer reachable from the ParaS code
+path: with `--disable-radix-cache` enforced, neither `RadixCache` nor
+`SWARadixCache` is constructed. Prefix sharing in ParaS would require
+migrating the radix tree across switches; this is documented as future
+work in [`future/radix_cache.md`](file:///home/shaoyuw/sglang/docs/paras/future/radix_cache.md).
+
+References for this update:
+
+- `server_args.py:1512+` — assertion flip (`assert self.disable_radix_cache`).
+- `gather_manager.py:36-49` — `recover_request` with `tree_cache.disable` branch.
+- `gather_manager.py:242+` — `_tighten_swa_pool_to_in_window` (Phase C).
+- `schedule_batch.py:1573+` — `maybe_evict_swa` and `_evict_swa` (Phase A).
+- `runs/2026-05-09-swa-window-only-transfer-design/DESIGN.md` — full design.
+- `future/radix_cache.md` — what would be required to re-enable radix cache for ParaS.
+
 ## Probes That Worked
 
 Two methodological patterns made this chronicle tractable and are worth

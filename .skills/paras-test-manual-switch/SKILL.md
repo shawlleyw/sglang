@@ -360,9 +360,16 @@ No HTTP runtime toggle exists; the toggle is server-startup-only.
   `ServerArgs._check_paras_config` as a fail-fast assertion). ParaS migration
   cannot preserve mid-chunked-prefill state — `chunked_req` is not part of
   the gather/scatter set.
-- **`--disable-radix-cache` is rejected by ParaS init** (also fail-fast).
-  Migration relies on `tree_cache.reset()` to clear stale per-Req references
-  across switches; ChunkCache has no equivalent reset semantics.
+- **`--disable-radix-cache` is required by ParaS init** (fail-fast asserts it).
+  ParaS does not use prefix sharing, and ChunkCache / SWAChunkCache are the
+  supported tree-cache backends. The launch scripts pass this flag automatically
+  under `ENABLE_PARAS=1`.
+- **`--disable-overlap-schedule` is required by ParaS** (asserted at runtime in
+  `SchedulerParasMixin.paras_configure_*`). The overlap scheduler runs the next
+  forward pass while the previous result is still being processed; switching
+  mid-overlap would require migrating an in-flight forward's intermediate
+  state, which is not modeled by the gather/scatter contract. Baked into both
+  launch scripts under `ENABLE_PARAS=1`.
 - **Wording differences EP vs TP**: BF16 floating-point differences cause
   minor sampling divergence at `temperature=0`. Content/meaning must be
   equivalent across phases; exact tokens may not.

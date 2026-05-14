@@ -32,9 +32,15 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+
+    from sglang.srt.paras.layers.utils import LayerCacheSpec
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -70,19 +76,34 @@ class LayoutEntry:
 
 @dataclass(frozen=True)
 class ParaSKVCapacityPlan:
-    """UMM-owned EP/TP KV cache capacity plan."""
+    """UMM-owned EP/TP KV cache capacity plan.
+
+    SWA fields are zero / empty for pure-MHA plans. ``layer_specs`` is set
+    only by the SWA planner for downstream :meth:`reserve_kv_cache`.
+    """
 
     available_gpu_memory_bytes: int
     total_gpu_memory_bytes: int
     dynamic_reserve_bytes: int
     umm_budget_bytes: int
+    weights_only_bytes: int
     kv_budget_bytes: int
+
+    kv_dtype: torch.dtype
+
     ep_max_tokens: int
     tp_max_tokens: int
     ep_cell_bytes: int
     tp_cell_bytes: int
     ep_kv_heads: int
     tp_kv_heads: int
+
+    full_layers: int = 0
+    swa_layers: int = 0
+    ep_max_tokens_swa: int = 0
+    tp_max_tokens_swa: int = 0
+
+    layer_specs: Optional[List["LayerCacheSpec"]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +232,26 @@ class ParaSMemoryManager:
 
     ALIGNMENT: int = 256  # bytes — keeps GPU loads aligned
 
-    def __init__(self, device: str = "cuda") -> None:
+    def __init__(
+        self,
+        *,
+        device: str = "cuda",
+        gpu_id: Optional[int] = None,
+        server_args: Optional["ServerArgs"] = None,
+        cpu_group: Optional["ProcessGroup"] = None,
+        world_size: int = 1,
+    ) -> None:
         self.device = device
+        if gpu_id is not None:
+            self.gpu_id = gpu_id
+        elif device == "cuda":
+            self.gpu_id = torch.cuda.current_device()
+        else:
+            self.gpu_id = 0
+        self.server_args = server_args
+        self.cpu_group = cpu_group
+        self.world_size = world_size
+
         self._entries: Dict[str, LayoutEntry] = {}
         self._reservation_order: List[str] = []
         self._buffer: Optional[torch.Tensor] = None
@@ -391,29 +430,80 @@ class ParaSMemoryManager:
 
         self._kv_reserved = True
 
+    def _resolve_kv_store_dtype(self) -> torch.dtype:
+        s = self.server_args.kv_cache_dtype if self.server_args is not None else "auto"
+        if s in ("fp8", "fp8_e4m3fn"):
+            return torch.float8_e4m3fn
+        return torch.bfloat16
+
+    def _compute_kv_budget_bytes(self) -> Tuple[int, int, int, int, int, float]:
+        from sglang.srt.utils.common import get_available_gpu_memory
+
+        assert self.server_args is not None, (
+            "ParaSMemoryManager: server_args required for budget planning. "
+            "Construct via ParaSMemoryManager(server_args=...) in model_runner."
+        )
+
+        total_gpu_bytes = torch.cuda.get_device_properties(self.gpu_id).total_memory
+        avail_now_gib = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=self.world_size > 1,
+            cpu_group=self.cpu_group,
+            empty_cache=True,
+        )
+        avail_now_bytes = int(avail_now_gib * (1 << 30))
+
+        mem_fraction = self.server_args.mem_fraction_static
+        assert mem_fraction is not None, "server_args.mem_fraction_static is required"
+        dynamic_reserve_bytes = int(total_gpu_bytes * (1.0 - mem_fraction))
+        umm_budget_bytes = max(0, avail_now_bytes - dynamic_reserve_bytes)
+        kv_budget_bytes = max(0, umm_budget_bytes - self.weights_only_bytes)
+
+        return (
+            avail_now_bytes,
+            total_gpu_bytes,
+            dynamic_reserve_bytes,
+            umm_budget_bytes,
+            kv_budget_bytes,
+            avail_now_gib,
+        )
+
     def plan_mha_kv_capacity(
         self,
         *,
-        available_gpu_memory_bytes: int,
-        total_gpu_memory_bytes: int,
-        mem_fraction_static: float,
-        num_layers: int,
-        num_kv_heads: int,
-        head_dim: int,
+        config,
         tp_size: int,
-        kv_dtype: torch.dtype,
+        head_dim: int,
     ) -> ParaSKVCapacityPlan:
-        """Compute EP and TP KV token capacities from the UMM budget."""
+        """End-to-end MHA KV capacity planner.
+
+        Reads device / gpu_id / server_args / cpu_group / world_size from
+        ``self`` (set at construction in model_runner). Calls
+        ``get_available_gpu_memory``, computes the UMM and KV byte budgets,
+        derives EP and TP per-token caps, populates ``self.ep_max_kv_tokens``
+        and ``self.tp_max_kv_tokens``, logs at INFO level, and returns the
+        plan including the resolved ``kv_dtype`` for downstream
+        ``reserve_kv_cache``.
+        """
+        kv_dtype = self._resolve_kv_store_dtype()
         elem_size = (
             kv_dtype.itemsize
             if hasattr(kv_dtype, "itemsize")
             else torch.tensor([], dtype=kv_dtype).element_size()
         )
-        dynamic_reserve_bytes = int(
-            total_gpu_memory_bytes * (1.0 - mem_fraction_static)
-        )
-        umm_budget_bytes = max(0, available_gpu_memory_bytes - dynamic_reserve_bytes)
-        kv_budget_bytes = max(0, umm_budget_bytes - self.weights_only_bytes)
+
+        (
+            avail_now_bytes,
+            total_gpu_bytes,
+            dynamic_reserve_bytes,
+            umm_budget_bytes,
+            kv_budget_bytes,
+            avail_now_gib,
+        ) = self._compute_kv_budget_bytes()
+
+        num_layers = config.num_hidden_layers
+        num_kv_heads = config.num_key_value_heads
 
         ep_kv_heads = num_kv_heads
         tp_kv_heads = max(1, num_kv_heads // tp_size)
@@ -425,18 +515,146 @@ class ParaSMemoryManager:
         self.ep_max_kv_tokens = ep_max_tokens
         self.tp_max_kv_tokens = tp_max_tokens
 
+        logger.info(
+            f"ParaS KV budget: avail_now={avail_now_gib:.3f}GiB  "
+            f"total={total_gpu_bytes / (1 << 30):.3f}GiB  "
+            f"dynamic_reserve={dynamic_reserve_bytes / (1 << 30):.3f}GiB  "
+            f"umm_budget={umm_budget_bytes / (1 << 30):.3f}GiB  "
+            f"weights_only={self.weights_only_bytes / (1 << 30):.3f}GiB  "
+            f"kv_budget={kv_budget_bytes / (1 << 30):.3f}GiB  "
+            f"ep_max_tokens={ep_max_tokens}  "
+            f"tp_max_tokens={tp_max_tokens}  "
+            f"ep_kv_heads={ep_kv_heads}  "
+            f"tp_kv_heads={tp_kv_heads}"
+        )
+
         return ParaSKVCapacityPlan(
-            available_gpu_memory_bytes=available_gpu_memory_bytes,
-            total_gpu_memory_bytes=total_gpu_memory_bytes,
+            available_gpu_memory_bytes=avail_now_bytes,
+            total_gpu_memory_bytes=total_gpu_bytes,
             dynamic_reserve_bytes=dynamic_reserve_bytes,
             umm_budget_bytes=umm_budget_bytes,
+            weights_only_bytes=self.weights_only_bytes,
             kv_budget_bytes=kv_budget_bytes,
+            kv_dtype=kv_dtype,
             ep_max_tokens=ep_max_tokens,
             tp_max_tokens=tp_max_tokens,
             ep_cell_bytes=ep_cell_bytes,
             tp_cell_bytes=tp_cell_bytes,
             ep_kv_heads=ep_kv_heads,
             tp_kv_heads=tp_kv_heads,
+            full_layers=num_layers,
+        )
+
+    def plan_hybrid_swa_kv_capacity(
+        self,
+        *,
+        config,
+        tp_size: int,
+        head_dim: int,
+    ) -> ParaSKVCapacityPlan:
+        """End-to-end SWA-aware KV capacity planner for hybrid full / SWA models.
+
+        Same prelude as :meth:`plan_mha_kv_capacity` (reads device, gpu_id,
+        cpu_group, world_size, server_args from ``self``). Then splits the
+        per-layer-token budget across full and SWA layers using
+        ``plan_hybrid_kv_budget`` with ``server_args.swa_full_tokens_ratio``,
+        builds per-layer specs via :func:`classify_layers_from_config`, and
+        returns a plan whose ``layer_specs`` is consumed downstream by
+        :meth:`reserve_kv_cache`.
+        """
+        from sglang.srt.paras.layers.utils import classify_layers_from_config
+
+        kv_dtype = self._resolve_kv_store_dtype()
+        elem_size = (
+            kv_dtype.itemsize
+            if hasattr(kv_dtype, "itemsize")
+            else torch.tensor([], dtype=kv_dtype).element_size()
+        )
+
+        (
+            avail_now_bytes,
+            total_gpu_bytes,
+            dynamic_reserve_bytes,
+            umm_budget_bytes,
+            kv_budget_bytes,
+            avail_now_gib,
+        ) = self._compute_kv_budget_bytes()
+
+        num_layers = config.num_hidden_layers
+        num_kv_heads = config.num_key_value_heads
+
+        layer_types = getattr(config, "layer_types", None) or (
+            ["full_attention"] * num_layers
+        )
+        n_full = sum(1 for t in layer_types if t == "full_attention")
+        n_swa = sum(1 for t in layer_types if t == "sliding_attention")
+
+        ep_kv_heads = num_kv_heads
+        tp_kv_heads = max(1, num_kv_heads // tp_size)
+        cell_bytes = num_kv_heads * head_dim * 2 * elem_size
+        total_token_layers = max(1, int(kv_budget_bytes // cell_bytes))
+
+        if n_swa > 0:
+            swa_ratio = getattr(self.server_args, "swa_full_tokens_ratio", 0.5)
+            full_max_tokens, swa_max_tokens = plan_hybrid_kv_budget(
+                total_token_layers, n_full, n_swa, swa_ratio,
+            )
+        else:
+            full_max_tokens = max(1, total_token_layers // num_layers)
+            swa_max_tokens = 0
+
+        ep_max_tokens = full_max_tokens
+        tp_max_tokens = full_max_tokens * tp_size
+        ep_max_tokens_swa = swa_max_tokens
+        tp_max_tokens_swa = swa_max_tokens * tp_size
+
+        layer_specs = classify_layers_from_config(
+            config,
+            tp_size=tp_size,
+            ep_tokens_full=ep_max_tokens,
+            tp_tokens_full=tp_max_tokens,
+            ep_tokens_swa=ep_max_tokens_swa,
+            tp_tokens_swa=tp_max_tokens_swa,
+        )
+
+        self.ep_max_kv_tokens = ep_max_tokens
+        self.tp_max_kv_tokens = tp_max_tokens
+        self.ep_max_kv_tokens_swa = ep_max_tokens_swa
+        self.tp_max_kv_tokens_swa = tp_max_tokens_swa
+
+        ep_cell_bytes = ep_kv_heads * head_dim * num_layers * 2 * elem_size
+        tp_cell_bytes = tp_kv_heads * head_dim * num_layers * 2 * elem_size
+
+        logger.info(
+            f"ParaS SWA KV budget: avail_now={avail_now_gib:.3f}GiB  "
+            f"total={total_gpu_bytes / (1 << 30):.3f}GiB  "
+            f"dynamic_reserve={dynamic_reserve_bytes / (1 << 30):.3f}GiB  "
+            f"umm_budget={umm_budget_bytes / (1 << 30):.3f}GiB  "
+            f"weights_only={self.weights_only_bytes / (1 << 30):.3f}GiB  "
+            f"kv_budget={kv_budget_bytes / (1 << 30):.3f}GiB  "
+            f"full_max_tokens={full_max_tokens}  swa_max_tokens={swa_max_tokens}  "
+            f"layers={num_layers} (full={n_full} swa={n_swa})"
+        )
+
+        return ParaSKVCapacityPlan(
+            available_gpu_memory_bytes=avail_now_bytes,
+            total_gpu_memory_bytes=total_gpu_bytes,
+            dynamic_reserve_bytes=dynamic_reserve_bytes,
+            umm_budget_bytes=umm_budget_bytes,
+            weights_only_bytes=self.weights_only_bytes,
+            kv_budget_bytes=kv_budget_bytes,
+            kv_dtype=kv_dtype,
+            ep_max_tokens=ep_max_tokens,
+            tp_max_tokens=tp_max_tokens,
+            ep_cell_bytes=ep_cell_bytes,
+            tp_cell_bytes=tp_cell_bytes,
+            ep_kv_heads=ep_kv_heads,
+            tp_kv_heads=tp_kv_heads,
+            full_layers=n_full,
+            swa_layers=n_swa,
+            ep_max_tokens_swa=ep_max_tokens_swa,
+            tp_max_tokens_swa=tp_max_tokens_swa,
+            layer_specs=layer_specs,
         )
 
     def plan_req_capacities(

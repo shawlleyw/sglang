@@ -23,7 +23,7 @@ from sglang.srt.paras.cache_transfer.utils import (
 )
 
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+from sglang.srt.paras.layers.utils import LayerCacheSpec
 from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
 from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 
@@ -38,8 +38,12 @@ def recover_request(
     tree_cache: BasePrefixCache,
     tokenizer: Any,
 ):
-    req.last_host_node = tree_cache.root_node
-    req.last_node = tree_cache.root_node
+    if tree_cache.disable:
+        req.last_host_node = None
+        req.last_node = None
+    else:
+        req.last_host_node = tree_cache.root_node
+        req.last_node = tree_cache.root_node
     req.prefix_indices = []
     req.tokenizer = tokenizer
 
@@ -232,8 +236,34 @@ class ParaSReqGatherManager:
                 
             self.global_token_indices = global_token_indices
             assert self.global_token_indices.shape[0] == self.num_global_tokens, "The number of global tokens is not equal to the number of tokens in the global requests."
+
+            self._tighten_swa_pool_to_in_window()
         else:
             self.global_token_indices = None
+
+    def _tighten_swa_pool_to_in_window(self) -> None:
+        if not isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+            return
+        if self.layer_specs is None:
+            return
+        sliding_window_size = next(
+            (s.sliding_window_size for s in self.layer_specs
+             if s.kind == "swa" and s.sliding_window_size is not None),
+            None,
+        )
+        if sliding_window_size is None:
+            return
+        for req in self.global_reqs:
+            seqlen_no_last = req.seqlen - 1
+            in_window_start = max(
+                req.swa_evicted_seqlen, seqlen_no_last - sliding_window_size
+            )
+            if in_window_start > 0:
+                oow_full_slots = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, 0:in_window_start
+                ]
+                self.token_to_kv_pool_allocator.free_swa(oow_full_slots)
+                req.swa_evicted_seqlen = in_window_start
 
     def gather_cache(self) -> None:
         """Transfer KV cache from EP layout to TP layout.
@@ -430,8 +460,12 @@ class ParaSReqGatherManager:
         running_batch.return_hidden_states = any(req.return_hidden_states for req in self.global_reqs)
         running_batch.chunked_req = None
         
+        if running_batch.tree_cache.disable:
+            last_node = None
+        else:
+            last_node = running_batch.tree_cache.root_node
         for req in running_batch.reqs:
-            req.last_node = running_batch.tree_cache.root_node
+            req.last_node = last_node
         
         # Get the last token from each request (for decode input)
         input_ids_list = []

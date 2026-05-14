@@ -57,6 +57,7 @@ if [ "$ENABLE_PARAS" = "1" ]; then
         --enable-paras-moe
         --paras-tp-size "$NUM_GPUS"
         --disable-overlap-schedule
+        --disable-radix-cache
         --max-prefill-tokens 32000
     )
 fi

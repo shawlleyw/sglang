@@ -64,6 +64,7 @@ if [ "$ENABLE_PARAS" = "1" ]; then
         --enable-paras-moe
         --paras-tp-size "$NUM_GPUS"
         --disable-overlap-schedule
+        --disable-radix-cache
     )
     if [ "${PARAS_AUTO_SWITCH:-1}" = "0" ]; then
         PARAS_FLAGS+=(--no-paras-auto-switch)
