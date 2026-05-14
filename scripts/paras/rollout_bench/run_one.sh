@@ -41,6 +41,7 @@ SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${SGLANG_DEEPEP_NUM_MAX_DISPATCH_
 # Invariant: TP graph cap == rollout policy threshold (8/gpu * 8 gpus = 64).
 # Bigger TP batches immediately trigger TP->EP, so they never run captured.
 PARAS_TP_CUDA_GRAPH_MAX_BS=${PARAS_TP_CUDA_GRAPH_MAX_BS:-64}
+MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-8192}
 DRY_RUN=${DRY_RUN:-0}
 
 case "$MODEL_SLUG" in
@@ -88,7 +89,7 @@ esac
 # so passing it twice is a safe no-op.
 COMMON_ARGS=(
     --chunked-prefill-size -1
-    --max-prefill-tokens 16384
+    --max-prefill-tokens "$MAX_PREFILL_TOKENS"
 )
 
 mkdir -p "$OUTPUT_DIR"
