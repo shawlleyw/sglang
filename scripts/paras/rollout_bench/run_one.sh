@@ -38,6 +38,9 @@ MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-512}
 # canonical 256 default, which collides with our cuda-graph max bs).
 # Keep them in lockstep by deriving the cap from MAX_RUNNING_REQUESTS.
 SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-$MAX_RUNNING_REQUESTS}
+# Invariant: TP graph cap == rollout policy threshold (8/gpu * 8 gpus = 64).
+# Bigger TP batches immediately trigger TP->EP, so they never run captured.
+PARAS_TP_CUDA_GRAPH_MAX_BS=${PARAS_TP_CUDA_GRAPH_MAX_BS:-64}
 DRY_RUN=${DRY_RUN:-0}
 
 case "$MODEL_SLUG" in
@@ -71,6 +74,7 @@ case "$MODE" in
         EXTRA_ARGS=(
             --paras-auto-switch-policy rollout
             --paras-metrics-file "$OUTPUT_DIR/metrics_timeseries.csv"
+            --paras-tp-cuda-graph-max-bs "$PARAS_TP_CUDA_GRAPH_MAX_BS"
         )
         ;;
     *)
