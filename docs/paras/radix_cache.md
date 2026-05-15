@@ -12,6 +12,10 @@ ParaS migration now supports radix cache via tree-state migration across EP↔TP
 
 The body of this document below describes the historical hazards and the migration design.
 
+**See also:** [`docs/paras/radix_cache_migration.md`](radix_cache_migration.md) — comprehensive
+design and test-suite documentation for the tree-state migration system (architecture,
+components, algorithms, configuration, and one paragraph per test file).
+
 ---
 
 ## Historical Context: Why ParaS Previously Disabled Radix Cache
