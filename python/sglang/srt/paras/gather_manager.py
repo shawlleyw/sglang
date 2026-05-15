@@ -321,8 +321,18 @@ class ParaSReqGatherManager:
               ``SWAKVPool`` is a container holding both ``full_kv_pool`` and
               ``swa_kv_pool`` (each a plain ``MHATokenToKVPool``) plus the
               ``layers_mapping`` that routes per-layer access.
+
+        Note: this function used to call torch.cuda.empty_cache() up front to
+        defragment the caching allocator (~96 ms / call on 8 x A100 + 120B
+        weights). It was dropped because (1) the KV pool was already resized
+        by paras_resize_and_clear in reorchestrate_cache; (2) the transfer
+        kernels write into pre-allocated UMM peer addresses, not into newly
+        allocated caching-allocator blocks; and (3) empty_cache only sweeps
+        the caching allocator's free list, which does not touch anything the
+        transfer reads or writes. If post-switch decode OOMs surface across
+        many EP<->TP cycles (fragmentation accumulating), reintroduce
+        empty_cache on a background thread off the switch critical path.
         """
-        torch.cuda.empty_cache()
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         mgr = get_global_paras_memory_manager()
         method = self.method
