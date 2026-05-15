@@ -250,6 +250,17 @@ class SchedulerParasMixin:
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
                 self.tp_worker.get_tokens_per_layer_info()
             )
+
+        from sglang.srt.paras.paras_memory_manager import (
+            get_global_paras_memory_manager,
+        )
+
+        _paras_mgr = get_global_paras_memory_manager()
+        if _paras_mgr is not None:
+            if self.paras_parallelism_config == "TP":
+                self.max_running_requests = _paras_mgr.get_tp_max_running_requests()
+            else:
+                self.max_running_requests = _paras_mgr.get_ep_max_running_requests()
         
     def paras_check(self):
         # Canary: log if running_batch ever contains a req with output_ids=[].

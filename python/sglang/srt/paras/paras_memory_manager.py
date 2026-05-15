@@ -266,6 +266,8 @@ class ParaSMemoryManager:
         self.tp_max_kv_tokens_swa: int = 0
         self.ep_max_num_reqs: int = 0
         self.tp_max_num_reqs: int = 0
+        self.ep_max_running_requests: int = 0
+        self.tp_max_running_requests: int = 0
         self._kv_reserved: bool = False
         
 
@@ -699,8 +701,17 @@ class ParaSMemoryManager:
         *,
         context_len: int,
         ep_max_num_reqs: Optional[int] = None,
+        max_running_requests: Optional[int] = None,
+        dp_size: int = 1,
     ) -> Tuple[int, int]:
-        """Compute EP and TP request pool capacities from UMM token budgets."""
+        """Compute EP and TP request pool capacities from UMM token budgets.
+
+        Also derives per-mode ``max_running_requests`` caps. EP has 8 disjoint
+        per-rank schedulers, so each cap divides the global CLI value by
+        dp_size; TP runs one unified scheduler whose cap equals the full CLI
+        value. Both are clamped to the per-mode pool capacity so the
+        scheduler never tries to admit more reqs than the pool can hold.
+        """
 
         def _default_num_reqs(max_tokens: int) -> int:
             return min(max(int(max_tokens / context_len * 512), 2048), 4096)
@@ -714,6 +725,16 @@ class ParaSMemoryManager:
 
         self.ep_max_num_reqs = ep_num_reqs
         self.tp_max_num_reqs = tp_num_reqs
+
+        if max_running_requests is not None:
+            self.ep_max_running_requests = min(
+                max(max_running_requests // max(dp_size, 1), 1), ep_num_reqs
+            )
+            self.tp_max_running_requests = min(max_running_requests, tp_num_reqs)
+        else:
+            self.ep_max_running_requests = ep_num_reqs
+            self.tp_max_running_requests = tp_num_reqs
+
         return ep_num_reqs, tp_num_reqs
 
     def get_ep_max_num_reqs(self) -> int:
@@ -721,6 +742,12 @@ class ParaSMemoryManager:
 
     def get_tp_max_num_reqs(self) -> int:
         return self.tp_max_num_reqs
+
+    def get_ep_max_running_requests(self) -> int:
+        return self.ep_max_running_requests
+
+    def get_tp_max_running_requests(self) -> int:
+        return self.tp_max_running_requests
 
     def get_ep_max_kv_tokens(self, kind: str = "full") -> int:
         if kind == "full":
