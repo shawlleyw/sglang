@@ -353,6 +353,8 @@ def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: str):
     set_global_graph_memory_pool(state["graph_memory_pool"])
     for key in _SETTINGS_KEYS:
         setattr(runner, key, state[key])
+    runner.max_bs = max(runner.capture_bs)
+    runner.max_num_token = runner.max_bs * runner.num_tokens_per_bs
     runner.model_runner.attn_backend.paras_load_cuda_graph_state(state["attn_backend"])
 
 
