@@ -208,3 +208,111 @@ def serialize_swa_radix_cache(tree: "SWARadixCache") -> List[TreeRecord]:
             stack.append((child, full_path))
 
     return records
+
+
+# ---------------------------------------------------------------------------
+# Compact binary records format (T9)
+#
+# Per-record packed layout:
+#   path_len: i32       (number of int tokens in full_token_path)
+#   value_len: i32      (number of int slots in value_slots)
+#   flags: u8           (bit 0 = swa_tombstone)
+#   _pad: u8 * 3        (alignment)
+#   last_access_time: f32
+#   path_tokens: i32 * path_len
+#   value_slots: i64 * value_len
+#   extra_key_len: i32  (in BYTES; -1 if extra_key is None)
+#   extra_key_bytes: u8 * extra_key_len  (UTF-8 of repr(extra_key); only if len >= 0)
+#
+# Header: i32 num_records, then concatenation of per-record sections.
+# All multi-byte ints are little-endian.
+# ---------------------------------------------------------------------------
+
+
+def encode_records(records: list) -> bytes:
+    """Pack a list of TreeRecord into a compact binary blob.
+
+    Avoids Python pickle (slow); target ≥5× speedup. Format documented above.
+    """
+    import struct
+    parts: list = [struct.pack("<i", len(records))]
+    for r in records:
+        path_tokens = list(r.full_token_path)
+        value_slots = list(r.value_slots)
+        flags = 1 if r.swa_tombstone else 0
+
+        if r.extra_key is None:
+            extra_bytes = b""
+            extra_len = -1
+        else:
+            extra_bytes = repr(r.extra_key).encode("utf-8")
+            extra_len = len(extra_bytes)
+
+        header = struct.pack(
+            "<iiBBBBf",
+            len(path_tokens),
+            len(value_slots),
+            flags,
+            0,
+            0,
+            0,
+            float(r.last_access_time),
+        )
+        parts.append(header)
+        if path_tokens:
+            parts.append(struct.pack(f"<{len(path_tokens)}i", *path_tokens))
+        if value_slots:
+            parts.append(struct.pack(f"<{len(value_slots)}q", *value_slots))
+        parts.append(struct.pack("<i", extra_len))
+        if extra_bytes:
+            parts.append(extra_bytes)
+    return b"".join(parts)
+
+
+def decode_records(blob: bytes) -> list:
+    """Unpack a binary blob produced by encode_records back into List[TreeRecord]."""
+    import struct
+    out: list = []
+    if not blob:
+        return out
+
+    (num_records,) = struct.unpack_from("<i", blob, 0)
+    offset = 4
+    for _ in range(num_records):
+        (path_len, value_len, flags, _p1, _p2, _p3, last_access_time) = struct.unpack_from(
+            "<iiBBBBf", blob, offset
+        )
+        offset += struct.calcsize("<iiBBBBf")
+
+        if path_len:
+            path_tokens = list(struct.unpack_from(f"<{path_len}i", blob, offset))
+            offset += path_len * 4
+        else:
+            path_tokens = []
+
+        if value_len:
+            value_slots = list(struct.unpack_from(f"<{value_len}q", blob, offset))
+            offset += value_len * 8
+        else:
+            value_slots = []
+
+        (extra_len,) = struct.unpack_from("<i", blob, offset)
+        offset += 4
+        if extra_len >= 0:
+            extra_bytes = blob[offset : offset + extra_len]
+            offset += extra_len
+            extra_key = extra_bytes.decode("utf-8")
+        else:
+            extra_key = None
+
+        out.append(
+            TreeRecord(
+                full_token_path=path_tokens,
+                extra_key=extra_key,
+                value_slots=value_slots,
+                swa_tombstone=bool(flags & 0x1),
+                last_access_time=float(last_access_time),
+                host_value=None,
+            )
+        )
+    return out
