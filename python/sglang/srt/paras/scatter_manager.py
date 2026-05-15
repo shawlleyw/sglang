@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     MHATokenToKVPool,
@@ -25,6 +26,63 @@ from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
 from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 from sglang.srt.paras.gather_manager import paras_tp_group_all_gather_reqs
+
+
+def recover_request(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    tokenizer: Any,
+):
+    """Restore prunable fields on a migrated request (TP→EP path).
+
+    With radix-cache migration (T18): after T16's deserialize+rebuild has
+    populated this EP rank's partitioned tree, match_prefix on that tree;
+    attach req.last_node + prefix_indices on hit. Fallback to root +
+    tree_orphaned=True on miss / disable_radix_cache / ChunkCache.
+    """
+    req.tokenizer = tokenizer
+    req.tree_orphaned = False
+
+    if (
+        tree_cache is not None
+        and getattr(tree_cache, "root_node", None) is not None
+        and not getattr(tree_cache, "disable", False)
+        and hasattr(req, "fill_ids")
+    ):
+        try:
+            from sglang.srt.mem_cache.radix_cache import RadixKey
+            extra_key = getattr(req, "extra_key", None)
+            key = RadixKey(list(req.fill_ids), extra_key)
+            match = tree_cache.match_prefix(key)
+            matched_indices = getattr(match, "device_indices", None)
+            last_node = (
+                getattr(match, "last_device_node", None)
+                or getattr(match, "last_host_node", None)
+            )
+            if (
+                last_node is not None
+                and matched_indices is not None
+                and len(matched_indices) > 0
+            ):
+                req.last_node = last_node
+                req.last_host_node = getattr(match, "last_host_node", last_node)
+                req.prefix_indices = matched_indices
+                return
+        except Exception:
+            pass
+
+    if (
+        tree_cache is not None
+        and getattr(tree_cache, "root_node", None) is not None
+        and not getattr(tree_cache, "disable", False)
+    ):
+        req.last_node = tree_cache.root_node
+        req.last_host_node = tree_cache.root_node
+    else:
+        req.last_node = None
+        req.last_host_node = None
+    req.prefix_indices = []
+    req.tree_orphaned = True
 
 
 # ============================================================
@@ -442,7 +500,6 @@ class ParaSReqScatterManager:
     ):
         from sglang.srt.managers.schedule_batch import ScheduleBatch
         from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-        from sglang.srt.paras.gather_manager import recover_request
 
         if not self.local_reqs:
             return ScheduleBatch(reqs=[], batch_is_full=False)
