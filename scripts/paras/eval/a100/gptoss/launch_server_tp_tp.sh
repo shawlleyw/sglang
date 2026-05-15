@@ -40,4 +40,5 @@ python -m sglang.launch_server \
     --tp-size "$NUM_GPUS" \
     --max-running-requests "$MAX_RUNNING_REQUESTS" \
     --chunked-prefill-size -1 \
-    "${CUDA_GRAPH_FLAGS[@]}"
+    "${CUDA_GRAPH_FLAGS[@]}" \
+    "$@"
