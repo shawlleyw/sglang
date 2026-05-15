@@ -471,7 +471,13 @@ class VocabParallelEmbedding(torch.nn.Module):
                 self.shard_indices.added_vocab_end_index,
             )
         else:
-            masked_input = input_
+            # tp_size==1 takes the no-mask path. Clamp into [0, num_embeddings)
+            # to survive a malformed input_ids tensor (NaN-induced OOB ids
+            # propagated from the sampler under DP-attention long-tail BF16
+            # decode). Without this, F.embedding asserts at IndexKernel.cu:113
+            # and the scheduler watchdog kills the rank. Pairs with Fix A in
+            # layers/sampler.py.
+            masked_input = input_.clamp(0, self.num_embeddings - 1)
         # Get the embeddings.
         with use_symmetric_memory(get_tp_group(), disabled=not self.enable_tp):
             output_parallel = self.quant_method.embedding(self, masked_input.long())

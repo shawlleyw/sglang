@@ -207,6 +207,17 @@ class Sampler(nn.Module):
                 group=self.tp_sync_group,
             )
 
+        # Defense in depth: BF16 numerical drift during long-tail decode can
+        # push NaN/Inf into logits. flashinfer top_k_top_p_sampling_from_probs
+        # has unspecified behavior on NaN probs and may return OOB int32 ids
+        # (including negative sentinels). A MIN all-reduce above propagates
+        # such values rank-wide. embed_tokens runs the tp_size==1 (no-mask)
+        # path under DP attention (vocab_parallel_embedding.py:473-477), so an
+        # OOB id will assert at IndexKernel.cu:113 in the next forward.
+        # Clamp here keeps the input domain valid; the matching Fix B in
+        # vocab_parallel_embedding is the second layer.
+        batch_next_token_ids.clamp_(0, sampling_info.vocab_size - 1)
+
         return batch_next_token_ids
 
     def compute_logprobs_only(
