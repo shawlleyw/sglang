@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple, Any
+from typing import Callable, Dict, List, Optional, Tuple, Any
 import os
 import torch
 import pickle
@@ -137,6 +137,10 @@ class ParaSReqGatherManager:
         self.num_local_tokens = sum(self.local_seqlens_list) - len(local_reqs) # the last output token is not stored in kv cache
 
         self.source_full_to_swa_mapping: Optional[torch.Tensor] = None
+
+        # T7: global old->new slot map for tree-migration deserialize/remap (T15).
+        # Built in reorchestrate_cache when a radix tree (not ChunkCache) is active.
+        self.old_to_new_slot_map: Optional[Dict[int, int]] = None
         
         if self.local_no_reqs:
             self.local_token_indices = None
@@ -181,6 +185,7 @@ class ParaSReqGatherManager:
         new_req_pool_size: Optional[int] = None,
         new_cache_size: Optional[int] = None,
         new_cache_size_swa: Optional[int] = None,
+        tree_cache=None,  # T7: passed by scheduler for tree-migration; default None preserves caller compat
     ):
         '''
         Resize request and KV pools to the TP capacities planned by UMM.
@@ -236,6 +241,33 @@ class ParaSReqGatherManager:
                 
             self.global_token_indices = global_token_indices
             assert self.global_token_indices.shape[0] == self.num_global_tokens, "The number of global tokens is not equal to the number of tokens in the global requests."
+
+            # T7: build global old->new slot map for tree-migration remap.
+            # Skip for ChunkCache / SWAChunkCache (no tree topology to migrate).
+            # ChunkCache lacks root_node attribute; getattr fallback handles it.
+            should_build_map = tree_cache is None or getattr(tree_cache, "root_node", None) is not None
+            if should_build_map:
+                # Compute this rank's offset into global_token_indices.
+                # The local rank's portion starts at sum of preceding ranks' token counts.
+                rank_in_group = self.gather_group.rank_in_group
+                local_offset = sum(self.global_num_tokens[:rank_in_group])
+                if self.num_local_tokens > 0 and self.local_token_indices is not None:
+                    local_slots_cpu = self.local_token_indices.detach().cpu().tolist()
+                    new_slots_cpu = (
+                        self.global_token_indices[
+                            local_offset : local_offset + self.num_local_tokens
+                        ]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    assert len(local_slots_cpu) == len(new_slots_cpu), (
+                        f"Slot map length mismatch: "
+                        f"{len(local_slots_cpu)} vs {len(new_slots_cpu)}"
+                    )
+                    self.old_to_new_slot_map = dict(zip(local_slots_cpu, new_slots_cpu))
+                else:
+                    self.old_to_new_slot_map = {}
 
             self._tighten_swa_pool_to_in_window()
         else:
@@ -498,3 +530,14 @@ class ParaSReqGatherManager:
             running_batch,
             model_config.vocab_size,
         )
+
+    def build_slot_remap_callback(self):
+        """Return a callable that maps old EP-pool slot -> new TP-pool slot.
+
+        Returns -1 when an old slot is unknown (signal: dropped / not migrated).
+        Returns identity if no map was built (e.g., ChunkCache path).
+        """
+        slot_map = self.old_to_new_slot_map
+        if slot_map is None:
+            return lambda old: old
+        return lambda old, _m=slot_map: _m.get(old, -1)

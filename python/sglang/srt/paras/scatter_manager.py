@@ -7,7 +7,7 @@ Contains:
 - ParaSReqScatterManager
 """
 
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 import os
 import torch
 import torch.distributed as dist
@@ -155,6 +155,10 @@ class ParaSReqScatterManager:
         self.new_cache_size: Optional[int] = None
         self.source_full_to_swa_mapping: Optional[torch.Tensor] = None
 
+        # T7: global old->new slot map for tree-migration deserialize/remap (T16).
+        # Built in reorchestrate_cache when a radix tree (not ChunkCache) is active.
+        self.old_to_new_slot_map: Optional[Dict[int, int]] = None
+
         # In TP mode all ranks have identical req_to_token_pool entries.
         self.global_seqlens_list = [req.seqlen for req in global_reqs]
         # Last output token is not stored in KV cache.
@@ -220,6 +224,7 @@ class ParaSReqScatterManager:
         new_ep_cache_size: Optional[int] = None,
         new_req_pool_size: Optional[int] = None,
         new_ep_cache_size_swa: Optional[int] = None,
+        tree_cache=None,  # T7: passed by scheduler for tree-migration; default None preserves caller compat
     ):
         """Shrink pools to EP capacity and allocate new EP token indices."""
         mgr = get_global_paras_memory_manager()
@@ -285,6 +290,30 @@ class ParaSReqScatterManager:
 
                 self.ep_dst_positions = ep_token_indices
 
+                # T7: build global old->new slot map (TP -> EP direction).
+                should_build_map = tree_cache is None or getattr(tree_cache, "root_node", None) is not None
+                if should_build_map:
+                    if (
+                        self.token_partition is not None
+                        and self.global_token_indices is not None
+                        and self.ep_dst_positions is not None
+                    ):
+                        local_global_idx = self.token_partition[self.paras_tp_rank]
+                        if local_global_idx:
+                            old_slots = (
+                                self.global_token_indices[local_global_idx]
+                                .detach().cpu().tolist()
+                            )
+                            new_slots = (
+                                self.ep_dst_positions.detach().cpu().tolist()
+                            )
+                            assert len(old_slots) == len(new_slots), (
+                                f"Slot map mismatch: {len(old_slots)} vs {len(new_slots)}"
+                            )
+                            self.old_to_new_slot_map = dict(zip(old_slots, new_slots))
+                        else:
+                            self.old_to_new_slot_map = {}
+
                 self._tighten_swa_pool_to_in_window()
             else:
                 for req, rpi in zip(self.local_reqs, req_pool_indices):
@@ -319,6 +348,17 @@ class ParaSReqScatterManager:
 
     def get_new_waiting_queue(self) -> List[Req]:
         return list(self.local_waiting_reqs_after_partition)
+
+    def build_slot_remap_callback(self):
+        """Return a callable that maps old TP-pool slot -> new EP-pool slot.
+
+        Returns -1 when an old slot is unknown (signal: dropped / not migrated).
+        Returns identity if no map was built (e.g., ChunkCache path).
+        """
+        slot_map = self.old_to_new_slot_map
+        if slot_map is None:
+            return lambda old: old
+        return lambda old, _m=slot_map: _m.get(old, -1)
 
     # ------------------------------------------------------------------
     # Step 3: build running batch from local partition
