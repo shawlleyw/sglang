@@ -150,6 +150,9 @@ class ParaSReqScatterManager:
         self.local_reqs: List[Req] = []
         self.local_seqlens_list: List[int] = []
         self.num_local_tokens: int = 0
+        # T11: per-rank request partitions (populated by partition_requests();
+        # used by broadcast_tree_records to filter records by ownership).
+        self.partitions: Optional[List[List[Req]]] = None
         self.token_partition: Optional[List[List[int]]] = None
         self.ep_dst_positions: Optional[torch.Tensor] = None
         self.new_cache_size: Optional[int] = None
@@ -189,6 +192,7 @@ class ParaSReqScatterManager:
         partitions = partition_requests_for_ep(
             self.global_reqs, self.paras_tp_size
         )
+        self.partitions = partitions
         self.local_reqs = partitions[self.paras_tp_rank]
         self.local_seqlens_list = [req.seqlen for req in self.local_reqs]
         self.num_local_tokens = sum(s - 1 for s in self.local_seqlens_list)
@@ -359,6 +363,69 @@ class ParaSReqScatterManager:
         if slot_map is None:
             return lambda old: old
         return lambda old, _m=slot_map: _m.get(old, -1)
+
+    def broadcast_tree_records(self, local_tree):
+        """Rank 0 serializes the canonical TP tree, broadcasts via paras_tp_group.
+        Receivers decode and partition by request ownership.
+
+        Args:
+            local_tree: this rank's tree_cache (RadixCache or SWARadixCache).
+                On rank 0, must be the canonical TP tree. On other ranks, ignored.
+                None or ChunkCache means "no tree to broadcast" -> return [].
+
+        Returns:
+            List[TreeRecord]: records OWNED by this rank's partition (others dropped).
+            A record is OWNED if its full_token_path is a prefix of any req in
+            self.partitions[self.paras_tp_rank].
+        """
+        from sglang.srt.paras.tree_migration import (
+            serialize_radix_cache,
+            serialize_swa_radix_cache,
+            encode_records,
+            decode_records,
+        )
+        import torch.distributed as dist
+
+        if local_tree is None or getattr(local_tree, "root_node", None) is None:
+            return []
+
+        rank = self.scatter_group.rank_in_group
+        world_size = self.scatter_group.world_size
+
+        if rank == 0:
+            if hasattr(local_tree, "sliding_window_size") and getattr(local_tree, "sliding_window_size", None) is not None:
+                records = serialize_swa_radix_cache(local_tree)
+            else:
+                records = serialize_radix_cache(local_tree)
+            blob = encode_records(records)
+            payload = [blob]
+        else:
+            payload = [None]
+
+        dist.broadcast_object_list(payload, src=0, group=self.scatter_group.device_group)
+        blob = payload[0]
+        all_records = decode_records(blob) if blob else []
+
+        if self.partitions is None:
+            return all_records
+
+        owned_reqs = self.partitions[self.paras_tp_rank]
+        owned_token_lists = [list(req.fill_ids) if hasattr(req, "fill_ids") else [] for req in owned_reqs]
+
+        return self._partition_records_by_ownership(all_records, owned_token_lists)
+
+    @staticmethod
+    def _partition_records_by_ownership(records, owned_token_lists):
+        """A record is owned if its full_token_path is a prefix of any owned_token_list."""
+        owned: list = []
+        for rec in records:
+            path = rec.full_token_path
+            path_len = len(path)
+            for tokens in owned_token_lists:
+                if len(tokens) >= path_len and tokens[:path_len] == path:
+                    owned.append(rec)
+                    break
+        return owned
 
     # ------------------------------------------------------------------
     # Step 3: build running batch from local partition
