@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 MIXIN_PATH = REPO_ROOT / "python" / "sglang" / "srt" / "paras" / "scheduler_paras_mixin.py"
 SERVER_ARGS_PATH = REPO_ROOT / "python" / "sglang" / "srt" / "server_args.py"
 

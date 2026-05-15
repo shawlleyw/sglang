@@ -45,13 +45,13 @@ class TestSnapshotCoverageDocumented:
 
     def test_gather_manager_snapshot_capture_present(self):
         from pathlib import Path
-        src = (Path(__file__).resolve().parents[3] / "python/sglang/srt/paras/gather_manager.py").read_text()
+        src = (Path(__file__).resolve().parents[4] / "python/sglang/srt/paras/gather_manager.py").read_text()
         assert "source_full_to_swa_mapping" in src
         assert ".clone()" in src or "clone()" in src
 
     def test_scatter_manager_snapshot_capture_present(self):
         from pathlib import Path
-        src = (Path(__file__).resolve().parents[3] / "python/sglang/srt/paras/scatter_manager.py").read_text()
+        src = (Path(__file__).resolve().parents[4] / "python/sglang/srt/paras/scatter_manager.py").read_text()
         assert "source_full_to_swa_mapping" in src
         assert ".clone()" in src or "clone()" in src
 

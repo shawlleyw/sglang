@@ -35,7 +35,7 @@ def _load_recover_request():
     Avoids importing the full sglang chain (transformers, configs, etc.) which is
     not available in the lightweight test environment.
     """
-    src_path = pathlib.Path(__file__).parents[3] / "python" / "sglang" / "srt" / "paras" / "gather_manager.py"
+    src_path = pathlib.Path(__file__).parents[4] / "python" / "sglang" / "srt" / "paras" / "gather_manager.py"
     text = src_path.read_text()
     start = text.index("def recover_request(")
     after = text[start:]

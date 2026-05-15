@@ -45,8 +45,8 @@ def _import_scatter_manager():
         stub.__dict__.setdefault("paras_tp_group_all_gather_reqs", lambda *a, **kw: (None, None))
         sys.modules[name] = stub
 
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__)))))
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))))
     python_root = os.path.join(repo_root, "python")
     pkg_paths = {
         "sglang": os.path.join(python_root, "sglang"),

@@ -114,7 +114,7 @@ def test_production_callback_exists_in_managers():
 def test_production_callback_source_grep():
     """Module-import-free source check: grep production files for the -1 sentinel lambda."""
     import pathlib
-    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    repo_root = pathlib.Path(__file__).resolve().parents[4]
     gather_src = (repo_root / "python/sglang/srt/paras/gather_manager.py").read_text()
     scatter_src = (repo_root / "python/sglang/srt/paras/scatter_manager.py").read_text()
     assert "build_slot_remap_callback" in gather_src

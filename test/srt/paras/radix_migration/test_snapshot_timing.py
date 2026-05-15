@@ -20,7 +20,7 @@ def _line_indices(source: str, patterns: list) -> list:
     return out
 
 
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parents[4]
 
 
 def test_gather_manager_snapshot_timing():
