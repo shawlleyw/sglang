@@ -426,7 +426,11 @@ class SchedulerParasMixin:
 
         with TimeReporter("transfer_weights"):
             self.tp_worker.paras_configure_tp(self.paras_tp_size, self.paras_tp_rank)
-        
+
+        sampler = self.tp_worker.model_runner.sampler
+        sampler.tp_sync_group = self.paras_tp_group.device_group
+        sampler.force_sync_token_ids = True
+
         end_time = time.time()
         cost_ms = (end_time - start_time) * 1000
         logger.info(f"Time taken to configure TP: {cost_ms} ms")
@@ -533,6 +537,10 @@ class SchedulerParasMixin:
         # Phase 3: Model switch (weights + attention)
         with TimeReporter("transfer_weights"):
             self.tp_worker.paras_configure_ep()
+
+        sampler = self.tp_worker.model_runner.sampler
+        sampler.tp_sync_group = self.paras_tp_attn_tp_group.device_group
+        sampler.force_sync_token_ids = False
 
         end_time = time.time()
         cost_ms = (end_time - start_time) * 1000

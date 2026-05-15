@@ -39,6 +39,8 @@ class Sampler(nn.Module):
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
 
+        self.force_sync_token_ids = False
+
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
     ) -> torch.Tensor:
@@ -187,7 +189,11 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             ]
 
-        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+        if (
+            SYNC_TOKEN_IDS_ACROSS_TP
+            or sampling_info.grammars
+            or self.force_sync_token_ids
+        ):
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
