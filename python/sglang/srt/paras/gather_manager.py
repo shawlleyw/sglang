@@ -663,3 +663,21 @@ class ParaSReqGatherManager:
                 kept.append(candidates[0][1])
                 dropped += len(candidates) - 1
         return kept, dropped
+
+    def collect_unlocked_slots_for_preserve(self, local_tree, enabled: bool):
+        """T27: When --paras-radix-preserve-unlocked is on, enumerate this rank's
+        unlocked tree node slots so they can be appended to the K/V transfer set.
+
+        Returns:
+            torch.Tensor of slot indices (empty tensor if disabled or no tree).
+        """
+        import torch
+        if not enabled:
+            return torch.empty(0, dtype=torch.int64)
+        if local_tree is None or getattr(local_tree, "root_node", None) is None:
+            return torch.empty(0, dtype=torch.int64)
+        from sglang.srt.paras.tree_migration import enumerate_unlocked_slots
+        slots = enumerate_unlocked_slots(local_tree)
+        if not slots:
+            return torch.empty(0, dtype=torch.int64)
+        return torch.tensor(slots, dtype=torch.int64)

@@ -702,3 +702,31 @@ def emit_migration_events(tree, gathered_records: Optional[list] = None) -> None
 
         for c in node.children.values():
             stack.append(c)
+
+
+def enumerate_unlocked_slots(tree) -> list:
+    """T27: Walk tree iteratively, return list of slot indices belonging to UNLOCKED
+    nodes (lock_ref == 0; for SWA: full_lock_ref == 0). Used by T27's preserve-unlocked
+    path to extend the K/V transfer set on EP→TP.
+
+    Returns empty list for ChunkCache or empty tree.
+    """
+    if tree is None or getattr(tree, "root_node", None) is None:
+        return []
+
+    is_swa = hasattr(tree, "sliding_window_size") and getattr(tree, "sliding_window_size", None) is not None
+    out: list = []
+    stack = list(tree.root_node.children.values())
+    while stack:
+        node = stack.pop()
+        lock = getattr(node, "full_lock_ref" if is_swa else "lock_ref", 0)
+        if lock == 0:
+            value = getattr(node, "value", None)
+            if value is not None:
+                try:
+                    out.extend(value.tolist() if hasattr(value, "tolist") else list(value))
+                except Exception:
+                    pass
+        for c in node.children.values():
+            stack.append(c)
+    return out
