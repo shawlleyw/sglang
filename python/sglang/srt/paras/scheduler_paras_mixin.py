@@ -318,6 +318,34 @@ class SchedulerParasMixin:
         moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.NONE
         
         self.paras_start_profile("/tmp/paras_configure_profile")
+
+        # T13: tree-migration serialize (EP→TP). Capture local tree's records
+        # BEFORE tree_cache.reset() wipes them. Skip for ChunkCache path.
+        from sglang.srt.paras.tree_migration import (
+            serialize_radix_cache as _t_serialize_mha,
+            serialize_swa_radix_cache as _t_serialize_swa,
+            encode_records as _t_encode,
+        )
+        from sglang.srt.paras.migration_metrics import (
+            metrics as _t_metrics,
+            time_block as _t_time_block,
+        )
+
+        self._paras_serialized_tree_blob = None
+        if (
+            self.tree_cache is not None
+            and getattr(self.tree_cache, "root_node", None) is not None
+            and not self.server_args.disable_radix_cache
+        ):
+            with _t_time_block("serialize_ms_ema"):
+                if hasattr(self.tree_cache, "sliding_window_size") and getattr(
+                    self.tree_cache, "sliding_window_size", None
+                ) is not None:
+                    _t_records = _t_serialize_swa(self.tree_cache)
+                else:
+                    _t_records = _t_serialize_mha(self.tree_cache)
+                self._paras_serialized_tree_blob = _t_encode(_t_records)
+
         self.tree_cache.reset()
         local_reqs = self.paras_get_local_reqs()
         local_waiting_reqs = list(self.waiting_queue)
@@ -348,7 +376,62 @@ class SchedulerParasMixin:
         
         with TimeReporter("reorchestrate_cache"):
             paras_gather_manager.reorchestrate_cache()
-        
+
+        # T15: tree-migration deserialize+rebuild (EP→TP). After reorchestrate_cache
+        # has built the new TP slot map, all-gather the per-rank serialized blobs,
+        # dedup by (token_path, extra_key) with in-flight-lock-ref tiebreaker, and
+        # rebuild the canonical TP tree. Migrated reqs will reattach in T17.
+        if (
+            self._paras_serialized_tree_blob is not None
+            and self.tree_cache is not None
+            and getattr(self.tree_cache, "root_node", None) is not None
+        ):
+            from sglang.srt.paras.tree_migration import (
+                decode_records as _t_decode,
+                rebuild_radix_cache as _t_rebuild,
+                canonicalize_post_rebuild as _t_canonicalize,
+            )
+            import torch.distributed as dist
+
+            with _t_time_block("remap_ms_ema"):
+                _world_size = paras_gather_manager.gather_group.world_size
+                _gathered_blobs = [None] * _world_size
+                dist.all_gather_object(
+                    _gathered_blobs,
+                    self._paras_serialized_tree_blob,
+                    group=paras_gather_manager.gather_group.device_group,
+                )
+                _per_rank_records = [
+                    (_t_decode(b) if b else []) for b in _gathered_blobs
+                ]
+
+                # In-flight slot set: OLD pool slots captured by gather_manager at
+                # __init__ (pre-reorchestrate), used as the dedup tiebreaker signal.
+                _in_flight_slots: set = set()
+                _lti = getattr(paras_gather_manager, "local_token_indices", None)
+                if _lti is not None:
+                    try:
+                        _in_flight_slots.update(
+                            int(s) for s in _lti.detach().cpu().tolist() if s > 0
+                        )
+                    except Exception:
+                        pass
+
+                _kept, _dropped = paras_gather_manager._dedup_records_with_lockref(
+                    _per_rank_records, _in_flight_slots
+                )
+                _t_metrics.dedup_drop_count += _dropped
+                _remap_cb = paras_gather_manager.build_slot_remap_callback()
+                _t_rebuild(
+                    self.tree_cache,
+                    _kept,
+                    remap_slot_idx=_remap_cb,
+                    metrics=_t_metrics,
+                )
+                _t_canonicalize(self.tree_cache)
+
+            self._paras_serialized_tree_blob = None
+
         with TimeReporter("gather_cache"):
             paras_gather_manager.gather_cache()
         
@@ -421,6 +504,34 @@ class SchedulerParasMixin:
 
         self.paras_start_profile("/tmp/paras_configure_profile")
 
+        # T14: tree-migration serialize (TP→EP). Only rank 0 holds the canonical
+        # TP tree; non-rank-0 ranks will receive it via broadcast in T16.
+        from sglang.srt.paras.tree_migration import (
+            serialize_radix_cache as _t_serialize_mha,
+            serialize_swa_radix_cache as _t_serialize_swa,
+            encode_records as _t_encode,
+        )
+        from sglang.srt.paras.migration_metrics import (
+            metrics as _t_metrics,
+            time_block as _t_time_block,
+        )
+
+        self._paras_serialized_tree_blob = None
+        if (
+            self.tree_cache is not None
+            and getattr(self.tree_cache, "root_node", None) is not None
+            and not self.server_args.disable_radix_cache
+            and self.tp_rank == 0
+        ):
+            with _t_time_block("serialize_ms_ema"):
+                if hasattr(self.tree_cache, "sliding_window_size") and getattr(
+                    self.tree_cache, "sliding_window_size", None
+                ) is not None:
+                    _t_records = _t_serialize_swa(self.tree_cache)
+                else:
+                    _t_records = _t_serialize_mha(self.tree_cache)
+                self._paras_serialized_tree_blob = _t_encode(_t_records)
+
         # Phase 1: Prepare — reset tree cache, merge batches, build global req list
         self.tree_cache.reset()
         self.merge_last_batch()
@@ -455,6 +566,59 @@ class SchedulerParasMixin:
 
             with TimeReporter("reorchestrate_cache"):
                 paras_scatter_manager.reorchestrate_cache()
+
+        # T16: tree-migration deserialize+rebuild (TP→EP). Rank 0 broadcasts its
+        # serialized canonical TP tree; each rank partitions records by req
+        # ownership, then rebuilds its local EP tree.
+        if (
+            self.tree_cache is not None
+            and getattr(self.tree_cache, "root_node", None) is not None
+            and not self.server_args.disable_radix_cache
+        ):
+            from sglang.srt.paras.tree_migration import (
+                decode_records as _t_decode,
+                rebuild_radix_cache as _t_rebuild,
+                canonicalize_post_rebuild as _t_canonicalize,
+            )
+            import torch.distributed as dist
+
+            with _t_time_block("remap_ms_ema"):
+                if self.tp_rank == 0:
+                    _payload = [self._paras_serialized_tree_blob]
+                else:
+                    _payload = [None]
+                dist.broadcast_object_list(
+                    _payload,
+                    src=0,
+                    group=paras_scatter_manager.scatter_group.device_group,
+                )
+                _blob = _payload[0]
+                _all_records = _t_decode(_blob) if _blob else []
+
+                if paras_scatter_manager.partitions is not None:
+                    _owned_reqs = paras_scatter_manager.partitions[
+                        paras_scatter_manager.paras_tp_rank
+                    ]
+                    _owned_token_lists = [
+                        list(req.fill_ids) if hasattr(req, "fill_ids") else []
+                        for req in _owned_reqs
+                    ]
+                    _kept = paras_scatter_manager._partition_records_by_ownership(
+                        _all_records, _owned_token_lists
+                    )
+                else:
+                    _kept = _all_records
+
+                _remap_cb = paras_scatter_manager.build_slot_remap_callback()
+                _t_rebuild(
+                    self.tree_cache,
+                    _kept,
+                    remap_slot_idx=_remap_cb,
+                    metrics=_t_metrics,
+                )
+                _t_canonicalize(self.tree_cache)
+
+            self._paras_serialized_tree_blob = None
 
         with TimeReporter("scatter_cache"):
             paras_scatter_manager.scatter_cache()
