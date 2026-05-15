@@ -312,6 +312,10 @@ class ParaSReqScatterManager:
             f"Local reqs {num_local_reqs} exceed EP req pool {new_req_pool_size}"
         )
 
+        # INVARIANT (T26): snapshot MUST precede paras_resize_and_clear (which would
+        # zero the mapping) AND _tighten_swa_pool_to_in_window (which would free
+        # tree-only OOW slots). Future refactors that reorder these will break
+        # tree-migration's SWA layer remap.
         # Snapshot the source-mode (TP) full_to_swa_index_mapping BEFORE resize.
         # paras_resize_and_clear zero-fills this mapping; without a snapshot,
         # SWACacheTransfer.scatter_one_layer's lookup on TP-side source

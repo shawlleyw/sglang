@@ -245,6 +245,10 @@ class ParaSReqGatherManager:
         self.req_to_token_pool.paras_resize_and_clear(new_req_pool_size)
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
 
+        # INVARIANT (T26): snapshot MUST precede paras_resize_and_clear (which would
+        # zero the mapping) AND _tighten_swa_pool_to_in_window (which would free
+        # tree-only OOW slots). Future refactors that reorder these will break
+        # tree-migration's SWA layer remap.
         # Snapshot the source-mode (EP) full_to_swa_index_mapping BEFORE resize.
         # paras_resize_and_clear zero-fills this mapping; without a snapshot,
         # SWACacheTransfer.gather_one_layer's lookup on EP-side source positions
