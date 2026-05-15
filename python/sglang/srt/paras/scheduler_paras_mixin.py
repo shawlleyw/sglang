@@ -319,6 +319,11 @@ class SchedulerParasMixin:
         
         self.paras_start_profile("/tmp/paras_configure_profile")
 
+        # T20: flush GPU writes before serialize so node.value slot tensors
+        # reflect any in-flight kernels' final state.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         # T13: tree-migration serialize (EP→TP). Capture local tree's records
         # BEFORE tree_cache.reset() wipes them. Skip for ChunkCache path.
         from sglang.srt.paras.tree_migration import (
@@ -390,6 +395,7 @@ class SchedulerParasMixin:
                 decode_records as _t_decode,
                 rebuild_radix_cache as _t_rebuild,
                 canonicalize_post_rebuild as _t_canonicalize,
+                recompute_lock_refs as _t_recompute_lock_refs,
             )
             import torch.distributed as dist
 
@@ -429,6 +435,15 @@ class SchedulerParasMixin:
                     metrics=_t_metrics,
                 )
                 _t_canonicalize(self.tree_cache)
+                _t_recompute_lock_refs(
+                    self.tree_cache,
+                    self.running_batch.reqs if self.running_batch else [],
+                )
+
+            # T20: ensure the rebuilt tree + remapped slot tensors are fully
+            # committed before forward resumes on this rank.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
             self._paras_serialized_tree_blob = None
 
@@ -503,6 +518,11 @@ class SchedulerParasMixin:
             self._paras_auto_clear_window_on_switch()
 
         self.paras_start_profile("/tmp/paras_configure_profile")
+
+        # T20: flush GPU writes before serialize so node.value slot tensors
+        # reflect any in-flight kernels' final state (TP→EP direction).
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         # T14: tree-migration serialize (TP→EP). Only rank 0 holds the canonical
         # TP tree; non-rank-0 ranks will receive it via broadcast in T16.
@@ -579,6 +599,7 @@ class SchedulerParasMixin:
                 decode_records as _t_decode,
                 rebuild_radix_cache as _t_rebuild,
                 canonicalize_post_rebuild as _t_canonicalize,
+                recompute_lock_refs as _t_recompute_lock_refs,
             )
             import torch.distributed as dist
 
@@ -617,6 +638,15 @@ class SchedulerParasMixin:
                     metrics=_t_metrics,
                 )
                 _t_canonicalize(self.tree_cache)
+                _t_recompute_lock_refs(
+                    self.tree_cache,
+                    self.running_batch.reqs if self.running_batch else [],
+                )
+
+            # T20: ensure the rebuilt tree + remapped slot tensors are fully
+            # committed before forward resumes on this rank (TP→EP direction).
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
             self._paras_serialized_tree_blob = None
 

@@ -608,5 +608,245 @@ class TestCanonicalizePostRebuild:
             sys.setrecursionlimit(old_limit)
 
 
+class TestRecomputeLockRefs:
+    """T19: lock_ref recompute via inc_lock_ref walk."""
+
+    def _build_fake_mha_tree(self):
+        class FakeKey:
+            def __init__(self, t):
+                self.token_ids = list(t)
+
+        class FakeNode:
+            def __init__(self, key=None):
+                self.key = key
+                self.children = {}
+                self.parent = None
+                self.lock_ref = 999
+
+        class FakeTree:
+            def __init__(self):
+                self.root_node = FakeNode(FakeKey([]))
+                self.root_node.lock_ref = 999
+                self.inc_calls = []
+
+            def inc_lock_ref(self, node):
+                self.inc_calls.append(node)
+                node.lock_ref += 1
+                p = node.parent
+                while p is not None and p is not self.root_node:
+                    p.lock_ref += 1
+                    p = p.parent
+                return None
+
+        t = FakeTree()
+        a = FakeNode(FakeKey([1, 2]))
+        a.parent = t.root_node
+        t.root_node.children[1] = a
+        b = FakeNode(FakeKey([3]))
+        b.parent = a
+        a.children[3] = b
+        return t, a, b
+
+    def test_zeros_lock_refs_then_increments_for_in_flight(self):
+        from sglang.srt.paras.tree_migration import recompute_lock_refs
+        t, a, b = self._build_fake_mha_tree()
+
+        class Req:
+            tree_orphaned = False
+            last_node = b
+            cache_protected_len = 0
+
+        r = Req()
+        recompute_lock_refs(t, [r])
+        assert b.lock_ref == 1
+        assert a.lock_ref == 1
+        assert t.root_node.lock_ref == 1
+        assert r.cache_protected_len == 3
+
+    def test_orphaned_req_skipped(self):
+        from sglang.srt.paras.tree_migration import recompute_lock_refs
+        t, a, b = self._build_fake_mha_tree()
+
+        class Req:
+            tree_orphaned = True
+            last_node = b
+            cache_protected_len = 0
+
+        r = Req()
+        recompute_lock_refs(t, [r])
+        assert t.inc_calls == []
+        assert b.lock_ref == 0
+        assert a.lock_ref == 0
+        assert r.cache_protected_len == 0
+
+    def test_two_reqs_sharing_prefix_lock_to_2(self):
+        from sglang.srt.paras.tree_migration import recompute_lock_refs
+        t, a, b = self._build_fake_mha_tree()
+
+        class Req1:
+            tree_orphaned = False
+            last_node = b
+            cache_protected_len = 0
+
+        class Req2:
+            tree_orphaned = False
+            last_node = b
+            cache_protected_len = 0
+
+        r1, r2 = Req1(), Req2()
+        recompute_lock_refs(t, [r1, r2])
+        assert b.lock_ref == 2
+        assert a.lock_ref == 2
+        assert t.root_node.lock_ref == 1
+
+    def test_no_in_flight_reqs(self):
+        from sglang.srt.paras.tree_migration import recompute_lock_refs
+        t, a, b = self._build_fake_mha_tree()
+        recompute_lock_refs(t, [])
+        assert b.lock_ref == 0
+        assert a.lock_ref == 0
+        assert t.root_node.lock_ref == 1
+
+    def test_req_at_root_no_inc(self):
+        from sglang.srt.paras.tree_migration import recompute_lock_refs
+        t, _a, _b = self._build_fake_mha_tree()
+
+        class Req:
+            tree_orphaned = False
+            cache_protected_len = 0
+
+        r = Req()
+        r.last_node = t.root_node
+        recompute_lock_refs(t, [r])
+        assert t.inc_calls == []
+        assert r.cache_protected_len == 0
+
+    def test_inc_lock_ref_exception_marks_orphaned(self):
+        from sglang.srt.paras.tree_migration import recompute_lock_refs
+        t, a, b = self._build_fake_mha_tree()
+
+        def _raise(_node):
+            raise RuntimeError("simulated")
+
+        t.inc_lock_ref = _raise
+
+        class Req:
+            tree_orphaned = False
+            last_node = b
+            prefix_indices = [42, 43]
+            cache_protected_len = 0
+
+        r = Req()
+        recompute_lock_refs(t, [r])
+        assert r.tree_orphaned is True
+        assert r.last_node is t.root_node
+        assert r.prefix_indices == []
+
+    def test_swa_tree_uses_full_and_swa_lock_ref(self):
+        from sglang.srt.paras.tree_migration import recompute_lock_refs
+
+        class FakeKey:
+            def __init__(self, t):
+                self.token_ids = list(t)
+
+        class FakeSwaNode:
+            def __init__(self, key=None):
+                self.key = key
+                self.children = {}
+                self.parent = None
+                self.full_lock_ref = 999
+                self.swa_lock_ref = 999
+
+        class FakeSwaTree:
+            sliding_window_size = 16
+
+            def __init__(self):
+                self.root_node = FakeSwaNode(FakeKey([]))
+                self.root_node.full_lock_ref = 999
+                self.root_node.swa_lock_ref = 999
+
+            def inc_lock_ref(self, node):
+                node.full_lock_ref += 1
+                node.swa_lock_ref += 1
+                p = node.parent
+                while p is not None and p is not self.root_node:
+                    p.full_lock_ref += 1
+                    p.swa_lock_ref += 1
+                    p = p.parent
+                return "uuid-xyz"
+
+        t = FakeSwaTree()
+        a = FakeSwaNode(FakeKey([7]))
+        a.parent = t.root_node
+        t.root_node.children[7] = a
+
+        class Req:
+            tree_orphaned = False
+            last_node = a
+            cache_protected_len = 0
+            swa_uuid_for_lock = None
+
+        r = Req()
+        recompute_lock_refs(t, [r])
+        assert a.full_lock_ref == 1
+        assert a.swa_lock_ref == 1
+        assert t.root_node.full_lock_ref == 1
+        assert t.root_node.swa_lock_ref == 1
+        assert r.swa_uuid_for_lock == "uuid-xyz"
+        assert r.cache_protected_len == 1
+
+    def test_none_tree_cache_is_noop(self):
+        from sglang.srt.paras.tree_migration import recompute_lock_refs
+        recompute_lock_refs(None, [])
+
+    def test_deep_chain_iterative_no_recursion(self):
+        from sglang.srt.paras.tree_migration import recompute_lock_refs
+        import sys
+
+        class FakeKey:
+            def __init__(self, t):
+                self.token_ids = list(t)
+
+        class FakeNode:
+            def __init__(self, key=None):
+                self.key = key
+                self.children = {}
+                self.parent = None
+                self.lock_ref = 0
+
+        class FakeTree:
+            def __init__(self):
+                self.root_node = FakeNode(FakeKey([]))
+
+            def inc_lock_ref(self, node):
+                return None
+
+        t = FakeTree()
+        node = t.root_node
+        last = None
+        for i in range(1, 1001):
+            child = FakeNode(FakeKey([i]))
+            child.parent = node
+            node.children[i] = child
+            node = child
+            last = child
+
+        old_limit = sys.getrecursionlimit()
+        try:
+            sys.setrecursionlimit(50)
+            recompute_lock_refs(t, [])
+
+            class Req:
+                tree_orphaned = False
+                cache_protected_len = 0
+
+            r = Req()
+            r.last_node = last
+            recompute_lock_refs(t, [r])
+            assert r.cache_protected_len == 1000
+        finally:
+            sys.setrecursionlimit(old_limit)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

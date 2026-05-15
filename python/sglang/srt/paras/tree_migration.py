@@ -353,3 +353,94 @@ def canonicalize_post_rebuild(tree, base_time: float = 0.0) -> None:
             node.hash_value = None
         if hasattr(node, "last_access_time"):
             node.last_access_time = base_time + i
+
+
+def recompute_lock_refs(tree_cache, in_flight_reqs) -> None:
+    """T19: After tree rebuild + recover_request, walk each in-flight req and
+    re-lock its prefix path. Skips reqs marked tree_orphaned (T17/T18).
+
+    Steps:
+      1. Walk all non-root tree nodes (iterative DFS); zero lock_ref counters.
+         For SWA: zero full_lock_ref + swa_lock_ref.
+      2. Set root_node.lock_ref = 1 (MHA convention) or full_lock_ref=1 +
+         swa_lock_ref=1 (SWA).
+      3. For each in-flight req (not tree_orphaned): call
+         tree_cache.inc_lock_ref(req.last_node). For SWA: capture returned
+         swa_uuid_for_lock into req.swa_uuid_for_lock.
+      4. Set req.cache_protected_len = matched-prefix length (sum of
+         node.key.token_ids along last_node→root path).
+
+    Iterative DFS — no recursion.
+    """
+    if tree_cache is None or getattr(tree_cache, "root_node", None) is None:
+        return
+
+    is_swa = (
+        hasattr(tree_cache, "sliding_window_size")
+        and getattr(tree_cache, "sliding_window_size", None) is not None
+    )
+
+    root = tree_cache.root_node
+
+    # Step 1: iterative DFS — zero lock_refs on every non-root node.
+    stack = list(root.children.values())
+    while stack:
+        node = stack.pop()
+        if is_swa:
+            if hasattr(node, "full_lock_ref"):
+                node.full_lock_ref = 0
+            if hasattr(node, "swa_lock_ref"):
+                node.swa_lock_ref = 0
+        else:
+            if hasattr(node, "lock_ref"):
+                node.lock_ref = 0
+        for c in node.children.values():
+            stack.append(c)
+
+    # Step 2: reset root counter to 1 (matches RadixCache.__init__ convention).
+    if is_swa:
+        if hasattr(root, "full_lock_ref"):
+            root.full_lock_ref = 1
+        if hasattr(root, "swa_lock_ref"):
+            root.swa_lock_ref = 1
+    else:
+        if hasattr(root, "lock_ref"):
+            root.lock_ref = 1
+
+    # Step 3+4: per-req inc_lock_ref and cache_protected_len.
+    for req in in_flight_reqs:
+        if getattr(req, "tree_orphaned", False):
+            continue
+        last_node = getattr(req, "last_node", None)
+        if last_node is None or last_node is root:
+            continue
+        try:
+            uuid = tree_cache.inc_lock_ref(last_node)
+            if is_swa and uuid is not None:
+                req.swa_uuid_for_lock = uuid
+        except Exception:
+            req.tree_orphaned = True
+            req.last_node = root
+            req.prefix_indices = []
+            continue
+
+        # Walk last_node → root, summing key.token_ids lengths.
+        plen = 0
+        n = last_node
+        while n is not None and n is not root:
+            key = getattr(n, "key", None)
+            if key is None:
+                break
+            tokens = getattr(key, "token_ids", None)
+            if tokens is None:
+                try:
+                    tokens = list(key)
+                except TypeError:
+                    break
+            try:
+                plen += len(tokens)
+            except TypeError:
+                pass
+            n = getattr(n, "parent", None)
+        if hasattr(req, "cache_protected_len"):
+            req.cache_protected_len = plen
