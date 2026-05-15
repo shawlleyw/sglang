@@ -28,6 +28,14 @@ paras_default_cvd
 # TP/TP: ensure DeepEP env is unset so we don't accidentally pick up a stale config.
 unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
 
+# Force a MIN all-reduce on sampled token ids across TP ranks. Paras forces
+# Sampler.force_sync_token_ids=True after every EP->TP swap (see
+# paras/scheduler_paras_mixin.py paras_configure_tp) to absorb non-deterministic
+# attention / MoE / sampler kernels that would otherwise diverge across ranks
+# and deadlock at the next collective. tp-static must run the same sync to be a
+# structurally fair comparison and to inherit the same safety net.
+export SYNC_TOKEN_IDS_ACROSS_TP=1
+
 paras_init_cuda_graph
 
 python -m sglang.launch_server \
