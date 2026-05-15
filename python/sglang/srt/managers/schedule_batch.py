@@ -489,6 +489,9 @@ class Req:
         # by ScheduleBatch._evict_swa during sliding-window decode-time eviction.
         self.swa_evicted_seqlen = 0
 
+        # Tokens locked by tree.inc_lock_ref must not be SWA-evicted at runtime; floor used by ScheduleBatch._evict_swa.
+        self.cache_protected_len: int = 0
+
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
 
@@ -1580,8 +1583,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self._evict_swa(req, req.seqlen - 1, sliding_window_size)
 
     def _evict_swa(self, req: Req, pre_len: int, sliding_window_size: int):
+        # cache_protected_len: tokens locked by tree.inc_lock_ref must not be SWA-evicted, else _match_prefix_helper would return slots that point to SWA-padding-zero.
         new_swa_evicted_seqlen = max(
-            req.swa_evicted_seqlen, pre_len - sliding_window_size
+            req.swa_evicted_seqlen, req.cache_protected_len, pre_len - sliding_window_size
         )
         if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
             free_slots = self.req_to_token_pool.req_to_token[
