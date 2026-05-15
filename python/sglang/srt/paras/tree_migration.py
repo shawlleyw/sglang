@@ -316,3 +316,40 @@ def decode_records(blob: bytes) -> list:
             )
         )
     return out
+
+
+def canonicalize_post_rebuild(tree, base_time: float = 0.0) -> None:
+    """Post-rebuild walker: null out hash_value and assign canonical last_access_time.
+
+    - hash_value: invalidated by subtree reparenting (Merkle chain broken). Set None.
+      Defensive — HiRadix is asserted off, but null-out prevents future regressions.
+    - last_access_time: per-process counter divergence across ranks. Re-assign in
+      deterministic DFS order (deeper-first) so all ranks produce identical LRU.
+
+    Idempotent: safe to call multiple times.
+    Iterative DFS — no recursion.
+    """
+    stack: list = []
+    root = tree.root_node
+    for child in root.children.values():
+        stack.append(child)
+
+    nodes_in_dfs_order: list = []
+    while stack:
+        node = stack.pop()
+        nodes_in_dfs_order.append(node)
+        for child in node.children.values():
+            stack.append(child)
+
+    nodes_in_dfs_order.sort(
+        key=lambda n: (
+            -len(n.key.token_ids) if hasattr(n.key, "token_ids") else 0,
+            tuple(n.key.token_ids) if hasattr(n.key, "token_ids") else (),
+        )
+    )
+
+    for i, node in enumerate(nodes_in_dfs_order):
+        if hasattr(node, "hash_value"):
+            node.hash_value = None
+        if hasattr(node, "last_access_time"):
+            node.last_access_time = base_time + i

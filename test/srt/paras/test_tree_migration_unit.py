@@ -486,5 +486,127 @@ class TestEncodeDecodeRecords:
         )
 
 
+class TestCanonicalizePostRebuild:
+    """T12: Post-rebuild canonicalization of hash_value and last_access_time."""
+
+    def _build_fake_tree(self):
+        """Use the same FakeTree pattern as TestSerializeSWA."""
+        class FakeKey:
+            def __init__(self, token_ids):
+                self.token_ids = list(token_ids)
+
+        class FakeNode:
+            def __init__(self, key=None):
+                self.key = key
+                self.children = {}
+                self.hash_value = "stale_hash_xyz"
+                self.last_access_time = 999.0
+
+        class FakeTree:
+            def __init__(self):
+                self.root_node = FakeNode(FakeKey([]))
+
+        tree = FakeTree()
+        a = FakeNode(FakeKey([1, 2]))
+        b = FakeNode(FakeKey([1, 2, 3]))
+        c = FakeNode(FakeKey([4, 5, 6, 7]))
+        tree.root_node.children[1] = a
+        a.children[3] = b
+        tree.root_node.children[4] = c
+        return tree, [a, b, c]
+
+    def test_hash_value_nulled(self):
+        from sglang.srt.paras.tree_migration import canonicalize_post_rebuild
+        tree, nodes = self._build_fake_tree()
+        for n in nodes:
+            assert n.hash_value == "stale_hash_xyz"
+        canonicalize_post_rebuild(tree)
+        for n in nodes:
+            assert n.hash_value is None
+
+    def test_last_access_time_assigned_canonically(self):
+        from sglang.srt.paras.tree_migration import canonicalize_post_rebuild
+        tree, nodes = self._build_fake_tree()
+        canonicalize_post_rebuild(tree, base_time=100.0)
+        for n in nodes:
+            assert n.last_access_time != 999.0
+            assert n.last_access_time >= 100.0
+
+    def test_canonical_order_independent_of_dfs_traversal_order(self):
+        """Two trees built differently (same shape, different child-insertion order) yield
+        the same canonical assignment, because we sort by (-key_len, key_tuple)."""
+        from sglang.srt.paras.tree_migration import canonicalize_post_rebuild
+
+        class FakeKey:
+            def __init__(self, token_ids):
+                self.token_ids = list(token_ids)
+
+        class FakeNode:
+            def __init__(self, key=None):
+                self.key = key
+                self.children = {}
+                self.hash_value = None
+                self.last_access_time = 0.0
+
+        class FakeTree:
+            def __init__(self):
+                self.root_node = FakeNode(FakeKey([]))
+
+        def collect_times():
+            t = FakeTree()
+            n1 = FakeNode(FakeKey([1, 2]))
+            n2 = FakeNode(FakeKey([3, 4, 5]))
+            t.root_node.children[1] = n1
+            t.root_node.children[3] = n2
+            canonicalize_post_rebuild(t)
+            return sorted([(n.last_access_time, tuple(n.key.token_ids)) for n in (n1, n2)])
+
+        a = collect_times()
+        b = collect_times()
+        assert a == b
+
+    def test_idempotent(self):
+        from sglang.srt.paras.tree_migration import canonicalize_post_rebuild
+        tree, nodes = self._build_fake_tree()
+        canonicalize_post_rebuild(tree, base_time=1.0)
+        first_times = [n.last_access_time for n in nodes]
+        canonicalize_post_rebuild(tree, base_time=1.0)
+        second_times = [n.last_access_time for n in nodes]
+        assert first_times == second_times
+
+    def test_no_recursion(self):
+        import sys
+        from sglang.srt.paras.tree_migration import canonicalize_post_rebuild
+
+        class FakeKey:
+            def __init__(self, token_ids):
+                self.token_ids = list(token_ids)
+
+        class FakeNode:
+            def __init__(self, key):
+                self.key = key
+                self.children = {}
+                self.hash_value = None
+                self.last_access_time = 0.0
+
+        class FakeTree:
+            def __init__(self):
+                self.root_node = FakeNode(FakeKey([]))
+
+        tree = FakeTree()
+        node = tree.root_node
+        for i in range(1, 1001):
+            child = FakeNode(FakeKey([i]))
+            node.children[i] = child
+            node = child
+
+        old_limit = sys.getrecursionlimit()
+        try:
+            sys.setrecursionlimit(50)
+            canonicalize_post_rebuild(tree)
+        finally:
+            sys.setrecursionlimit(old_limit)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
