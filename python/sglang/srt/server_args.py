@@ -185,7 +185,7 @@ class ParasAutoSwitchDefaults:
 PARAS_AUTO_SWITCH_POLICY_DEFAULTS: Dict[str, ParasAutoSwitchDefaults] = {
     "prefill": ParasAutoSwitchDefaults(threshold_per_gpu=1024, window=8, cooldown_sec=10.0),
     "decode": ParasAutoSwitchDefaults(threshold_per_gpu=64, window=32, cooldown_sec=60.0),
-    "rollout": ParasAutoSwitchDefaults(threshold_per_gpu=8, window=1, cooldown_sec=60.0),
+    "rollout": ParasAutoSwitchDefaults(threshold_per_gpu=8, window=1, cooldown_sec=5.0),
 }
 # "hybrid" is intentionally absent from the defaults dict; _handle_paras_auto_switch
 # raises NotImplementedError for it. Keep it in the CLI choices so the error fires
