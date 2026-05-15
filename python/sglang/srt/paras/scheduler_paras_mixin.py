@@ -439,6 +439,9 @@ class SchedulerParasMixin:
                     self.tree_cache,
                     self.running_batch.reqs if self.running_batch else [],
                 )
+                _t_validator_msg = self._validate_post_migration()
+                if _t_validator_msg is not None:
+                    self._handle_validator_failure(_t_validator_msg)
 
             # T20: ensure the rebuilt tree + remapped slot tensors are fully
             # committed before forward resumes on this rank.
@@ -642,6 +645,9 @@ class SchedulerParasMixin:
                     self.tree_cache,
                     self.running_batch.reqs if self.running_batch else [],
                 )
+                _t_validator_msg = self._validate_post_migration()
+                if _t_validator_msg is not None:
+                    self._handle_validator_failure(_t_validator_msg)
 
             # T20: ensure the rebuilt tree + remapped slot tensors are fully
             # committed before forward resumes on this rank (TP→EP direction).
@@ -736,3 +742,174 @@ class SchedulerParasMixin:
     def paras_stop_profile(self):
         self.profiler.stop()
         self.profiler = None
+
+    def _validate_post_migration(self):
+        """T25: 4-invariant validator after tree migration. Returns None on success,
+        error message string on failure.
+
+        Invariants:
+          I1 Accounting: evictable_size + protected_size == sum(len(node.value)).
+             SWA: full_*_size_ counters match all-node sum; swa_*_size_ counters
+             match non-tombstone node sum.
+          I2 In-flight reachability: every in-flight req's last_node.parent chain
+             reaches root_node, AND last_node.lock_ref >= 1 (full_lock_ref for SWA).
+          I3 Slot bounds: req.prefix_indices values within [0, pool_size).
+          I4 SWA OOW: enforced upstream by canonicalize_post_rebuild.
+        """
+        if (
+            self.tree_cache is None
+            or getattr(self.tree_cache, "root_node", None) is None
+            or getattr(self.tree_cache, "disable", False)
+        ):
+            return None
+
+        is_swa = (
+            hasattr(self.tree_cache, "sliding_window_size")
+            and getattr(self.tree_cache, "sliding_window_size", None) is not None
+        )
+
+        # I1 accounting
+        try:
+            stack = list(self.tree_cache.root_node.children.values())
+            total_value_len = 0
+            non_tombstone_value_len = 0
+            while stack:
+                node = stack.pop()
+                v = getattr(node, "value", None)
+                if v is not None:
+                    try:
+                        n = len(v)
+                    except TypeError:
+                        n = int(v.shape[0]) if hasattr(v, "shape") else 0
+                    total_value_len += n
+                    if not getattr(node, "swa_tombstone", False):
+                        non_tombstone_value_len += n
+                for c in node.children.values():
+                    stack.append(c)
+
+            if is_swa:
+                full_acc = (
+                    self.tree_cache.full_evictable_size()
+                    + self.tree_cache.full_protected_size()
+                )
+                swa_acc = (
+                    self.tree_cache.swa_evictable_size()
+                    + self.tree_cache.swa_protected_size()
+                )
+                if full_acc != total_value_len:
+                    return f"I1 SWA full accounting: {full_acc} vs {total_value_len}"
+                if swa_acc != non_tombstone_value_len:
+                    return f"I1 SWA swa accounting: {swa_acc} vs {non_tombstone_value_len}"
+            else:
+                acc = (
+                    self.tree_cache.evictable_size()
+                    + self.tree_cache.protected_size()
+                )
+                if acc != total_value_len:
+                    return f"I1 MHA accounting: {acc} vs {total_value_len}"
+        except Exception as e:
+            return f"I1 accounting check raised: {e!r}"
+
+        # I2 in-flight reachability + lock
+        if self.running_batch is not None:
+            for req in self.running_batch.reqs:
+                if getattr(req, "tree_orphaned", False):
+                    continue
+                last_node = getattr(req, "last_node", None)
+                if last_node is None or last_node is self.tree_cache.root_node:
+                    continue
+                walker = last_node
+                hops = 0
+                reached_root = False
+                while walker is not None and hops < 10000:
+                    if walker is self.tree_cache.root_node:
+                        reached_root = True
+                        break
+                    walker = getattr(walker, "parent", None)
+                    hops += 1
+                if not reached_root:
+                    return (
+                        f"I2 reachability: req {getattr(req, 'rid', '?')} "
+                        f"last_node not reachable from root"
+                    )
+                lock_attr = (
+                    "full_lock_ref"
+                    if is_swa and hasattr(last_node, "full_lock_ref")
+                    else "lock_ref"
+                )
+                lock = getattr(last_node, lock_attr, 0)
+                if lock < 1:
+                    return (
+                        f"I2 lock: req {getattr(req, 'rid', '?')} "
+                        f"last_node {lock_attr}={lock}"
+                    )
+
+        # I3 slot bounds
+        try:
+            pool_size = (
+                getattr(self.token_to_kv_pool_allocator, "size", None)
+                or getattr(self.token_to_kv_pool_allocator, "_size", None)
+                or 2**31
+            )
+            if self.running_batch is not None:
+                for req in self.running_batch.reqs:
+                    if getattr(req, "tree_orphaned", False):
+                        continue
+                    pi = getattr(req, "prefix_indices", None)
+                    if pi is None:
+                        continue
+                    try:
+                        import torch
+
+                        if torch.is_tensor(pi) and pi.numel() > 0:
+                            mn = int(pi.min().item())
+                            mx = int(pi.max().item())
+                            if mn < 0 or mx >= pool_size:
+                                return (
+                                    f"I3 slot bounds: req {getattr(req, 'rid', '?')} "
+                                    f"indices [{mn}, {mx}] vs pool {pool_size}"
+                                )
+                    except Exception:
+                        pass
+        except Exception as e:
+            return f"I3 slot bounds check raised: {e!r}"
+
+        return None
+
+    def _handle_validator_failure(self, msg: str):
+        """T25: dispatch on --paras-radix-migration-strict.
+
+        - "fail":     bump failures_total, raise RuntimeError (supervisor restart).
+        - "fallback": bump fallbacks_total, log error, drop tree, orphan all
+                      migrated reqs, continue.
+        """
+        from sglang.srt.paras.migration_metrics import metrics as _t_metrics
+
+        strict_mode = getattr(self.server_args, "paras_radix_migration_strict", "fail")
+
+        if strict_mode == "fail":
+            _t_metrics.failures_total += 1
+            raise RuntimeError(
+                f"paras radix migration validator failed (strict=fail): {msg}"
+            )
+        else:
+            _t_metrics.fallbacks_total += 1
+            logger.error(
+                "paras radix migration validator failed (strict=fallback): %s", msg
+            )
+            try:
+                self.tree_cache.reset()
+            except Exception:
+                pass
+            if self.running_batch is not None:
+                for req in self.running_batch.reqs:
+                    req.tree_orphaned = True
+                    req.last_node = (
+                        self.tree_cache.root_node
+                        if self.tree_cache is not None
+                        else None
+                    )
+                    req.last_host_node = req.last_node
+                    req.prefix_indices = []
+                    if hasattr(req, "cache_protected_len"):
+                        req.cache_protected_len = 0
