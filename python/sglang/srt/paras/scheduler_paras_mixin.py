@@ -29,6 +29,7 @@ from sglang.srt.paras.scatter_manager import ParaSReqScatterManager
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.managers.utils import SenderWrapper
+from sglang.srt.utils.common import freeze_gc
 
 
 logger = logging.getLogger(__name__)
@@ -257,6 +258,18 @@ class SchedulerParasMixin:
                 window=sa.paras_auto_switch_window,
                 cooldown_sec=sa.paras_auto_switch_cooldown_sec,
             )
+
+        # Freeze the long-lived serving heap (weights, KV pool layouts, sampler
+        # state, radix tree, attention metadata buffers) so subsequent gen-2 GC
+        # cycles do not walk it. Without this, the ~2k Req objects deserialized
+        # by paras_tp_group_all_gather_reqs on every EP<->TP switch trip the
+        # gen-2 threshold and the resulting heap walk stalls the GIL for
+        # ~1.5-2 s (root-caused in INVESTIGATION_paras_gather_reqs_slow.md).
+        # Called on every rank: gc.freeze is per-process and idempotent. By
+        # this point model load + cuda graph capture inside TpModelWorker.__init__
+        # have completed (and their own freeze_gc context manager has exited),
+        # so the captured heap reflects the post-warmup steady state.
+        freeze_gc("paras_serving_warmup")
 
     def paras_configure_helper(self):
         (
