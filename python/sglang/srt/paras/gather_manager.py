@@ -34,18 +34,49 @@ def prune_request(req: Req):
     req.tokenizer = None
     
 def recover_request(
-    req: Req, 
+    req: Req,
     tree_cache: BasePrefixCache,
     tokenizer: Any,
 ):
-    if tree_cache.disable:
-        req.last_host_node = None
-        req.last_node = None
-    else:
-        req.last_host_node = tree_cache.root_node
-        req.last_node = tree_cache.root_node
-    req.prefix_indices = []
+    """Restore prunable fields on a migrated request.
+
+    With radix-cache migration (T17): if the post-migration tree contains a
+    prefix matching this req, attach req.last_node + prefix_indices to that
+    matched node. Otherwise (or if disable_radix_cache / ChunkCache path),
+    fall back to root + tree_orphaned=True.
+    """
     req.tokenizer = tokenizer
+    req.tree_orphaned = False
+
+    if (
+        tree_cache is not None
+        and getattr(tree_cache, "root_node", None) is not None
+        and not getattr(tree_cache, "disable", False)
+        and hasattr(req, "fill_ids")
+    ):
+        try:
+            from sglang.srt.mem_cache.radix_cache import RadixKey
+            extra_key = getattr(req, "extra_key", None)
+            key = RadixKey(list(req.fill_ids), extra_key)
+            match = tree_cache.match_prefix(key)
+            matched_indices = getattr(match, "device_indices", None)
+            last_node = getattr(match, "last_device_node", None) or getattr(match, "last_host_node", None)
+            if last_node is not None and matched_indices is not None and len(matched_indices) > 0:
+                req.last_node = last_node
+                req.last_host_node = getattr(match, "last_host_node", last_node)
+                req.prefix_indices = matched_indices
+                return
+        except Exception:
+            pass
+
+    if tree_cache is not None and getattr(tree_cache, "root_node", None) is not None and not getattr(tree_cache, "disable", False):
+        req.last_node = tree_cache.root_node
+        req.last_host_node = tree_cache.root_node
+    else:
+        req.last_node = None
+        req.last_host_node = None
+    req.prefix_indices = []
+    req.tree_orphaned = True
 
 def paras_tp_group_all_gather_reqs(
     reqs: List[Req],

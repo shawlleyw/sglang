@@ -492,6 +492,13 @@ class Req:
         # Tokens locked by tree.inc_lock_ref must not be SWA-evicted at runtime; floor used by ScheduleBatch._evict_swa.
         self.cache_protected_len: int = 0
 
+        # Set to True when a ParaS-migrated request could not be re-attached to a
+        # node in the post-switch radix tree (e.g. the prefix was dropped during
+        # migration, or ChunkCache is in use). Migrated reqs default to False;
+        # gather_manager.recover_request / scatter_manager.recover_request flip
+        # it on a per-req basis when match_prefix() returns no useful match.
+        self.tree_orphaned: bool = False
+
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
 
