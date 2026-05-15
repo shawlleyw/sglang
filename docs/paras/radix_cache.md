@@ -141,3 +141,19 @@ The assertion is therefore both a correctness guard and an honesty signal: ParaS
 - PR #17220 (commit `ce8a6ac69`) — adds the tombstone-aware insert and `cache_protected_len` to sglang main; would be the basis for re-enabling radix cache under ParaS.
 - [`docs/paras/swa.md`](file:///home/shaoyuw/sglang/docs/paras/swa.md) — companion doc on the SWA mechanism and ParaS's SWA cache transfer.
 - [`docs/paras/parallelism_switch.md`](file:///home/shaoyuw/sglang/docs/paras/parallelism_switch.md) — overall ParaS switch design and other unsupported features.
+
+## Known Pre-existing Issues (Defer-Fix)
+
+### `paras_resize_and_clear` is not page-aware
+
+**File**: `python/sglang/srt/mem_cache/allocator.py:TokenToKVPoolAllocator.paras_resize_and_clear` (~line 174-184).
+
+**Symptom**: When ParaS is enabled with `page_size > 1`, the free-list reset uses `torch.arange(1, new_size + 1)` which assumes token-level (page_size=1) indices. `PagedTokenToKVPoolAllocator` does not override `paras_resize_and_clear`, so it inherits this token-level reset and silently corrupts its page-level free list.
+
+**Status**: Independent of the radix-cache work. Pre-existing, latent. Surfaces only with `page_size > 1 + ParaS`, which is currently a hard assert (see `_check_paras_config` in `server_args.py`, added by the radix-cache plan's T1).
+
+**Workaround (in place)**: T1 of the paras-radix-cache plan asserts `page_size == 1` at startup when `enable_paras_moe=True and not disable_radix_cache`. This prevents the bug from surfacing in production.
+
+**Fix**: A separate PR should override `paras_resize_and_clear` on `PagedTokenToKVPoolAllocator` to reset the page-level free list correctly. Out of scope for the current radix-cache work.
+
+**Reference**: Discovered during Oracle architectural review of the radix-cache plan; flagged in `.sisyphus/notepads/paras-radix-cache/`.
