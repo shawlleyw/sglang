@@ -13,7 +13,8 @@
 #                        SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK→256,
 #                        CUDA_GRAPH_MAX_BS→8 (gpt-oss ParaS canonical = cuda-graph dual capture).
 #                        Drops --disable-hybrid-swa-memory (gpt-oss ParaS uses dual full+SWA memory pools).
-#                        Adds --disable-overlap-schedule + PARAS_* env vars.
+#                        Adds PARAS_* env vars. Overlap scheduling stays enabled
+#                        (drain-on-switch is handled by SchedulerParasMixin).
 #   PARAS_AUTO_SWITCH=0  When ENABLE_PARAS=1, disable load-driven EP↔TP autoswitch by passing
 #                        --no-paras-auto-switch. Use this when driving manual switches via
 #                        /paras_configure_tp and /paras_configure_ep HTTP endpoints. Default 1
@@ -63,8 +64,8 @@ if [ "$ENABLE_PARAS" = "1" ]; then
     PARAS_FLAGS=(
         --enable-paras-moe
         --paras-tp-size "$NUM_GPUS"
-        --disable-overlap-schedule
         --disable-radix-cache
+        --enable-nan-detection
     )
     if [ "${PARAS_AUTO_SWITCH:-1}" = "0" ]; then
         PARAS_FLAGS+=(--no-paras-auto-switch)

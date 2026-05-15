@@ -157,7 +157,7 @@ Models present:
 
 `launch_server_dp_ep.sh` for both qwen and gptoss accepts `ENABLE_PARAS=1`, which:
 
-1. Adds `--enable-paras-moe --paras-tp-size $NUM_GPUS --disable-overlap-schedule` to the launch command (qwen also adds `--chunked-prefill-size -1 --max-prefill-tokens 32000`).
+1. Adds `--enable-paras-moe --paras-tp-size $NUM_GPUS` to the launch command (qwen also adds `--chunked-prefill-size -1 --max-prefill-tokens 32000`). Overlap scheduling remains enabled; `SchedulerParasMixin._paras_drain_overlap_pipeline` drains any in-flight overlap-queued batch before each EP↔TP switch.
 2. Sets canonical ParaS env vars (`PARAS_CONFIGURE_METHOD=peer_access`, `PARAS_KV_TRANSFER_METHOD=peer_access`, etc.) — defaults differ slightly between qwen3 (eager) and gpt-oss (cuda-graph dual capture). See each script's header for the full list.
 3. User-supplied env vars on the same line override the ParaS defaults.
 

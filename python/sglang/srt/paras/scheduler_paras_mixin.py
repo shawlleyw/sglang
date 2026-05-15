@@ -310,6 +310,26 @@ class SchedulerParasMixin:
             return
         self._paras_auto_policy.observe(self, batch, time.time())
 
+    def _paras_drain_overlap_pipeline(self) -> None:
+        # event_loop_overlap builds batch N+1 on CPU while GPU runs batch N
+        # and stores (batch_copy, result) tuples in self.result_queue for
+        # processing in the NEXT iteration. A paras EP<->TP switch destroys
+        # mode-dependent state (KV pool layout, attention metadata, expert
+        # routing, future_map indices), so any in-flight queued batch MUST
+        # be fully processed before the switch body runs. Otherwise the
+        # post-switch process_batch_result would dereference stale GPU
+        # tensors or pool indices and either crash or corrupt outputs.
+        if not getattr(self, "enable_overlap", False):
+            return
+        result_queue = getattr(self, "result_queue", None)
+        if result_queue is None:
+            return
+        while result_queue:
+            tmp_batch, tmp_result = result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+        self.last_batch = None
+        self.cur_batch = None
+
     def _paras_auto_clear_window_on_switch(self) -> None:
         assert self._paras_auto_policy is not None
         policy = self._paras_auto_policy
@@ -355,7 +375,7 @@ class SchedulerParasMixin:
             return
 
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
-        assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
+        self._paras_drain_overlap_pipeline()
         torch.cuda.synchronize()
 
         if self._paras_auto_policy is not None:
@@ -475,8 +495,8 @@ class SchedulerParasMixin:
         if not self.paras_check():
             return
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
-        assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
         assert self.paras_dp_size == 1, "paras_configure_ep only supports dp_size==1"
+        self._paras_drain_overlap_pipeline()
         torch.cuda.synchronize()
 
         if self._paras_auto_policy is not None:

@@ -13,7 +13,8 @@
 #                        SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK→512,
 #                        ENABLE_CUDA_GRAPH→0 (qwen ParaS canonical = eager).
 #                        Adds --chunked-prefill-size -1 --max-prefill-tokens 32000
-#                        --disable-overlap-schedule, plus PARAS_* env vars.
+#                        plus PARAS_* env vars. Overlap scheduling stays enabled
+#                        (drain-on-switch is handled by SchedulerParasMixin).
 #   ENABLE_CUDA_GRAPH=0  Pass --disable-cuda-graph (default 1; auto-flipped to 0 under ENABLE_PARAS).
 #   CUDA_GRAPH_MAX_BS=N  Pass --cuda-graph-max-bs N (only honored when ENABLE_CUDA_GRAPH=1).
 
@@ -56,9 +57,9 @@ if [ "$ENABLE_PARAS" = "1" ]; then
     PARAS_FLAGS=(
         --enable-paras-moe
         --paras-tp-size "$NUM_GPUS"
-        --disable-overlap-schedule
         --disable-radix-cache
         --max-prefill-tokens 32000
+        --enable-nan-detection
     )
 fi
 
