@@ -469,7 +469,9 @@ class SchedulerParasMixin:
         self.tree_cache.reset()
         self.merge_last_batch()
         global_reqs = list(self.running_batch.reqs) if self.running_batch else []
-        local_waiting_reqs = list(self.waiting_queue)
+        local_waiting_reqs = (
+            list(self.waiting_queue) if self.paras_tp_rank == 0 else []
+        )
 
         # Phase 2: Scatter — partition reqs, shrink pools, scatter KV cache
         paras_scatter_manager = ParaSReqScatterManager(
