@@ -848,5 +848,122 @@ class TestRecomputeLockRefs:
             sys.setrecursionlimit(old_limit)
 
 
+class TestSWATombstonePreservation:
+    """T22: tombstone records survive serialize → encode → decode → rebuild round-trip."""
+
+    def _build_swa_records(self):
+        from sglang.srt.paras.tree_migration import TreeRecord
+        return [
+            TreeRecord(full_token_path=[1, 2, 3, 4],
+                       extra_key=None,
+                       value_slots=[10, 20, 30, 40],
+                       swa_tombstone=True),
+            TreeRecord(full_token_path=[1, 2, 3, 4, 5, 6],
+                       extra_key=None,
+                       value_slots=[10, 20, 30, 40, 50, 60],
+                       swa_tombstone=False),
+        ]
+
+    def test_round_trip_via_encode_decode_preserves_tombstone(self):
+        from sglang.srt.paras.tree_migration import encode_records, decode_records
+        records = self._build_swa_records()
+        decoded = decode_records(encode_records(records))
+        assert len(decoded) == 2
+        assert decoded[0].swa_tombstone is True
+        assert decoded[1].swa_tombstone is False
+        assert decoded[0].full_token_path == [1, 2, 3, 4]
+        assert decoded[1].full_token_path == [1, 2, 3, 4, 5, 6]
+
+    def test_rebuild_passes_correct_swa_evicted_seqlen(self):
+        from sglang.srt.paras.tree_migration import rebuild_radix_cache, TreeRecord
+        captured = []
+        class FakeTreeWithSWA:
+            def insert(self, key, value, swa_evicted_seqlen=0):
+                path = list(key.token_ids if hasattr(key, "token_ids") else key)
+                captured.append((tuple(path), swa_evicted_seqlen))
+        records = self._build_swa_records()
+        rebuild_radix_cache(FakeTreeWithSWA(), records, remap_slot_idx=lambda x: x)
+        # Tombstone record (path len 4) -> swa_evicted_seqlen=4.
+        # Non-tombstone (path len 6) -> swa_evicted_seqlen=0.
+        captured.sort(key=lambda p: len(p[0]))
+        assert captured[0] == ((1, 2, 3, 4), 4)
+        assert captured[1] == ((1, 2, 3, 4, 5, 6), 0)
+
+
+class TestNormalizeLRULists:
+    """T24: deterministic LRU rebuild post-tree-migration."""
+
+    def _build_swa_tree(self, with_tombstones=False):
+        class FakeKey:
+            def __init__(self, t): self.token_ids = list(t)
+        class FakeNode:
+            def __init__(self, k=None, swa_tombstone=False):
+                self.key = k
+                self.children = {}
+                self.parent = None
+                self.swa_tombstone = swa_tombstone
+        class FakeLRU:
+            def __init__(self):
+                self.entries = []
+            def insert_mru(self, n):
+                if n in self.entries:
+                    self.entries.remove(n)
+                self.entries.insert(0, n)
+            def remove(self, n):
+                self.entries.remove(n)
+        class FakeSWATree:
+            def __init__(self):
+                self.root_node = FakeNode(FakeKey([]))
+                self.full_lru_list = FakeLRU()
+                self.swa_lru_list = FakeLRU()
+        t = FakeSWATree()
+        a = FakeNode(FakeKey([1, 2]), swa_tombstone=with_tombstones)
+        b = FakeNode(FakeKey([3]))
+        a.parent = t.root_node
+        b.parent = a
+        t.root_node.children[1] = a
+        a.children[3] = b
+        # Initial state: insert in arbitrary order
+        t.full_lru_list.insert_mru(b)
+        t.full_lru_list.insert_mru(a)
+        if not with_tombstones:
+            t.swa_lru_list.insert_mru(a)
+        t.swa_lru_list.insert_mru(b)
+        return t, a, b
+
+    def test_no_op_on_mha_tree(self):
+        from sglang.srt.paras.tree_migration import normalize_lru_lists
+        class FakeMHATree:
+            def __init__(self):
+                self.root_node = type("N", (), {"children": {}})()
+        normalize_lru_lists(FakeMHATree())  # must not raise
+
+    def test_swa_tree_full_lru_contains_all_non_root(self):
+        from sglang.srt.paras.tree_migration import normalize_lru_lists
+        t, a, b = self._build_swa_tree(with_tombstones=False)
+        normalize_lru_lists(t)
+        assert a in t.full_lru_list.entries
+        assert b in t.full_lru_list.entries
+        assert len(t.full_lru_list.entries) == 2
+
+    def test_swa_lru_excludes_tombstones(self):
+        from sglang.srt.paras.tree_migration import normalize_lru_lists
+        t, a, b = self._build_swa_tree(with_tombstones=True)
+        normalize_lru_lists(t)
+        assert a not in t.swa_lru_list.entries
+        assert b in t.swa_lru_list.entries
+        # full_lru still includes both
+        assert a in t.full_lru_list.entries
+
+    def test_idempotent(self):
+        from sglang.srt.paras.tree_migration import normalize_lru_lists
+        t, a, b = self._build_swa_tree(with_tombstones=False)
+        normalize_lru_lists(t)
+        first = list(t.full_lru_list.entries)
+        normalize_lru_lists(t)
+        second = list(t.full_lru_list.entries)
+        assert first == second
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -355,6 +355,61 @@ def canonicalize_post_rebuild(tree, base_time: float = 0.0) -> None:
             node.last_access_time = base_time + i
 
 
+def normalize_lru_lists(tree) -> None:
+    """T24: After rebuild, normalize full_lru / swa_lru insertion order so all ranks
+    agree. Iterates non-root nodes in canonical DFS order (depth-first, sorted by
+    (-key_len, key_tuple) for determinism), removes each from existing LRU lists
+    if present, then re-inserts at MRU. Tombstone nodes are NOT inserted into
+    swa_lru_list (only full_lru_list).
+
+    Idempotent. Iterative — no recursion.
+    No-op when tree has no full_lru_list / swa_lru_list (MHA RadixCache case).
+    """
+    has_full = hasattr(tree, "full_lru_list")
+    has_swa = hasattr(tree, "swa_lru_list")
+    if not (has_full or has_swa):
+        return
+
+    stack = list(tree.root_node.children.values())
+    nodes: list = []
+    while stack:
+        node = stack.pop()
+        nodes.append(node)
+        for c in node.children.values():
+            stack.append(c)
+
+    nodes.sort(
+        key=lambda n: (
+            -len(n.key.token_ids) if hasattr(n.key, "token_ids") else 0,
+            tuple(n.key.token_ids) if hasattr(n.key, "token_ids") else (),
+        )
+    )
+
+    for node in nodes:
+        if has_full:
+            try:
+                tree.full_lru_list.remove(node)
+            except (ValueError, KeyError, AttributeError):
+                pass
+        if has_swa and not getattr(node, "swa_tombstone", False):
+            try:
+                tree.swa_lru_list.remove(node)
+            except (ValueError, KeyError, AttributeError):
+                pass
+
+    for node in nodes:
+        if has_full:
+            try:
+                tree.full_lru_list.insert_mru(node)
+            except AttributeError:
+                pass
+        if has_swa and not getattr(node, "swa_tombstone", False):
+            try:
+                tree.swa_lru_list.insert_mru(node)
+            except AttributeError:
+                pass
+
+
 def recompute_lock_refs(tree_cache, in_flight_reqs) -> None:
     """T19: After tree rebuild + recover_request, walk each in-flight req and
     re-lock its prefix path. Skips reqs marked tree_orphaned (T17/T18).
