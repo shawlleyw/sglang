@@ -260,5 +260,133 @@ class TestSerializeSWA:
         assert r.host_value is None
 
 
+class TestRebuildRadixCache:
+    """T6: Rebuild radix tree from migration records via parent-first insert()."""
+
+    def test_rebuild_empty_records(self):
+        """No records -> tree unchanged."""
+        from sglang.srt.paras.tree_migration import rebuild_radix_cache
+        calls = []
+
+        class FakeTree:
+            def insert(self, key, value, **kwargs):
+                calls.append((key, value, kwargs))
+
+        tree = FakeTree()
+        rebuild_radix_cache(tree, [], remap_slot_idx=lambda x: x)
+        assert calls == []
+
+    def test_rebuild_linear_chain_calls_insert_in_parent_first_order(self):
+        """5 records of increasing depth -> 5 insert calls in ascending path-length order."""
+        from sglang.srt.paras.tree_migration import rebuild_radix_cache, TreeRecord
+        calls = []
+
+        class FakeTree:
+            def insert(self, key, value, **kwargs):
+                token_ids = key.token_ids if hasattr(key, "token_ids") else key
+                calls.append(len(token_ids))
+
+        records = [
+            TreeRecord(
+                full_token_path=list(range(1, n + 1)),
+                extra_key=None,
+                value_slots=[10 + i for i in range(n)],
+            )
+            for n in [3, 1, 5, 2, 4]
+        ]
+        tree = FakeTree()
+        rebuild_radix_cache(tree, records, remap_slot_idx=lambda x: x)
+        assert calls == sorted(calls)
+        assert calls == [1, 2, 3, 4, 5]
+
+    def test_rebuild_skips_dropped_slots(self):
+        """When remap_slot_idx returns -1 for any slot, record is SKIPPED + metric incremented."""
+        from sglang.srt.paras.tree_migration import rebuild_radix_cache, TreeRecord
+        from sglang.srt.paras.migration_metrics import MigrationMetrics
+        calls = []
+
+        class FakeTree:
+            def insert(self, key, value, **kwargs):
+                calls.append(value)
+
+        records = [
+            TreeRecord(full_token_path=[1, 2], extra_key=None, value_slots=[10, 20]),
+            TreeRecord(full_token_path=[1, 2, 3], extra_key=None, value_slots=[10, 20, 999]),
+        ]
+
+        def remap(s):
+            return -1 if s == 999 else s + 100
+
+        m = MigrationMetrics()
+        tree = FakeTree()
+        rebuild_radix_cache(tree, records, remap_slot_idx=remap, metrics=m)
+        assert len(calls) == 1
+        assert m.dedup_drop_count == 1
+
+    def test_rebuild_swa_tombstone_passes_evicted_seqlen(self):
+        """If tree.insert supports swa_evicted_seqlen, tombstone records pass it."""
+        from sglang.srt.paras.tree_migration import rebuild_radix_cache, TreeRecord
+        captured = []
+
+        class FakeTreeWithSWA:
+            def insert(self, key, value, swa_evicted_seqlen=0):
+                captured.append(swa_evicted_seqlen)
+
+        records = [
+            TreeRecord(
+                full_token_path=[1, 2, 3],
+                extra_key=None,
+                value_slots=[10, 20, 30],
+                swa_tombstone=True,
+            ),
+            TreeRecord(
+                full_token_path=[1, 2, 3, 4],
+                extra_key=None,
+                value_slots=[10, 20, 30, 40],
+                swa_tombstone=False,
+            ),
+        ]
+        rebuild_radix_cache(FakeTreeWithSWA(), records, remap_slot_idx=lambda x: x)
+        assert captured == [3, 0]
+
+    def test_rebuild_mha_no_swa_kwarg(self):
+        """MHA tree.insert doesn't accept swa_evicted_seqlen; rebuild must not pass it."""
+        from sglang.srt.paras.tree_migration import rebuild_radix_cache, TreeRecord
+        captured_kwargs = []
+
+        class FakeMHATree:
+            def insert(self, key, value):
+                captured_kwargs.append({})
+
+        records = [
+            TreeRecord(full_token_path=[1, 2], extra_key=None, value_slots=[10, 20]),
+        ]
+        rebuild_radix_cache(FakeMHATree(), records, remap_slot_idx=lambda x: x)
+        assert len(captured_kwargs) == 1
+
+    def test_rebuild_canonical_order_independence(self):
+        """Two rebuilds from the same record set in different orders produce the same call sequence."""
+        from sglang.srt.paras.tree_migration import rebuild_radix_cache, TreeRecord
+
+        def collect_calls(records_order):
+            calls = []
+
+            class FT:
+                def insert(self, key, value, **kwargs):
+                    token_ids = key.token_ids if hasattr(key, "token_ids") else key
+                    calls.append(tuple(token_ids))
+
+            rebuild_radix_cache(FT(), records_order, remap_slot_idx=lambda x: x)
+            return calls
+
+        records1 = [
+            TreeRecord(full_token_path=[1, 2, 3], extra_key=None, value_slots=[10, 20, 30]),
+            TreeRecord(full_token_path=[1], extra_key=None, value_slots=[10]),
+            TreeRecord(full_token_path=[1, 2], extra_key=None, value_slots=[10, 20]),
+        ]
+        records2 = list(reversed(records1))
+        assert collect_calls(records1) == collect_calls(records2)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -81,6 +81,75 @@ def serialize_radix_cache(tree: "RadixCache") -> List[TreeRecord]:
     return records
 
 
+def rebuild_radix_cache(
+    tree,
+    records: list,
+    remap_slot_idx,
+    metrics=None,
+):
+    """Rebuild a radix tree from migration records, applying slot-index remap.
+
+    Sorts records parent-first (by full_token_path length ascending) so each
+    insert() resolves into an existing chain rather than forcing later merges.
+
+    Args:
+        tree: target RadixCache or SWARadixCache (already reset / empty post-tree.reset()).
+        records: List[TreeRecord] from serialize_*_radix_cache on sender.
+        remap_slot_idx: Callable[[int], int]. Maps source-pool slot to dest-pool slot.
+            Returns -1 to signal "slot dropped" (record skipped, metric incremented).
+        metrics: optional MigrationMetrics instance to increment dedup_drop_count.
+
+    Notes:
+        - Does NOT call inc_lock_ref (that's T19's job after this function returns).
+        - For SWA: records with swa_tombstone=True are inserted via the post-T2
+          tombstone-aware insert path (swa_evicted_seqlen=len(full_token_path)).
+        - For MHA: swa_evicted_seqlen kwarg is silently ignored by RadixCache.insert.
+    """
+    import torch
+
+    try:
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+    except ImportError:
+        RadixKey = None
+
+    sorted_records = sorted(
+        records,
+        key=lambda r: (len(r.full_token_path), tuple(r.full_token_path)),
+    )
+
+    has_swa_kwarg = _supports_swa_evicted_seqlen(tree)
+
+    for record in sorted_records:
+        new_slots = [remap_slot_idx(s) for s in record.value_slots]
+        if any(s < 0 for s in new_slots):
+            if metrics is not None:
+                metrics.dedup_drop_count += 1
+            continue
+
+        value_tensor = torch.tensor(new_slots, dtype=torch.int64)
+
+        if RadixKey is not None:
+            key = RadixKey(record.full_token_path, record.extra_key)
+        else:
+            key = record.full_token_path
+
+        if has_swa_kwarg:
+            swa_evicted = len(record.full_token_path) if record.swa_tombstone else 0
+            tree.insert(key, value_tensor, swa_evicted_seqlen=swa_evicted)
+        else:
+            tree.insert(key, value_tensor)
+
+
+def _supports_swa_evicted_seqlen(tree) -> bool:
+    """Detect at runtime whether tree.insert accepts swa_evicted_seqlen kwarg."""
+    import inspect
+    try:
+        sig = inspect.signature(tree.insert)
+        return "swa_evicted_seqlen" in sig.parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def serialize_swa_radix_cache(tree: "SWARadixCache") -> List[TreeRecord]:
     """Iterative DFS through the SWA radix tree; emit one ``TreeRecord`` per non-root node.
 
