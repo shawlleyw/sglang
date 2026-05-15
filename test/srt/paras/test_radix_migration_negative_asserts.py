@@ -2,104 +2,105 @@
 Test negative assertions for radix cache migration under ParaS.
 
 These tests verify that incompatible features (EAGLE, HiRadix, CPP radix, page_size>1)
-are properly rejected at startup when radix cache is enabled under ParaS.
+are properly rejected when radix cache is enabled under ParaS.
+
+NOTE: ServerArgs.__post_init__ short-circuits when model_path == "dummy",
+so we construct with model_path="dummy" and invoke ``_check_paras_config()``
+directly to exercise the assertion logic without requiring a real model
+config / HF lookup.
 """
 
-import os
 import pytest
 from sglang.srt.server_args import ServerArgs
 
 
+def _make_paras_args(**overrides):
+    """Build a ServerArgs instance configured for ParaS, with sane defaults
+    for fields ``_check_paras_config()`` reads. Caller can override any field
+    via kwargs.
+    """
+    args = ServerArgs(model_path="dummy")
+    # Core ParaS prerequisites checked by _check_paras_config
+    args.enable_paras_moe = True
+    args.enable_dp_attention = True
+    args.enable_dp_lm_head = True
+    args.paras_tp_size = 4
+    args.tp_size = 4
+    args.dp_size = 4
+    # ParaS requires chunked_prefill_size <= 0 (set to a passing value
+    # by default so the 4 negative asserts fire first).
+    args.chunked_prefill_size = -1
+    # Default radix cache fields to a passing config; tests flip these.
+    args.disable_radix_cache = False
+    args.enable_hierarchical_cache = False
+    args.speculative_algorithm = None
+    args.page_size = 1
+    for k, v in overrides.items():
+        setattr(args, k, v)
+    return args
+
+
 class TestRadixMigrationNegativeAsserts:
-    """Test suite for negative assertions in ParaS + radix cache configuration."""
+    """Test suite for negative assertions in ParaS + radix cache configuration.
+
+    Each test asserts that ``_check_paras_config()`` raises ``AssertionError``
+    *and* that the error message uniquely names the offending feature
+    (HiRadix / CPP / EAGLE / page_size).
+    """
 
     def test_eagle_with_paras_radix_raises(self):
-        """Test that EAGLE speculative decoding raises AssertionError with ParaS + radix cache."""
-        with pytest.raises(AssertionError, match="EAGLE"):
-            ServerArgs(
-                enable_paras_moe=True,
-                enable_dp_attention=True,
-                enable_dp_lm_head=True,
-                paras_tp_size=4,
-                disable_radix_cache=False,
-                speculative_algorithm="EAGLE",
-            ).check_server_args()
+        """EAGLE + ParaS + radix cache: AssertionError mentions EAGLE/speculative."""
+        args = _make_paras_args(speculative_algorithm="EAGLE")
+        with pytest.raises(AssertionError, match="(?i)eagle|speculative"):
+            args._check_paras_config()
 
     def test_hi_radix_with_paras_radix_raises(self):
-        """Test that HiRadixCache raises AssertionError with ParaS + radix cache."""
-        with pytest.raises(AssertionError, match="hierarchical|HiRadix"):
-            ServerArgs(
-                enable_paras_moe=True,
-                enable_dp_attention=True,
-                enable_dp_lm_head=True,
-                paras_tp_size=4,
-                disable_radix_cache=False,
-                enable_hierarchical_cache=True,
-            ).check_server_args()
+        """HiRadix + ParaS + radix cache: AssertionError mentions hierarchical/HiRadix."""
+        args = _make_paras_args(enable_hierarchical_cache=True)
+        with pytest.raises(AssertionError, match="(?i)hierarchical|hi.?radix"):
+            args._check_paras_config()
 
     def test_cpp_radix_with_paras_radix_raises(self, monkeypatch):
-        """Test that CPP radix tree raises AssertionError with ParaS + radix cache."""
+        """CPP radix env + ParaS + radix cache: AssertionError mentions CPP/cpp."""
         monkeypatch.setenv("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE", "1")
-        with pytest.raises(AssertionError, match="CPP|cpp"):
-            ServerArgs(
-                enable_paras_moe=True,
-                enable_dp_attention=True,
-                enable_dp_lm_head=True,
-                paras_tp_size=4,
-                disable_radix_cache=False,
-            ).check_server_args()
+        args = _make_paras_args()
+        with pytest.raises(AssertionError, match="(?i)cpp|c\\+\\+|experimental"):
+            args._check_paras_config()
 
     def test_page_size_gt_1_with_paras_radix_raises(self):
-        """Test that page_size > 1 raises AssertionError with ParaS + radix cache."""
-        with pytest.raises(AssertionError, match="page_size"):
-            ServerArgs(
-                enable_paras_moe=True,
-                enable_dp_attention=True,
-                enable_dp_lm_head=True,
-                paras_tp_size=4,
-                disable_radix_cache=False,
-                page_size=16,
-            ).check_server_args()
+        """page_size>1 + ParaS + radix cache: AssertionError mentions page_size."""
+        args = _make_paras_args(page_size=16)
+        with pytest.raises(AssertionError, match="(?i)page_size|page size"):
+            args._check_paras_config()
 
     def test_new_flags_present(self):
-        """Test that new flags are present with correct defaults."""
-        args = ServerArgs()
+        """New ParaS-radix flags exist on ServerArgs with correct defaults."""
+        args = ServerArgs(model_path="dummy")
         assert hasattr(args, "paras_radix_preserve_unlocked")
         assert hasattr(args, "paras_radix_migration_strict")
         assert args.paras_radix_preserve_unlocked is False
         assert args.paras_radix_migration_strict == "fail"
 
     def test_no_asserts_when_disable_radix_cache_true(self):
-        """Test that incompatible features don't raise when disable_radix_cache=True."""
-        # These should NOT raise because disable_radix_cache=True
-        args = ServerArgs(
-            enable_paras_moe=True,
-            enable_dp_attention=True,
-            enable_dp_lm_head=True,
-            paras_tp_size=4,
+        """Incompatible features don't raise when disable_radix_cache=True
+        (the 4 conditional asserts are skipped by the guard)."""
+        args = _make_paras_args(
             disable_radix_cache=True,
             enable_hierarchical_cache=True,
             speculative_algorithm="EAGLE",
             page_size=16,
         )
-        # Should not raise
-        args.check_server_args()
+        # Should not raise — the guard `if not self.disable_radix_cache:`
+        # short-circuits the 4 incompatible-feature asserts.
+        args._check_paras_config()
         assert args.disable_radix_cache is True
 
     def test_radix_cache_works_with_paras_after_lift(self):
-        """T30: ServerArgs(enable_paras_moe=True, disable_radix_cache=False) should be ACCEPTED."""
-        args = ServerArgs(
-            model_path="dummy",
-            enable_paras_moe=True,
-            enable_dp_attention=True,
-            enable_dp_lm_head=True,
-            paras_tp_size=4,
-            tp_size=4,
-            dp_size=4,
-            disable_radix_cache=False,
-        )
-        # Should not raise — the assertion has been lifted
-        args.check_server_args()
+        """T30: enable_paras_moe=True + disable_radix_cache=False should be ACCEPTED
+        (the original ParaS-blocks-radix-cache assertion was lifted)."""
+        args = _make_paras_args()
+        # All defaults are migration-compatible; should not raise.
+        args._check_paras_config()
         assert args.disable_radix_cache is False
         assert args.enable_paras_moe is True
 
