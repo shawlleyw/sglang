@@ -185,6 +185,7 @@ class ParasAutoSwitchDefaults:
 PARAS_AUTO_SWITCH_POLICY_DEFAULTS: Dict[str, ParasAutoSwitchDefaults] = {
     "prefill": ParasAutoSwitchDefaults(threshold_per_gpu=1024, window=8, cooldown_sec=10.0),
     "decode": ParasAutoSwitchDefaults(threshold_per_gpu=64, window=32, cooldown_sec=60.0),
+    "rollout": ParasAutoSwitchDefaults(threshold_per_gpu=8, window=1, cooldown_sec=5.0),
 }
 # "hybrid" is intentionally absent from the defaults dict; _handle_paras_auto_switch
 # raises NotImplementedError for it. Keep it in the CLI choices so the error fires
@@ -447,6 +448,7 @@ class ServerArgs:
     paras_auto_switch_threshold: Optional[int] = None
     paras_auto_switch_window: Optional[int] = None
     paras_auto_switch_cooldown_sec: Optional[float] = None
+    paras_metrics_file: Optional[str] = None
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -3139,6 +3141,12 @@ class ServerArgs:
                 "When unset, defaults to the policy's value (see "
                 "--paras-auto-switch-policy)."
             ),
+        )
+        parser.add_argument(
+            "--paras-metrics-file",
+            type=str,
+            default=ServerArgs.paras_metrics_file,
+            help="CSV path for per-second ParaS metrics (mode, running, waiting, throughput). Only tp_rank 0 writes.",
         )
         parser.add_argument(
             "--elastic-ep-backend",

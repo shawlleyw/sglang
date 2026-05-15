@@ -1754,6 +1754,12 @@ class ModelRunner:
                     _, paras_max_size = _paras_mgr.plan_req_capacities(
                         context_len=self.model_config.context_len,
                         ep_max_num_reqs=max_num_reqs,
+                        max_running_requests=self.server_args.max_running_requests,
+                        dp_size=(
+                            self.server_args.dp_size
+                            if self.server_args.enable_dp_attention
+                            else 1
+                        ),
                     )
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,

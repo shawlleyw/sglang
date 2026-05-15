@@ -87,6 +87,7 @@ class ParaSKVCapacityPlan:
     dynamic_reserve_bytes: int
     umm_budget_bytes: int
     weights_only_bytes: int
+    non_umm_static_bytes: int
     kv_budget_bytes: int
 
     kv_dtype: torch.dtype
@@ -265,6 +266,8 @@ class ParaSMemoryManager:
         self.tp_max_kv_tokens_swa: int = 0
         self.ep_max_num_reqs: int = 0
         self.tp_max_num_reqs: int = 0
+        self.ep_max_running_requests: int = 0
+        self.tp_max_running_requests: int = 0
         self._kv_reserved: bool = False
         
 
@@ -436,7 +439,21 @@ class ParaSMemoryManager:
             return torch.float8_e4m3fn
         return torch.bfloat16
 
-    def _compute_kv_budget_bytes(self) -> Tuple[int, int, int, int, int, float]:
+    def _compute_non_umm_static_bytes(self, config) -> int:
+        # embed_tokens + lm_head are DP-replicated full vocab tensors (not
+        # mode-switching, so they live outside the UMM) but must count
+        # against mem-fraction-static so the contract holds at the driver.
+        vocab_size = getattr(config, "vocab_size", 0)
+        hidden_size = getattr(config, "hidden_size", 0)
+        tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
+        elem_size = 2
+        embed_bytes = vocab_size * hidden_size * elem_size
+        lm_head_bytes = 0 if tie_word_embeddings else embed_bytes
+        return embed_bytes + lm_head_bytes
+
+    def _compute_kv_budget_bytes(
+        self, config=None
+    ) -> Tuple[int, int, int, int, int, int, float]:
         from sglang.srt.utils.common import get_available_gpu_memory
 
         assert self.server_args is not None, (
@@ -458,7 +475,13 @@ class ParaSMemoryManager:
         assert mem_fraction is not None, "server_args.mem_fraction_static is required"
         dynamic_reserve_bytes = int(total_gpu_bytes * (1.0 - mem_fraction))
         umm_budget_bytes = max(0, avail_now_bytes - dynamic_reserve_bytes)
-        kv_budget_bytes = max(0, umm_budget_bytes - self.weights_only_bytes)
+        non_umm_static_bytes = (
+            self._compute_non_umm_static_bytes(config) if config is not None else 0
+        )
+        kv_budget_bytes = max(
+            0,
+            umm_budget_bytes - self.weights_only_bytes - non_umm_static_bytes,
+        )
 
         return (
             avail_now_bytes,
@@ -466,6 +489,7 @@ class ParaSMemoryManager:
             dynamic_reserve_bytes,
             umm_budget_bytes,
             kv_budget_bytes,
+            non_umm_static_bytes,
             avail_now_gib,
         )
 
@@ -499,16 +523,20 @@ class ParaSMemoryManager:
             dynamic_reserve_bytes,
             umm_budget_bytes,
             kv_budget_bytes,
+            non_umm_static_bytes,
             avail_now_gib,
-        ) = self._compute_kv_budget_bytes()
+        ) = self._compute_kv_budget_bytes(config)
 
         num_layers = config.num_hidden_layers
         num_kv_heads = config.num_key_value_heads
 
         ep_kv_heads = num_kv_heads
         tp_kv_heads = max(1, num_kv_heads // tp_size)
-        ep_cell_bytes = ep_kv_heads * head_dim * num_layers * 2 * elem_size
-        tp_cell_bytes = tp_kv_heads * head_dim * num_layers * 2 * elem_size
+        # (num_layers + 1) reserves one layer's K+V for the EP/TP cache-transfer
+        # overlap_gap baked into _create_kv_layout (line 783). Without this the
+        # materialized KV region exceeds kv_budget by one max-layer worth.
+        ep_cell_bytes = ep_kv_heads * head_dim * (num_layers + 1) * 2 * elem_size
+        tp_cell_bytes = tp_kv_heads * head_dim * (num_layers + 1) * 2 * elem_size
         ep_max_tokens = max(1, int(kv_budget_bytes // ep_cell_bytes))
         tp_max_tokens = max(1, int(kv_budget_bytes // tp_cell_bytes))
 
@@ -521,6 +549,7 @@ class ParaSMemoryManager:
             f"dynamic_reserve={dynamic_reserve_bytes / (1 << 30):.3f}GiB  "
             f"umm_budget={umm_budget_bytes / (1 << 30):.3f}GiB  "
             f"weights_only={self.weights_only_bytes / (1 << 30):.3f}GiB  "
+            f"non_umm_static={non_umm_static_bytes / (1 << 30):.3f}GiB  "
             f"kv_budget={kv_budget_bytes / (1 << 30):.3f}GiB  "
             f"ep_max_tokens={ep_max_tokens}  "
             f"tp_max_tokens={tp_max_tokens}  "
@@ -534,6 +563,7 @@ class ParaSMemoryManager:
             dynamic_reserve_bytes=dynamic_reserve_bytes,
             umm_budget_bytes=umm_budget_bytes,
             weights_only_bytes=self.weights_only_bytes,
+            non_umm_static_bytes=non_umm_static_bytes,
             kv_budget_bytes=kv_budget_bytes,
             kv_dtype=kv_dtype,
             ep_max_tokens=ep_max_tokens,
@@ -577,8 +607,9 @@ class ParaSMemoryManager:
             dynamic_reserve_bytes,
             umm_budget_bytes,
             kv_budget_bytes,
+            non_umm_static_bytes,
             avail_now_gib,
-        ) = self._compute_kv_budget_bytes()
+        ) = self._compute_kv_budget_bytes(config)
 
         num_layers = config.num_hidden_layers
         num_kv_heads = config.num_key_value_heads
@@ -592,16 +623,21 @@ class ParaSMemoryManager:
         ep_kv_heads = num_kv_heads
         tp_kv_heads = max(1, num_kv_heads // tp_size)
         cell_bytes = num_kv_heads * head_dim * 2 * elem_size
-        total_token_layers = max(1, int(kv_budget_bytes // cell_bytes))
 
-        if n_swa > 0:
-            swa_ratio = getattr(self.server_args, "swa_full_tokens_ratio", 0.5)
-            full_max_tokens, swa_max_tokens = plan_hybrid_kv_budget(
-                total_token_layers, n_full, n_swa, swa_ratio,
-            )
-        else:
-            full_max_tokens = max(1, total_token_layers // num_layers)
-            swa_max_tokens = 0
+        def _solve_tokens(kv_budget: int) -> Tuple[int, int]:
+            tt = max(1, int(kv_budget // cell_bytes))
+            if n_swa > 0:
+                swa_ratio = getattr(self.server_args, "swa_full_tokens_ratio", 0.5)
+                return plan_hybrid_kv_budget(tt, n_full, n_swa, swa_ratio)
+            return max(1, tt // num_layers), 0
+
+        # Two-pass: pass 1 estimates full_max_tokens, pass 2 subtracts the
+        # _create_kv_layout overlap_gap (one max-layer of K+V bytes) and
+        # re-solves. Single iteration converges because overlap_gap << kv_budget.
+        full_max_tokens_pass1, _ = _solve_tokens(kv_budget_bytes)
+        overlap_gap_bytes = full_max_tokens_pass1 * cell_bytes
+        kv_budget_bytes = max(0, kv_budget_bytes - overlap_gap_bytes)
+        full_max_tokens, swa_max_tokens = _solve_tokens(kv_budget_bytes)
 
         ep_max_tokens = full_max_tokens
         tp_max_tokens = full_max_tokens * tp_size
@@ -631,6 +667,8 @@ class ParaSMemoryManager:
             f"dynamic_reserve={dynamic_reserve_bytes / (1 << 30):.3f}GiB  "
             f"umm_budget={umm_budget_bytes / (1 << 30):.3f}GiB  "
             f"weights_only={self.weights_only_bytes / (1 << 30):.3f}GiB  "
+            f"non_umm_static={non_umm_static_bytes / (1 << 30):.3f}GiB  "
+            f"overlap_gap={overlap_gap_bytes / (1 << 30):.3f}GiB  "
             f"kv_budget={kv_budget_bytes / (1 << 30):.3f}GiB  "
             f"full_max_tokens={full_max_tokens}  swa_max_tokens={swa_max_tokens}  "
             f"layers={num_layers} (full={n_full} swa={n_swa})"
@@ -642,6 +680,7 @@ class ParaSMemoryManager:
             dynamic_reserve_bytes=dynamic_reserve_bytes,
             umm_budget_bytes=umm_budget_bytes,
             weights_only_bytes=self.weights_only_bytes,
+            non_umm_static_bytes=non_umm_static_bytes,
             kv_budget_bytes=kv_budget_bytes,
             kv_dtype=kv_dtype,
             ep_max_tokens=ep_max_tokens,
@@ -662,8 +701,17 @@ class ParaSMemoryManager:
         *,
         context_len: int,
         ep_max_num_reqs: Optional[int] = None,
+        max_running_requests: Optional[int] = None,
+        dp_size: int = 1,
     ) -> Tuple[int, int]:
-        """Compute EP and TP request pool capacities from UMM token budgets."""
+        """Compute EP and TP request pool capacities from UMM token budgets.
+
+        Also derives per-mode ``max_running_requests`` caps. EP has 8 disjoint
+        per-rank schedulers, so each cap divides the global CLI value by
+        dp_size; TP runs one unified scheduler whose cap equals the full CLI
+        value. Both are clamped to the per-mode pool capacity so the
+        scheduler never tries to admit more reqs than the pool can hold.
+        """
 
         def _default_num_reqs(max_tokens: int) -> int:
             return min(max(int(max_tokens / context_len * 512), 2048), 4096)
@@ -677,6 +725,16 @@ class ParaSMemoryManager:
 
         self.ep_max_num_reqs = ep_num_reqs
         self.tp_max_num_reqs = tp_num_reqs
+
+        if max_running_requests is not None:
+            self.ep_max_running_requests = min(
+                max(max_running_requests // max(dp_size, 1), 1), ep_num_reqs
+            )
+            self.tp_max_running_requests = min(max_running_requests, tp_num_reqs)
+        else:
+            self.ep_max_running_requests = ep_num_reqs
+            self.tp_max_running_requests = tp_num_reqs
+
         return ep_num_reqs, tp_num_reqs
 
     def get_ep_max_num_reqs(self) -> int:
@@ -684,6 +742,12 @@ class ParaSMemoryManager:
 
     def get_tp_max_num_reqs(self) -> int:
         return self.tp_max_num_reqs
+
+    def get_ep_max_running_requests(self) -> int:
+        return self.ep_max_running_requests
+
+    def get_tp_max_running_requests(self) -> int:
+        return self.tp_max_running_requests
 
     def get_ep_max_kv_tokens(self, kind: str = "full") -> int:
         if kind == "full":

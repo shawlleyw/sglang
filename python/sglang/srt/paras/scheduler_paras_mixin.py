@@ -50,8 +50,9 @@ class ParasAutoSwitchPolicy(abc.ABC):
     """Base class for ParaS auto-switch policies.
 
     Subclasses define `observation_for_batch` to (a) filter iterations the
-    policy cares about and (b) compute the per-iteration global metric value.
-    The base handles windowing, cooldown, and the cross-threshold decision.
+    policy cares about and (b) compute the per-iteration global metric value
+    using whatever scheduler state they need. The base handles windowing,
+    cooldown, and the cross-threshold decision.
     """
 
     def __init__(self, threshold: int, window: int, cooldown_sec: float):
@@ -61,11 +62,15 @@ class ParasAutoSwitchPolicy(abc.ABC):
         self.cooldown_until: float = 0.0
 
     @abc.abstractmethod
-    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
+    def observation_for_batch(
+        self, scheduler: Any, batch: Optional[ScheduleBatch]
+    ) -> Optional[int]:
         """Return this iteration's global metric, or None to skip the iteration."""
 
-    def observe(self, batch: ScheduleBatch, now: float) -> None:
-        value = self.observation_for_batch(batch)
+    def observe(
+        self, scheduler: Any, batch: Optional[ScheduleBatch], now: float
+    ) -> None:
+        value = self.observation_for_batch(scheduler, batch)
         if value is None or value <= 0:
             return
         self.window.append(value)
@@ -97,8 +102,10 @@ class ParasAutoSwitchPolicy(abc.ABC):
 class PrefillAutoSwitchPolicy(ParasAutoSwitchPolicy):
     """Observes pure prefill (EXTEND) iterations; metric is global prefill tokens."""
 
-    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
-        if batch.forward_mode != ForwardMode.EXTEND:
+    def observation_for_batch(
+        self, scheduler: Any, batch: Optional[ScheduleBatch]
+    ) -> Optional[int]:
+        if batch is None or batch.forward_mode != ForwardMode.EXTEND:
             return None
         if batch.global_num_tokens:
             return int(sum(batch.global_num_tokens))
@@ -118,7 +125,11 @@ class DecodeAutoSwitchPolicy(ParasAutoSwitchPolicy):
     requests to a non-zero DP rank.
     """
 
-    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
+    def observation_for_batch(
+        self, scheduler: Any, batch: Optional[ScheduleBatch]
+    ) -> Optional[int]:
+        if batch is None:
+            return None
         if batch.global_num_tokens:
             return int(sum(batch.global_num_tokens))
         return len(batch.reqs)
@@ -134,14 +145,52 @@ class HybridAutoSwitchPolicy(ParasAutoSwitchPolicy):
             "ForwardMode.MIXED should not occur in practice."
         )
 
-    def observation_for_batch(self, batch: ScheduleBatch) -> Optional[int]:
+    def observation_for_batch(
+        self, scheduler: Any, batch: Optional[ScheduleBatch]
+    ) -> Optional[int]:
         raise NotImplementedError  # unreachable: __init__ raises
+
+
+class RolloutAutoSwitchPolicy(ParasAutoSwitchPolicy):
+    """Observes every iteration; metric is global pending request count.
+
+    Mode-aware source selection:
+
+    * EP mode: rank 0 holds only its DP slice, so the per-rank running batch
+      and waiting queue underrepresent the global state. We sum the MLP-sync
+      all-gather output (``batch.global_running_reqs`` / ``global_waiting_reqs``)
+      across DP ranks. Skip iterations where the all-gather hasn't populated
+      yet (idle / boot).
+    * TP mode: unified data plane, every rank holds the same running batch
+      after the EP->TP switch. Rank 0's local view IS the global view, so we
+      read ``scheduler.running_batch`` and ``scheduler.waiting_queue``
+      directly. The all-gather is unreliable in TP mode post-switch (see the
+      matching workaround in ParasMetricsSampler), so we must NOT consult
+      ``batch.global_*`` here.
+    """
+
+    def observation_for_batch(
+        self, scheduler: Any, batch: Optional[ScheduleBatch]
+    ) -> Optional[int]:
+        if scheduler.paras_parallelism_config == "EP":
+            if batch is None:
+                return None
+            running_field = batch.global_running_reqs
+            waiting_field = batch.global_waiting_reqs
+            if running_field is None or waiting_field is None:
+                return None
+            return int(sum(running_field)) + int(sum(waiting_field))
+        rb = scheduler.running_batch
+        running = len(rb.reqs) if rb is not None else 0
+        waiting = len(scheduler.waiting_queue)
+        return running + waiting
 
 
 _PARAS_AUTO_SWITCH_POLICY_CLASSES = {
     "prefill": PrefillAutoSwitchPolicy,
     "decode": DecodeAutoSwitchPolicy,
     "hybrid": HybridAutoSwitchPolicy,
+    "rollout": RolloutAutoSwitchPolicy,
 }
 
 
@@ -227,6 +276,17 @@ class SchedulerParasMixin:
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
                 self.tp_worker.get_tokens_per_layer_info()
             )
+
+        from sglang.srt.paras.paras_memory_manager import (
+            get_global_paras_memory_manager,
+        )
+
+        _paras_mgr = get_global_paras_memory_manager()
+        if _paras_mgr is not None:
+            if self.paras_parallelism_config == "TP":
+                self.max_running_requests = _paras_mgr.get_tp_max_running_requests()
+            else:
+                self.max_running_requests = _paras_mgr.get_ep_max_running_requests()
         
     def paras_check(self):
         # Canary: log if running_batch ever contains a req with output_ids=[].
@@ -246,10 +306,9 @@ class SchedulerParasMixin:
         return True
 
     def paras_auto_observe(self, batch: Optional[ScheduleBatch]) -> None:
-        assert self._paras_auto_policy is not None
-        if batch is None:
+        if self._paras_auto_policy is None:
             return
-        self._paras_auto_policy.observe(batch, time.time())
+        self._paras_auto_policy.observe(self, batch, time.time())
 
     def _paras_auto_clear_window_on_switch(self) -> None:
         assert self._paras_auto_policy is not None
@@ -367,7 +426,11 @@ class SchedulerParasMixin:
 
         with TimeReporter("transfer_weights"):
             self.tp_worker.paras_configure_tp(self.paras_tp_size, self.paras_tp_rank)
-        
+
+        sampler = self.tp_worker.model_runner.sampler
+        sampler.tp_sync_group = self.paras_tp_group.device_group
+        sampler.force_sync_token_ids = True
+
         end_time = time.time()
         cost_ms = (end_time - start_time) * 1000
         logger.info(f"Time taken to configure TP: {cost_ms} ms")
@@ -425,7 +488,9 @@ class SchedulerParasMixin:
         self.tree_cache.reset()
         self.merge_last_batch()
         global_reqs = list(self.running_batch.reqs) if self.running_batch else []
-        local_waiting_reqs = list(self.waiting_queue)
+        local_waiting_reqs = (
+            list(self.waiting_queue) if self.paras_tp_rank == 0 else []
+        )
 
         # Phase 2: Scatter — partition reqs, shrink pools, scatter KV cache
         paras_scatter_manager = ParaSReqScatterManager(
@@ -472,6 +537,10 @@ class SchedulerParasMixin:
         # Phase 3: Model switch (weights + attention)
         with TimeReporter("transfer_weights"):
             self.tp_worker.paras_configure_ep()
+
+        sampler = self.tp_worker.model_runner.sampler
+        sampler.tp_sync_group = self.paras_tp_attn_tp_group.device_group
+        sampler.force_sync_token_ids = False
 
         end_time = time.time()
         cost_ms = (end_time - start_time) * 1000

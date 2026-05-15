@@ -435,6 +435,9 @@ class Scheduler(
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
+        # Cumulative lifetime counters (never reset). Used by ParaS metrics sampler.
+        self.total_decode_tokens_lifetime: int = 0
+        self.total_prefill_tokens_lifetime: int = 0
         self.last_prefill_tokens = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
@@ -516,6 +519,15 @@ class Scheduler(
         
         # Init ParaS configuration
         self.init_paras_config()
+
+        self._paras_metrics_sampler = None
+        if server_args.paras_metrics_file:
+            from sglang.srt.managers.paras_metrics_sampler import ParasMetricsSampler
+
+            self._paras_metrics_sampler = ParasMetricsSampler(
+                self, server_args.paras_metrics_file
+            )
+            self._paras_metrics_sampler.start()
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
@@ -1122,7 +1134,7 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
             
-            logger.info(f"Processing request: {recv_req}")
+            # logger.info(f"Processing request: {recv_req}")
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -2146,6 +2158,12 @@ class Scheduler(
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            local_running_batch_size=(
+                len(self.running_batch.reqs) if self.running_batch else 0
+            ),
+            local_waiting_queue_size=len(self.waiting_queue),
+            local_total_decode_tokens=self.total_decode_tokens_lifetime,
+            local_total_prefill_tokens=self.total_prefill_tokens_lifetime,
         )
 
     @staticmethod
@@ -2161,6 +2179,10 @@ class Scheduler(
         require_mlp_tp_gather: bool,
         disable_overlap_schedule: bool,
         offload_tags: set[str],
+        local_running_batch_size: int = 0,
+        local_waiting_queue_size: int = 0,
+        local_total_decode_tokens: int = 0,
+        local_total_prefill_tokens: int = 0,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -2210,12 +2232,16 @@ class Scheduler(
                 *tbo_preparer.prepare_all_gather(
                     local_batch,
                 ),
+                local_running_batch_size,
+                local_waiting_queue_size,
+                local_total_decode_tokens,
+                local_total_prefill_tokens,
             ],
             dtype=torch.int64,
             device=device,
         )
         global_info = torch.empty(
-            (dp_size, attn_tp_size, 6),
+            (dp_size, attn_tp_size, 10),
             dtype=torch.int64,
             device=device,
         )
@@ -2228,6 +2254,10 @@ class Scheduler(
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
+        global_running_reqs = global_info[:, 0, 6].tolist()
+        global_waiting_reqs = global_info[:, 0, 7].tolist()
+        global_total_decode_tokens = global_info[:, 0, 8].tolist()
+        global_total_prefill_tokens = global_info[:, 0, 9].tolist()
 
         tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
             global_info[:, :, 4:6]
@@ -2249,6 +2279,10 @@ class Scheduler(
             local_batch.is_extend_in_batch = any(is_extend_in_batch)
             local_batch.tbo_split_seq_index = tbo_split_seq_index
             local_batch.global_forward_mode = global_forward_mode
+            local_batch.global_running_reqs = global_running_reqs
+            local_batch.global_waiting_reqs = global_waiting_reqs
+            local_batch.global_total_decode_tokens = global_total_decode_tokens
+            local_batch.global_total_prefill_tokens = global_total_prefill_tokens
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:

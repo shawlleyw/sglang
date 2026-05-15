@@ -25,9 +25,12 @@ The policy is a sliding-window controller with a single threshold and a wall-clo
 |---|---|---|---|---|---|
 | `decode` *(default)* | `ForwardMode.DECODE` | global decode batch size (= request count) | `64 * world_size` | `32` | `60 s` |
 | `prefill` | `ForwardMode.EXTEND` | global prefill token count | `1024 * world_size` | `8` | `10 s` |
+| `rollout` | (every iteration) | global running + waiting request count | `8 * world_size` | `1` | `5 s` |
 | `hybrid` | (mixed prefill+decode) | n/a | n/a | n/a | n/a |
 
 The decode and prefill defaults follow from the EP/TP crossover band measured in `parallelism_switch.md`. Threshold scales with `world_size` (= `tp_size`) so the per-GPU work that justifies a switch is constant. Prefill iterations are larger and rarer than decode, so the prefill policy uses a shorter window and shorter cooldown to stay reactive.
+
+`rollout` is tuned for synchronous-rollout-style batch inference (GRPO post-training), where a single client submits a fixed burst of N requests (typically 512–2048), waits for all to complete, and submits the next burst. The metric is `global_running_reqs + global_waiting_reqs` rather than the per-iteration token count, because rollout cares about the **total in-flight workload** (not the size of any single forward). Low threshold (`8/GPU`) + `window=1` + short cooldown (`5 s`) make the policy react to load swings within a few seconds: TP during the boot grace window when the system is empty, EP when the burst arrives, and EP→TP again when the long-tail of slow requests drains the running batch below threshold.
 
 `hybrid` is **not implemented** — picking it raises `NotImplementedError` at startup. ParaS disables chunked prefill, so `ForwardMode.MIXED` should not occur in practice; if a mixed workload becomes relevant, this is where to add a multi-metric policy.
 
@@ -45,10 +48,13 @@ Defaults resolve at startup inside `ServerArgs._handle_paras_auto_switch`. Any C
 
 ### 2.3 Per-iteration observation
 
-After each forward iteration that results in `process_batch_result(batch, result)`, the scheduler calls `paras_auto_observe(batch)`, which dispatches to the active policy's `observation_for_batch(batch)`:
+After each forward iteration that results in `process_batch_result(batch, result)`, the scheduler calls `paras_auto_observe(batch)`, which calls `policy.observe(scheduler, batch, now)` on the active policy. The base class invokes `observation_for_batch(scheduler, batch)` and appends the returned value (if any) to the policy's sliding window. Passing the scheduler reference lets each policy compute its metric using whatever scheduler state it needs — not just the batch — which is what `RolloutAutoSwitchPolicy` exploits to do mode-aware source selection (see below).
 
-- `DecodeAutoSwitchPolicy.observation_for_batch` — observes **every iteration** (no `forward_mode` filter). Metric is `sum(batch.global_num_tokens)` in EP mode (the all-gathered per-DP token count summed across all DP ranks; in steady-state decode each request contributes exactly one token per iteration, so the sum equals the global decode batch size) and `len(batch.reqs)` in TP mode. Dropping the `is_decode()` filter is intentional: rank 0 may run an idle batch when other DP ranks hold the work, but its `batch.global_num_tokens` still carries the true global state via the MLP all-gather, so the in-flight indicator is preserved across both decode and idle iterations on rank 0.
-- `PrefillAutoSwitchPolicy.observation_for_batch` — returns `None` unless `batch.forward_mode == ForwardMode.EXTEND`. Metric is `sum(batch.global_num_tokens)` in EP mode and `sum(req.seqlen for req in batch.reqs)` in TP mode.
+- `DecodeAutoSwitchPolicy.observation_for_batch` — observes **every iteration** (no `forward_mode` filter). Metric is `sum(batch.global_num_tokens)` in EP mode (the all-gathered per-DP token count summed across all DP ranks; in steady-state decode each request contributes exactly one token per iteration, so the sum equals the global decode batch size) and `len(batch.reqs)` in TP mode. Dropping the `is_decode()` filter is intentional: rank 0 may run an idle batch when other DP ranks hold the work, but its `batch.global_num_tokens` still carries the true global state via the MLP all-gather, so the in-flight indicator is preserved across both decode and idle iterations on rank 0. The `scheduler` argument is ignored.
+- `PrefillAutoSwitchPolicy.observation_for_batch` — returns `None` unless `batch.forward_mode == ForwardMode.EXTEND`. Metric is `sum(batch.global_num_tokens)` in EP mode and `sum(req.seqlen for req in batch.reqs)` in TP mode. The `scheduler` argument is ignored.
+- `RolloutAutoSwitchPolicy.observation_for_batch` — observes **every iteration** and returns `running + waiting` requests globally with **mode-aware source selection**:
+   - **EP mode**: rank 0 holds only its DP slice, so the per-rank running batch and waiting queue underrepresent the global state. The policy sums the MLP all-gather output (`batch.global_running_reqs` / `batch.global_waiting_reqs`) across DP ranks. If the all-gather hasn't populated yet (idle / boot), it returns `None` to skip the iteration.
+   - **TP mode**: unified data plane — every rank holds the same `running_batch` after the EP→TP gather. Rank 0's local view IS the global view, so the policy reads `scheduler.running_batch.reqs` and `scheduler.waiting_queue` directly. The all-gather is unreliable in TP mode post-switch (the MLP-sync path does not repopulate the `batch.global_*` fields when DP attention is off), so the policy must **not** consult `batch.global_*` in TP mode or it would go blind and never fire back.
 - `HybridAutoSwitchPolicy.__init__` raises before any observation can happen.
 
 Non-positive metric values are silently skipped. Otherwise the value is appended to the policy's `deque` (capped at `window`).
@@ -206,14 +212,25 @@ After the gather, TP rank 0's waiting queue contains every queued prefill from e
 
 ### 4.3 TP→EP scatter
 
-In TP mode only rank 0 has a non-empty `waiting_queue`. The scatter partitions it across the new EP ranks using the same greedy strategy already used for the running batch:
+In TP mode the unified data plane runs on every rank, and `scheduler.recv_requests` broadcasts each new request to every rank's `waiting_queue` via the attention TP group (which is full-rank in TP mode). So every rank's `waiting_queue` actually holds the same global set of pending requests — **not** disjoint slices. The scatter must explicitly elect rank 0 as the sole contributor; otherwise the all-gather inside `ScatterManager` would multiply the global set by `paras_tp_size`, and the subsequent partition would redistribute duplicates back as the full global set on every rank's local queue.
+
+The rank-0 gate is enforced **at the call site** in `paras_configure_ep` (`scheduler_paras_mixin.py:472-474`), not by the scatter manager itself:
+
+```python
+# scheduler_paras_mixin.py — paras_configure_ep
+global_reqs = list(self.running_batch.reqs) if self.running_batch else []
+local_waiting_reqs = (
+    list(self.waiting_queue) if self.paras_tp_rank == 0 else []
+)
+```
+
+This mirrors the EP→TP path's existing convention in `GatherManager` (`gather_manager.py`), where `get_new_waiting_queue(paras_tp_rank)` returns the global queue only on rank 0 and empty lists on the others. The scatter then proceeds normally:
 
 ```python
 class ParaSReqScatterManager:
     def __init__(self, global_reqs, ..., local_waiting_reqs=None):
-        # Only rank 0 populates local_waiting_reqs in TP mode. Other ranks
-        # send [] into the all-gather, but every rank receives the union,
-        # so all ranks can deterministically run the same partition algorithm.
+        # Caller (paras_configure_ep) has already gated to rank-0-only.
+        # Non-zero ranks pass [] here.
         local_waiting_reqs = local_waiting_reqs or []
         gathered_waiting, _ = paras_tp_group_all_gather_reqs(
             local_waiting_reqs, scatter_group)
@@ -286,7 +303,38 @@ Running on every rank (not just rank 0) keeps the configure entry symmetric and 
 
 Combined with the idempotent guard (§5.1), the system absorbs any concurrent control-plane invocations, and stale state from any prior mode never drives a reverse switch.
 
-## 6. Verified Behavior
+## 6. Robustness Fixes for the Rollout Path (May 2026)
+
+The first end-to-end rollout-policy run (qwen3-30B-A3B and gpt-oss-120b-BF16 on 8×A100, dapo dataset, 512 reqs, ParaS auto-switch with the rollout policy) surfaced four classes of bugs that were latent in the original design and would have prevented production use. Each is documented inline below with the commit that fixed it and the verification signal that confirms the fix.
+
+### 6.1 Per-mode `max_bs` sync on the cuda-graph runner (`3f64fa33c`)
+
+`paras_init_dual_cuda_graphs` captures two graph sets — one with EP-mode batch sizes (`cuda_graph_bs`, default up to 256) and one with TP-mode batch sizes (`paras_tp_cuda_graph_bs`, default up to 64) — and stores both under `runner._paras_saved[mode]`. At runtime, `paras_load_cuda_graph_state(runner, mode)` swaps the graphs and `capture_bs` per mode via a `_SETTINGS_KEYS` tuple. But `runner.max_bs` is set once at `CudaGraphRunner.__init__` to `max(EP_max, TP_max)` (= 256 in the canonical config) and was **not** in `_SETTINGS_KEYS`, so the runtime `can_run()` check `cuda_graph_bs <= self.max_bs` used the stale 256 in TP mode. A TP-mode batch with `cuda_graph_bs > 64` passed `can_run()` (256 > 64 = False, but 100 ≤ 256 = True), then `replay_prepare` did `bisect_left(capture_bs=[1..64], 100) = 12` → `capture_bs[12]` → `IndexError: list index out of range`. The fix appends two lines to `paras_load_cuda_graph_state` that sync `runner.max_bs = max(runner.capture_bs)` and `runner.max_num_token` per mode.
+
+### 6.2 Rank-0 sole contributor to the waiting queue on TP→EP (`217b542fe`)
+
+In TP mode, `scheduler.recv_requests` broadcasts each new request to every rank's `waiting_queue` via the attention TP group (`attn_tp_size == paras_tp_size == 8` post-switch). So every rank's `waiting_queue` ends up holding the **same** global set of pending requests, not disjoint slices. The original `paras_configure_ep` passed `local_waiting_reqs=list(self.waiting_queue)` from **every** rank into `ScatterManager`'s all-gather, producing an 8× duplicated global set that the partition then redistributed as the entire global set onto every rank's local queue. EP-mode steady-state then promoted those duplicates into the running batch until hitting the `max_running_requests / dp_size` per-rank cap — so every rank ran the same requests in parallel, wasting 7/8 of the compute and spamming the tokenizer manager with `"state was deleted"` orphan-output errors (~10/sec across 8 ranks). The fix elects rank 0 as the sole contributor at the call site, mirroring `GatherManager.get_new_waiting_queue(paras_tp_rank)` on the EP→TP side. Verified on smoke v9: per-rank running drops from 256 (replicated) to ~57 (disjoint), per-rank token counts diverge by ~16k confirming truly independent slices, and `"state was deleted"` count drops to **0**.
+
+### 6.3 Per-mode `max_running_requests` via `plan_req_capacities` (`bad15b290`)
+
+`tp_worker.max_running_requests` is computed once at startup as `server_args.max_running_requests // (dp_size if enable_dp_attention else 1)` — correct for EP (8 disjoint per-rank schedulers, each capped at `CLI/8`) but wrong for TP, where ParaS collapses to one unified scheduler whose running batch is shared across all ranks. With a static value, TP-mode peak running was capped at `CLI/8 = 256` (with `CLI=2048` and `dp_size=8`) even though `tp_max_num_reqs` already sized the pool for the full 2048. The fix computes both `ep_max_running_requests` and `tp_max_running_requests` inside `paras_memory_manager.plan_req_capacities` (alongside the existing per-mode pool sizes), and `paras_configure_helper` overrides `scheduler.max_running_requests` with the active-mode value after every EP↔TP swap.
+
+### 6.4 Sampler `tp_sync_group` re-pointing on every mode swap (`2460fa666`)
+
+`Sampler.tp_sync_group` is cached at `Sampler.__init__` from `get_attention_tp_group().device_group`, which under DP attention is a single-rank group. The optional token-id all-reduce gated by `SYNC_TOKEN_IDS_ACROSS_TP` is therefore a single-rank no-op for the lifetime of the process — even after ParaS swaps `parallel_state._TP` and the attn-tp metadata on an EP→TP transition. SGLang relies on deterministic kernels (last all-reduce, lm-head matmul, sampling) to keep per-rank sampled token ids in agreement without an explicit sync; for qwen3 (flashinfer + non-SWA) the kernels are deterministic enough, but for gpt-oss-120b (triton attention + triton MoE + SWA) they are not. On the wind-down EP→TP transition with active in-flight requests, ranks sampled different tokens → different `req.finished()` → different `running_batch.batch_size` (DP0=20, DP3=14, DP1/5/7=13 in the watchdog dump) → next forward's NCCL collective deadlocked on shape mismatch. 100% GPU util, 300 s watchdog timeout, no recovery. The fix has two parts:
+
+1. `sampler.py`: add a `force_sync_token_ids` instance flag (default `False`) and OR it into the existing all-reduce gate alongside `SYNC_TOKEN_IDS_ACROSS_TP` and `sampling_info.grammars`.
+2. `scheduler_paras_mixin.py`: on `paras_configure_tp`, repoint `sampler.tp_sync_group` to `self.paras_tp_group.device_group` (the full 8-rank TP group) and set `sampler.force_sync_token_ids = True`. On `paras_configure_ep`, restore `sampler.tp_sync_group` to `self.paras_tp_attn_tp_group.device_group` (the EP-mode single-rank attn-tp group) and clear the force flag.
+
+The all-reduce is now a real cross-rank `MIN` reduce of `batch_next_token_ids` in TP mode and a single-rank no-op in EP mode, matching the runtime parallelism contract at every moment.
+
+### 6.5 Additional log-spam reduction (`94dc29146`)
+
+Two unrelated noise sources surfaced under the 512-burst rollout load. `scheduler_output_processor_mixin._handle_decode_batch` force-emitted an output batch every `DEFAULT_FORCE_STREAM_INTERVAL` decode tokens even for non-streaming requests, creating an IPC-in-flight window in which post-finish duplicates land orphaned in `TokenizerManager.rid_to_state` (`"state was deleted"` log spam — ~600/min in pre-fix smoke). The fix sets `should_output = False` on the non-streaming non-multimodal path, deferring to `req.finished()` for the single terminal output. Separately, `scheduler.recv_requests` was emitting a per-request `logger.info("Processing request: ...")` line that, with 8× DP broadcast and a 2k-req burst, produced thousands of TokenizedGenerateReqInput-repr lines per second. The line is now commented out.
+
+## 7. Verified Behavior
+
+### 7.1 Decode policy — original autoswitch smoke
 
 End-to-end test on 8×A100 with gpt-oss-120b-bf16, decode policy, test-scale tunables (`--paras-auto-switch-policy decode --paras-auto-switch-threshold 8 --paras-auto-switch-window 4 --paras-auto-switch-cooldown-sec 15`):
 
@@ -304,10 +352,24 @@ For production-scale validation, the policy defaults resolve at startup via `Ser
 
 - `decode` policy: `threshold = 64 * world_size`, `window = 32`, `cooldown = 60 s`
 - `prefill` policy: `threshold = 1024 * world_size`, `window = 8`, `cooldown = 10 s`
+- `rollout` policy: `threshold = 8 * world_size`, `window = 1`, `cooldown = 5 s`
 
 The production defaults require sustained traffic at the corresponding global batch sizes; the same control-plane flow applies as in the test above.
 
-## 7. Limitations and Future Work
+### 7.2 Rollout policy — 2026-05-15 smoke validation
+
+Per-model end-to-end smoke on the dapo dataset (DAPO-Math-17k sampled to 8k, no spec mode, 16k max-completion cap), 512 requests submitted via async-gather to `/v1/chat/completions`, 8×A100-80GB:
+
+| Model | mfs | completed/failed | e2e_time | output_throughput | policy fires | state-deleted errors |
+|---|---|---|---|---|---|---|
+| qwen3-30B-A3B | 0.80 | **512 / 0** | 689.9 s | 6,360 tok/s | 4× (boot EP→TP, burst TP→EP, wind-down EP→TP, tail-drain TP→EP) | 0 |
+| gpt-oss-120b-BF16 | 0.75 | **512 / 0** | 650.6 s | 2,641 tok/s | 3× (boot EP→TP, burst TP→EP, wind-down EP→TP) | 0 |
+
+Both runs exercise the canonical rollout pattern: an empty system at boot (policy fires EP→TP because running+waiting < 8/GPU); a 512-request burst arrives (policy fires TP→EP at obs ≫ 64, e.g. 283 or 335); the system runs in EP for several minutes draining the burst; the long-tail of slow requests drops the running+waiting count below threshold and the policy fires EP→TP (`obs = 63` in both smokes — exactly the threshold boundary); the remaining ~50 requests finish in TP mode and the run completes. **The wind-down EP→TP transition is the one that hung gpt-oss before commit `2460fa666` (§6.4) — both smokes confirm the fix.**
+
+Investigation records and per-row forensics for the 2026-05-15 work are filed under `docs/paras/runs/20260515_rollout_matrix/`.
+
+## 8. Limitations and Future Work
 
 1. **Decode-only window.** Prefill iterations are not counted toward the moving average. This isolates steady-state decode load, but means a prefill-heavy workload (many short prompts in a tight loop) won't accumulate evidence to fire — even though prefill cost is also affected by EP vs TP. A future refinement could add a separate prefill window or a unified token-budget metric.
 2. **No automatic policy tuning.** Defaults are taken from the design-doc crossover band on a fixed 8×A100 reference. A model-specific or hardware-specific policy (e.g., probing the actual crossover at startup) would improve generality.
@@ -315,9 +377,10 @@ The production defaults require sustained traffic at the corresponding global ba
 4. **No metric export.** Switch events are only visible in the scheduler log via `ParaS auto-switch policy fired: ... -> ...` and `Time taken to configure TP/EP: ... ms`. A Prometheus counter would help operators observe the policy's behavior.
 5. **The policy assumes batched workload.** A single long-running streaming request that decodes one token at a time will fire EP→TP after `window` decode iterations — which is correct, but the decode policy's default `threshold = 64 * world_size` was chosen for production batches and effectively makes any single-stream workload force TP. Operators serving primarily latency-sensitive streaming should override `--paras-auto-switch-threshold` to a smaller value or disable auto-switch entirely.
 
-## 8. References
+## 9. References
 
 - `parallelism_switch.md` — base EP↔TP switch design (gather/scatter, weight transfer, N+1 slot, control plane)
 - `parallelism_configuration.md` — why DP/EP and TP/TP are the two practical configurations and where the crossover is
 - `cuda_graph.md` — dual graph capture and per-mode state preservation
 - `gpt_oss_support.md` — model-specific adaptations including the in-flight switch correctness chronicle
+- `runs/20260515_rollout_matrix/` — investigation records for the four rollout-path bugs documented in §6 (cuda-graph max_bs, rank-0 waiting, sampler sync, log spam) plus the original 2026-05-14 background and opening prompt that bootstrapped the work

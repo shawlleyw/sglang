@@ -486,6 +486,10 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
             disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
             offload_tags=set(),
+            local_running_batch_size=0,
+            local_waiting_queue_size=0,
+            local_total_decode_tokens=0,
+            local_total_prefill_tokens=0,
         )
 
 
