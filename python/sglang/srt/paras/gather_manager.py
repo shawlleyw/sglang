@@ -259,6 +259,12 @@ class ParaSReqGatherManager:
             self.global_token_indices = None
 
     def _tighten_swa_pool_to_in_window(self) -> None:
+        # Drop the SWA backing for every req's out-of-window prefix in a single
+        # batched gather + free_swa, rather than scanning bs req CUDA gathers
+        # serially. At running=2048 the per-req version takes ~47 ms (~23 us/req,
+        # dominated by per-slice CUDA launches + an implicit host sync on each
+        # req_to_token[req_pool_idx, 0:in_window_start] view); the vectorized
+        # version reduces that to one CUDA gather + one free_swa call.
         if not isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             return
         if self.layer_specs is None:
@@ -270,17 +276,41 @@ class ParaSReqGatherManager:
         )
         if sliding_window_size is None:
             return
+
+        req_pool_idxs: List[int] = []
+        oow_lens: List[int] = []
         for req in self.global_reqs:
             seqlen_no_last = req.seqlen - 1
             in_window_start = max(
                 req.swa_evicted_seqlen, seqlen_no_last - sliding_window_size
             )
             if in_window_start > 0:
-                oow_full_slots = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, 0:in_window_start
-                ]
-                self.token_to_kv_pool_allocator.free_swa(oow_full_slots)
+                req_pool_idxs.append(req.req_pool_idx)
+                oow_lens.append(in_window_start)
                 req.swa_evicted_seqlen = in_window_start
+
+        if not req_pool_idxs:
+            return
+
+        device = self.req_to_token_pool.device
+        row_idx_t = torch.tensor(req_pool_idxs, dtype=torch.int64, device=device)
+        lens_t = torch.tensor(oow_lens, dtype=torch.int64, device=device)
+        flat_rows = torch.repeat_interleave(row_idx_t, lens_t)
+
+        # flat_cols = concat of arange(oow_lens[i]) for each i, built on GPU
+        # via a single arange + cumulative-start subtraction (avoids a Python
+        # loop over reqs to materialize per-req column tensors).
+        total = int(lens_t.sum().item())
+        arange_t = torch.arange(total, dtype=torch.int64, device=device)
+        cumsum_t = torch.cumsum(lens_t, dim=0)
+        starts = torch.cat(
+            (torch.zeros(1, dtype=torch.int64, device=device), cumsum_t[:-1])
+        )
+        starts_per_pos = torch.repeat_interleave(starts, lens_t)
+        flat_cols = arange_t - starts_per_pos
+
+        oow_full_slots = self.req_to_token_pool.req_to_token[flat_rows, flat_cols]
+        self.token_to_kv_pool_allocator.free_swa(oow_full_slots)
 
     def gather_cache(self) -> None:
         """Transfer KV cache from EP layout to TP layout.
