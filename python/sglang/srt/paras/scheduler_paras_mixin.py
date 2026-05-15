@@ -442,6 +442,8 @@ class SchedulerParasMixin:
                 _t_validator_msg = self._validate_post_migration()
                 if _t_validator_msg is not None:
                     self._handle_validator_failure(_t_validator_msg)
+                from sglang.srt.paras.tree_migration import emit_migration_events as _t_emit_events
+                _t_emit_events(self.tree_cache)
 
             # T20: ensure the rebuilt tree + remapped slot tensors are fully
             # committed before forward resumes on this rank.
@@ -648,6 +650,8 @@ class SchedulerParasMixin:
                 _t_validator_msg = self._validate_post_migration()
                 if _t_validator_msg is not None:
                     self._handle_validator_failure(_t_validator_msg)
+                from sglang.srt.paras.tree_migration import emit_migration_events as _t_emit_events
+                _t_emit_events(self.tree_cache)
 
             # T20: ensure the rebuilt tree + remapped slot tensors are fully
             # committed before forward resumes on this rank (TP→EP direction).

@@ -469,6 +469,43 @@ def recompute_lock_refs(tree_cache, in_flight_reqs) -> None:
         last_node = getattr(req, "last_node", None)
         if last_node is None or last_node is root:
             continue
+
+        if is_swa:
+            sliding_window_size = getattr(tree_cache, "sliding_window_size", None) or 0
+            walker = last_node
+            tokens_traversed = 0
+            tombstone_in_window = False
+            while walker is not None and walker is not root and tokens_traversed < sliding_window_size:
+                if getattr(walker, "swa_tombstone", False):
+                    tombstone_in_window = True
+                    break
+                key = getattr(walker, "key", None)
+                if key is not None:
+                    if isinstance(key, list):
+                        tokens = key
+                    else:
+                        tokens = getattr(key, "token_ids", None)
+                        if tokens is None:
+                            try:
+                                tokens = list(key)
+                            except TypeError:
+                                tokens = None
+                    if tokens is not None:
+                        try:
+                            tokens_traversed += len(tokens)
+                        except TypeError:
+                            pass
+                walker = getattr(walker, "parent", None)
+            if tombstone_in_window:
+                req.tree_orphaned = True
+                req.last_node = root
+                if hasattr(req, "last_host_node"):
+                    req.last_host_node = root
+                req.prefix_indices = []
+                if hasattr(req, "swa_uuid_for_lock"):
+                    req.swa_uuid_for_lock = None
+                continue
+
         try:
             uuid = tree_cache.inc_lock_ref(last_node)
             if is_swa and uuid is not None:
@@ -499,3 +536,169 @@ def recompute_lock_refs(tree_cache, in_flight_reqs) -> None:
             n = getattr(n, "parent", None)
         if hasattr(req, "cache_protected_len"):
             req.cache_protected_len = plen
+
+
+def compose_swa_remap(remap_callback, source_full_to_swa_mapping=None):
+    """T21: Compose slot-index remap with SWA full→SWA-pool mapping.
+
+    For full-attention layers: slot remap is direct (old_full_slot → new_full_slot).
+    For SWA layers: must first translate old_full_slot → old_swa_slot via the
+    source_full_to_swa_mapping snapshot, then remap.
+
+    Returns:
+        dict with two callables:
+          {"full": Callable[[int], int],  # for full attn layers
+           "swa": Callable[[int], int]}   # for SWA attn layers
+        Both return -1 to signal "dropped".
+
+    If source_full_to_swa_mapping is None, the SWA callback degrades to remap_callback
+    (identity-mode for non-SWA caches).
+    """
+    full_cb = remap_callback
+
+    if source_full_to_swa_mapping is None:
+        return {"full": full_cb, "swa": full_cb}
+
+    try:
+        mapping_list = (
+            source_full_to_swa_mapping.tolist()
+            if hasattr(source_full_to_swa_mapping, "tolist")
+            else list(source_full_to_swa_mapping)
+        )
+    except Exception:
+        mapping_list = None
+
+    def swa_cb(full_slot, _m=mapping_list, _r=remap_callback):
+        if _m is None:
+            return _r(full_slot)
+        if 0 <= full_slot < len(_m):
+            swa_slot = _m[full_slot]
+            return _r(int(swa_slot))
+        return -1
+
+    return {"full": full_cb, "swa": swa_cb}
+
+
+def emit_migration_events(tree, gathered_records: Optional[list] = None) -> None:
+    """T29: After tree-migration rebuild, if enable_kv_cache_events is set on the
+    tree, emit a synthetic AllBlocksCleared + per-node BlockStored sequence.
+
+    Downstream event consumers (e.g. PD disaggregation) thus see the migration
+    as if it were a flush + bulk-insert.
+
+    Iterative DFS — no recursion. Tolerant of missing event-type imports
+    (silently skips if event types not available in this build).
+    """
+    if not getattr(tree, "enable_kv_cache_events", False):
+        return
+    if not hasattr(tree, "kv_event_queue"):
+        return
+
+    AllBlocksCleared = None
+    BlockStored = None
+    for module_path in (
+        "sglang.srt.disaggregation.kv_events",
+        "sglang.srt.mem_cache.radix_cache",
+        "sglang.srt.mem_cache.swa_radix_cache",
+    ):
+        try:
+            mod = __import__(module_path, fromlist=["AllBlocksCleared", "BlockStored"])
+            if AllBlocksCleared is None:
+                AllBlocksCleared = getattr(mod, "AllBlocksCleared", None)
+            if BlockStored is None:
+                BlockStored = getattr(mod, "BlockStored", None)
+            if AllBlocksCleared is not None and BlockStored is not None:
+                break
+        except ImportError:
+            continue
+
+    if AllBlocksCleared is None or BlockStored is None:
+        return
+
+    # Emit AllBlocksCleared first; tolerate variants of the constructor.
+    try:
+        tree.kv_event_queue.append(AllBlocksCleared())
+    except TypeError:
+        try:
+            tree.kv_event_queue.append(
+                AllBlocksCleared(tree.page_size if hasattr(tree, "page_size") else 1)
+            )
+        except Exception:
+            return
+
+    page_size = getattr(tree, "page_size", 1) or 1
+
+    # Iterative DFS over non-root tree nodes (BFS-ish via stack is fine — only
+    # ordering constraint is that every emitted BlockStored is between the
+    # leading AllBlocksCleared and any later real events the tree emits).
+    stack = list(tree.root_node.children.values())
+    while stack:
+        node = stack.pop()
+        try:
+            # Reconstruct full token path: walk parent chain up to (but not
+            # including) the root, prepending each node's key tokens.
+            token_ids: list = []
+            walker = node
+            while walker is not None and walker is not tree.root_node:
+                key = getattr(walker, "key", None)
+                if key is None:
+                    break
+                if hasattr(key, "token_ids"):
+                    tokens = list(key.token_ids)
+                else:
+                    try:
+                        tokens = list(key)
+                    except TypeError:
+                        tokens = []
+                token_ids = tokens + token_ids
+                walker = getattr(walker, "parent", None)
+
+            # Synthesize one BlockStored per page_size chunk so downstream
+            # consumers see the same per-block granularity as the live emitter
+            # in _record_store_event. Fall back to a single event with the
+            # whole token path when page_size=1 (still correct, just coarser).
+            parent_block_hash = None
+            num_chunks = max(1, (len(token_ids) + page_size - 1) // page_size)
+            for chunk_idx in range(num_chunks):
+                start = chunk_idx * page_size
+                page_tokens = token_ids[start : start + page_size]
+                if not page_tokens:
+                    continue
+                block_hash = hash(tuple(page_tokens))
+                try:
+                    tree.kv_event_queue.append(
+                        BlockStored(
+                            block_hashes=[block_hash],
+                            parent_block_hash=parent_block_hash,
+                            token_ids=list(page_tokens),
+                            block_size=len(page_tokens),
+                            lora_id=None,
+                        )
+                    )
+                except TypeError:
+                    # Older/alternative signature: fall back to the minimal
+                    # keyword set most builds support.
+                    try:
+                        tree.kv_event_queue.append(
+                            BlockStored(
+                                block_hashes=[block_hash],
+                                parent_block_hash=parent_block_hash,
+                                token_ids=list(page_tokens),
+                            )
+                        )
+                    except Exception:
+                        try:
+                            tree.kv_event_queue.append(
+                                BlockStored(token_ids=list(page_tokens))
+                            )
+                        except Exception:
+                            pass
+                parent_block_hash = block_hash
+        except Exception:
+            # Per-node best-effort: a malformed node should not abort the
+            # whole synthetic emit (and certainly should not crash the
+            # scheduler mid-switch).
+            pass
+
+        for c in node.children.values():
+            stack.append(c)
