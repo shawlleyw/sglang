@@ -86,6 +86,23 @@ class TestRadixMigrationNegativeAsserts:
         args.check_server_args()
         assert args.disable_radix_cache is True
 
+    def test_radix_cache_works_with_paras_after_lift(self):
+        """T30: ServerArgs(enable_paras_moe=True, disable_radix_cache=False) should be ACCEPTED."""
+        args = ServerArgs(
+            model_path="dummy",
+            enable_paras_moe=True,
+            enable_dp_attention=True,
+            enable_dp_lm_head=True,
+            paras_tp_size=4,
+            tp_size=4,
+            dp_size=4,
+            disable_radix_cache=False,
+        )
+        # Should not raise — the assertion has been lifted
+        args.check_server_args()
+        assert args.disable_radix_cache is False
+        assert args.enable_paras_moe is True
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

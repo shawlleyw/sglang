@@ -1,6 +1,22 @@
-# Radix Cache in SGLang and Why ParaS Disables It
+# Radix Cache in SGLang and ParaS
 
-ParaS requires `--disable-radix-cache` (asserted at startup in [`server_args._check_paras_config`](file:///home/shaoyuw/sglang/python/sglang/srt/server_args.py)). This document explains what the radix cache does in sglang, why combining it with ParaS migration is unsafe today, and what would go wrong if the assertion were bypassed.
+## Status: Supported (as of paras-radix-cache plan T30)
+
+ParaS migration now supports radix cache via tree-state migration across EP↔TP switches.
+
+- Operators can run with `--disable-radix-cache=False` (the default) under ParaS.
+- The 4 hard asserts (HiRadix `--enable-hierarchical-cache`, CPP radix `SGLANG_EXPERIMENTAL_CPP_RADIX_TREE=1`, EAGLE `--speculative-algorithm EAGLE`, `--page-size > 1`) remain in place — those features are NOT yet supported with tree migration. See "Known Pre-existing Issues" section for `page_size > 1` background.
+- Configurable preservation:
+  - `--paras-radix-preserve-unlocked` (default `false`): if true, EP→TP transfers unlocked tree nodes' K/V too (TP→EP still drops). Adds latency.
+  - `--paras-radix-migration-strict={fail,fallback}` (default `fail`): on post-switch validator failure, either crash (supervisor restarts) or orphan all migrated reqs and continue.
+
+The body of this document below describes the historical hazards and the migration design.
+
+---
+
+## Historical Context: Why ParaS Previously Disabled Radix Cache
+
+This document explains what the radix cache does in sglang, why combining it with ParaS migration was unsafe before tree-migration support (T2-T29), and what would have gone wrong if the assertion had been bypassed.
 
 ## What the radix cache provides
 

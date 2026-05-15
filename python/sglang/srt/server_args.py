@@ -1576,12 +1576,12 @@ class ServerArgs:
             assert self.enable_dp_attention, "enable_dp_attention must be set when enable_paras_moe is set"
             assert self.paras_tp_size <= 8 and self.paras_tp_size > 0, "paras_tp_size must be positive when enable_paras_moe is set"
             assert self.tp_size == self.dp_size, "paras moe requires tp_size == dp_size, which means attn tp size is 1"
-            assert self.disable_radix_cache, (
-                "ParaS requires --disable-radix-cache (uses ChunkCache / SWAChunkCache). "
-                "Prefix sharing is not used by ParaS, and the radix cache's tree state "
-                "would not survive EP<->TP switches anyway. Pass --disable-radix-cache "
-                "when --enable-paras-moe is set."
-            )
+            # T30: --disable-radix-cache no longer required under ParaS.
+            # Tree-migration support (T2-T29) preserves radix tree state across
+            # EP↔TP switches. Operators can opt INTO radix cache under ParaS.
+            # The 4 hard asserts below (HiRadix / CPP radix / EAGLE / page_size>1)
+            # remain in place because those features are NOT yet supported with
+            # tree migration; see docs/paras/radix_cache.md for status.
             # Hard asserts for incompatible features when radix cache is enabled under ParaS
             if not self.disable_radix_cache:
                 assert not self.enable_hierarchical_cache, (
