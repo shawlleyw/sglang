@@ -1,4 +1,5 @@
 from typing import List, Optional, Tuple, Any
+import gc
 import os
 import torch
 import pickle
@@ -50,51 +51,67 @@ def recover_request(
 def paras_tp_group_all_gather_reqs(
     reqs: List[Req],
     group: GroupCoordinator,
-) -> Tuple[List[Req], List[int]]:
-    device = torch.device("cuda")
-    
-    num_ranks = group.world_size
-    
-    # Clean up tensor members to avoid pickle triggering torch device copy, mostly radix cache related stuff
-    for req in reqs:
-        prune_request(req)
+) -> Tuple[Optional[List[Req]], Optional[List[int]]]:
+    # The 8 x pickle.loads loop below allocates ~2,048 fresh Req objects
+    # (256 reqs x 8 ranks, each with nested fields). That allocation rate
+    # trips CPython's gen-2 threshold and the resulting heap walk over the
+    # long-lived serving heap (radix nodes, req pools, sampler state, etc.)
+    # stalls the GIL for ~1.5-2 s with NO Python frame on the stack (so
+    # Kineto sees a silent gap). Disable GC for the duration of the call;
+    # gc.collect(0) at the end sweeps the young generation cheaply
+    # (O(new_objects), not O(heap_size)) so gen0 does not accumulate across
+    # switches. Root cause: INVESTIGATION_paras_gather_reqs_slow.md.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        device = torch.device("cuda")
 
-    
-    serialized_data = pickle.dumps(reqs)
-    size = len(serialized_data)
-    tensor_data = torch.ByteTensor(
-        np.frombuffer(serialized_data, dtype=np.uint8),
-        device="cpu",
-    )
-    tensor_size = torch.tensor([size], dtype=torch.long, device=device)
-    
-    gathered_size = torch.empty(num_ranks, dtype=torch.long, device=device)
-    group.all_gather_into_tensor(gathered_size, tensor_size)
-    gathered_size_list = gathered_size.tolist()
-    max_size = max(gathered_size_list)
-    if max_size == 0:
-        return None, None
-    
-    padded_tensor_data = torch.empty((max_size,), dtype=torch.uint8, device=device)
-    padded_tensor_data[:size].copy_(tensor_data)
+        num_ranks = group.world_size
 
-    gathered_data: torch.Tensor = torch.empty((max_size * num_ranks), dtype=torch.uint8, device=device)
-    group.all_gather_into_tensor(gathered_data, padded_tensor_data)
-    
-    serialized_data_per_rank = np.split(gathered_data.cpu().numpy(), num_ranks, axis=0)
-    
-    gathered_reqs = []
-    split_sizes = []
-    for i in range(num_ranks):
-        data = serialized_data_per_rank[i]
-        effective_size = gathered_size_list[i]
-        remote_reqs = pickle.loads(data[:effective_size]) if effective_size > 0 else []
-        gathered_reqs.extend(remote_reqs)
-        split_sizes.append(len(remote_reqs))
-        
-    print(f"metadata sizes: {gathered_size_list}, num_gathered_reqs: {len(gathered_reqs)}, split_sizes: {split_sizes}")
-    
-    return gathered_reqs, split_sizes
+        # Clean up tensor members to avoid pickle triggering torch device copy, mostly radix cache related stuff
+        for req in reqs:
+            prune_request(req)
+
+
+        serialized_data = pickle.dumps(reqs)
+        size = len(serialized_data)
+        tensor_data = torch.ByteTensor(
+            np.frombuffer(serialized_data, dtype=np.uint8),
+            device="cpu",
+        )
+        tensor_size = torch.tensor([size], dtype=torch.long, device=device)
+
+        gathered_size = torch.empty(num_ranks, dtype=torch.long, device=device)
+        group.all_gather_into_tensor(gathered_size, tensor_size)
+        gathered_size_list = gathered_size.tolist()
+        max_size = max(gathered_size_list)
+        if max_size == 0:
+            return None, None
+
+        padded_tensor_data = torch.empty((max_size,), dtype=torch.uint8, device=device)
+        padded_tensor_data[:size].copy_(tensor_data)
+
+        gathered_data: torch.Tensor = torch.empty((max_size * num_ranks), dtype=torch.uint8, device=device)
+        group.all_gather_into_tensor(gathered_data, padded_tensor_data)
+
+        serialized_data_per_rank = np.split(gathered_data.cpu().numpy(), num_ranks, axis=0)
+
+        gathered_reqs = []
+        split_sizes = []
+        for i in range(num_ranks):
+            data = serialized_data_per_rank[i]
+            effective_size = gathered_size_list[i]
+            remote_reqs = pickle.loads(data[:effective_size]) if effective_size > 0 else []
+            gathered_reqs.extend(remote_reqs)
+            split_sizes.append(len(remote_reqs))
+
+        print(f"metadata sizes: {gathered_size_list}, num_gathered_reqs: {len(gathered_reqs)}, split_sizes: {split_sizes}")
+
+        return gathered_reqs, split_sizes
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+        gc.collect(0)
 
 # from EP to TP, requests are all-gathered from all ranks
 class ParaSReqGatherManager:
