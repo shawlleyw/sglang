@@ -965,5 +965,82 @@ class TestNormalizeLRULists:
         assert first == second
 
 
+class TestTombstonePathSafety:
+    """T23: defensive guard prevents inc_lock_ref from firing on tombstone-in-window."""
+
+    def _make_swa_chain(self, sliding_window_size=8, tombstone_at_depth=None):
+        class FakeKey:
+            def __init__(self, t): self.token_ids = list(t)
+        class FakeNode:
+            def __init__(self, k=None, swa_tombstone=False):
+                self.key = k
+                self.children = {}
+                self.parent = None
+                self.full_lock_ref = 0
+                self.swa_lock_ref = 0
+                self.swa_tombstone = swa_tombstone
+        class FakeSWATree:
+            def __init__(self, sw):
+                self.root_node = FakeNode(FakeKey([]))
+                self.sliding_window_size = sw
+                self.inc_calls = []
+            def inc_lock_ref(self, node):
+                self.inc_calls.append(node)
+                return None
+        t = FakeSWATree(sliding_window_size)
+        nodes = [FakeNode(FakeKey([100 + i, 100 + i + 1]),
+                          swa_tombstone=(tombstone_at_depth == i))
+                 for i in range(4)]
+        prev = t.root_node
+        for n in nodes:
+            n.parent = prev
+            prev.children[n.key.token_ids[0]] = n
+            prev = n
+        return t, nodes
+
+    def test_no_tombstone_in_window_inc_called(self):
+        from sglang.srt.paras.tree_migration import recompute_lock_refs
+        t, nodes = self._make_swa_chain(sliding_window_size=8, tombstone_at_depth=None)
+        leaf = nodes[3]
+        class Req:
+            tree_orphaned = False
+            last_node = None
+            cache_protected_len = 0
+        r = Req()
+        r.last_node = leaf
+        recompute_lock_refs(t, [r])
+        assert r.tree_orphaned is False
+        assert leaf in t.inc_calls
+
+    def test_tombstone_in_window_orphans_req(self):
+        from sglang.srt.paras.tree_migration import recompute_lock_refs
+        t, nodes = self._make_swa_chain(sliding_window_size=8, tombstone_at_depth=1)
+        leaf = nodes[3]
+        class Req:
+            tree_orphaned = False
+            last_node = None
+            cache_protected_len = 0
+            last_host_node = None
+            prefix_indices = None
+        r = Req()
+        r.last_node = leaf
+        recompute_lock_refs(t, [r])
+        assert r.tree_orphaned is True
+        assert leaf not in t.inc_calls
+
+    def test_tombstone_outside_window_no_orphan(self):
+        from sglang.srt.paras.tree_migration import recompute_lock_refs
+        t, nodes = self._make_swa_chain(sliding_window_size=2, tombstone_at_depth=0)
+        leaf = nodes[3]
+        class Req:
+            tree_orphaned = False
+            last_node = None
+            cache_protected_len = 0
+        r = Req()
+        r.last_node = leaf
+        recompute_lock_refs(t, [r])
+        assert r.tree_orphaned is False
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
