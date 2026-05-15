@@ -541,3 +541,90 @@ class ParaSReqGatherManager:
         if slot_map is None:
             return lambda old: old
         return lambda old, _m=slot_map: _m.get(old, -1)
+
+    def gather_tree_records(
+        self,
+        local_tree,
+        in_flight_slot_set,
+    ):
+        """Serialize local tree, all-gather across paras_tp_group, dedup.
+
+        Args:
+            local_tree: this rank's RadixCache or SWARadixCache (pre-tree.reset()).
+                None or ChunkCache means "no tree to gather" -> return ([], 0).
+            in_flight_slot_set: set[int] of pool slots currently held by in-flight
+                requests on this rank. Used as the lock-ref tiebreaker signal.
+
+        Returns:
+            Tuple (deduped_records: List[TreeRecord], dropped_count: int)
+            dropped_count: number of records lost to dedup.
+
+        Notes:
+            - Tiebreaker (Metis Q5): on (token_path, extra_key) collision, prefer
+              the record whose value_slots intersects in_flight_slot_set
+              (any rank). If none of the colliding records has an in-flight slot,
+              fall back to lex-min source rank order.
+        """
+        from sglang.srt.paras.tree_migration import (
+            serialize_radix_cache,
+            serialize_swa_radix_cache,
+            encode_records,
+            decode_records,
+        )
+
+        if local_tree is None or getattr(local_tree, "root_node", None) is None:
+            return [], 0
+
+        if hasattr(local_tree, "sliding_window_size") and getattr(local_tree, "sliding_window_size", None) is not None:
+            local_records = serialize_swa_radix_cache(local_tree)
+        else:
+            local_records = serialize_radix_cache(local_tree)
+
+        local_blob = encode_records(local_records)
+
+        world_size = self.gather_group.world_size
+        gathered_blobs = [None] * world_size
+        dist.all_gather_object(gathered_blobs, local_blob, group=self.gather_group.device_group)
+
+        per_rank_records = []
+        for rank_idx, blob in enumerate(gathered_blobs):
+            if blob is None:
+                per_rank_records.append([])
+                continue
+            per_rank_records.append(decode_records(blob))
+
+        return self._dedup_records_with_lockref(per_rank_records, in_flight_slot_set)
+
+    def _dedup_records_with_lockref(self, per_rank_records, in_flight_slot_set):
+        """Dedup by (full_token_path, extra_key); tiebreaker: prefer in-flight-held slots.
+
+        Returns (kept_records, dropped_count).
+        """
+        from collections import defaultdict
+        bucket = defaultdict(list)
+        for rank_idx, records in enumerate(per_rank_records):
+            for r in records:
+                key = (tuple(r.full_token_path), r.extra_key)
+                bucket[key].append((rank_idx, r))
+
+        kept = []
+        dropped = 0
+        for key, candidates in bucket.items():
+            if len(candidates) == 1:
+                kept.append(candidates[0][1])
+                continue
+
+            with_in_flight = [
+                (rank_idx, r)
+                for rank_idx, r in candidates
+                if any(s in in_flight_slot_set for s in r.value_slots)
+            ]
+            if with_in_flight:
+                with_in_flight.sort(key=lambda pair: pair[0])
+                kept.append(with_in_flight[0][1])
+                dropped += len(candidates) - 1
+            else:
+                candidates.sort(key=lambda pair: pair[0])
+                kept.append(candidates[0][1])
+                dropped += len(candidates) - 1
+        return kept, dropped
