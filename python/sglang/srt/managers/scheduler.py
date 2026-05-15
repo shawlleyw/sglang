@@ -1134,7 +1134,7 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
             
-            logger.info(f"Processing request: {recv_req}")
+            # logger.info(f"Processing request: {recv_req}")
 
             output = self._request_dispatcher(recv_req)
             if output is not None:

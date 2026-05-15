@@ -828,11 +828,7 @@ class SchedulerOutputProcessorMixin:
                         # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                         should_output &= not req.check_match_stop_str_prefix()
                 else:
-                    should_output = (
-                        len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
-                        if not self.model_config.is_multimodal_gen
-                        else False
-                    )
+                    should_output = False
 
             if should_output:
                 send_token_offset = req.send_token_offset
