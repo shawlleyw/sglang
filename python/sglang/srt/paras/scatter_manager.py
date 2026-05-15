@@ -563,6 +563,13 @@ class ParaSReqScatterManager:
               ``swa_kv_pool`` (each a plain ``MHATokenToKVPool``) plus the
               ``layers_mapping`` that routes per-layer access.
         """
+        # ASYMMETRIC DESIGN (T28): TP→EP drops unlocked tree nodes by design.
+        # Replicating unlocked-node K/V to all EP ranks would multiply the K/V
+        # transfer by tp_size and break the latency budget. Hash-partitioning
+        # unlocked nodes across EP ranks would break tree topology (children may
+        # land on different rank than parents). Per Oracle Q4: drop is the right
+        # call given the partitioned-EP topology decision. The
+        # --paras-radix-preserve-unlocked flag (T1) only takes effect on EP→TP.
         if tp_kv_cache is None:
             tp_kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
 

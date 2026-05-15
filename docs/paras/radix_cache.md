@@ -173,3 +173,33 @@ The assertion is therefore both a correctness guard and an honesty signal: ParaS
 **Fix**: A separate PR should override `paras_resize_and_clear` on `PagedTokenToKVPoolAllocator` to reset the page-level free list correctly. Out of scope for the current radix-cache work.
 
 **Reference**: Discovered during Oracle architectural review of the radix-cache plan; flagged in `.sisyphus/notepads/paras-radix-cache/`.
+
+## Preserve-unlocked: asymmetric semantics (T27/T28)
+
+The `--paras-radix-preserve-unlocked` flag controls whether UNLOCKED tree nodes (those held only by finished, evictable cached prefixes — not by any in-flight req) are migrated across an EP↔TP switch.
+
+| Direction | Default behavior | Flag-on behavior |
+|---|---|---|
+| EP→TP | drop unlocked | preserve via extending K/V transfer set with each rank's unlocked-node slots |
+| TP→EP | drop unlocked | **still drop** (asymmetric) |
+
+### Why TP→EP always drops
+
+- In TP mode, every rank holds the same canonical tree. Unlocked nodes have no per-rank owner.
+- Replicating their K/V to every EP rank multiplies transfer volume by `tp_size` (e.g., 8×), busting the latency budget.
+- Hash-partitioning unlocked nodes across EP ranks breaks tree topology (children may land on different rank than parents — match_prefix lookup would fail to find the descendant subtree).
+- The right call (per Oracle architectural review): drop unlocked nodes on TP→EP.
+
+### Why EP→TP can preserve
+
+- In EP mode, each rank holds its own per-rank tree partition. Unlocked nodes have a clear owning rank (the rank whose tree they belong to).
+- On EP→TP, that owning rank can include its unlocked nodes' K/V slots in the cross-rank gather. The receiver TP tree remaps them via the global old→new slot map (T7).
+- Latency cost is bounded by the unlocked-tree size on each rank.
+
+### Operator guidance
+
+- Default `false` is safe: tree state is preserved for in-flight prefixes only; new post-switch reqs benefit from the migrated tree of in-flight reqs.
+- Enable `true` only when:
+  - Workload has very high prefix-sharing across switches (e.g., shared system prompts that survive multiple switches).
+  - Latency tail (especially EP→TP P99) is acceptable to grow.
+- Revisit after running `pytest test/srt/paras/test_radix_migration_sla.py` to measure the actual latency impact on your workload.
