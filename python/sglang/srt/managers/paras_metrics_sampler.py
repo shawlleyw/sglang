@@ -96,7 +96,17 @@ class ParasMetricsSampler:
     def _sample_once(self) -> None:
         scheduler = self.scheduler
         batch = getattr(scheduler, "last_batch", None)
-        mode = getattr(scheduler, "paras_parallelism_config", "UNK") or "UNK"
+
+        paras_config = getattr(scheduler, "paras_parallelism_config", None)
+        if paras_config is not None:
+            mode = paras_config
+        else:
+            # Static mode (no ParaS): enable_dp_attention <=> "EP" shape data plane.
+            sa = getattr(scheduler, "server_args", None)
+            if sa is not None and getattr(sa, "enable_dp_attention", False):
+                mode = "EP"
+            else:
+                mode = "TP"
 
         # Source selection mirrors paras_auto_observe in scheduler_paras_mixin:
         # EP mode -> rank 0 holds only its DP slice, so sum the all-gather output;
