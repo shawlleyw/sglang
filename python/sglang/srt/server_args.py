@@ -447,6 +447,8 @@ class ServerArgs:
     paras_auto_switch_threshold: Optional[int] = None
     paras_auto_switch_window: Optional[int] = None
     paras_auto_switch_cooldown_sec: Optional[float] = None
+    paras_radix_preserve_unlocked: bool = False
+    paras_radix_migration_strict: str = "fail"
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -1580,6 +1582,24 @@ class ServerArgs:
                 "would not survive EP<->TP switches anyway. Pass --disable-radix-cache "
                 "when --enable-paras-moe is set."
             )
+            # Hard asserts for incompatible features when radix cache is enabled under ParaS
+            if not self.disable_radix_cache:
+                assert not self.enable_hierarchical_cache, (
+                    "ParaS + radix cache: HiRadixCache (--enable-hierarchical-cache) is not supported "
+                    "under ParaS migration. The host tier doesn't survive paras_resize_and_clear."
+                )
+                assert os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") != "1", (
+                    "ParaS + radix cache: CPP radix tree (SGLANG_EXPERIMENTAL_CPP_RADIX_TREE=1) is not "
+                    "supported under ParaS migration; only Python RadixCache/SWARadixCache are migration-aware."
+                )
+                assert self.speculative_algorithm in (None, "NONE"), (
+                    "ParaS + radix cache: EAGLE speculative decoding is not supported "
+                    "(bigram keys + value length conventions diverge from migration code path)."
+                )
+                assert self.page_size == 1, (
+                    "ParaS + radix cache: page_size > 1 is not supported "
+                    "(pre-existing ParaS bug in paras_resize_and_clear; documented in docs/paras/radix_cache.md)."
+                )
             assert self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0, (
                 "ParaS migration cannot preserve mid-chunked-prefill state "
                 "(chunked_req is not part of the gather/scatter set, and per-token "
@@ -3138,6 +3158,26 @@ class ServerArgs:
                 "Wall-clock seconds between successive auto-switch decisions. "
                 "When unset, defaults to the policy's value (see "
                 "--paras-auto-switch-policy)."
+            ),
+        )
+        parser.add_argument(
+            "--paras-radix-preserve-unlocked",
+            action="store_true",
+            default=ServerArgs.paras_radix_preserve_unlocked,
+            help=(
+                "When enabled, preserve unlocked tree nodes during EP->TP radix cache migration. "
+                "Default is False (strict mode, only locked nodes preserved)."
+            ),
+        )
+        parser.add_argument(
+            "--paras-radix-migration-strict",
+            type=str,
+            default=ServerArgs.paras_radix_migration_strict,
+            choices=["fail", "fallback"],
+            help=(
+                "Migration strictness mode for radix cache under ParaS. "
+                "'fail' (default) raises AssertionError on migration validation failure; "
+                "'fallback' silently falls back to ChunkCache on failure."
             ),
         )
         parser.add_argument(
