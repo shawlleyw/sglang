@@ -1007,6 +1007,17 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
+            # Mirror event_loop_normal's paras auto-switch hook. The original
+            # Task 3 commit (12e75efaa) enabled overlap for paras by adding
+            # the drain-on-switch path but forgot to port this observe/signal
+            # pair. Without it the policy never runs in overlap mode and the
+            # server never switches regardless of how low `running` drops.
+            if batch and self._paras_auto_policy is not None and self.tp_rank == 0:
+                self.paras_auto_observe(batch)
+                signal = self.paras_auto_pick_signal()
+                if signal is not None:
+                    self.send_to_tokenizer.send_output(signal)
+
             self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
 
