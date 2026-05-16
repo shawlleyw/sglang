@@ -1,6 +1,6 @@
 ---
 name: paras-test-manual-switch
-description: Test ParaS manual EP↔TP switching for any supported model. Covers Qwen3-30B-A3B (4×A100, FlashInfer, eager) and gpt-oss-120b-bf16 (4-8×A100, Triton, cuda-graph dual capture). Drives the canonical 14-step procedure via scripts/paras/eval/paras_cmd/e2e_test.sh: kill → launch → wait → health → 5 send_prompts/configure pairs (round-trip pre-switch / TP / round-trip post-switch) → 2 inflight_switch (EP→TP, TP→EP) → check_log → kill. send_prompts and inflight_switch each fire BURST_SIZE=32 parallel diverse prompts and fail-fast on the degenerate-attractor regex. Use after any change to paras/ code or scripts/paras/eval/.
+description: Test ParaS manual EP↔TP switching for any supported model. Covers Qwen3-30B-A3B (4×A100, FlashInfer, cuda-graph) and gpt-oss-120b-bf16 (4-8×A100, Triton, cuda-graph dual capture). Drives the canonical 14-step procedure via scripts/paras/eval/paras_cmd/e2e_test.sh: kill → launch → wait → health → 5 send_prompts/configure pairs (round-trip pre-switch / TP / round-trip post-switch) → 2 inflight_switch (EP→TP, TP→EP) → check_log → kill. send_prompts and inflight_switch each fire BURST_SIZE=32 parallel diverse prompts and fail-fast on the degenerate-attractor regex. Use after any change to paras/ code or scripts/paras/eval/.
 ---
 
 # Test ParaS Manual EP↔TP Switch
@@ -27,7 +27,7 @@ EP→TP→EP is functionally consistent.
 | `SLEEP_BETWEEN` for `wait_ready.sh` | 5 (default) | **10** |
 | Default GPU count | 4 | 4 (test) or 8 (canonical deployment) |
 | Default attention backend | FlashInfer | **Triton** (required by gpt-oss SWA + sinks) |
-| Default cuda graph | **eager** (`ENABLE_CUDA_GRAPH=0`, qwen ParaS canonical) | **cuda graph dual capture** (`ENABLE_CUDA_GRAPH=1`, `--cuda-graph-max-bs 8`) |
+| Default cuda graph | cuda graph (`ENABLE_CUDA_GRAPH=1`; max-bs auto = `MAX_RUNNING_REQUESTS/NUM_GPUS` = 256) | cuda graph dual capture (`ENABLE_CUDA_GRAPH=1`; max-bs auto = 256) |
 | Hybrid SWA + dual-cache pool | n/a (vanilla full attention) | yes (18 full + 18 SWA layers) |
 | Per-head attention sinks | n/a | yes |
 | MoE w13 layout | concat `[gate..., up...]` | interleaved `[g0, u0, g1, u1, ...]` |
@@ -54,25 +54,19 @@ conda activate sgl_paras
 cd /home/shaoyuw/sglang
 pip install -e python/ -q --no-deps
 
-# qwen3 defaults in lib.sh match — no env overrides needed.
 bash scripts/paras/eval/paras_cmd/kill.sh                            # step 1
 
 # PARAS_AUTO_SWITCH=0 disables load-driven autoswitch so the test exercises
-# manual /paras_configure_* endpoints only. See "Disabling autoswitch" below.
+# manual /paras_configure_* endpoints only. The toggle is wired in
+# launch_common.sh for ALL dp_ep launchers (qwen + gpt-oss).
 ENABLE_PARAS=1 PARAS_AUTO_SWITCH=0 NUM_GPUS=4 MEM_FRACTION_STATIC=0.7 \
     bash scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh \
-    --no-paras-auto-switch \
     2>&1 | tee /tmp/sglang_paras_test.log &                          # step 2
 
 bash scripts/paras/eval/paras_cmd/e2e_test.sh                        # steps 3-13
 
 bash scripts/paras/eval/paras_cmd/kill.sh                            # step 14
 ```
-
-> Note: `PARAS_AUTO_SWITCH=0` is wired in the gpt-oss launch script (lines 68-70)
-> but **not** in the qwen3 launch script as of this writing — pass
-> `--no-paras-auto-switch` directly via `"$@"` for qwen3 until the qwen launch
-> script gains the same toggle.
 
 ## Quick Start (gpt-oss-120b-bf16, 4×A100)
 
@@ -153,21 +147,29 @@ script is model-specific, the log path is model-specific, and the launch is
 long-lived (must be backgrounded or run in tmux). See model-specific Quick
 Start blocks above for the exact launch command.
 
-The launch script automatically picks the right defaults under
-`ENABLE_PARAS=1`:
+Shared defaults live in `launch_common.sh` (sourced by every launcher):
 
-- **qwen3**: `MEM_FRACTION_STATIC=0.6`, `MAX_RUNNING_REQUESTS=1024`,
-  `ENABLE_CUDA_GRAPH=0` (eager), `--max-prefill-tokens 32000`,
-  `--disable-overlap-schedule`. Override `MEM_FRACTION_STATIC=0.7` on the
-  launch line per the standard test config.
-- **gpt-oss**: `MEM_FRACTION_STATIC=0.8`, `MAX_RUNNING_REQUESTS=1024`,
-  `CUDA_GRAPH_MAX_BS=8` (cuda-graph dual capture canonical), Triton attention
-  + Triton MoE backend, no `--disable-hybrid-swa-memory`. Override
+- `MAX_RUNNING_REQUESTS=2048`, `MAX_PREFILL_TOKENS=8192` (uniform across all
+  models / servers).
+- `CUDA_GRAPH_MAX_BS = MAX_RUNNING_REQUESTS / NUM_GPUS` for DP/EP (per-rank
+  attn batch); `= MAX_RUNNING_REQUESTS` for TP/TP (global batch).
+- `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = MAX_REQ_PER_RANK`,
+  `SGLANG_ATTN_MAX_BS = MAX_REQ_PER_RANK` (paras-only).
+- `DISABLE_RADIX_CACHE=1`, `DISABLE_OVERLAP=0` (overlap is now supported under
+  paras via `SchedulerParasMixin._paras_drain_overlap_pipeline`).
+
+Per-model launcher only sets `MODEL_PATH` and `MEM_FRACTION_STATIC`:
+
+- **qwen3 dp_ep paras**: `MEM_FRACTION_STATIC=0.6` default. Override
   `MEM_FRACTION_STATIC=0.7` on the launch line per the standard test config.
+- **gpt-oss dp_ep**: `MEM_FRACTION_STATIC=0.75` default (paras + static),
+  Triton attention + Triton MoE backend pinned, `HYBRID_SWA=auto` (on under
+  paras, off under static). Override `MEM_FRACTION_STATIC=0.8` for 4-GPU
+  paras testing (per-rank weights ≈ 57 GiB at TP=4).
 
-Both launch scripts add `--enable-paras-moe --paras-tp-size $NUM_GPUS
---disable-overlap-schedule --chunked-prefill-size -1` plus model-specific
-PARAS env vars (`PARAS_CONFIGURE_METHOD=peer_access`,
+Both `launch_server_dp_ep.sh` add `--enable-paras-moe --paras-tp-size $NUM_GPUS
+--enable-nan-detection --chunked-prefill-size -1 --disable-radix-cache` under
+`ENABLE_PARAS=1`, plus PARAS env vars (`PARAS_CONFIGURE_METHOD=peer_access`,
 `PARAS_KV_TRANSFER_METHOD=peer_access`).
 
 ### 3. Wait for server ready
@@ -330,7 +332,7 @@ tests. ALWAYS disable it for manual-switch tests:
 
 | Mechanism | Where | Notes |
 |---|---|---|
-| `PARAS_AUTO_SWITCH=0` env var | gpt-oss launch script (lines 68-70) | Translated to `--no-paras-auto-switch` automatically. |
+| `PARAS_AUTO_SWITCH=0` env var | `launch_common.sh` (`paras_launch_setup_dp_ep`) | Wired for every dp_ep launcher (qwen + gpt-oss); appends `--no-paras-auto-switch` automatically when `ENABLE_PARAS=1`. |
 | `--no-paras-auto-switch` CLI flag | sglang server | Direct; works for any model. Pass via `"$@"` to the launch script. |
 
 Confirmed by code audit: setting either reliably stops ALL automatic switches.
@@ -364,12 +366,12 @@ No HTTP runtime toggle exists; the toggle is server-startup-only.
   ParaS does not use prefix sharing, and ChunkCache / SWAChunkCache are the
   supported tree-cache backends. The launch scripts pass this flag automatically
   under `ENABLE_PARAS=1`.
-- **`--disable-overlap-schedule` is required by ParaS** (asserted at runtime in
-  `SchedulerParasMixin.paras_configure_*`). The overlap scheduler runs the next
-  forward pass while the previous result is still being processed; switching
-  mid-overlap would require migrating an in-flight forward's intermediate
-  state, which is not modeled by the gather/scatter contract. Baked into both
-  launch scripts under `ENABLE_PARAS=1`.
+- **Overlap scheduler is now supported under paras** (as of commit `adacebf22`,
+  which ported the auto-switch observe/signal hook to `event_loop_overlap`;
+  `SchedulerParasMixin._paras_drain_overlap_pipeline` drains the in-flight
+  overlap batch before every EP↔TP switch). Default is overlap-ON
+  (`DISABLE_OVERLAP=0`); set `DISABLE_OVERLAP=1` only to reproduce the legacy
+  no-overlap path for forensics.
 - **Wording differences EP vs TP**: BF16 floating-point differences cause
   minor sampling divergence at `temperature=0`. Content/meaning must be
   equivalent across phases; exact tokens may not.
@@ -440,8 +442,10 @@ No HTTP runtime toggle exists; the toggle is server-startup-only.
    default `peer_access` path.
 6. **`OutOfMemoryError` during dual capture (gpt-oss)**: a regression has
    re-introduced a pre-grow somewhere, or `--cuda-graph-max-bs` is too high.
-   The state-preservation redesign verified `--cuda-graph-max-bs 8
-   --max-running-requests 1024 --mem-fraction-static 0.7-0.8` fits in 80 GB.
+   With the current auto-sized defaults (`--cuda-graph-max-bs 256
+   --max-running-requests 2048 --mem-fraction-static 0.75-0.8`) dual capture
+   fits in 80 GB. To shrink the capture footprint for forensics, set
+   `CUDA_GRAPH_MAX_BS=8 MAX_RUNNING_REQUESTS=1024` on the launch line.
 7. **`NotImplementedError: <Backend> does not implement
    paras_save_cuda_graph_state`** during dual capture: the configured
    attention backend (other than Triton or FlashInfer) was selected with

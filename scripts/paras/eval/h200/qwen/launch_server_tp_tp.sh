@@ -6,52 +6,23 @@
 #   MODEL_PATH HOST PORT NUM_GPUS CUDA_VISIBLE_DEVICES
 #   MEM_FRACTION_STATIC MAX_RUNNING_REQUESTS
 #
-# Toggles:
-#   ENABLE_CUDA_GRAPH=0  Pass --disable-cuda-graph (default 1).
-#   CUDA_GRAPH_MAX_BS=N  Pass --cuda-graph-max-bs N (only honored when ENABLE_CUDA_GRAPH=1).
-#   DISABLE_OVERLAP=0|1  0 (default) keeps the scheduler overlap; 1 adds
-#                        --disable-overlap-schedule.
+# Toggles (see ../../launch_common.sh for full semantics):
+#   ENABLE_CUDA_GRAPH=0  Disable cuda graphs (default 1).
+#   CUDA_GRAPH_MAX_BS=N  Override cuda-graph max bs. Default = MAX_RUNNING_REQUESTS
+#                        (TP global batch size).
+#   DISABLE_OVERLAP=0|1  1 adds --disable-overlap-schedule (default 0).
 #   DISABLE_RADIX_CACHE=0|1
-#                        1 (default) adds --disable-radix-cache. Matches paras's required
-#                        radix-off. Set 0 to keep radix.
+#                        1 (default) adds --disable-radix-cache (matches paras).
 
 set -uo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-source "$SCRIPT_DIR/../../lib.sh"
+source "$SCRIPT_DIR/../../launch_common.sh"
 
 MODEL_PATH=${MODEL_PATH:-/models/Qwen3-235B-A22B-Instruct-2507}
-HOST=${HOST:-0.0.0.0}
-PORT=${PORT:-30000}
-NUM_GPUS=${NUM_GPUS:-8}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
-MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-256}
-ENABLE_CUDA_GRAPH=${ENABLE_CUDA_GRAPH:-1}
 
-paras_default_cvd
-
-unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
-
-# Force a MIN all-reduce on sampled token ids across TP ranks. Paras forces
-# Sampler.force_sync_token_ids=True after every EP->TP swap (see
-# paras/scheduler_paras_mixin.py paras_configure_tp) to absorb non-deterministic
-# attention / MoE / sampler kernels that would otherwise diverge across ranks
-# and deadlock at the next collective. tp-static must run the same sync to be a
-# structurally fair comparison and to inherit the same safety net.
-export SYNC_TOKEN_IDS_ACROSS_TP=1
-
-DISABLE_OVERLAP=${DISABLE_OVERLAP:-0}
-DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-1}
-OVERLAP_FLAGS=()
-if [ "$DISABLE_OVERLAP" = "1" ]; then
-    OVERLAP_FLAGS=(--disable-overlap-schedule)
-fi
-RADIX_FLAGS=()
-if [ "$DISABLE_RADIX_CACHE" = "1" ]; then
-    RADIX_FLAGS=(--disable-radix-cache)
-fi
-
-paras_init_cuda_graph
+paras_launch_setup_tp_tp
 
 python -m sglang.launch_server \
     --model-path "$MODEL_PATH" \
@@ -60,6 +31,7 @@ python -m sglang.launch_server \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --tp-size "$NUM_GPUS" \
     --max-running-requests "$MAX_RUNNING_REQUESTS" \
+    --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
     --chunked-prefill-size -1 \
     "${OVERLAP_FLAGS[@]}" \
     "${RADIX_FLAGS[@]}" \

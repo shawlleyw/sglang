@@ -24,20 +24,24 @@ Every sweep runs every system at these values. Deviations require an explicit re
 
 ### Shared across ALL systems
 
+All shared knobs are now resolved in [`scripts/paras/eval/launch_common.sh`](file:///home/shaoyuw/sglang/scripts/paras/eval/launch_common.sh) (sourced by every `launch_server_*.sh`). Drivers should pass overrides via env var; per-knob defaults below.
+
 | Knob | Value | Layer | Default-in-launcher? |
 |---|---|---|---|
-| `DISABLE_RADIX_CACHE` | `1` | env | both launchers default `1` ✓ — paras requires; static parity |
-| `HYBRID_SWA` | `1` | env | `tp_tp` default `0` (driver must override); `dp_ep` default `auto` → resolves to `1` for paras, `0` for ep-static (driver must override for ep-static) |
-| `DISABLE_OVERLAP` | `0` (overlap ON) | env | both launchers default `0` ✓ — paras now supports overlap; no parity penalty on baselines |
-| `SYNC_TOKEN_IDS_ACROSS_TP` | `1` (tp-static only) | env | **baked into `launch_server_tp_tp.sh` for both gpt-oss and qwen** (line ~40 of each) — drivers do NOT need to set it. Forces a MIN all-reduce on sampled token-ids so tp-static inherits the same kernel-determinism safety net paras forces in TP mode. |
+| `DISABLE_RADIX_CACHE` | `1` | env | `launch_common.sh` default `1` ✓ — paras requires; static parity |
+| `HYBRID_SWA` | `1` (paras) / `0` (ep-static) for gpt-oss; unset for qwen | env | gpt-oss `dp_ep` default `auto` (paras→1, static→0); gpt-oss `tp_tp` default `1`; qwen launchers leave unset (no hybrid SWA) |
+| `DISABLE_OVERLAP` | `0` (overlap ON) | env | `launch_common.sh` default `0` ✓ — paras now supports overlap; no parity penalty on baselines |
+| `SYNC_TOKEN_IDS_ACROSS_TP` | `1` (tp-static only) | env | exported by `paras_launch_setup_tp_tp` in `launch_common.sh` — drivers do NOT need to set it. Forces a MIN all-reduce on sampled token-ids so tp-static inherits the same kernel-determinism safety net paras forces in TP mode. |
 | `--chunked-prefill-size` | `-1` | CLI | both launchers hardcode ✓ — paras requires; static parity |
-| `--max-prefill-tokens` | `8192` | CLI | driver passes |
+| `--max-prefill-tokens` | `8192` | CLI | `launch_common.sh` default `MAX_PREFILL_TOKENS=8192` ✓ — drivers may override via env or `--max-prefill-tokens N` in `"$@"` |
 | `--attention-backend` | `triton` | CLI | gpt-oss launchers hardcode ✓ — required for gpt-oss-120b |
 | `--moe-runner-backend` | `triton` | CLI | gpt-oss launchers hardcode ✓ — required for gpt-oss-120b |
-| `ENABLE_CUDA_GRAPH` | `1` | env | both launchers default `1` ✓ |
-| `CUDA_GRAPH_MAX_BS` | `256` | env | both launchers unset by default (no cap arg) → **driver must set** |
-| `MAX_RUNNING_REQUESTS` | `2048` | env | both launchers default `256` → **driver must override to 2048** |
-| `NUM_GPUS` | `8` | env | both launchers default `8` ✓ |
+| `ENABLE_CUDA_GRAPH` | `1` | env | `launch_common.sh` default `1` ✓ |
+| `CUDA_GRAPH_MAX_BS` | auto-sized | env | `launch_common.sh` auto-derives: `MAX_RUNNING_REQUESTS / NUM_GPUS` (dp_ep, per-rank attn batch); `MAX_RUNNING_REQUESTS` (tp_tp, global batch). Driver override via env wins. |
+| `MAX_REQ_PER_RANK` | derived | env | `launch_common.sh` exposes `MAX_REQ_PER_RANK = MAX_RUNNING_REQUESTS / NUM_GPUS` inside `paras_launch_setup_dp_ep`; feeds `SGLANG_ATTN_MAX_BS`, `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`, and `CUDA_GRAPH_MAX_BS` (single source of truth). |
+| `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | `MAX_REQ_PER_RANK` (= 256 at defaults) | env | `launch_common.sh` default — uniform across paras and static for parity (NVSHMEM_QP_DEPTH constraint) |
+| `MAX_RUNNING_REQUESTS` | `2048` | env | `launch_common.sh` default ✓ — uniform across all models/servers |
+| `NUM_GPUS` | `8` | env | `launch_common.sh` default `8` ✓ |
 
 ### Per-system overrides
 
@@ -45,13 +49,16 @@ Every sweep runs every system at these values. Deviations require an explicit re
 |---|---|---|---|
 | Launch script (gpt-oss-120b) | `a100/gptoss/launch_server_tp_tp.sh` | `a100/gptoss/launch_server_dp_ep.sh` | `a100/gptoss/launch_server_dp_ep.sh` |
 | `ENABLE_PARAS` | `0` | `0` | `1` |
-| `MEM_FRACTION_STATIC` | **0.80** | **0.75** | **0.75** |
-| `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | — (no DeepEP) | `256` | `256` |
+| `MEM_FRACTION_STATIC` (gpt-oss-120b) | **0.80** | **0.75** | **0.75** |
+| `MEM_FRACTION_STATIC` (qwen3-30B, a100) | **0.85** | **0.85** | **0.60** |
+| `MEM_FRACTION_STATIC` (qwen3-235B, h200) | **0.85** | **0.85** | **0.85** |
 | `--paras-tp-cuda-graph-max-bs` | — | — | `128` |
 | `--paras-auto-switch-policy` | — | — | `rollout` |
 | `--paras-auto-switch-threshold` | — | — | `N` (encoded in tag, e.g. `paras-t64`) |
 | `--paras-auto-switch-window` | — | — | (default; code: `1` for rollout) |
 | `--paras-auto-switch-cooldown-sec` | — | — | (default; code: `5` for rollout) |
+
+`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`, `SGLANG_ATTN_MAX_BS`, and `CUDA_GRAPH_MAX_BS` are all set by `launch_common.sh` from `MAX_REQ_PER_RANK = MAX_RUNNING_REQUESTS / NUM_GPUS` (= 256 at the canonical 2048/8 defaults) — driver does not need to set them individually.
 
 ### Notes
 
@@ -242,13 +249,15 @@ Both should match (modulo defaults). Discrepancies indicate either a typo in the
 
 Subset of the "Canonical runtime options" table above, for quick reference when sizing a sweep. Override via env at the driver:
 
+All three tables below assume the canonical `MAX_RUNNING_REQUESTS=2048` and `NUM_GPUS=8` defaults (set in `launch_common.sh`). `CUDA_GRAPH_MAX_BS` and `DeepEP dispatch cap` are auto-derived from `MAX_REQ_PER_RANK = MAX_RUNNING_REQUESTS / NUM_GPUS = 256` for dp_ep, and `MAX_RUNNING_REQUESTS = 2048` for tp_tp.
+
 ### 8 × A100-80GB · gpt-oss-120b
 
 | Server | MEM_FRACTION_STATIC | MAX_RUNNING_REQUESTS | CUDA_GRAPH_MAX_BS | DeepEP dispatch cap |
 |---|---:|---:|---:|---:|
-| tp-static | 0.80 | 2048 | 256 | n/a (no DeepEP) |
-| ep-static | 0.75 | 2048 | 256 | 256 |
-| paras-t* | 0.75 | 2048 | 256 (+ `--paras-tp-cuda-graph-max-bs=128`) | 256 |
+| tp-static | 0.80 | 2048 | 2048 (= global) | n/a (no DeepEP) |
+| ep-static | 0.75 | 2048 | 256 (= per-rank) | 256 |
+| paras-t* | 0.75 | 2048 | 256 (= per-rank) + `--paras-tp-cuda-graph-max-bs=128` (driver) | 256 |
 
 gpt-oss-120b OOMs at mfs=0.80 in ep-static / paras configs (DeepEP buffers + dual cuda-graph capture).
 
@@ -256,23 +265,24 @@ gpt-oss-120b OOMs at mfs=0.80 in ep-static / paras configs (DeepEP buffers + dua
 
 | Server | MEM_FRACTION_STATIC | MAX_RUNNING_REQUESTS | CUDA_GRAPH_MAX_BS | DeepEP dispatch cap |
 |---|---:|---:|---:|---:|
-| tp-static | 0.85 | 2048 | 256 | n/a |
-| ep-static | 0.85 | 2048 | 256 | 512 (DeepEP default for qwen on A100) |
-| paras-t* | 0.60 (launcher default; override via driver) | 2048 | 8 (launcher default; override via driver) | 256 |
+| tp-static | 0.85 | 2048 | 2048 (= global) | n/a |
+| ep-static | 0.85 | 2048 | 256 (= per-rank) | 256 |
+| paras-t* | 0.60 (launcher default; override via driver) | 2048 | 256 (= per-rank) | 256 |
 
 ### 8 × H200 · Qwen3-235B-A22B-Instruct-2507
 
 | Server | MEM_FRACTION_STATIC | MAX_RUNNING_REQUESTS | CUDA_GRAPH_MAX_BS | DeepEP dispatch cap |
 |---|---:|---:|---:|---:|
-| tp-static | 0.85 | 2048 | 256 | n/a |
-| ep-static | 0.85 | 2048 | 256 | 512 |
-| paras-t* | 0.70 (launcher default; override via driver) | 2048 | 8 (launcher default; override via driver) | 512 |
+| tp-static | 0.85 | 2048 | 2048 (= global) | n/a |
+| ep-static | 0.85 | 2048 | 256 (= per-rank) | 256 |
+| paras-t* | 0.85 | 2048 | 256 (= per-rank) | 256 |
 
 ### Notes
 
-- `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256` always when paras is enabled (NVSHMEM_QP_DEPTH constraint). Static EP can use 512.
-- Launcher paras defaults for `CUDA_GRAPH_MAX_BS=8` are intentionally small — keeps capture cost low at boot when the canonical paras workload is small. Production sweeps override to 256 via driver env. **All paras launchers keep `ENABLE_CUDA_GRAPH=1`**; cuda graphs are always on under paras.
-- Launcher paras defaults for `MEM_FRACTION_STATIC` (0.60 a100/qwen, 0.70 h200/qwen, 0.80 a100/gptoss) leave headroom for the dual cuda-graph capture and the UMM contiguous slab. Drivers can raise if validated for a specific workload.
+- **All three knobs (`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`, `SGLANG_ATTN_MAX_BS`, `CUDA_GRAPH_MAX_BS`) for dp_ep launchers derive from `MAX_REQ_PER_RANK`** in `launch_common.sh`. Override any one via env; the others stay at the per-rank default.
+- DeepEP dispatch cap is uniformly 256 (paras parity / NVSHMEM_QP_DEPTH constraint). Static EP could use 512 but we keep aligned for forensic comparability.
+- **All launchers keep `ENABLE_CUDA_GRAPH=1`**; cuda graphs are always on. To force eager, set `ENABLE_CUDA_GRAPH=0` on the driver line.
+- Launcher per-model `MEM_FRACTION_STATIC` defaults leave headroom for dual cuda-graph capture and the UMM contiguous slab. Drivers can raise if validated for a specific workload.
 
 ## Pre-sampling (deterministic snapshots)
 
