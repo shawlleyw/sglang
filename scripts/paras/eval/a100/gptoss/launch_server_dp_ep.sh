@@ -21,6 +21,12 @@
 #                        keeps the canonical autoswitch behavior.
 #   ENABLE_CUDA_GRAPH=0  Pass --disable-cuda-graph (default 1).
 #   CUDA_GRAPH_MAX_BS=N  Pass --cuda-graph-max-bs N (only honored when ENABLE_CUDA_GRAPH=1).
+#   HYBRID_SWA=auto|0|1  auto (default) follows ENABLE_PARAS (paras=on, static=off).
+#                        Force 0 to add --disable-hybrid-swa-memory; force 1 to omit it
+#                        regardless of ENABLE_PARAS. Used by run_smoke.sh to walk the
+#                        SWA on/off x overlap on/off matrix on static servers.
+#   DISABLE_OVERLAP=0|1  0 (default) keeps the scheduler overlap; 1 adds
+#                        --disable-overlap-schedule. Works for both paras and static.
 
 set -uo pipefail
 
@@ -55,7 +61,8 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${SGLANG_DEEPEP_NUM_MAX_DI
 export NVSHMEM_QP_DEPTH=${NVSHMEM_QP_DEPTH:-2048}
 
 PARAS_FLAGS=()
-HYBRID_SWA_FLAGS=(--disable-hybrid-swa-memory)
+HYBRID_SWA=${HYBRID_SWA:-auto}
+DISABLE_OVERLAP=${DISABLE_OVERLAP:-0}
 if [ "$ENABLE_PARAS" = "1" ]; then
     export SGLANG_ATTN_MAX_BS
     export PARAS_CONFIGURE_METHOD
@@ -70,7 +77,23 @@ if [ "$ENABLE_PARAS" = "1" ]; then
     if [ "${PARAS_AUTO_SWITCH:-1}" = "0" ]; then
         PARAS_FLAGS+=(--no-paras-auto-switch)
     fi
-    HYBRID_SWA_FLAGS=()
+fi
+
+# Resolve HYBRID_SWA=auto from ENABLE_PARAS (paras default = on, static default = off).
+if [ "$HYBRID_SWA" = "auto" ]; then
+    if [ "$ENABLE_PARAS" = "1" ]; then
+        HYBRID_SWA=1
+    else
+        HYBRID_SWA=0
+    fi
+fi
+HYBRID_SWA_FLAGS=()
+if [ "$HYBRID_SWA" = "0" ]; then
+    HYBRID_SWA_FLAGS=(--disable-hybrid-swa-memory)
+fi
+OVERLAP_FLAGS=()
+if [ "$DISABLE_OVERLAP" = "1" ]; then
+    OVERLAP_FLAGS=(--disable-overlap-schedule)
 fi
 
 paras_init_cuda_graph
@@ -88,6 +111,7 @@ python -m sglang.launch_server \
     --max-running-requests "$MAX_RUNNING_REQUESTS" \
     --chunked-prefill-size -1 \
     "${HYBRID_SWA_FLAGS[@]}" \
+    "${OVERLAP_FLAGS[@]}" \
     "${CUDA_GRAPH_FLAGS[@]}" \
     "${PARAS_FLAGS[@]}" \
     "$@"

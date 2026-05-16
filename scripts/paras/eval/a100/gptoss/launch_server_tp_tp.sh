@@ -9,6 +9,11 @@
 # Toggles:
 #   ENABLE_CUDA_GRAPH=0  Pass --disable-cuda-graph (default 1).
 #   CUDA_GRAPH_MAX_BS=N  Pass --cuda-graph-max-bs N (only honored when ENABLE_CUDA_GRAPH=1).
+#   HYBRID_SWA=0|1       0 (default) passes --disable-hybrid-swa-memory; 1 enables hybrid
+#                        full + SWA memory pools on the TP-TP server. Used by run_smoke.sh
+#                        to walk the SWA on/off x overlap on/off matrix.
+#   DISABLE_OVERLAP=0|1  0 (default) keeps the scheduler overlap; 1 adds
+#                        --disable-overlap-schedule.
 
 set -uo pipefail
 
@@ -35,6 +40,17 @@ unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
 # structurally fair comparison and to inherit the same safety net.
 export SYNC_TOKEN_IDS_ACROSS_TP=1
 
+HYBRID_SWA=${HYBRID_SWA:-0}
+DISABLE_OVERLAP=${DISABLE_OVERLAP:-0}
+HYBRID_SWA_FLAGS=()
+if [ "$HYBRID_SWA" = "0" ]; then
+    HYBRID_SWA_FLAGS=(--disable-hybrid-swa-memory)
+fi
+OVERLAP_FLAGS=()
+if [ "$DISABLE_OVERLAP" = "1" ]; then
+    OVERLAP_FLAGS=(--disable-overlap-schedule)
+fi
+
 paras_init_cuda_graph
 
 python -m sglang.launch_server \
@@ -44,9 +60,10 @@ python -m sglang.launch_server \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --attention-backend triton \
     --moe-runner-backend triton \
-    --disable-hybrid-swa-memory \
     --tp-size "$NUM_GPUS" \
     --max-running-requests "$MAX_RUNNING_REQUESTS" \
     --chunked-prefill-size -1 \
+    "${HYBRID_SWA_FLAGS[@]}" \
+    "${OVERLAP_FLAGS[@]}" \
     "${CUDA_GRAPH_FLAGS[@]}" \
     "$@"
