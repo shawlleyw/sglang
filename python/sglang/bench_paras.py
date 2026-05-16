@@ -104,6 +104,7 @@ class RequestRecord:
     completed: bool
     error: Optional[str] = None
     http_status: Optional[int] = None
+    response_text: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +306,8 @@ async def submit_one_request(
         finish_reason = (
             choices[0].get("finish_reason") if choices else None
         )
+        message = (choices[0].get("message") or {}) if choices else {}
+        response_text = message.get("content") or ""
     except (AttributeError, IndexError, TypeError, ValueError) as e:
         logger.warning(
             "request %d returned malformed body: %s; raw=%.200s",
@@ -340,6 +343,7 @@ async def submit_one_request(
         completed=True,
         error=None,
         http_status=200,
+        response_text=response_text,
     )
 
 
@@ -475,7 +479,20 @@ def write_outputs(
     per_request_path = os.path.join(output_dir, "per_request.jsonl")
     with open(per_request_path, "w", encoding="utf-8") as f:
         for rec in records:
-            f.write(json.dumps(asdict(rec)) + "\n")
+            d = asdict(rec)
+            d.pop("response_text", None)
+            f.write(json.dumps(d) + "\n")
+
+    if getattr(args, "dump_outputs", True):
+        outputs_path = os.path.join(output_dir, "outputs.jsonl")
+        with open(outputs_path, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps({
+                    "request_id": rec.request_id,
+                    "unique_id": rec.unique_id,
+                    "replica_id": rec.replica_id,
+                    "response_text": rec.response_text,
+                }, ensure_ascii=False) + "\n")
 
     run_config = {
         **vars(args),
@@ -564,6 +581,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Shuffle the replicated prompt list before submission.",
+    )
+    parser.add_argument(
+        "--dump-outputs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Write outputs.jsonl alongside per_request.jsonl with each "
+            "request's response_text. Disable with --no-dump-outputs when "
+            "disk pressure is tight (file can be 20-200 MB at N=2048 cap=32k)."
+        ),
     )
     parser.add_argument(
         "--max-completion-tokens-cap",
