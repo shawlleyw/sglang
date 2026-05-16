@@ -539,16 +539,25 @@ __global__ void peer_access_kv_transfer(
                 const unsigned int head_local = rem2 / int4_per_head_u;
                 const unsigned int in_head = rem2 - head_local * int4_per_head_u;
 
-                // Source: scattered read via index array
+                // Source: scattered read via index array.
+                // Destination: contiguous write via NVLink.
                 const int src_token = local_token_indices[token_idx];
+                const int dst_token = dst_token_start + token_idx;
+
+                // Slot 0 is the reserved padding slot in both pools
+                // (TokenToKVPoolAllocator.clear seeds free_pages at index 1)
+                // and full_to_swa_index_mapping returns 0 for positions whose
+                // SWA was already freed by ScheduleBatch._evict_swa during
+                // EP-mode decode. Transferring such tokens would shuffle
+                // padding bytes; skip them entirely to save HBM bandwidth.
+                if (src_token == 0 || dst_token == 0) continue;
+
                 const int64_t src_base = (kv_idx == 0) ? src_k_offset : src_v_offset;
                 const int64_t src_off = src_base
                     + (int64_t)src_token * num_kv_heads * head_dim * elem_size
                     + (int64_t)(ep_head + head_local) * head_dim * elem_size
                     + (int64_t)in_head * 16;
 
-                // Destination: contiguous write via NVLink
-                const int dst_token = dst_token_start + token_idx;
                 const int64_t dst_base = (kv_idx == 0) ? dst_k_offset : dst_v_offset;
                 const int64_t dst_off = dst_base
                     + (int64_t)dst_token * heads_per_peer * head_dim * elem_size
@@ -697,16 +706,26 @@ __global__ void peer_access_kv_scatter(
                 // Route: only process tokens destined for this warp's peer
                 const int dst_rank = token_to_rank[token_idx];
                 if (dst_rank == peer) {
-                    // Source: scattered read from local TP buffer
+                    // Source: scattered read from local TP buffer.
+                    // Destination: scattered write to peer EP buffer via NVLink.
                     const int src_token = tp_token_positions[token_idx];
+                    const int ep_dst_token = ep_dst_positions[token_idx];
+
+                    // Slot 0 is the reserved padding slot in both pools
+                    // (TokenToKVPoolAllocator.clear seeds free_pages at index 1)
+                    // and full_to_swa_index_mapping returns 0 for positions
+                    // whose SWA was already freed by ScheduleBatch._evict_swa
+                    // during the source-mode decode. Transferring such tokens
+                    // would shuffle padding bytes; skip them entirely to save
+                    // HBM bandwidth.
+                    if (src_token == 0 || ep_dst_token == 0) continue;
+
                     const int64_t src_base = (kv_idx == 0) ? src_k_offset : src_v_offset;
                     const int64_t src_off = src_base
                         + (int64_t)src_token * src_token_stride
                         + (int64_t)head_local * head_stride
                         + (int64_t)in_head * 16;
 
-                    // Destination: write to peer's EP buffer via NVLink
-                    const int ep_dst_token = ep_dst_positions[token_idx];
                     const int64_t dst_base = (kv_idx == 0) ? dst_k_offset : dst_v_offset;
                     const int64_t dst_off = dst_base
                         + (int64_t)ep_dst_token * dst_token_stride
