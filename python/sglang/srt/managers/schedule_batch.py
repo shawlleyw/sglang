@@ -486,7 +486,7 @@ class Req:
         self.evicted_seqlen_local = 0
 
         # The length of leading SWA-pool slots that have been freed for this request
-        # by ScheduleBatch._evict_swa during sliding-window decode-time eviction.
+        # by ScheduleBatch.maybe_evict_swa during sliding-window decode-time eviction.
         self.swa_evicted_seqlen = 0
 
         # For multi-http worker
@@ -1578,25 +1578,83 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
     def maybe_evict_swa(self):
+        # Batched per-decode-step SWA eviction. The original per-req loop
+        # issued one CUDA slice + one free_swa call per req (~30-80 us / req
+        # at bs=256 -> ~10-25 ms / step, identified as the dominant
+        # paras-vs-static-no-SWA gap in INVESTIGATION_paras_residual_overhead.md).
+        # The vectorized version collapses bs CUDA launches into a single
+        # batched gather + one free_swa call, dropping the per-step overhead
+        # to a few hundred microseconds in steady state.
         if not self.forward_mode.is_decode():
             return
         sliding_window_size = getattr(self.tree_cache, "sliding_window_size", None)
         if sliding_window_size is None:
             return
-        for req in self.reqs:
-            self._evict_swa(req, req.seqlen - 1, sliding_window_size)
 
-    def _evict_swa(self, req: Req, pre_len: int, sliding_window_size: int):
-        new_swa_evicted_seqlen = max(
-            req.swa_evicted_seqlen, pre_len - sliding_window_size
-        )
-        if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
-            free_slots = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx,
-                req.swa_evicted_seqlen : new_swa_evicted_seqlen,
-            ]
-            self.token_to_kv_pool_allocator.free_swa(free_slots)
-            req.swa_evicted_seqlen = new_swa_evicted_seqlen
+        req_pool_idxs: List[int] = []
+        old_starts: List[int] = []
+        lens: List[int] = []
+        for req in self.reqs:
+            pre_len = req.seqlen - 1
+            new_swa_evicted_seqlen = max(
+                req.swa_evicted_seqlen, pre_len - sliding_window_size
+            )
+            if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
+                req_pool_idxs.append(req.req_pool_idx)
+                old_starts.append(req.swa_evicted_seqlen)
+                lens.append(new_swa_evicted_seqlen - req.swa_evicted_seqlen)
+                req.swa_evicted_seqlen = new_swa_evicted_seqlen
+
+        if not req_pool_idxs:
+            return
+
+        device = self.req_to_token_pool.device
+        total = sum(lens)
+        if total == len(lens):
+            # Steady-state fast path: every active req advances by exactly 1
+            # slot this step (lens are all 1), so flat_rows == req_pool_idxs
+            # and flat_cols == old_starts directly. Skips the arange / cumsum
+            # / repeat_interleave machinery the general path needs and avoids
+            # one tensor alloc + several small kernel launches per step.
+            flat_rows = torch.tensor(
+                req_pool_idxs, dtype=torch.int64, device=device
+            )
+            flat_cols = torch.tensor(
+                old_starts, dtype=torch.int64, device=device
+            )
+        else:
+            # General path: lens > 1 happens after a switch or after prefill,
+            # where swa_evicted_seqlen has to catch up multiple positions in
+            # one step. Build flat (row, col) for the slots to free via:
+            #   flat_cols[k] = old_starts[i] + (k - cumulative_lengths[i])
+            # where i is the req index covering flat position k. Implemented
+            # as arange(total) + repeat_interleave(old_starts - cumlen, lens),
+            # which has the same shape as flat_rows.
+            row_idx_t = torch.tensor(
+                req_pool_idxs, dtype=torch.int64, device=device
+            )
+            old_starts_t = torch.tensor(
+                old_starts, dtype=torch.int64, device=device
+            )
+            lens_t = torch.tensor(lens, dtype=torch.int64, device=device)
+            flat_rows = torch.repeat_interleave(row_idx_t, lens_t)
+            cumsum_t = torch.cumsum(lens_t, dim=0)
+            cumulative_lengths = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int64, device=device),
+                    cumsum_t[:-1],
+                )
+            )
+            bases_per_pos = torch.repeat_interleave(
+                old_starts_t - cumulative_lengths, lens_t
+            )
+            flat_cols = (
+                torch.arange(total, dtype=torch.int64, device=device)
+                + bases_per_pos
+            )
+
+        free_slots = self.req_to_token_pool.req_to_token[flat_rows, flat_cols]
+        self.token_to_kv_pool_allocator.free_swa(free_slots)
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
