@@ -27,6 +27,13 @@
 #                        SWA on/off x overlap on/off matrix on static servers.
 #   DISABLE_OVERLAP=0|1  0 (default) keeps the scheduler overlap; 1 adds
 #                        --disable-overlap-schedule. Works for both paras and static.
+#   DISABLE_RADIX_CACHE=auto|0|1
+#                        auto (default) follows ENABLE_PARAS (paras=disabled, static=enabled).
+#                        Force 1 to add --disable-radix-cache regardless of ENABLE_PARAS;
+#                        force 0 to keep radix cache on. Needed for apples-to-apples paras
+#                        parity on static servers (paras requires --disable-radix-cache,
+#                        which forces SWAChunkCache instead of SWARadixCache; the latter
+#                        has known SWA-accounting drift).
 
 set -uo pipefail
 
@@ -63,6 +70,7 @@ export NVSHMEM_QP_DEPTH=${NVSHMEM_QP_DEPTH:-2048}
 PARAS_FLAGS=()
 HYBRID_SWA=${HYBRID_SWA:-auto}
 DISABLE_OVERLAP=${DISABLE_OVERLAP:-0}
+DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-auto}
 if [ "$ENABLE_PARAS" = "1" ]; then
     export SGLANG_ATTN_MAX_BS
     export PARAS_CONFIGURE_METHOD
@@ -71,7 +79,6 @@ if [ "$ENABLE_PARAS" = "1" ]; then
     PARAS_FLAGS=(
         --enable-paras-moe
         --paras-tp-size "$NUM_GPUS"
-        --disable-radix-cache
         --enable-nan-detection
     )
     if [ "${PARAS_AUTO_SWITCH:-1}" = "0" ]; then
@@ -95,6 +102,20 @@ OVERLAP_FLAGS=()
 if [ "$DISABLE_OVERLAP" = "1" ]; then
     OVERLAP_FLAGS=(--disable-overlap-schedule)
 fi
+# Resolve DISABLE_RADIX_CACHE=auto from ENABLE_PARAS (paras requires radix-off
+# for correct UMM init; static defaults to radix-on, but tests that compare to
+# paras should force radix-off for parity).
+if [ "$DISABLE_RADIX_CACHE" = "auto" ]; then
+    if [ "$ENABLE_PARAS" = "1" ]; then
+        DISABLE_RADIX_CACHE=1
+    else
+        DISABLE_RADIX_CACHE=0
+    fi
+fi
+RADIX_FLAGS=()
+if [ "$DISABLE_RADIX_CACHE" = "1" ]; then
+    RADIX_FLAGS=(--disable-radix-cache)
+fi
 
 paras_init_cuda_graph
 
@@ -112,6 +133,7 @@ python -m sglang.launch_server \
     --chunked-prefill-size -1 \
     "${HYBRID_SWA_FLAGS[@]}" \
     "${OVERLAP_FLAGS[@]}" \
+    "${RADIX_FLAGS[@]}" \
     "${CUDA_GRAPH_FLAGS[@]}" \
     "${PARAS_FLAGS[@]}" \
     "$@"

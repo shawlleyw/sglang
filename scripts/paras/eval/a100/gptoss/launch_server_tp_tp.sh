@@ -14,6 +14,10 @@
 #                        to walk the SWA on/off x overlap on/off matrix.
 #   DISABLE_OVERLAP=0|1  0 (default) keeps the scheduler overlap; 1 adds
 #                        --disable-overlap-schedule.
+#   DISABLE_RADIX_CACHE=0|1
+#                        0 (default) keeps the radix cache; 1 adds --disable-radix-cache.
+#                        Set to 1 for apples-to-apples parity with paras (which requires
+#                        radix-off for correct UMM init).
 
 set -uo pipefail
 
@@ -42,6 +46,7 @@ export SYNC_TOKEN_IDS_ACROSS_TP=1
 
 HYBRID_SWA=${HYBRID_SWA:-0}
 DISABLE_OVERLAP=${DISABLE_OVERLAP:-0}
+DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-0}
 HYBRID_SWA_FLAGS=()
 if [ "$HYBRID_SWA" = "0" ]; then
     HYBRID_SWA_FLAGS=(--disable-hybrid-swa-memory)
@@ -49,6 +54,10 @@ fi
 OVERLAP_FLAGS=()
 if [ "$DISABLE_OVERLAP" = "1" ]; then
     OVERLAP_FLAGS=(--disable-overlap-schedule)
+fi
+RADIX_FLAGS=()
+if [ "$DISABLE_RADIX_CACHE" = "1" ]; then
+    RADIX_FLAGS=(--disable-radix-cache)
 fi
 
 paras_init_cuda_graph
@@ -65,5 +74,6 @@ python -m sglang.launch_server \
     --chunked-prefill-size -1 \
     "${HYBRID_SWA_FLAGS[@]}" \
     "${OVERLAP_FLAGS[@]}" \
+    "${RADIX_FLAGS[@]}" \
     "${CUDA_GRAPH_FLAGS[@]}" \
     "$@"
