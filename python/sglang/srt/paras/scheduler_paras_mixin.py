@@ -340,6 +340,16 @@ class SchedulerParasMixin:
         while result_queue:
             tmp_batch, tmp_result = result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            # process_batch_result_prefill populates output_ids[0] on the
+            # newly-prefilled reqs but does NOT add them to running_batch.
+            # In normal overlap flow the next iter's get_next_batch_to_run
+            # calls merge_last_batch to absorb them; the switch path skips
+            # that iter and reads running_batch.reqs directly for global
+            # gather, so without an explicit merge here the just-prefilled
+            # reqs are silently dropped (causing the 37-req loss + apparent
+            # hang reproduced in the 20260516 smoke). Mirror the merge.
+            self.last_batch = tmp_batch
+            self.merge_last_batch()
         self.last_batch = None
         self.cur_batch = None
 
