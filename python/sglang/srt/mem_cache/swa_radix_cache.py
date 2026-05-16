@@ -57,14 +57,6 @@ class TreeNode:
         self.parent: TreeNode = None
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
-        # Number of positions in `value` that still have a non-zero entry in
-        # SWATokenToKVPoolAllocator.full_to_swa_index_mapping at the time the
-        # value was set. This can be < len(value) because ScheduleBatch._evict_swa
-        # frees the SWA backing of out-of-window positions during decode before
-        # those positions ever get inserted into the tree. Using `len(value)`
-        # for swa_evictable_size_ over-counts and drives the reported
-        # `swa_num_used` negative (see Task 2 of 20260516_paras_perf_followup).
-        self.swa_value_count: int = 0
         # swa_tombstone is used to indicate the kv indices have been freed for swa layers
         self.swa_tombstone = False
         # invariant: for any node, if swa_lock_ref is locked, full_lock_ref must be locked;
@@ -278,9 +270,7 @@ class LRUList:
         node = self.get_lru_no_lock()
         evictable_size = 0
         while self.in_list(node):
-            evictable_size += (
-                node.swa_value_count if self.swa else len(node.value)
-            )
+            evictable_size += len(node.value)
             node = self.get_prev_no_lock(node)
         return evictable_size
 
@@ -349,9 +339,7 @@ class SWARadixCache(BasePrefixCache):
     ):
         assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool_allocator: SWATokenToKVPoolAllocator = (
-            token_to_kv_pool_allocator
-        )
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
         self.disable = disable
         self.is_eagle = is_eagle
@@ -375,12 +363,6 @@ class SWARadixCache(BasePrefixCache):
 
         self.sliding_window_size = sliding_window_size
         self.reset()
-
-    def _count_swa_backed(self, value: torch.Tensor) -> int:
-        if value is None or value.numel() == 0:
-            return 0
-        mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
-        return int((mapping[value] > 0).sum().item())
 
     ##### Public API #####
 
@@ -621,9 +603,9 @@ class SWARadixCache(BasePrefixCache):
                 assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
 
                 # 1. free node kv indices, evict full and swa tokens
-                full_num_evicted += len(x.value)
-                swa_num_evicted += x.swa_value_count
                 self.token_to_kv_pool_allocator.free(x.value)
+                full_num_evicted += len(x.value)
+                swa_num_evicted += len(x.value)
 
                 # 2. get the next leaf, update the lru lists
                 x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
@@ -656,8 +638,8 @@ class SWARadixCache(BasePrefixCache):
 
                 if len(x.children) > 0:
                     # 1. an internal node, free swa tokens.
-                    swa_num_evicted += x.swa_value_count
                     self.token_to_kv_pool_allocator.free_swa(x.value)
+                    swa_num_evicted += len(x.value)
 
                     # 2. get the next node, update the lru lists
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
@@ -670,9 +652,9 @@ class SWARadixCache(BasePrefixCache):
                         x.full_lock_ref == 0
                     ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     # 1. a leaf node, free full and swa tokens
-                    full_num_evicted += len(x.value)
-                    swa_num_evicted += x.swa_value_count
                     self.token_to_kv_pool_allocator.free(x.value)
+                    full_num_evicted += len(x.value)
+                    swa_num_evicted += len(x.value)
 
                     # 2. get the next node, update the lru lists
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
@@ -717,8 +699,8 @@ class SWARadixCache(BasePrefixCache):
                     not node.swa_tombstone
                 ), f"inc_lock_swa on swa_tombstone node, {node.id=}"
                 if node.swa_lock_ref == 0:
-                    self.swa_evictable_size_ -= node.swa_value_count
-                    self.swa_protected_size_ += node.swa_value_count
+                    self.swa_evictable_size_ -= len(node.value)
+                    self.swa_protected_size_ += len(node.value)
                 node.swa_lock_ref += 1
                 swa_lock_size += len(node.value)
                 if swa_lock_size >= self.sliding_window_size:
@@ -757,8 +739,8 @@ class SWARadixCache(BasePrefixCache):
                 ), f"dec_lock_ref on node with {node.swa_lock_ref=}, {node.id=}"
 
                 if node.swa_lock_ref == 1:
-                    self.swa_evictable_size_ += node.swa_value_count
-                    self.swa_protected_size_ -= node.swa_value_count
+                    self.swa_evictable_size_ += len(node.value)
+                    self.swa_protected_size_ -= len(node.value)
                 node.swa_lock_ref -= 1
                 if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
                     dec_lock_swa = False
@@ -891,11 +873,6 @@ class SWARadixCache(BasePrefixCache):
         new_node.swa_lock_ref = child.swa_lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len]
-        # Split swa_value_count between the new prefix node and the original
-        # child. The new node owns positions [0, split_len); recount its
-        # SWA-backed entries from the mapping and give the child the remainder.
-        new_node.swa_value_count = self._count_swa_backed(new_node.value)
-        child.swa_value_count = max(0, child.swa_value_count - new_node.swa_value_count)
         # parent inherits the swa_uuid from child for swa lock ref
         new_node.swa_uuid = child.swa_uuid
         child.swa_uuid = None
@@ -960,13 +937,12 @@ class SWARadixCache(BasePrefixCache):
                     ), f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
                     self.token_to_kv_pool_allocator.free(node.value[first_diff_idx:])
                     node.value = value[:prefix_len]
-                    node.swa_value_count = self._count_swa_backed(node.value)
                     node.swa_tombstone = False
 
                     # insert the node into the lru lists
                     self.swa_lru_list.insert_mru(node)
 
-                    self.swa_evictable_size_ += node.swa_value_count
+                    self.swa_evictable_size_ += len(node.value)
                 else:
                     self.token_to_kv_pool_allocator.free(
                         value[first_diff_idx:prefix_len]
@@ -984,12 +960,11 @@ class SWARadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value
-            new_node.swa_value_count = self._count_swa_backed(value)
             self.full_lru_list.insert_mru(new_node)
             self.swa_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
-            self.swa_evictable_size_ += new_node.swa_value_count
+            self.swa_evictable_size_ += len(value)
         return total_prefix_length
 
     def _iteratively_delete_tombstone_leaf(
@@ -1025,12 +1000,12 @@ class SWARadixCache(BasePrefixCache):
                 break
         del node.parent.children[k]
         self.full_evictable_size_ -= len(node.key)
-        self.swa_evictable_size_ -= node.swa_value_count
+        self.swa_evictable_size_ -= len(node.key)
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
         node.swa_tombstone = True
-        self.swa_evictable_size_ -= node.swa_value_count
+        self.swa_evictable_size_ -= len(node.key)
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
         assert (
