@@ -9,6 +9,9 @@
 # Toggles:
 #   ENABLE_CUDA_GRAPH=0  Pass --disable-cuda-graph (default 1).
 #   CUDA_GRAPH_MAX_BS=N  Pass --cuda-graph-max-bs N (only honored when ENABLE_CUDA_GRAPH=1).
+#   DISABLE_RADIX_CACHE=0|1
+#                        1 (default) adds --disable-radix-cache. Matches paras's required
+#                        radix-off. Set 0 to keep radix.
 
 set -uo pipefail
 
@@ -35,6 +38,12 @@ unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
 # structurally fair comparison and to inherit the same safety net.
 export SYNC_TOKEN_IDS_ACROSS_TP=1
 
+DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-1}
+RADIX_FLAGS=()
+if [ "$DISABLE_RADIX_CACHE" = "1" ]; then
+    RADIX_FLAGS=(--disable-radix-cache)
+fi
+
 paras_init_cuda_graph
 
 python -m sglang.launch_server \
@@ -45,4 +54,5 @@ python -m sglang.launch_server \
     --tp-size "$NUM_GPUS" \
     --max-running-requests "$MAX_RUNNING_REQUESTS" \
     --chunked-prefill-size -1 \
+    "${RADIX_FLAGS[@]}" \
     "${CUDA_GRAPH_FLAGS[@]}"

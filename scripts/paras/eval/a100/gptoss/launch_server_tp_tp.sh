@@ -15,9 +15,9 @@
 #   DISABLE_OVERLAP=0|1  0 (default) keeps the scheduler overlap; 1 adds
 #                        --disable-overlap-schedule.
 #   DISABLE_RADIX_CACHE=0|1
-#                        0 (default) keeps the radix cache; 1 adds --disable-radix-cache.
-#                        Set to 1 for apples-to-apples parity with paras (which requires
-#                        radix-off for correct UMM init).
+#                        1 (default) adds --disable-radix-cache. Matches paras's required
+#                        radix-off (avoids SWARadixCache's SWA-accounting drift / leak
+#                        check at idle when SWA is also enabled). Set 0 to keep radix.
 
 set -uo pipefail
 
@@ -46,7 +46,7 @@ export SYNC_TOKEN_IDS_ACROSS_TP=1
 
 HYBRID_SWA=${HYBRID_SWA:-0}
 DISABLE_OVERLAP=${DISABLE_OVERLAP:-0}
-DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-0}
+DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-1}
 HYBRID_SWA_FLAGS=()
 if [ "$HYBRID_SWA" = "0" ]; then
     HYBRID_SWA_FLAGS=(--disable-hybrid-swa-memory)
