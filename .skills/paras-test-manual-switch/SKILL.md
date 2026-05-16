@@ -168,8 +168,8 @@ Per-model launcher only sets `MODEL_PATH` and `MEM_FRACTION_STATIC`:
   paras testing (per-rank weights ≈ 57 GiB at TP=4).
 
 Both `launch_server_dp_ep.sh` add `--enable-paras-moe --paras-tp-size $NUM_GPUS
---enable-nan-detection --chunked-prefill-size -1 --disable-radix-cache` under
-`ENABLE_PARAS=1`, plus PARAS env vars (`PARAS_CONFIGURE_METHOD=peer_access`,
+--chunked-prefill-size -1 --disable-radix-cache` under `ENABLE_PARAS=1`,
+plus PARAS env vars (`PARAS_CONFIGURE_METHOD=peer_access`,
 `PARAS_KV_TRANSFER_METHOD=peer_access`).
 
 ### 3. Wait for server ready

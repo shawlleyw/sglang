@@ -105,7 +105,6 @@ paras_launch_setup_dp_ep() {
         PARAS_FLAGS=(
             --enable-paras-moe
             --paras-tp-size "$NUM_GPUS"
-            --enable-nan-detection
         )
         if [ "${PARAS_AUTO_SWITCH:-1}" = "0" ]; then
             PARAS_FLAGS+=(--no-paras-auto-switch)
