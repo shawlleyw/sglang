@@ -11,11 +11,12 @@
 #   ENABLE_PARAS=1       Bake in ParaS EP↔TP switching (--enable-paras-moe + canonical defaults).
 #                        Shifts: MEM_FRACTION_STATIC→0.7, MAX_RUNNING_REQUESTS→1024,
 #                        SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK→512,
-#                        ENABLE_CUDA_GRAPH→0 (qwen ParaS canonical = eager).
+#                        CUDA_GRAPH_MAX_BS→8 (cuda graphs stay enabled; small default
+#                        keeps capture cheap for the canonical paras workload).
 #                        Adds --chunked-prefill-size -1 --max-prefill-tokens 32000
 #                        plus PARAS_* env vars. Overlap scheduling stays enabled
 #                        (drain-on-switch is handled by SchedulerParasMixin).
-#   ENABLE_CUDA_GRAPH=0  Pass --disable-cuda-graph (default 1; auto-flipped to 0 under ENABLE_PARAS).
+#   ENABLE_CUDA_GRAPH=0  Pass --disable-cuda-graph (default 1).
 #   CUDA_GRAPH_MAX_BS=N  Pass --cuda-graph-max-bs N (only honored when ENABLE_CUDA_GRAPH=1).
 #   DISABLE_OVERLAP=0|1  0 (default) keeps the scheduler overlap; 1 adds
 #                        --disable-overlap-schedule.
@@ -42,7 +43,8 @@ if [ "$ENABLE_PARAS" = "1" ]; then
     : "${SGLANG_ATTN_MAX_BS:=256}"
     : "${PARAS_CONFIGURE_METHOD:=peer_access}"
     : "${PARAS_KV_TRANSFER_METHOD:=peer_access}"
-    : "${ENABLE_CUDA_GRAPH:=0}"
+    : "${PARAS_DISABLE_PEER_ACCESS:=0}"
+    : "${CUDA_GRAPH_MAX_BS:=8}"
 fi
 
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}

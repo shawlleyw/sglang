@@ -238,9 +238,11 @@ Every server-launch dir contains `server_launch.cmd.txt` with the exact bash inv
 
 Both should match (modulo defaults). Discrepancies indicate either a typo in the driver or an env var that didn't propagate. Drivers in this skill (`run_sweep.sh`, `run_smoke.sh`) emit `server_launch.cmd.txt` automatically.
 
-## Memory + cuda-graph caps per server class (gpt-oss-120b)
+## Memory + cuda-graph caps per (hardware, model, server class)
 
-Subset of the "Canonical runtime options" table above, for quick reference when sizing a sweep on 8 × A100-80GB:
+Subset of the "Canonical runtime options" table above, for quick reference when sizing a sweep. Override via env at the driver:
+
+### 8 × A100-80GB · gpt-oss-120b
 
 | Server | MEM_FRACTION_STATIC | MAX_RUNNING_REQUESTS | CUDA_GRAPH_MAX_BS | DeepEP dispatch cap |
 |---|---:|---:|---:|---:|
@@ -250,7 +252,27 @@ Subset of the "Canonical runtime options" table above, for quick reference when 
 
 gpt-oss-120b OOMs at mfs=0.80 in ep-static / paras configs (DeepEP buffers + dual cuda-graph capture).
 
-`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256` always when DeepEP is in use (NVSHMEM_QP_DEPTH constraint).
+### 8 × A100-80GB · Qwen3-30B-A3B
+
+| Server | MEM_FRACTION_STATIC | MAX_RUNNING_REQUESTS | CUDA_GRAPH_MAX_BS | DeepEP dispatch cap |
+|---|---:|---:|---:|---:|
+| tp-static | 0.85 | 2048 | 256 | n/a |
+| ep-static | 0.85 | 2048 | 256 | 512 (DeepEP default for qwen on A100) |
+| paras-t* | 0.60 (launcher default; override via driver) | 2048 | 8 (launcher default; override via driver) | 256 |
+
+### 8 × H200 · Qwen3-235B-A22B-Instruct-2507
+
+| Server | MEM_FRACTION_STATIC | MAX_RUNNING_REQUESTS | CUDA_GRAPH_MAX_BS | DeepEP dispatch cap |
+|---|---:|---:|---:|---:|
+| tp-static | 0.85 | 2048 | 256 | n/a |
+| ep-static | 0.85 | 2048 | 256 | 512 |
+| paras-t* | 0.70 (launcher default; override via driver) | 2048 | 8 (launcher default; override via driver) | 512 |
+
+### Notes
+
+- `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256` always when paras is enabled (NVSHMEM_QP_DEPTH constraint). Static EP can use 512.
+- Launcher paras defaults for `CUDA_GRAPH_MAX_BS=8` are intentionally small — keeps capture cost low at boot when the canonical paras workload is small. Production sweeps override to 256 via driver env. **All paras launchers keep `ENABLE_CUDA_GRAPH=1`**; cuda graphs are always on under paras.
+- Launcher paras defaults for `MEM_FRACTION_STATIC` (0.60 a100/qwen, 0.70 h200/qwen, 0.80 a100/gptoss) leave headroom for the dual cuda-graph capture and the UMM contiguous slab. Drivers can raise if validated for a specific workload.
 
 ## Pre-sampling (deterministic snapshots)
 
