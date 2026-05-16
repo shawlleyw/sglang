@@ -17,6 +17,8 @@
 #                        (drain-on-switch is handled by SchedulerParasMixin).
 #   ENABLE_CUDA_GRAPH=0  Pass --disable-cuda-graph (default 1; auto-flipped to 0 under ENABLE_PARAS).
 #   CUDA_GRAPH_MAX_BS=N  Pass --cuda-graph-max-bs N (only honored when ENABLE_CUDA_GRAPH=1).
+#   DISABLE_OVERLAP=0|1  0 (default) keeps the scheduler overlap; 1 adds
+#                        --disable-overlap-schedule.
 #   DISABLE_RADIX_CACHE=0|1
 #                        1 (default) adds --disable-radix-cache. Required for paras
 #                        (correct UMM init) and also forces SWAChunkCache on static
@@ -56,6 +58,7 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${SGLANG_DEEPEP_NUM_MAX_DI
 export NVSHMEM_QP_DEPTH=${NVSHMEM_QP_DEPTH:-2048}
 
 PARAS_FLAGS=()
+DISABLE_OVERLAP=${DISABLE_OVERLAP:-0}
 DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-1}
 if [ "$ENABLE_PARAS" = "1" ]; then
     export SGLANG_ATTN_MAX_BS
@@ -67,6 +70,10 @@ if [ "$ENABLE_PARAS" = "1" ]; then
         --max-prefill-tokens 32000
         --enable-nan-detection
     )
+fi
+OVERLAP_FLAGS=()
+if [ "$DISABLE_OVERLAP" = "1" ]; then
+    OVERLAP_FLAGS=(--disable-overlap-schedule)
 fi
 RADIX_FLAGS=()
 if [ "$DISABLE_RADIX_CACHE" = "1" ]; then
@@ -85,6 +92,7 @@ python -m sglang.launch_server \
     --moe-a2a-backend deepep --deepep-mode auto \
     --max-running-requests "$MAX_RUNNING_REQUESTS" \
     --chunked-prefill-size -1 \
+    "${OVERLAP_FLAGS[@]}" \
     "${RADIX_FLAGS[@]}" \
     "${CUDA_GRAPH_FLAGS[@]}" \
     "${PARAS_FLAGS[@]}" \
