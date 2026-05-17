@@ -540,7 +540,7 @@ class SchedulerParasMixin:
                 precheck_details["new_req_pool_size"],
             )
             self._paras_restore_ep_state_after_aborted_tp_switch()
-            return
+            return True
 
         with TimeReporter("reorchestrate_cache"):
             paras_gather_manager.reorchestrate_cache()
@@ -683,7 +683,7 @@ class SchedulerParasMixin:
                     ep_precheck_details["new_req_pool_size"],
                 )
                 self._paras_restore_tp_state_after_aborted_ep_switch()
-                return
+                return True
 
             with TimeReporter("reorchestrate_cache"):
                 paras_scatter_manager.reorchestrate_cache()
@@ -752,10 +752,37 @@ class SchedulerParasMixin:
         torch.cuda.synchronize()
 
     def paras_configure_handle(self, recv_req: ParaSConfigureReqInput):
+        # A successful switch swaps self.send_to_tokenizer to the post-switch
+        # variant (tp_send_to_tokenizer or ep_send_to_tokenizer) BEFORE
+        # process_input_requests auto-emits this handler's return value, and
+        # that swap silently drops the emission on non-designated ranks via
+        # SenderWrapper(None) so the reply count matches the cardinality
+        # TokenizerManager.paras_configure_{tp,ep} pre-set on the communicator
+        # (fan_out = paras_dp_size for TP-target; fan_out = server_args.dp_size
+        # for EP-target). A precheck-rejected switch returns BEFORE that swap,
+        # so the auto-emit would fire from every rank under the current
+        # (pre-switch) sender topology and overflow the communicator's
+        # _result_values=None state after the first reply lands -- crashing
+        # TokenizerManager at tokenizer_communicator_mixin.py:163 with
+        # AttributeError on .append. To mirror the success path's
+        # send-suppression on the rejection path, emit the reply ourselves
+        # via the POST-target-mode sender (whose null-wrapper distribution
+        # naturally gates emissions to the expected count) and return None so
+        # process_input_requests does not auto-emit a second time.
         if recv_req.type == ParaSConfigureReqType.CONFIGURE_TP:
-            self.paras_configure_tp()
+            rejected = self.paras_configure_tp()
+            if rejected:
+                self.tp_send_to_tokenizer.send_output(
+                    ParaSConfigureReqOutput(), recv_req
+                )
+                return None
         elif recv_req.type == ParaSConfigureReqType.CONFIGURE_EP:
-            self.paras_configure_ep()
+            rejected = self.paras_configure_ep()
+            if rejected:
+                self.ep_send_to_tokenizer.send_output(
+                    ParaSConfigureReqOutput(), recv_req
+                )
+                return None
         else:
             raise ValueError(f"Unrecognized ParaSConfigureReqType: {recv_req.type}")
         return ParaSConfigureReqOutput()
