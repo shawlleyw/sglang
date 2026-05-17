@@ -192,7 +192,79 @@ class ParaSReqGatherManager:
         if paras_tp_rank == 0:
             return list(self.global_waiting_reqs)
         return []
-        
+
+    def precheck_tp_capacity(
+        self,
+        new_req_pool_size: Optional[int] = None,
+        new_cache_size: Optional[int] = None,
+        new_cache_size_swa: Optional[int] = None,
+    ) -> Tuple[bool, str, dict]:
+        """Read-only precheck for ``reorchestrate_cache``.
+
+        For models where ``num_kv_heads < paras_tp_size`` (e.g. Qwen3-235B has
+        ``num_kv_heads=4`` at ``paras_tp_size=8``), KV heads are replicated
+        across ranks in TP mode, which roughly halves the effective KV-cache
+        capacity vs the EP-mode pool. Under heavy in-flight load, an EP->TP
+        switch can therefore overflow the smaller TP pool and the existing
+        asserts at the top of ``reorchestrate_cache`` crash the scheduler
+        irrecoverably (observed in the N=2048 paras-t128 rollout sweep).
+
+        Must be called AFTER ``gather_global_reqs`` (so ``self.num_global_tokens``
+        and ``self.global_reqs`` are populated) and BEFORE
+        ``reorchestrate_cache`` (so the caller can abort the switch gracefully
+        instead of crashing inside the destructive pool resize).
+
+        Mirrors the capacity computation in ``reorchestrate_cache`` exactly so
+        the precheck is a faithful predicate over the same asserts.
+
+        Returns:
+            ok: True if the planned TP pools can hold the in-flight workload.
+            reason: empty string when ok; human-readable explanation otherwise.
+            details: dict with ``num_global_tokens``, ``new_cache_size``,
+                ``num_reqs``, ``new_req_pool_size`` for structured logging by
+                the caller.
+
+        Does NOT mutate any pool state.
+        """
+        mgr = get_global_paras_memory_manager()
+        if new_req_pool_size is None:
+            new_req_pool_size = mgr.get_tp_max_num_reqs()
+
+        is_swa_alloc = isinstance(
+            self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+        )
+        if is_swa_alloc:
+            if new_cache_size is None:
+                new_cache_size = mgr.get_tp_max_kv_tokens()
+            if new_cache_size_swa is None:
+                new_cache_size_swa = mgr.get_tp_max_kv_tokens("swa")
+        else:
+            if new_cache_size is None:
+                new_cache_size = mgr.get_tp_max_kv_tokens()
+
+        num_reqs = len(self.global_reqs)
+        details = {
+            "num_global_tokens": int(self.num_global_tokens),
+            "new_cache_size": int(new_cache_size),
+            "num_reqs": int(num_reqs),
+            "new_req_pool_size": int(new_req_pool_size),
+        }
+
+        # Mirror reorchestrate_cache asserts (KV pool + req pool).
+        if self.num_global_tokens > new_cache_size:
+            return False, (
+                f"in-flight KV total ({self.num_global_tokens} tokens) exceeds "
+                f"TP-mode cache capacity ({new_cache_size} tokens)"
+            ), details
+
+        if num_reqs > new_req_pool_size:
+            return False, (
+                f"in-flight req count ({num_reqs}) exceeds TP-mode req pool "
+                f"size ({new_req_pool_size})"
+            ), details
+
+        return True, "", details
+
     def reorchestrate_cache(
         self, 
         new_req_pool_size: Optional[int] = None,

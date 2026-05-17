@@ -24,7 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 
 from sglang.srt.paras.utils import paras_func, paras_profile_func
-from sglang.srt.paras.gather_manager import ParaSReqGatherManager
+from sglang.srt.paras.gather_manager import ParaSReqGatherManager, recover_request
 from sglang.srt.paras.scatter_manager import ParaSReqScatterManager
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import MoeA2ABackend
@@ -366,6 +366,37 @@ class SchedulerParasMixin:
             policy.cooldown_until, time.time() + policy.cooldown_sec
         )
 
+    def _paras_restore_ep_state_after_aborted_tp_switch(self) -> None:
+        # Roll back the EP->TP preamble in paras_configure_tp when the
+        # capacity precheck aborts the switch. Undoes (in reverse order):
+        #   1. prune_request mutations on running_batch.reqs and waiting_queue
+        #      applied by paras_tp_group_all_gather_reqs (it nulls
+        #      tokenizer / radix-tree linkage on every local req to keep
+        #      pickle off GPU tensors). Without this restore the scheduler
+        #      would dereference None on the next prefill/decode iteration.
+        #   2. profiler started by paras_start_profile (no destructive side
+        #      effect, but leaving it running leaks a profiler context).
+        #   3. server_args + global moe_a2a_backend mutations -- mirrors the
+        #      EP epilogue in paras_configure_ep so subsequent EP iterations
+        #      see a coherent config.
+        # tree_cache.reset() and merge_last_batch() are NOT reverted: the
+        # radix tree rebuilds naturally on subsequent prefills, and the
+        # merged running_batch is already the correct EP-mode state.
+        if self.running_batch is not None:
+            for req in self.running_batch.reqs:
+                recover_request(req, self.tree_cache, self.tokenizer)
+        for req in self.waiting_queue:
+            recover_request(req, self.tree_cache, self.tokenizer)
+
+        self.paras_stop_profile()
+
+        self.paras_parallelism_config = "EP"
+        self.server_args.enable_dp_attention = True
+        self.server_args.moe_a2a_backend = MoeA2ABackend.DEEPEP.value
+        self.server_args.dp_size = self.paras_ep_size
+        self.server_args.ep_size = self.paras_ep_size
+        moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.DEEPEP
+
     def paras_auto_pick_signal(self) -> Optional[ParaSAutoSwitchReq]:
         assert self._paras_auto_policy is not None
         target = self._paras_auto_policy.pick_target(
@@ -452,7 +483,36 @@ class SchedulerParasMixin:
         
         with TimeReporter("gather_global_reqs"):
             paras_gather_manager.gather_global_reqs()
-        
+
+        # Capacity precheck. For models with num_kv_heads < paras_tp_size
+        # (e.g. Qwen3-235B: num_kv_heads=4 at paras_tp_size=8 -> KV heads
+        # replicated 2x across ranks), the TP-mode KV pool is roughly half
+        # the EP-mode pool. Under heavy in-flight load an EP->TP switch can
+        # overflow the smaller TP pool. Detect that here and abort the
+        # switch gracefully -- staying in EP, restoring preamble state --
+        # instead of letting the asserts in reorchestrate_cache crash the
+        # scheduler (observed in the N=2048 paras-t128 rollout sweep on
+        # 2026-05-16). The autoswitch policy's cooldown was already
+        # extended by _paras_auto_clear_window_on_switch above, so the
+        # natural retry spacing applies.
+        precheck_ok, precheck_reason, precheck_details = (
+            paras_gather_manager.precheck_tp_capacity()
+        )
+        if not precheck_ok:
+            logger.warning(
+                "ParaS EP->TP switch rejected by precheck: %s | "
+                "num_global_tokens=%d new_cache_size=%d "
+                "num_reqs=%d new_req_pool_size=%d. "
+                "Staying in EP; autoswitch will retry after cooldown.",
+                precheck_reason,
+                precheck_details["num_global_tokens"],
+                precheck_details["new_cache_size"],
+                precheck_details["num_reqs"],
+                precheck_details["new_req_pool_size"],
+            )
+            self._paras_restore_ep_state_after_aborted_tp_switch()
+            return
+
         with TimeReporter("reorchestrate_cache"):
             paras_gather_manager.reorchestrate_cache()
         
