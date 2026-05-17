@@ -366,6 +366,35 @@ class SchedulerParasMixin:
             policy.cooldown_until, time.time() + policy.cooldown_sec
         )
 
+    def _paras_restore_tp_state_after_aborted_ep_switch(self) -> None:
+        # Roll back the TP->EP preamble in paras_configure_ep when the
+        # capacity precheck aborts the switch. Asymmetric vs the EP->TP
+        # restore: paras_configure_ep defers all server_args /
+        # parallelism_config / MOE_A2A_BACKEND mutations until AFTER
+        # reorchestrate_cache succeeds, so the preamble has only two
+        # things to undo (in reverse order):
+        #   1. prune_request mutations applied by the ParaSReqScatterManager
+        #      constructor on local_waiting_reqs (via
+        #      paras_tp_group_all_gather_reqs). Rank 0's waiting_queue items
+        #      are pruned in place; other ranks pass an empty list so are
+        #      no-ops. running_batch.reqs are NOT pruned by the scatter
+        #      ctor, but tree_cache.reset() ran earlier so their stale
+        #      last_host_node / last_node references must be re-linked to
+        #      the new (empty) root via recover_request -- defensively
+        #      iterating over them too costs nothing and matches the EP->TP
+        #      restore's symmetry.
+        #   2. profiler started by paras_start_profile.
+        # tree_cache.reset() and merge_last_batch() are NOT reverted: the
+        # radix tree rebuilds on subsequent prefills, and the merged
+        # running_batch is the correct TP-mode resume state.
+        if self.running_batch is not None:
+            for req in self.running_batch.reqs:
+                recover_request(req, self.tree_cache, self.tokenizer)
+        for req in self.waiting_queue:
+            recover_request(req, self.tree_cache, self.tokenizer)
+
+        self.paras_stop_profile()
+
     def _paras_restore_ep_state_after_aborted_tp_switch(self) -> None:
         # Roll back the EP->TP preamble in paras_configure_tp when the
         # capacity precheck aborts the switch. Undoes (in reverse order):
@@ -625,6 +654,36 @@ class SchedulerParasMixin:
 
         with TimeReporter("partition_requests"):
             paras_scatter_manager.partition_requests()
+
+            # Capacity precheck (TP->EP direction). Defensive parity with
+            # the EP->TP precheck: although the current Qwen3+TP=8 config
+            # makes the EP pool >= the TP pool, a different model / memory
+            # config could make EP pool axes smaller and the per-rank
+            # asserts in the scatter manager's reorchestrate_cache would
+            # then crash the scheduler the same way the gather path did.
+            # Checks the worst-loaded rank using the deterministic
+            # partition so every rank arrives at the same accept/reject
+            # decision without a collective. The autoswitch policy's
+            # cooldown was already extended by
+            # _paras_auto_clear_window_on_switch above, so natural retry
+            # spacing applies.
+            ep_precheck_ok, ep_precheck_reason, ep_precheck_details = (
+                paras_scatter_manager.precheck_ep_capacity()
+            )
+            if not ep_precheck_ok:
+                logger.warning(
+                    "ParaS TP->EP switch rejected by precheck: %s | "
+                    "max_tokens_per_rank=%d new_ep_cache_size=%d "
+                    "max_reqs_per_rank=%d new_req_pool_size=%d. "
+                    "Staying in TP; autoswitch will retry after cooldown.",
+                    ep_precheck_reason,
+                    ep_precheck_details["max_tokens_per_rank"],
+                    ep_precheck_details["new_ep_cache_size"],
+                    ep_precheck_details["max_reqs_per_rank"],
+                    ep_precheck_details["new_req_pool_size"],
+                )
+                self._paras_restore_tp_state_after_aborted_ep_switch()
+                return
 
             with TimeReporter("reorchestrate_cache"):
                 paras_scatter_manager.reorchestrate_cache()

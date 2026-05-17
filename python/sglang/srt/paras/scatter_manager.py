@@ -7,7 +7,7 @@ Contains:
 - ParaSReqScatterManager
 """
 
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 import os
 import torch
 import torch.distributed as dist
@@ -185,6 +185,11 @@ class ParaSReqScatterManager:
         partitions = partition_requests_for_ep(
             self.global_reqs, self.paras_tp_size
         )
+        # Retain the full per-rank breakdown so precheck_ep_capacity can
+        # compute max-per-rank load deterministically without recomputing
+        # the partition (the strategy is a pure function per its docstring,
+        # so every rank holds an identical _all_partitions list).
+        self._all_partitions: List[List[Req]] = partitions
         self.local_reqs = partitions[self.paras_tp_rank]
         self.local_seqlens_list = [req.seqlen for req in self.local_reqs]
         self.num_local_tokens = sum(s - 1 for s in self.local_seqlens_list)
@@ -214,6 +219,93 @@ class ParaSReqScatterManager:
     # ------------------------------------------------------------------
     # Step 2: shrink pools to EP capacity
     # ------------------------------------------------------------------
+
+    def precheck_ep_capacity(
+        self,
+        new_ep_cache_size: Optional[int] = None,
+        new_req_pool_size: Optional[int] = None,
+        new_ep_cache_size_swa: Optional[int] = None,
+    ) -> Tuple[bool, str, dict]:
+        """Read-only precheck for ``reorchestrate_cache`` (TP->EP direction).
+
+        Symmetric counterpart of ``ParaSReqGatherManager.precheck_tp_capacity``
+        for defensive parity: even though for current Qwen3+TP=8 the EP-mode
+        pool is always >= the TP-mode pool, a different model / memory config
+        could make the EP req-pool or KV-pool smaller along some axis and the
+        existing asserts at the top of ``reorchestrate_cache`` would crash
+        the scheduler the same way the EP->TP path did.
+
+        The scatter-side asserts are PER-RANK (``num_local_tokens`` and
+        ``len(local_reqs)``), so a faithful precheck must check the
+        worst-loaded rank to guarantee no rank overflows. We rely on the
+        deterministic ``_greedy_partition`` strategy (pure function of
+        ``(global_reqs, num_ranks)`` per its docstring) and read
+        ``self._all_partitions`` populated by ``partition_requests``, so
+        every rank arrives at the identical accept/reject decision without
+        any collective.
+
+        Must be called AFTER ``partition_requests`` (so ``self._all_partitions``
+        is populated) and BEFORE ``reorchestrate_cache`` (so the caller can
+        abort gracefully instead of crashing inside the destructive resize).
+
+        Mirrors the capacity computation in ``reorchestrate_cache`` exactly so
+        the precheck is a faithful predicate over the same asserts.
+
+        Returns:
+            ok: True if every rank's planned slice fits its EP pool.
+            reason: empty string when ok; human-readable explanation otherwise.
+            details: dict with ``max_tokens_per_rank``, ``new_ep_cache_size``,
+                ``max_reqs_per_rank``, ``new_req_pool_size`` for structured
+                logging by the caller.
+
+        Does NOT mutate any pool state.
+        """
+        mgr = get_global_paras_memory_manager()
+        if new_req_pool_size is None:
+            new_req_pool_size = mgr.get_ep_max_num_reqs()
+
+        is_swa_alloc = isinstance(
+            self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+        )
+        if is_swa_alloc:
+            if new_ep_cache_size is None:
+                new_ep_cache_size = mgr.get_ep_max_kv_tokens()
+            if new_ep_cache_size_swa is None:
+                new_ep_cache_size_swa = mgr.get_ep_max_kv_tokens("swa")
+        else:
+            if new_ep_cache_size is None:
+                new_ep_cache_size = mgr.get_ep_max_kv_tokens()
+
+        # Worst-loaded rank wins -- guarantees no rank's per-rank assert in
+        # reorchestrate_cache will fire.
+        max_reqs_per_rank = max(
+            (len(p) for p in self._all_partitions), default=0
+        )
+        max_tokens_per_rank = max(
+            (sum(req.seqlen - 1 for req in p) for p in self._all_partitions),
+            default=0,
+        )
+
+        details = {
+            "max_tokens_per_rank": int(max_tokens_per_rank),
+            "new_ep_cache_size": int(new_ep_cache_size),
+            "max_reqs_per_rank": int(max_reqs_per_rank),
+            "new_req_pool_size": int(new_req_pool_size),
+        }
+
+        if max_tokens_per_rank > new_ep_cache_size:
+            return False, (
+                f"worst-rank in-flight KV ({max_tokens_per_rank} tokens) "
+                f"exceeds EP-mode cache capacity ({new_ep_cache_size} tokens)"
+            ), details
+
+        if max_reqs_per_rank > new_req_pool_size:
+            return False, (
+                f"worst-rank in-flight req count ({max_reqs_per_rank}) "
+                f"exceeds EP-mode req pool size ({new_req_pool_size})"
+            ), details
+
+        return True, "", details
 
     def reorchestrate_cache(
         self,
