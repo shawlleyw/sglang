@@ -70,6 +70,14 @@ class ParasPerStepMetricsSampler:
         self._writer: Any = None
         self._active: bool = False
 
+    def is_active(self) -> bool:
+        """True iff this rank is the writer rank AND start() succeeded.
+
+        Used by Scheduler.run_batch to gate the per-step
+        torch.cuda.synchronize() so non-writer ranks pay zero overhead.
+        """
+        return self._active
+
     def start(self) -> None:
         # Distributed-correctness gate: only rank 0 writes the metrics file.
         if getattr(self.scheduler, "tp_rank", 0) != 0:

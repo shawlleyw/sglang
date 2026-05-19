@@ -2021,11 +2021,12 @@ class Scheduler(
                 req.time_stats.prefill_start_time = current_time
 
         # Per-step metrics: start the host-clock timer for the forward window.
-        # Recorder is None unless --paras-per-step-metrics-file is set, so the
-        # branch is free for production. On non-rank-0 the recorder's start()
-        # was a no-op and record() will be a no-op; we still avoid the
-        # synchronize cost by gating on the rank-0 sampler being active.
-        if self._paras_per_step_metrics_sampler is not None:
+        # Gated on sampler.is_active() so the synchronize + record path runs
+        # ONLY on the writer rank (tp_rank == 0). Non-writer ranks pay zero
+        # per-step overhead. Production paths (arg unset) also pay zero cost
+        # because the sampler is None.
+        if (self._paras_per_step_metrics_sampler is not None
+                and self._paras_per_step_metrics_sampler.is_active()):
             _paras_step_t0 = time.perf_counter()
         else:
             _paras_step_t0 = None
