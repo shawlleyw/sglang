@@ -449,6 +449,7 @@ class ServerArgs:
     paras_auto_switch_window: Optional[int] = None
     paras_auto_switch_cooldown_sec: Optional[float] = None
     paras_metrics_file: Optional[str] = None
+    paras_per_step_metrics_file: Optional[str] = None
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -3147,6 +3148,17 @@ class ServerArgs:
             type=str,
             default=ServerArgs.paras_metrics_file,
             help="CSV path for per-second ParaS metrics (mode, running, waiting, throughput). Only tp_rank 0 writes.",
+        )
+        parser.add_argument(
+            "--paras-per-step-metrics-file",
+            type=str,
+            default=ServerArgs.paras_per_step_metrics_file,
+            help=(
+                "CSV path for per-forward-step ParaS metrics (one row per scheduler step: "
+                "step_idx, mode, forward_mode, batch sizes, num_tokens, step_latency_ms, ...). "
+                "Adds torch.cuda.synchronize() per step to measure GPU-completed forward "
+                "latency; intended for batch-size microbench, NOT production. Only tp_rank 0 writes."
+            ),
         )
         parser.add_argument(
             "--elastic-ep-backend",

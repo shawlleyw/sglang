@@ -529,6 +529,19 @@ class Scheduler(
             )
             self._paras_metrics_sampler.start()
 
+        # Per-forward-step metrics sampler (synchronous, called from run_batch).
+        # Adds torch.cuda.synchronize() per step, so intended for microbench only.
+        self._paras_per_step_metrics_sampler = None
+        if server_args.paras_per_step_metrics_file:
+            from sglang.srt.managers.paras_per_step_metrics_sampler import (
+                ParasPerStepMetricsSampler,
+            )
+
+            self._paras_per_step_metrics_sampler = ParasPerStepMetricsSampler(
+                self, server_args.paras_per_step_metrics_file
+            )
+            self._paras_per_step_metrics_sampler.start()
+
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 
@@ -2007,6 +2020,16 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_start_time = current_time
 
+        # Per-step metrics: start the host-clock timer for the forward window.
+        # Recorder is None unless --paras-per-step-metrics-file is set, so the
+        # branch is free for production. On non-rank-0 the recorder's start()
+        # was a no-op and record() will be a no-op; we still avoid the
+        # synchronize cost by gating on the rank-0 sampler being active.
+        if self._paras_per_step_metrics_sampler is not None:
+            _paras_step_t0 = time.perf_counter()
+        else:
+            _paras_step_t0 = None
+
         # Run forward
         if self.is_generation:
             batch_or_worker_batch = batch
@@ -2105,6 +2128,16 @@ class Scheduler(
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)
+
+        # Per-step metrics: synchronize the GPU to get accurate GPU-completed
+        # forward latency, then record this step. With --disable-overlap-schedule
+        # the synchronize is essentially free (would happen at the next step
+        # boundary anyway). Without overlap disabled, this WILL serialize the
+        # pipeline - that is the intended cost for measurement accuracy.
+        if _paras_step_t0 is not None:
+            torch.get_device_module(self.device).synchronize()
+            _paras_step_latency_ms = (time.perf_counter() - _paras_step_t0) * 1000.0
+            self._paras_per_step_metrics_sampler.record(batch, _paras_step_latency_ms)
 
         # Capture prefill end time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
