@@ -300,7 +300,18 @@ class SchedulerParasMixin:
                 self.max_running_requests = _paras_mgr.get_tp_max_running_requests()
             else:
                 self.max_running_requests = _paras_mgr.get_ep_max_running_requests()
-        
+
+        # Refresh pp_max_micro_batch_size to track the post-switch per-mode cap.
+        # Without this, the scheduler's admission gate
+        # (Scheduler.get_num_allocatable_reqs in managers/scheduler.py, which
+        # returns pp_max_micro_batch_size - running_bs) keeps using the
+        # boot-time EP per-rank value (max_running_requests // dp_size) and
+        # silently caps paras-tp's running batch at the EP slice even after
+        # configure_tp updates self.max_running_requests to the global cap.
+        get_global_server_args().pp_max_micro_batch_size = max(
+            self.max_running_requests // max(self.server_args.pp_size, 1), 1
+        )
+
     def paras_check(self):
         # Canary: log if running_batch ever contains a req with output_ids=[].
         # This state was thought unreachable in normal mode (all reqs entering
