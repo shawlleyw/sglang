@@ -2020,16 +2020,22 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_start_time = current_time
 
-        # Per-step metrics: start the host-clock timer for the forward window.
-        # Gated on sampler.is_active() so the synchronize + record path runs
-        # ONLY on the writer rank (tp_rank == 0). Non-writer ranks pay zero
-        # per-step overhead. Production paths (arg unset) also pay zero cost
-        # because the sampler is None.
+        # Per-step metrics: paired CUDA Events bracketing the forward stream's
+        # kernel sequence. Recorded on `self.forward_stream` when overlap is
+        # enabled, otherwise the current (default) stream where the
+        # forward_batch_generation kernels will land. The sampler queries
+        # elapsed_time in a background drain thread so this path adds zero
+        # host stall. Non-writer ranks short-circuit via is_active().
         if (self._paras_per_step_metrics_sampler is not None
                 and self._paras_per_step_metrics_sampler.is_active()):
-            _paras_step_t0 = time.perf_counter()
+            _paras_step_stream = (
+                self.forward_stream if self.enable_overlap else None
+            )
+            _paras_step_start_event = torch.cuda.Event(enable_timing=True)
+            _paras_step_start_event.record(stream=_paras_step_stream)
         else:
-            _paras_step_t0 = None
+            _paras_step_stream = None
+            _paras_step_start_event = None
 
         # Run forward
         if self.is_generation:
@@ -2130,15 +2136,16 @@ class Scheduler(
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)
 
-        # Per-step metrics: synchronize the GPU to get accurate GPU-completed
-        # forward latency, then record this step. With --disable-overlap-schedule
-        # the synchronize is essentially free (would happen at the next step
-        # boundary anyway). Without overlap disabled, this WILL serialize the
-        # pipeline - that is the intended cost for measurement accuracy.
-        if _paras_step_t0 is not None:
-            torch.get_device_module(self.device).synchronize()
-            _paras_step_latency_ms = (time.perf_counter() - _paras_step_t0) * 1000.0
-            self._paras_per_step_metrics_sampler.record(batch, _paras_step_latency_ms)
+        # Per-step metrics: record the end Event on the same stream as the
+        # start Event, then hand both to the sampler for deferred drain.
+        # No synchronize here: the drain thread queries event readiness
+        # without blocking the scheduler.
+        if _paras_step_start_event is not None:
+            _paras_step_end_event = torch.cuda.Event(enable_timing=True)
+            _paras_step_end_event.record(stream=_paras_step_stream)
+            self._paras_per_step_metrics_sampler.record(
+                batch, _paras_step_start_event, _paras_step_end_event
+            )
 
         # Capture prefill end time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
