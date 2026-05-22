@@ -366,6 +366,19 @@ class SchedulerParasMixin:
         # `other`. The copy and self.last_batch share the reqs list, so
         # process_batch_result's output_ids mutations are visible here.
         self.merge_last_batch()
+        # process_batch_result above already called cache_finished_req on reqs
+        # that finished during the drain, freeing their old KV/req-pool slots.
+        # But those reqs remain in running_batch.reqs until the next iter's
+        # update_running_batch -> filter_batch removes them. The paras switch
+        # path skips that iter and reads running_batch.reqs straight into the
+        # gather/scatter manager, so without an explicit filter here those
+        # finished reqs get fresh KV slots allocated for them in the new pool
+        # via reorchestrate_cache, then orphaned on the post-switch iter --
+        # producing the ~4105-token leak first observed in paras-t256
+        # (~16 finished reqs * ~256 tokens, tripping the strict-mode
+        # check_memory assertion in scheduler_runtime_checker_mixin).
+        if self.running_batch is not None:
+            self.running_batch.filter_batch()
         self.last_batch = None
         self.cur_batch = None
 
