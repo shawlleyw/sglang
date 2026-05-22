@@ -332,6 +332,14 @@ The all-reduce is now a real cross-rank `MIN` reduce of `batch_next_token_ids` i
 
 Two unrelated noise sources surfaced under the 512-burst rollout load. `scheduler_output_processor_mixin._handle_decode_batch` force-emitted an output batch every `DEFAULT_FORCE_STREAM_INTERVAL` decode tokens even for non-streaming requests, creating an IPC-in-flight window in which post-finish duplicates land orphaned in `TokenizerManager.rid_to_state` (`"state was deleted"` log spam — ~600/min in pre-fix smoke). The fix sets `should_output = False` on the non-streaming non-multimodal path, deferring to `req.finished()` for the single terminal output. Separately, `scheduler.recv_requests` was emitting a per-request `logger.info("Processing request: ...")` line that, with 8× DP broadcast and a 2k-req burst, produced thousands of TokenizedGenerateReqInput-repr lines per second. The line is now commented out.
 
+### 6.6 Refresh `pp_max_micro_batch_size` on every mode swap (`ea666dd1f`)
+
+§6.3 fixed `scheduler.max_running_requests` to track the active-mode cap, but the scheduler's admission gate at `Scheduler.get_num_allocatable_reqs` (`managers/scheduler.py`) returns `pp_max_micro_batch_size - running_bs`, not `max_running_requests - running_bs`. `pp_max_micro_batch_size` is set once at scheduler boot from the EP-mode per-rank value (`max_running_requests // pp_size` = 256 on 8-way DP) and was never updated by `paras_configure_helper`. In TP mode after configure_tp, `max_running_requests` correctly read 2048 but the admission gate silently kept rejecting all but the first 256 reqs — paras-tp's kernel batch never grew past 256 even with `--paras-tp-cuda-graph-max-bs 2048` and full TP-mode graph capture in place.
+
+Observed on a Qwen3-235B 8×H200 decode-batch-size microbench sweep (paras-modal `artifacts/20260520T030003Z_qwen3_235b_microbench_v3/`): paras-tp at bench_bs=2048 ran 792 decode steps at kernel_bs=256 (eight sequential waves of 256), while tp-static at the same bench_bs ran a single wave at kernel_bs=2048. Per-step kernel latency at matching kernel_bs (≤256) placed paras-tp within 1.7–5.9 % of tp-static, indicating the per-step kernel path itself was healthy — the bottleneck was admission, not compute. paras-ep matched ep-static within ±0.4 % across all kernel_bs values.
+
+The fix mirrors the boot-time formula (`scheduler.py:373`: `max(max_running_requests // max(pp_size, 1), 1)`) in `paras_configure_helper` immediately after the `max_running_requests` update, so the admission gate tracks the post-switch per-mode cap on every EP↔TP swap.
+
 ## 7. Verified Behavior
 
 ### 7.1 Decode policy — original autoswitch smoke
