@@ -91,6 +91,12 @@ class FutureMap:
 
     def alloc_future_indices(self, bs: int) -> FutureIndices:
         """Update the circular buffer pointer and allocate future indices."""
+        assert bs <= self.future_buffer_len - self.future_limit, (
+            f"FutureMap overflow: bs={bs} exceeds safety margin "
+            f"{self.future_buffer_len - self.future_limit} "
+            f"(buf={self.future_buffer_len}, limit={self.future_limit}); "
+            f"rebuild FutureMap with a larger max_running_requests."
+        )
         cur_future_ct = self.future_ct
         self.future_ct = (cur_future_ct + bs) % self.future_limit
         start = cur_future_ct + 1

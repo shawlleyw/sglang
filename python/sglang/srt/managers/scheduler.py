@@ -952,8 +952,24 @@ class Scheduler(
             self.device
         ).stream(self.copy_stream)
 
+        # ParaS dynamically mutates self.max_running_requests at EP<->TP switches
+        # (see scheduler_paras_mixin.paras_configure_helper). FutureMap's circular
+        # buffer is sized ONCE here at boot and its invariant requires
+        # bs <= 2 * cap. Size the buffer for the LARGER of the two per-mode caps
+        # so neither direction overflows after a switch.
+        future_map_cap = self.max_running_requests
+        if self.server_args.enable_paras_moe:
+            from sglang.srt.paras.paras_memory_manager import (
+                get_global_paras_memory_manager,
+            )
+            _mgr = get_global_paras_memory_manager()
+            if _mgr is not None:
+                future_map_cap = max(
+                    _mgr.get_ep_max_running_requests(),
+                    _mgr.get_tp_max_running_requests(),
+                )
         self.future_map = FutureMap(
-            self.max_running_requests, self.device, self.spec_algorithm
+            future_map_cap, self.device, self.spec_algorithm
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
