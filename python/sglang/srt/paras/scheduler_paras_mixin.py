@@ -580,9 +580,7 @@ class SchedulerParasMixin:
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor
         )
-        self.waiting_queue = paras_gather_manager.get_new_waiting_queue(
-            self.paras_tp_rank
-        )
+        self.waiting_queue = paras_gather_manager.get_new_waiting_queue()
         # paras_gather_manager.update_running_batch_inplace(self.running_batch)
 
         with TimeReporter("transfer_weights"):

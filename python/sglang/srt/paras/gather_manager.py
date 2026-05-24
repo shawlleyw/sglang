@@ -188,10 +188,13 @@ class ParaSReqGatherManager:
         )
         self.global_waiting_reqs = gathered_waiting or []
 
-    def get_new_waiting_queue(self, paras_tp_rank: int) -> List[Req]:
-        if paras_tp_rank == 0:
-            return list(self.global_waiting_reqs)
-        return []
+    def get_new_waiting_queue(self) -> List[Req]:
+        # TP-mode invariant: every TP rank must hold an identical waiting_queue
+        # so that the next iteration's get_next_batch_to_run picks the same
+        # prefill-vs-decode batch on all ranks. Returning the global list only
+        # on rank 0 desynchronizes the event loop and deadlocks the first TP
+        # collective in run_batch (cf. scatter_manager.get_new_waiting_queue).
+        return list(self.global_waiting_reqs)
 
     def precheck_tp_capacity(
         self,
