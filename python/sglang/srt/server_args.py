@@ -175,22 +175,29 @@ class ParasAutoSwitchDefaults:
     `cooldown_sec` are absolute. Prefill iterations are larger and rarer than
     decode, so the prefill policy uses a shorter window and shorter cooldown
     to stay reactive.
+
+    `prefill_threshold_per_gpu` is hybrid-only: the prefill-token threshold
+    (multiplied by world_size) used as the second signal in HybridAutoSwitch.
     """
 
     threshold_per_gpu: int
     window: int
     cooldown_sec: float
+    prefill_threshold_per_gpu: Optional[int] = None
 
 
 PARAS_AUTO_SWITCH_POLICY_DEFAULTS: Dict[str, ParasAutoSwitchDefaults] = {
     "prefill": ParasAutoSwitchDefaults(threshold_per_gpu=1024, window=8, cooldown_sec=10.0),
     "decode": ParasAutoSwitchDefaults(threshold_per_gpu=64, window=32, cooldown_sec=60.0),
     "rollout": ParasAutoSwitchDefaults(threshold_per_gpu=8, window=1, cooldown_sec=5.0),
+    "hybrid": ParasAutoSwitchDefaults(
+        threshold_per_gpu=32,
+        window=8,
+        cooldown_sec=5.0,
+        prefill_threshold_per_gpu=512,
+    ),
 }
-# "hybrid" is intentionally absent from the defaults dict; _handle_paras_auto_switch
-# raises NotImplementedError for it. Keep it in the CLI choices so the error fires
-# at startup rather than as an "unknown value" later.
-PARAS_AUTO_SWITCH_POLICY_CHOICES = list(PARAS_AUTO_SWITCH_POLICY_DEFAULTS) + ["hybrid"]
+PARAS_AUTO_SWITCH_POLICY_CHOICES = list(PARAS_AUTO_SWITCH_POLICY_DEFAULTS)
 
 
 # Allow external code to add more choices
@@ -448,6 +455,7 @@ class ServerArgs:
     paras_auto_switch_threshold: Optional[int] = None
     paras_auto_switch_window: Optional[int] = None
     paras_auto_switch_cooldown_sec: Optional[float] = None
+    paras_auto_switch_prefill_threshold: Optional[int] = None
     paras_metrics_file: Optional[str] = None
     paras_per_step_metrics_file: Optional[str] = None
 
@@ -1547,11 +1555,6 @@ class ServerArgs:
             f"{PARAS_AUTO_SWITCH_POLICY_CHOICES}, got "
             f"{self.paras_auto_switch_policy!r}"
         )
-        if self.paras_auto_switch_policy == "hybrid":
-            raise NotImplementedError(
-                "Hybrid (mixed prefill+decode) auto-switch policy is not implemented. "
-                "Use 'prefill' or 'decode'."
-            )
         defaults = PARAS_AUTO_SWITCH_POLICY_DEFAULTS[self.paras_auto_switch_policy]
         if self.paras_auto_switch_threshold is None:
             self.paras_auto_switch_threshold = (
@@ -1561,6 +1564,15 @@ class ServerArgs:
             self.paras_auto_switch_window = defaults.window
         if self.paras_auto_switch_cooldown_sec is None:
             self.paras_auto_switch_cooldown_sec = defaults.cooldown_sec
+        if self.paras_auto_switch_prefill_threshold is None:
+            if defaults.prefill_threshold_per_gpu is not None:
+                self.paras_auto_switch_prefill_threshold = (
+                    defaults.prefill_threshold_per_gpu * self.tp_size
+                )
+            else:
+                self.paras_auto_switch_prefill_threshold = (
+                    self.paras_auto_switch_threshold * 16
+                )
         assert self.paras_auto_switch_threshold > 0, (
             "--paras-auto-switch-threshold must be positive"
         )
@@ -1569,6 +1581,9 @@ class ServerArgs:
         )
         assert self.paras_auto_switch_cooldown_sec >= 0, (
             "--paras-auto-switch-cooldown-sec must be non-negative"
+        )
+        assert self.paras_auto_switch_prefill_threshold > 0, (
+            "--paras-auto-switch-prefill-threshold must be positive"
         )
 
     def _check_paras_config(self):
@@ -3110,7 +3125,12 @@ class ServerArgs:
                 "decode batch (default threshold 64 * world_size, window 32, "
                 "cooldown 60s). 'prefill' fires on global prefill tokens "
                 "(default threshold 1024 * world_size, window 8, cooldown "
-                "10s). 'hybrid' is not implemented and raises at startup."
+                "10s). 'rollout' fires on global pending reqs (running + "
+                "waiting; default threshold 8 * world_size, window 1, "
+                "cooldown 5s). 'hybrid' combines running+waiting reqs AND "
+                "prefill tokens with OR-to-EP / AND-to-TP logic (default "
+                "threshold 32 * world_size, prefill_threshold 512 * world_size, "
+                "window 8, cooldown 5s)."
             ),
         )
         parser.add_argument(
@@ -3141,6 +3161,17 @@ class ServerArgs:
                 "Wall-clock seconds between successive auto-switch decisions. "
                 "When unset, defaults to the policy's value (see "
                 "--paras-auto-switch-policy)."
+            ),
+        )
+        parser.add_argument(
+            "--paras-auto-switch-prefill-threshold",
+            type=int,
+            default=ServerArgs.paras_auto_switch_prefill_threshold,
+            help=(
+                "Prefill-token threshold for the hybrid auto-switch policy. "
+                "Ignored by other policies. When unset, defaults to the "
+                "policy's prefill_threshold_per_gpu * world_size, or "
+                "16x the req-count threshold as a fallback."
             ),
         )
         parser.add_argument(
