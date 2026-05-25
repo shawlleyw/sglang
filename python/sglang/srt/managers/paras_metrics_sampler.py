@@ -49,6 +49,7 @@ class ParasMetricsSampler:
         self._t0 = time.time()
         self._prev_decode_total = 0
         self._prev_prefill_total = 0
+        self._prev_mode: Optional[str] = None
         self._fh: Any = None
         self._writer: Any = None
 
@@ -122,6 +123,16 @@ class ParasMetricsSampler:
             waiting = len(getattr(scheduler, "waiting_queue", []) or [])
             decode_total = getattr(scheduler, "total_decode_tokens_lifetime", 0) or 0
             prefill_total = getattr(scheduler, "total_prefill_tokens_lifetime", 0) or 0
+
+        # PARAS-BURSTY-PATCH: re-anchor on mode change (incl. first sample).
+        # TP mode reads scheduler.total_*_lifetime (one rank's counter);
+        # EP mode reads sum(batch.global_total_*) (all 8 ranks' counters).
+        # Without re-anchoring, the first sample after a switch computes
+        # a delta across two incompatible counter scales -> millions tok/s.
+        if mode != self._prev_mode:
+            self._prev_decode_total = decode_total
+            self._prev_prefill_total = prefill_total
+            self._prev_mode = mode
 
         decode_delta = decode_total - self._prev_decode_total
         prefill_delta = prefill_total - self._prev_prefill_total
