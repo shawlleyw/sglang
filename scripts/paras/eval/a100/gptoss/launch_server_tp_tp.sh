@@ -6,28 +6,29 @@
 #   MODEL_PATH HOST PORT NUM_GPUS CUDA_VISIBLE_DEVICES
 #   MEM_FRACTION_STATIC MAX_RUNNING_REQUESTS
 #
-# Toggles:
-#   ENABLE_CUDA_GRAPH=0  Pass --disable-cuda-graph (default 1).
-#   CUDA_GRAPH_MAX_BS=N  Pass --cuda-graph-max-bs N (only honored when ENABLE_CUDA_GRAPH=1).
+# Toggles (see ../../launch_common.sh for full semantics):
+#   ENABLE_CUDA_GRAPH=0  Disable cuda graphs (default 1).
+#   CUDA_GRAPH_MAX_BS=N  Override cuda-graph max bs. Default = MAX_RUNNING_REQUESTS
+#                        (TP global batch size).
+#   HYBRID_SWA=0|1       0 adds --disable-hybrid-swa-memory; 1 (default) keeps
+#                        hybrid full + SWA memory pools. Used by run_smoke.sh to
+#                        walk SWA on/off × overlap on/off matrix.
+#   DISABLE_OVERLAP=0|1  1 adds --disable-overlap-schedule (default 0).
+#   DISABLE_RADIX_CACHE=0|1
+#                        1 (default) adds --disable-radix-cache. Matches paras's
+#                        required radix-off (avoids SWARadixCache's SWA-accounting
+#                        drift when SWA is enabled).
 
 set -uo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-source "$SCRIPT_DIR/../../lib.sh"
+source "$SCRIPT_DIR/../../launch_common.sh"
 
 MODEL_PATH=${MODEL_PATH:-/data/shaoyuw/models/gpt-oss-120b-BF16-unsloth}
-HOST=${HOST:-0.0.0.0}
-PORT=${PORT:-30000}
-NUM_GPUS=${NUM_GPUS:-8}
-MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.7}
-MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-256}
-ENABLE_CUDA_GRAPH=${ENABLE_CUDA_GRAPH:-1}
+MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.8}
+HYBRID_SWA=${HYBRID_SWA:-1}
 
-paras_default_cvd
-
-unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
-
-paras_init_cuda_graph
+paras_launch_setup_tp_tp
 
 python -m sglang.launch_server \
     --model-path "$MODEL_PATH" \
@@ -36,9 +37,12 @@ python -m sglang.launch_server \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --attention-backend triton \
     --moe-runner-backend triton \
-    --disable-hybrid-swa-memory \
     --tp-size "$NUM_GPUS" \
     --max-running-requests "$MAX_RUNNING_REQUESTS" \
+    --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
     --chunked-prefill-size -1 \
+    "${HYBRID_SWA_FLAGS[@]}" \
+    "${OVERLAP_FLAGS[@]}" \
+    "${RADIX_FLAGS[@]}" \
     "${CUDA_GRAPH_FLAGS[@]}" \
     "$@"

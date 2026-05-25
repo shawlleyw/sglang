@@ -24,11 +24,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 
 from sglang.srt.paras.utils import paras_func, paras_profile_func
-from sglang.srt.paras.gather_manager import ParaSReqGatherManager
+from sglang.srt.paras.gather_manager import ParaSReqGatherManager, recover_request
 from sglang.srt.paras.scatter_manager import ParaSReqScatterManager
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.managers.utils import SenderWrapper
+from sglang.srt.utils.common import freeze_gc
 
 
 logger = logging.getLogger(__name__)
@@ -258,6 +259,18 @@ class SchedulerParasMixin:
                 cooldown_sec=sa.paras_auto_switch_cooldown_sec,
             )
 
+        # Freeze the long-lived serving heap (weights, KV pool layouts, sampler
+        # state, radix tree, attention metadata buffers) so subsequent gen-2 GC
+        # cycles do not walk it. Without this, the ~2k Req objects deserialized
+        # by paras_tp_group_all_gather_reqs on every EP<->TP switch trip the
+        # gen-2 threshold and the resulting heap walk stalls the GIL for
+        # ~1.5-2 s (root-caused in INVESTIGATION_paras_gather_reqs_slow.md).
+        # Called on every rank: gc.freeze is per-process and idempotent. By
+        # this point model load + cuda graph capture inside TpModelWorker.__init__
+        # have completed (and their own freeze_gc context manager has exited),
+        # so the captured heap reflects the post-warmup steady state.
+        freeze_gc("paras_serving_warmup")
+
     def paras_configure_helper(self):
         (
             self.max_total_num_tokens,
@@ -287,7 +300,18 @@ class SchedulerParasMixin:
                 self.max_running_requests = _paras_mgr.get_tp_max_running_requests()
             else:
                 self.max_running_requests = _paras_mgr.get_ep_max_running_requests()
-        
+
+        # Refresh pp_max_micro_batch_size to track the post-switch per-mode cap.
+        # Without this, the scheduler's admission gate
+        # (Scheduler.get_num_allocatable_reqs in managers/scheduler.py, which
+        # returns pp_max_micro_batch_size - running_bs) keeps using the
+        # boot-time EP per-rank value (max_running_requests // dp_size) and
+        # silently caps paras-tp's running batch at the EP slice even after
+        # configure_tp updates self.max_running_requests to the global cap.
+        get_global_server_args().pp_max_micro_batch_size = max(
+            self.max_running_requests // max(self.server_args.pp_size, 1), 1
+        )
+
     def paras_check(self):
         # Canary: log if running_batch ever contains a req with output_ids=[].
         # This state was thought unreachable in normal mode (all reqs entering
@@ -310,6 +334,54 @@ class SchedulerParasMixin:
             return
         self._paras_auto_policy.observe(self, batch, time.time())
 
+    def _paras_drain_overlap_pipeline(self) -> None:
+        # event_loop_overlap builds batch N+1 on CPU while GPU runs batch N
+        # and stores (batch_copy, result) tuples in self.result_queue for
+        # processing in the NEXT iteration. A paras EP<->TP switch destroys
+        # mode-dependent state (KV pool layout, attention metadata, expert
+        # routing, future_map indices), so any in-flight queued batch MUST
+        # be fully processed before the switch body runs. Otherwise the
+        # post-switch process_batch_result would dereference stale GPU
+        # tensors or pool indices and either crash or corrupt outputs.
+        if not getattr(self, "enable_overlap", False):
+            return
+        result_queue = getattr(self, "result_queue", None)
+        if result_queue is None:
+            return
+        while result_queue:
+            tmp_batch, tmp_result = result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+        # process_batch_result_prefill populates output_ids[0] on the
+        # newly-prefilled reqs but does NOT add them to running_batch.
+        # In normal overlap flow the next iter's get_next_batch_to_run
+        # calls merge_last_batch to absorb them; the switch path skips
+        # that iter and reads running_batch.reqs directly for global
+        # gather, so without an explicit merge here the just-prefilled
+        # reqs are silently dropped (causing the 37-req loss + apparent
+        # hang reproduced in the 20260516 smoke). Merge against the
+        # existing self.last_batch (the original batch from the previous
+        # iter, with intact sampling_info), NOT the popped tmp_batch:
+        # ScheduleBatch.copy() omits sampling_info so merge_batch on the
+        # copy crashes at SamplingBatchInfo.merge_batch:315 on a NoneType
+        # `other`. The copy and self.last_batch share the reqs list, so
+        # process_batch_result's output_ids mutations are visible here.
+        self.merge_last_batch()
+        # process_batch_result above already called cache_finished_req on reqs
+        # that finished during the drain, freeing their old KV/req-pool slots.
+        # But those reqs remain in running_batch.reqs until the next iter's
+        # update_running_batch -> filter_batch removes them. The paras switch
+        # path skips that iter and reads running_batch.reqs straight into the
+        # gather/scatter manager, so without an explicit filter here those
+        # finished reqs get fresh KV slots allocated for them in the new pool
+        # via reorchestrate_cache, then orphaned on the post-switch iter --
+        # producing the ~4105-token leak first observed in paras-t256
+        # (~16 finished reqs * ~256 tokens, tripping the strict-mode
+        # check_memory assertion in scheduler_runtime_checker_mixin).
+        if self.running_batch is not None:
+            self.running_batch.filter_batch()
+        self.last_batch = None
+        self.cur_batch = None
+
     def _paras_auto_clear_window_on_switch(self) -> None:
         assert self._paras_auto_policy is not None
         policy = self._paras_auto_policy
@@ -317,6 +389,66 @@ class SchedulerParasMixin:
         policy.cooldown_until = max(
             policy.cooldown_until, time.time() + policy.cooldown_sec
         )
+
+    def _paras_restore_tp_state_after_aborted_ep_switch(self) -> None:
+        # Roll back the TP->EP preamble in paras_configure_ep when the
+        # capacity precheck aborts the switch. Asymmetric vs the EP->TP
+        # restore: paras_configure_ep defers all server_args /
+        # parallelism_config / MOE_A2A_BACKEND mutations until AFTER
+        # reorchestrate_cache succeeds, so the preamble has only two
+        # things to undo (in reverse order):
+        #   1. prune_request mutations applied by the ParaSReqScatterManager
+        #      constructor on local_waiting_reqs (via
+        #      paras_tp_group_all_gather_reqs). Rank 0's waiting_queue items
+        #      are pruned in place; other ranks pass an empty list so are
+        #      no-ops. running_batch.reqs are NOT pruned by the scatter
+        #      ctor, but tree_cache.reset() ran earlier so their stale
+        #      last_host_node / last_node references must be re-linked to
+        #      the new (empty) root via recover_request -- defensively
+        #      iterating over them too costs nothing and matches the EP->TP
+        #      restore's symmetry.
+        #   2. profiler started by paras_start_profile.
+        # tree_cache.reset() and merge_last_batch() are NOT reverted: the
+        # radix tree rebuilds on subsequent prefills, and the merged
+        # running_batch is the correct TP-mode resume state.
+        if self.running_batch is not None:
+            for req in self.running_batch.reqs:
+                recover_request(req, self.tree_cache, self.tokenizer)
+        for req in self.waiting_queue:
+            recover_request(req, self.tree_cache, self.tokenizer)
+
+        self.paras_stop_profile()
+
+    def _paras_restore_ep_state_after_aborted_tp_switch(self) -> None:
+        # Roll back the EP->TP preamble in paras_configure_tp when the
+        # capacity precheck aborts the switch. Undoes (in reverse order):
+        #   1. prune_request mutations on running_batch.reqs and waiting_queue
+        #      applied by paras_tp_group_all_gather_reqs (it nulls
+        #      tokenizer / radix-tree linkage on every local req to keep
+        #      pickle off GPU tensors). Without this restore the scheduler
+        #      would dereference None on the next prefill/decode iteration.
+        #   2. profiler started by paras_start_profile (no destructive side
+        #      effect, but leaving it running leaks a profiler context).
+        #   3. server_args + global moe_a2a_backend mutations -- mirrors the
+        #      EP epilogue in paras_configure_ep so subsequent EP iterations
+        #      see a coherent config.
+        # tree_cache.reset() and merge_last_batch() are NOT reverted: the
+        # radix tree rebuilds naturally on subsequent prefills, and the
+        # merged running_batch is already the correct EP-mode state.
+        if self.running_batch is not None:
+            for req in self.running_batch.reqs:
+                recover_request(req, self.tree_cache, self.tokenizer)
+        for req in self.waiting_queue:
+            recover_request(req, self.tree_cache, self.tokenizer)
+
+        self.paras_stop_profile()
+
+        self.paras_parallelism_config = "EP"
+        self.server_args.enable_dp_attention = True
+        self.server_args.moe_a2a_backend = MoeA2ABackend.DEEPEP.value
+        self.server_args.dp_size = self.paras_ep_size
+        self.server_args.ep_size = self.paras_ep_size
+        moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.DEEPEP
 
     def paras_auto_pick_signal(self) -> Optional[ParaSAutoSwitchReq]:
         assert self._paras_auto_policy is not None
@@ -355,7 +487,7 @@ class SchedulerParasMixin:
             return
 
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
-        assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
+        self._paras_drain_overlap_pipeline()
         torch.cuda.synchronize()
 
         if self._paras_auto_policy is not None:
@@ -404,7 +536,36 @@ class SchedulerParasMixin:
         
         with TimeReporter("gather_global_reqs"):
             paras_gather_manager.gather_global_reqs()
-        
+
+        # Capacity precheck. For models with num_kv_heads < paras_tp_size
+        # (e.g. Qwen3-235B: num_kv_heads=4 at paras_tp_size=8 -> KV heads
+        # replicated 2x across ranks), the TP-mode KV pool is roughly half
+        # the EP-mode pool. Under heavy in-flight load an EP->TP switch can
+        # overflow the smaller TP pool. Detect that here and abort the
+        # switch gracefully -- staying in EP, restoring preamble state --
+        # instead of letting the asserts in reorchestrate_cache crash the
+        # scheduler (observed in the N=2048 paras-t128 rollout sweep on
+        # 2026-05-16). The autoswitch policy's cooldown was already
+        # extended by _paras_auto_clear_window_on_switch above, so the
+        # natural retry spacing applies.
+        precheck_ok, precheck_reason, precheck_details = (
+            paras_gather_manager.precheck_tp_capacity()
+        )
+        if not precheck_ok:
+            logger.warning(
+                "ParaS EP->TP switch rejected by precheck: %s | "
+                "num_global_tokens=%d new_cache_size=%d "
+                "num_reqs=%d new_req_pool_size=%d. "
+                "Staying in EP; autoswitch will retry after cooldown.",
+                precheck_reason,
+                precheck_details["num_global_tokens"],
+                precheck_details["new_cache_size"],
+                precheck_details["num_reqs"],
+                precheck_details["new_req_pool_size"],
+            )
+            self._paras_restore_ep_state_after_aborted_tp_switch()
+            return True
+
         with TimeReporter("reorchestrate_cache"):
             paras_gather_manager.reorchestrate_cache()
         
@@ -419,9 +580,7 @@ class SchedulerParasMixin:
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor
         )
-        self.waiting_queue = paras_gather_manager.get_new_waiting_queue(
-            self.paras_tp_rank
-        )
+        self.waiting_queue = paras_gather_manager.get_new_waiting_queue()
         # paras_gather_manager.update_running_batch_inplace(self.running_batch)
 
         with TimeReporter("transfer_weights"):
@@ -475,8 +634,8 @@ class SchedulerParasMixin:
         if not self.paras_check():
             return
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
-        assert not self.enable_overlap, "Overlap schedule is not supported currently in ParaS."
         assert self.paras_dp_size == 1, "paras_configure_ep only supports dp_size==1"
+        self._paras_drain_overlap_pipeline()
         torch.cuda.synchronize()
 
         if self._paras_auto_policy is not None:
@@ -517,6 +676,36 @@ class SchedulerParasMixin:
 
         with TimeReporter("partition_requests"):
             paras_scatter_manager.partition_requests()
+
+            # Capacity precheck (TP->EP direction). Defensive parity with
+            # the EP->TP precheck: although the current Qwen3+TP=8 config
+            # makes the EP pool >= the TP pool, a different model / memory
+            # config could make EP pool axes smaller and the per-rank
+            # asserts in the scatter manager's reorchestrate_cache would
+            # then crash the scheduler the same way the gather path did.
+            # Checks the worst-loaded rank using the deterministic
+            # partition so every rank arrives at the same accept/reject
+            # decision without a collective. The autoswitch policy's
+            # cooldown was already extended by
+            # _paras_auto_clear_window_on_switch above, so natural retry
+            # spacing applies.
+            ep_precheck_ok, ep_precheck_reason, ep_precheck_details = (
+                paras_scatter_manager.precheck_ep_capacity()
+            )
+            if not ep_precheck_ok:
+                logger.warning(
+                    "ParaS TP->EP switch rejected by precheck: %s | "
+                    "max_tokens_per_rank=%d new_ep_cache_size=%d "
+                    "max_reqs_per_rank=%d new_req_pool_size=%d. "
+                    "Staying in TP; autoswitch will retry after cooldown.",
+                    ep_precheck_reason,
+                    ep_precheck_details["max_tokens_per_rank"],
+                    ep_precheck_details["new_ep_cache_size"],
+                    ep_precheck_details["max_reqs_per_rank"],
+                    ep_precheck_details["new_req_pool_size"],
+                )
+                self._paras_restore_tp_state_after_aborted_ep_switch()
+                return True
 
             with TimeReporter("reorchestrate_cache"):
                 paras_scatter_manager.reorchestrate_cache()
@@ -585,10 +774,37 @@ class SchedulerParasMixin:
         torch.cuda.synchronize()
 
     def paras_configure_handle(self, recv_req: ParaSConfigureReqInput):
+        # A successful switch swaps self.send_to_tokenizer to the post-switch
+        # variant (tp_send_to_tokenizer or ep_send_to_tokenizer) BEFORE
+        # process_input_requests auto-emits this handler's return value, and
+        # that swap silently drops the emission on non-designated ranks via
+        # SenderWrapper(None) so the reply count matches the cardinality
+        # TokenizerManager.paras_configure_{tp,ep} pre-set on the communicator
+        # (fan_out = paras_dp_size for TP-target; fan_out = server_args.dp_size
+        # for EP-target). A precheck-rejected switch returns BEFORE that swap,
+        # so the auto-emit would fire from every rank under the current
+        # (pre-switch) sender topology and overflow the communicator's
+        # _result_values=None state after the first reply lands -- crashing
+        # TokenizerManager at tokenizer_communicator_mixin.py:163 with
+        # AttributeError on .append. To mirror the success path's
+        # send-suppression on the rejection path, emit the reply ourselves
+        # via the POST-target-mode sender (whose null-wrapper distribution
+        # naturally gates emissions to the expected count) and return None so
+        # process_input_requests does not auto-emit a second time.
         if recv_req.type == ParaSConfigureReqType.CONFIGURE_TP:
-            self.paras_configure_tp()
+            rejected = self.paras_configure_tp()
+            if rejected:
+                self.tp_send_to_tokenizer.send_output(
+                    ParaSConfigureReqOutput(), recv_req
+                )
+                return None
         elif recv_req.type == ParaSConfigureReqType.CONFIGURE_EP:
-            self.paras_configure_ep()
+            rejected = self.paras_configure_ep()
+            if rejected:
+                self.ep_send_to_tokenizer.send_output(
+                    ParaSConfigureReqOutput(), recv_req
+                )
+                return None
         else:
             raise ValueError(f"Unrecognized ParaSConfigureReqType: {recv_req.type}")
         return ParaSConfigureReqOutput()

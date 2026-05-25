@@ -529,6 +529,19 @@ class Scheduler(
             )
             self._paras_metrics_sampler.start()
 
+        # Per-forward-step metrics sampler (synchronous, called from run_batch).
+        # Adds torch.cuda.synchronize() per step, so intended for microbench only.
+        self._paras_per_step_metrics_sampler = None
+        if server_args.paras_per_step_metrics_file:
+            from sglang.srt.managers.paras_per_step_metrics_sampler import (
+                ParasPerStepMetricsSampler,
+            )
+
+            self._paras_per_step_metrics_sampler = ParasPerStepMetricsSampler(
+                self, server_args.paras_per_step_metrics_file
+            )
+            self._paras_per_step_metrics_sampler.start()
+
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 
@@ -939,8 +952,24 @@ class Scheduler(
             self.device
         ).stream(self.copy_stream)
 
+        # ParaS dynamically mutates self.max_running_requests at EP<->TP switches
+        # (see scheduler_paras_mixin.paras_configure_helper). FutureMap's circular
+        # buffer is sized ONCE here at boot and its invariant requires
+        # bs <= 2 * cap. Size the buffer for the LARGER of the two per-mode caps
+        # so neither direction overflows after a switch.
+        future_map_cap = self.max_running_requests
+        if self.server_args.enable_paras_moe:
+            from sglang.srt.paras.paras_memory_manager import (
+                get_global_paras_memory_manager,
+            )
+            _mgr = get_global_paras_memory_manager()
+            if _mgr is not None:
+                future_map_cap = max(
+                    _mgr.get_ep_max_running_requests(),
+                    _mgr.get_tp_max_running_requests(),
+                )
         self.future_map = FutureMap(
-            self.max_running_requests, self.device, self.spec_algorithm
+            future_map_cap, self.device, self.spec_algorithm
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -1006,6 +1035,17 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+
+            # Mirror event_loop_normal's paras auto-switch hook. The original
+            # Task 3 commit (12e75efaa) enabled overlap for paras by adding
+            # the drain-on-switch path but forgot to port this observe/signal
+            # pair. Without it the policy never runs in overlap mode and the
+            # server never switches regardless of how low `running` drops.
+            if batch and self._paras_auto_policy is not None and self.tp_rank == 0:
+                self.paras_auto_observe(batch)
+                signal = self.paras_auto_pick_signal()
+                if signal is not None:
+                    self.send_to_tokenizer.send_output(signal)
 
             self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
@@ -1996,6 +2036,23 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_start_time = current_time
 
+        # Per-step metrics: paired CUDA Events bracketing the forward stream's
+        # kernel sequence. Recorded on `self.forward_stream` when overlap is
+        # enabled, otherwise the current (default) stream where the
+        # forward_batch_generation kernels will land. The sampler queries
+        # elapsed_time in a background drain thread so this path adds zero
+        # host stall. Non-writer ranks short-circuit via is_active().
+        if (self._paras_per_step_metrics_sampler is not None
+                and self._paras_per_step_metrics_sampler.is_active()):
+            _paras_step_stream = (
+                self.forward_stream if self.enable_overlap else None
+            )
+            _paras_step_start_event = torch.cuda.Event(enable_timing=True)
+            _paras_step_start_event.record(stream=_paras_step_stream)
+        else:
+            _paras_step_stream = None
+            _paras_step_start_event = None
+
         # Run forward
         if self.is_generation:
             batch_or_worker_batch = batch
@@ -2094,6 +2151,17 @@ class Scheduler(
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)
+
+        # Per-step metrics: record the end Event on the same stream as the
+        # start Event, then hand both to the sampler for deferred drain.
+        # No synchronize here: the drain thread queries event readiness
+        # without blocking the scheduler.
+        if _paras_step_start_event is not None:
+            _paras_step_end_event = torch.cuda.Event(enable_timing=True)
+            _paras_step_end_event.record(stream=_paras_step_stream)
+            self._paras_per_step_metrics_sampler.record(
+                batch, _paras_step_start_event, _paras_step_end_event
+            )
 
         # Capture prefill end time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:

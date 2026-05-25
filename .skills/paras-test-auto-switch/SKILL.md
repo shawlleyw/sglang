@@ -210,17 +210,19 @@ your expected light-load and burst-load values.
 
   At an undersized fraction, the server boots through weight load and then
   dies in `init_memory_pool` with `kv_budget=0.000GiB`.
-- **`--disable-radix-cache`, `--chunked-prefill-size -1`, and
-  `--disable-overlap-schedule` are all mandatory** (baked into the launch
-  scripts under `ENABLE_PARAS=1` and enforced by ParaS init assertions in
-  `server_args._check_paras_config` and runtime asserts in
-  `scheduler_paras_mixin`). Same constraints as manual switch:
+- **`--disable-radix-cache` and `--chunked-prefill-size -1` are mandatory**
+  (baked into `launch_common.sh` for every `launch_server_*.sh` and enforced
+  by ParaS init assertions in `server_args._check_paras_config`):
   - **Radix cache disabled**: ParaS uses `ChunkCache` / `SWAChunkCache`;
     radix tree state would not survive `tree.reset()` at switch.
   - **Chunked prefill disabled**: ParaS migration cannot preserve
     mid-chunked-prefill state.
-  - **Overlap scheduler disabled**: switching mid-overlap would require
-    migrating an in-flight forward's intermediate state.
+- **Overlap scheduler is now SUPPORTED under paras** (commit `adacebf22` ported
+  the auto-switch observe/signal hook to `event_loop_overlap`;
+  `SchedulerParasMixin._paras_drain_overlap_pipeline` drains the in-flight
+  overlap batch before every EP↔TP switch). `DISABLE_OVERLAP=0` is the
+  launcher default. Set `DISABLE_OVERLAP=1` only to reproduce the legacy
+  no-overlap path for forensics.
 - **Burst size and threshold tuning interact**: `BURST_SIZE` must be
   comfortably greater than `--paras-auto-switch-threshold` for the TP→EP
   direction to fire on the burst. With `BURST_SIZE=32` and `threshold=8`,

@@ -8,6 +8,7 @@ Scripts for evaluating ParaS (Parallelism Switching) — both **correctness** (u
 scripts/paras/eval/
 ├── README.md                   # this file
 ├── lib.sh                      # shared bash helpers (sourced by launch_*/bench_* scripts)
+├── launch_common.sh            # topology-aware setup for launch_server_*.sh
 ├── run_paras_tests.sh          # correctness test runner (pytest + torchrun)
 ├── paras_cmd/                  # server interaction toolkit for ParaS EP↔TP smoke tests
 │   ├── lib.sh
@@ -38,7 +39,25 @@ Shared bash helpers sourced by every per-hardware launch / bench script. **Do no
 |---|---|---|
 | `paras_default_cvd` | all | If `CUDA_VISIBLE_DEVICES` is unset, set it to `0,1,...,NUM_GPUS-1`. |
 | `paras_init_profile` | `bench_one_batch_*` | Builds `LAUNCHER`, `PROFILE_FLAGS`, `LOAD_FORMAT_FLAGS` arrays from `ENABLE_NSYS`, `ENABLE_TORCH_PROFILE`, `LOAD_FORMAT`. |
-| `paras_init_cuda_graph` | `launch_server_*` | Builds `CUDA_GRAPH_FLAGS` array from `ENABLE_CUDA_GRAPH`, `CUDA_GRAPH_MAX_BS`. |
+| `paras_init_cuda_graph` | `launch_common.sh` | Builds `CUDA_GRAPH_FLAGS` array from `ENABLE_CUDA_GRAPH`, `CUDA_GRAPH_MAX_BS`. |
+
+### `launch_common.sh`
+
+Topology-aware setup sourced by every `launch_server_*.sh`. Provides two public functions; each resolves the parity contract knobs from [`.skills/paras-rollout-eval/SKILL.md`](../../../.skills/paras-rollout-eval/SKILL.md) and auto-sizes `CUDA_GRAPH_MAX_BS` from `MAX_RUNNING_REQUESTS` per topology.
+
+| Function | Used by | Behavior |
+|---|---|---|
+| `paras_launch_setup_dp_ep` | `launch_server_dp_ep.sh` | DeepEP env exports, `ENABLE_PARAS` toggle → `PARAS_FLAGS`, `HYBRID_SWA_FLAGS` (resolves `auto` → on/off via `ENABLE_PARAS`), `OVERLAP_FLAGS`, `RADIX_FLAGS`, `CUDA_GRAPH_FLAGS`. Default `CUDA_GRAPH_MAX_BS = MAX_RUNNING_REQUESTS / NUM_GPUS` (per-rank attn batch). |
+| `paras_launch_setup_tp_tp` | `launch_server_tp_tp.sh` | Unsets stale DeepEP env, exports `SYNC_TOKEN_IDS_ACROSS_TP=1`, builds the same flag arrays. Default `CUDA_GRAPH_MAX_BS = MAX_RUNNING_REQUESTS` (global TP batch). |
+
+**`CUDA_GRAPH_MAX_BS` sizing rule** — applied uniformly to paras and static. User-provided `CUDA_GRAPH_MAX_BS=N` env wins.
+
+| Topology | Default | Reason |
+|---|---|---|
+| DP/EP | `MAX_RUNNING_REQUESTS / NUM_GPUS` | each DP-attention rank captures graphs for its own ≤ N/8 slice |
+| TP/TP | `MAX_RUNNING_REQUESTS` | single global batch dispatched across TP ranks |
+
+Per-model launchers stay thin: they set `MODEL_PATH` and `MEM_FRACTION_STATIC` defaults (with optional `ENABLE_PARAS=1` branch), `HYBRID_SWA` default for gpt-oss, then call the right `paras_launch_setup_*` and splice the resulting arrays into the `python -m sglang.launch_server` invocation. All shared knobs (`MAX_RUNNING_REQUESTS=2048`, `MAX_PREFILL_TOKENS=8192`, `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=MAX_REQ_PER_RANK`, etc.) live in `launch_common.sh` — see the [Override Cheatsheet](#override-cheatsheet) below for the full list.
 
 ### `run_paras_tests.sh`
 
@@ -157,29 +176,57 @@ Models present:
 
 `launch_server_dp_ep.sh` for both qwen and gptoss accepts `ENABLE_PARAS=1`, which:
 
-1. Adds `--enable-paras-moe --paras-tp-size $NUM_GPUS --disable-overlap-schedule` to the launch command (qwen also adds `--chunked-prefill-size -1 --max-prefill-tokens 32000`).
-2. Sets canonical ParaS env vars (`PARAS_CONFIGURE_METHOD=peer_access`, `PARAS_KV_TRANSFER_METHOD=peer_access`, etc.) — defaults differ slightly between qwen3 (eager) and gpt-oss (cuda-graph dual capture). See each script's header for the full list.
-3. User-supplied env vars on the same line override the ParaS defaults.
+1. Adds `--enable-paras-moe --paras-tp-size $NUM_GPUS` to the launch command. Overlap scheduling remains enabled; `SchedulerParasMixin._paras_drain_overlap_pipeline` drains any in-flight overlap-queued batch before each EP↔TP switch.
+2. Sets canonical ParaS env vars (`PARAS_CONFIGURE_METHOD=peer_access`, `PARAS_KV_TRANSFER_METHOD=peer_access`, etc. — see table below).
+3. User-supplied env vars on the same line override every ParaS default.
+4. `PARAS_AUTO_SWITCH=0` additionally appends `--no-paras-auto-switch` (use this when driving manual switches via `/paras_configure_{tp,ep}`).
 
 Without `ENABLE_PARAS=1`, the same script launches a vanilla DP+EP server suitable for serving benchmarks.
 
-### Common Env Var Cheatsheet
+### Override Cheatsheet
 
-Used by **launch + bench scripts**:
+Every var below honors the standard `${VAR:-default}` pattern: `VAR=N bash launch_server_*.sh` overrides; the launcher's default applies otherwise. Defaults live in `launch_common.sh` (shared) or the per-model script (model-specific). Anything passed after `--` on the command line (via `"$@"`) reaches `sglang.launch_server` directly and wins via argparse last-value semantics.
+
+#### Set in `launch_common.sh` (shared by every launcher)
+
+| Var | Default | Topology | Purpose |
+|---|---|---|---|
+| `HOST` | `0.0.0.0` | both | bind address |
+| `PORT` | `30000` | both | bind port |
+| `NUM_GPUS` | `8` | both | tp/dp/ep size; seeds `CUDA_VISIBLE_DEVICES` |
+| `CUDA_VISIBLE_DEVICES` | `0,1,...,NUM_GPUS-1` | both | physical GPUs (only set if unset) |
+| `ENABLE_CUDA_GRAPH` | `1` | both | `0` ⇒ pass `--disable-cuda-graph` |
+| `MAX_RUNNING_REQUESTS` | `2048` | both | sglang `--max-running-requests`; uniform across all models/servers |
+| `MAX_PREFILL_TOKENS` | `8192` | both | sglang `--max-prefill-tokens`; uniform across all models/servers |
+| `MAX_REQ_PER_RANK` | `MAX_RUNNING_REQUESTS / NUM_GPUS` | dp_ep | derived; feeds the three per-rank knobs below |
+| `CUDA_GRAPH_MAX_BS` | `MAX_REQ_PER_RANK` (dp_ep) / `MAX_RUNNING_REQUESTS` (tp_tp) | both | `--cuda-graph-max-bs` (only honored when graph enabled) |
+| `SGLANG_DEEPEP_BF16_DISPATCH` | `true` | dp_ep | BF16 in DeepEP dispatch |
+| `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | `MAX_REQ_PER_RANK` | dp_ep | DeepEP buffer size per rank (NVSHMEM_QP_DEPTH constraint) |
+| `NVSHMEM_QP_DEPTH` | `2048` | dp_ep | NVSHMEM queue pair depth |
+| `DISABLE_OVERLAP` | `0` | both | `1` adds `--disable-overlap-schedule` |
+| `DISABLE_RADIX_CACHE` | `1` | both | `1` (default) adds `--disable-radix-cache` (paras parity) |
+| `HYBRID_SWA` | `auto` (dp_ep) / unset (tp_tp) | both | `auto` resolves to `1` under paras, `0` under static. `0` adds `--disable-hybrid-swa-memory`. Only meaningful for gpt-oss. |
+| `SYNC_TOKEN_IDS_ACROSS_TP` | `1` (exported) | tp_tp only | MIN all-reduce on sampled token ids; parity with paras post-EP→TP swap |
+
+#### ParaS-only (set by `launch_common.sh` when `ENABLE_PARAS=1`)
 
 | Var | Default | Purpose |
 |---|---|---|
-| `MODEL_PATH` | model-specific | hf snapshot path (override for non-default checkout) |
-| `HOST` | `0.0.0.0` | bind address (launch) |
-| `PORT` | `30000` | bind port (launch) |
-| `NUM_GPUS` | `8` | tp/dp/ep size; also seeds `CUDA_VISIBLE_DEVICES` |
-| `CUDA_VISIBLE_DEVICES` | `0,1,...,N-1` | physical GPUs |
-| `MEM_FRACTION_STATIC` | model+mode-specific | sglang `--mem-fraction-static` |
-| `MAX_RUNNING_REQUESTS` | model+mode-specific | sglang `--max-running-requests` |
-| `ENABLE_CUDA_GRAPH` | `1` | `0` ⇒ pass `--disable-cuda-graph` |
-| `CUDA_GRAPH_MAX_BS` | unset | `--cuda-graph-max-bs` (only honored when graph enabled) |
+| `ENABLE_PARAS` | `0` | `1` enables paras mode |
+| `PARAS_AUTO_SWITCH` | `1` | `0` adds `--no-paras-auto-switch` for manual `/paras_configure_*` testing |
+| `PARAS_CONFIGURE_METHOD` | `peer_access` | `peer_access` or `naive` (NCCL all-to-all) |
+| `PARAS_KV_TRANSFER_METHOD` | `peer_access` | `peer_access` or `naive` |
+| `PARAS_DISABLE_PEER_ACCESS` | `0` | `1` force-disables peer-access pre-init at boot |
+| `SGLANG_ATTN_MAX_BS` | `MAX_REQ_PER_RANK` | attention batch-size cap (must be ≥ per-rank attn batch) |
 
-Used by **bench scripts only** (`paras_init_profile`):
+#### Set in per-model launcher (model-specific)
+
+| Var | Where set | Default |
+|---|---|---|
+| `MODEL_PATH` | per-model | `a100/gptoss`: `/data/shaoyuw/models/gpt-oss-120b-BF16-unsloth`; `a100/qwen`: `/data/shaoyuw/models/Qwen3-30B-A3B`; `h200/qwen`: `/models/Qwen3-235B-A22B-Instruct-2507` |
+| `MEM_FRACTION_STATIC` | per-model | `a100/gptoss` dp_ep: `0.75`; `a100/gptoss` tp_tp: `0.8`; qwen dp_ep paras: `0.6` (a100), `0.85` (h200); qwen static and tp_tp: `0.85` |
+
+#### Used by `bench_one_batch_*` only (out of scope for `launch_common.sh`)
 
 | Var | Default | Purpose |
 |---|---|---|
@@ -192,23 +239,6 @@ Used by **bench scripts only** (`paras_init_profile`):
 | `INPUT_LEN`, `OUTPUT_LEN` | `10` | prompt / decode length |
 | `RESULT_FILE` | `/tmp/<model>_<config>.jsonl` | bench output |
 | `RUN_NAME` | `<config>` | tag in output / profile dir names |
-
-Used by **`launch_server_dp_ep`** (DeepEP path):
-
-| Var | Default | Purpose |
-|---|---|---|
-| `SGLANG_DEEPEP_BF16_DISPATCH` | `true` | use BF16 in DeepEP dispatch |
-| `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | `512` (`256` under `ENABLE_PARAS=1`) | DeepEP buffer size per rank |
-| `NVSHMEM_QP_DEPTH` | `2048` | NVSHMEM queue pair depth |
-
-Used by **ParaS launches only** (`ENABLE_PARAS=1`):
-
-| Var | Default | Purpose |
-|---|---|---|
-| `PARAS_CONFIGURE_METHOD` | `peer_access` | `peer_access` (default) or `naive` (NCCL all-to-all) |
-| `PARAS_KV_TRANSFER_METHOD` | `peer_access` | `peer_access` (default) or `naive` |
-| `PARAS_DISABLE_PEER_ACCESS` | `0` (gpt-oss) | force-disable peer-access pre-init at boot |
-| `SGLANG_ATTN_MAX_BS` | `256` | attention batch-size cap (must be ≥ `MAX_RUNNING_REQUESTS / NUM_GPUS`) |
 
 ## Common Workflows
 

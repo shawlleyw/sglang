@@ -1,4 +1,5 @@
 from typing import List, Optional, Tuple, Any
+import gc
 import os
 import torch
 import pickle
@@ -50,51 +51,67 @@ def recover_request(
 def paras_tp_group_all_gather_reqs(
     reqs: List[Req],
     group: GroupCoordinator,
-) -> Tuple[List[Req], List[int]]:
-    device = torch.device("cuda")
-    
-    num_ranks = group.world_size
-    
-    # Clean up tensor members to avoid pickle triggering torch device copy, mostly radix cache related stuff
-    for req in reqs:
-        prune_request(req)
+) -> Tuple[Optional[List[Req]], Optional[List[int]]]:
+    # The 8 x pickle.loads loop below allocates ~2,048 fresh Req objects
+    # (256 reqs x 8 ranks, each with nested fields). That allocation rate
+    # trips CPython's gen-2 threshold and the resulting heap walk over the
+    # long-lived serving heap (radix nodes, req pools, sampler state, etc.)
+    # stalls the GIL for ~1.5-2 s with NO Python frame on the stack (so
+    # Kineto sees a silent gap). Disable GC for the duration of the call;
+    # gc.collect(0) at the end sweeps the young generation cheaply
+    # (O(new_objects), not O(heap_size)) so gen0 does not accumulate across
+    # switches. Root cause: INVESTIGATION_paras_gather_reqs_slow.md.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        device = torch.device("cuda")
 
-    
-    serialized_data = pickle.dumps(reqs)
-    size = len(serialized_data)
-    tensor_data = torch.ByteTensor(
-        np.frombuffer(serialized_data, dtype=np.uint8),
-        device="cpu",
-    )
-    tensor_size = torch.tensor([size], dtype=torch.long, device=device)
-    
-    gathered_size = torch.empty(num_ranks, dtype=torch.long, device=device)
-    group.all_gather_into_tensor(gathered_size, tensor_size)
-    gathered_size_list = gathered_size.tolist()
-    max_size = max(gathered_size_list)
-    if max_size == 0:
-        return None, None
-    
-    padded_tensor_data = torch.empty((max_size,), dtype=torch.uint8, device=device)
-    padded_tensor_data[:size].copy_(tensor_data)
+        num_ranks = group.world_size
 
-    gathered_data: torch.Tensor = torch.empty((max_size * num_ranks), dtype=torch.uint8, device=device)
-    group.all_gather_into_tensor(gathered_data, padded_tensor_data)
-    
-    serialized_data_per_rank = np.split(gathered_data.cpu().numpy(), num_ranks, axis=0)
-    
-    gathered_reqs = []
-    split_sizes = []
-    for i in range(num_ranks):
-        data = serialized_data_per_rank[i]
-        effective_size = gathered_size_list[i]
-        remote_reqs = pickle.loads(data[:effective_size]) if effective_size > 0 else []
-        gathered_reqs.extend(remote_reqs)
-        split_sizes.append(len(remote_reqs))
-        
-    print(f"metadata sizes: {gathered_size_list}, num_gathered_reqs: {len(gathered_reqs)}, split_sizes: {split_sizes}")
-    
-    return gathered_reqs, split_sizes
+        # Clean up tensor members to avoid pickle triggering torch device copy, mostly radix cache related stuff
+        for req in reqs:
+            prune_request(req)
+
+
+        serialized_data = pickle.dumps(reqs)
+        size = len(serialized_data)
+        tensor_data = torch.ByteTensor(
+            np.frombuffer(serialized_data, dtype=np.uint8),
+            device="cpu",
+        )
+        tensor_size = torch.tensor([size], dtype=torch.long, device=device)
+
+        gathered_size = torch.empty(num_ranks, dtype=torch.long, device=device)
+        group.all_gather_into_tensor(gathered_size, tensor_size)
+        gathered_size_list = gathered_size.tolist()
+        max_size = max(gathered_size_list)
+        if max_size == 0:
+            return None, None
+
+        padded_tensor_data = torch.empty((max_size,), dtype=torch.uint8, device=device)
+        padded_tensor_data[:size].copy_(tensor_data)
+
+        gathered_data: torch.Tensor = torch.empty((max_size * num_ranks), dtype=torch.uint8, device=device)
+        group.all_gather_into_tensor(gathered_data, padded_tensor_data)
+
+        serialized_data_per_rank = np.split(gathered_data.cpu().numpy(), num_ranks, axis=0)
+
+        gathered_reqs = []
+        split_sizes = []
+        for i in range(num_ranks):
+            data = serialized_data_per_rank[i]
+            effective_size = gathered_size_list[i]
+            remote_reqs = pickle.loads(data[:effective_size]) if effective_size > 0 else []
+            gathered_reqs.extend(remote_reqs)
+            split_sizes.append(len(remote_reqs))
+
+        print(f"metadata sizes: {gathered_size_list}, num_gathered_reqs: {len(gathered_reqs)}, split_sizes: {split_sizes}")
+
+        return gathered_reqs, split_sizes
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+        gc.collect(0)
 
 # from EP to TP, requests are all-gathered from all ranks
 class ParaSReqGatherManager:
@@ -171,11 +188,86 @@ class ParaSReqGatherManager:
         )
         self.global_waiting_reqs = gathered_waiting or []
 
-    def get_new_waiting_queue(self, paras_tp_rank: int) -> List[Req]:
-        if paras_tp_rank == 0:
-            return list(self.global_waiting_reqs)
-        return []
-        
+    def get_new_waiting_queue(self) -> List[Req]:
+        # TP-mode invariant: every TP rank must hold an identical waiting_queue
+        # so that the next iteration's get_next_batch_to_run picks the same
+        # prefill-vs-decode batch on all ranks. Returning the global list only
+        # on rank 0 desynchronizes the event loop and deadlocks the first TP
+        # collective in run_batch (cf. scatter_manager.get_new_waiting_queue).
+        return list(self.global_waiting_reqs)
+
+    def precheck_tp_capacity(
+        self,
+        new_req_pool_size: Optional[int] = None,
+        new_cache_size: Optional[int] = None,
+        new_cache_size_swa: Optional[int] = None,
+    ) -> Tuple[bool, str, dict]:
+        """Read-only precheck for ``reorchestrate_cache``.
+
+        For models where ``num_kv_heads < paras_tp_size`` (e.g. Qwen3-235B has
+        ``num_kv_heads=4`` at ``paras_tp_size=8``), KV heads are replicated
+        across ranks in TP mode, which roughly halves the effective KV-cache
+        capacity vs the EP-mode pool. Under heavy in-flight load, an EP->TP
+        switch can therefore overflow the smaller TP pool and the existing
+        asserts at the top of ``reorchestrate_cache`` crash the scheduler
+        irrecoverably (observed in the N=2048 paras-t128 rollout sweep).
+
+        Must be called AFTER ``gather_global_reqs`` (so ``self.num_global_tokens``
+        and ``self.global_reqs`` are populated) and BEFORE
+        ``reorchestrate_cache`` (so the caller can abort the switch gracefully
+        instead of crashing inside the destructive pool resize).
+
+        Mirrors the capacity computation in ``reorchestrate_cache`` exactly so
+        the precheck is a faithful predicate over the same asserts.
+
+        Returns:
+            ok: True if the planned TP pools can hold the in-flight workload.
+            reason: empty string when ok; human-readable explanation otherwise.
+            details: dict with ``num_global_tokens``, ``new_cache_size``,
+                ``num_reqs``, ``new_req_pool_size`` for structured logging by
+                the caller.
+
+        Does NOT mutate any pool state.
+        """
+        mgr = get_global_paras_memory_manager()
+        if new_req_pool_size is None:
+            new_req_pool_size = mgr.get_tp_max_num_reqs()
+
+        is_swa_alloc = isinstance(
+            self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+        )
+        if is_swa_alloc:
+            if new_cache_size is None:
+                new_cache_size = mgr.get_tp_max_kv_tokens()
+            if new_cache_size_swa is None:
+                new_cache_size_swa = mgr.get_tp_max_kv_tokens("swa")
+        else:
+            if new_cache_size is None:
+                new_cache_size = mgr.get_tp_max_kv_tokens()
+
+        num_reqs = len(self.global_reqs)
+        details = {
+            "num_global_tokens": int(self.num_global_tokens),
+            "new_cache_size": int(new_cache_size),
+            "num_reqs": int(num_reqs),
+            "new_req_pool_size": int(new_req_pool_size),
+        }
+
+        # Mirror reorchestrate_cache asserts (KV pool + req pool).
+        if self.num_global_tokens > new_cache_size:
+            return False, (
+                f"in-flight KV total ({self.num_global_tokens} tokens) exceeds "
+                f"TP-mode cache capacity ({new_cache_size} tokens)"
+            ), details
+
+        if num_reqs > new_req_pool_size:
+            return False, (
+                f"in-flight req count ({num_reqs}) exceeds TP-mode req pool "
+                f"size ({new_req_pool_size})"
+            ), details
+
+        return True, "", details
+
     def reorchestrate_cache(
         self, 
         new_req_pool_size: Optional[int] = None,
@@ -242,6 +334,12 @@ class ParaSReqGatherManager:
             self.global_token_indices = None
 
     def _tighten_swa_pool_to_in_window(self) -> None:
+        # Drop the SWA backing for every req's out-of-window prefix in a single
+        # batched gather + free_swa, rather than scanning bs req CUDA gathers
+        # serially. At running=2048 the per-req version takes ~47 ms (~23 us/req,
+        # dominated by per-slice CUDA launches + an implicit host sync on each
+        # req_to_token[req_pool_idx, 0:in_window_start] view); the vectorized
+        # version reduces that to one CUDA gather + one free_swa call.
         if not isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             return
         if self.layer_specs is None:
@@ -253,17 +351,41 @@ class ParaSReqGatherManager:
         )
         if sliding_window_size is None:
             return
+
+        req_pool_idxs: List[int] = []
+        oow_lens: List[int] = []
         for req in self.global_reqs:
             seqlen_no_last = req.seqlen - 1
             in_window_start = max(
                 req.swa_evicted_seqlen, seqlen_no_last - sliding_window_size
             )
             if in_window_start > 0:
-                oow_full_slots = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, 0:in_window_start
-                ]
-                self.token_to_kv_pool_allocator.free_swa(oow_full_slots)
+                req_pool_idxs.append(req.req_pool_idx)
+                oow_lens.append(in_window_start)
                 req.swa_evicted_seqlen = in_window_start
+
+        if not req_pool_idxs:
+            return
+
+        device = self.req_to_token_pool.device
+        row_idx_t = torch.tensor(req_pool_idxs, dtype=torch.int64, device=device)
+        lens_t = torch.tensor(oow_lens, dtype=torch.int64, device=device)
+        flat_rows = torch.repeat_interleave(row_idx_t, lens_t)
+
+        # flat_cols = concat of arange(oow_lens[i]) for each i, built on GPU
+        # via a single arange + cumulative-start subtraction (avoids a Python
+        # loop over reqs to materialize per-req column tensors).
+        total = int(lens_t.sum().item())
+        arange_t = torch.arange(total, dtype=torch.int64, device=device)
+        cumsum_t = torch.cumsum(lens_t, dim=0)
+        starts = torch.cat(
+            (torch.zeros(1, dtype=torch.int64, device=device), cumsum_t[:-1])
+        )
+        starts_per_pos = torch.repeat_interleave(starts, lens_t)
+        flat_cols = arange_t - starts_per_pos
+
+        oow_full_slots = self.req_to_token_pool.req_to_token[flat_rows, flat_cols]
+        self.token_to_kv_pool_allocator.free_swa(oow_full_slots)
 
     def gather_cache(self) -> None:
         """Transfer KV cache from EP layout to TP layout.
@@ -274,8 +396,18 @@ class ParaSReqGatherManager:
               ``SWAKVPool`` is a container holding both ``full_kv_pool`` and
               ``swa_kv_pool`` (each a plain ``MHATokenToKVPool``) plus the
               ``layers_mapping`` that routes per-layer access.
+
+        Note: this function used to call torch.cuda.empty_cache() up front to
+        defragment the caching allocator (~96 ms / call on 8 x A100 + 120B
+        weights). It was dropped because (1) the KV pool was already resized
+        by paras_resize_and_clear in reorchestrate_cache; (2) the transfer
+        kernels write into pre-allocated UMM peer addresses, not into newly
+        allocated caching-allocator blocks; and (3) empty_cache only sweeps
+        the caching allocator's free list, which does not touch anything the
+        transfer reads or writes. If post-switch decode OOMs surface across
+        many EP<->TP cycles (fragmentation accumulating), reintroduce
+        empty_cache on a background thread off the switch critical path.
         """
-        torch.cuda.empty_cache()
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         mgr = get_global_paras_memory_manager()
         method = self.method

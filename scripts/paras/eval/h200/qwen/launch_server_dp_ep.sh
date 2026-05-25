@@ -7,62 +7,27 @@
 #   MEM_FRACTION_STATIC MAX_RUNNING_REQUESTS
 #   SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
 #
-# Toggles:
-#   ENABLE_PARAS=1       Bake in ParaS EP↔TP switching (--enable-paras-moe + canonical defaults).
-#                        Shifts: MEM_FRACTION_STATIC→0.7, MAX_RUNNING_REQUESTS→1024,
-#                        SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK→512,
-#                        ENABLE_CUDA_GRAPH→0 (qwen ParaS canonical = eager).
-#                        Adds --chunked-prefill-size -1 --max-prefill-tokens 32000
-#                        --disable-overlap-schedule, plus PARAS_* env vars.
-#   ENABLE_CUDA_GRAPH=0  Pass --disable-cuda-graph (default 1; auto-flipped to 0 under ENABLE_PARAS).
-#   CUDA_GRAPH_MAX_BS=N  Pass --cuda-graph-max-bs N (only honored when ENABLE_CUDA_GRAPH=1).
+# Toggles (see ../../launch_common.sh for full semantics):
+#   ENABLE_PARAS=1       Bake in ParaS EP↔TP switching (--enable-paras-moe + canonical
+#                        defaults). Overlap stays enabled (drain-on-switch in
+#                        SchedulerParasMixin).
+#   ENABLE_CUDA_GRAPH=0  Disable cuda graphs (default 1).
+#   CUDA_GRAPH_MAX_BS=N  Override cuda-graph max bs. Default = MAX_RUNNING_REQUESTS/NUM_GPUS.
+#   DISABLE_OVERLAP=0|1  1 adds --disable-overlap-schedule (default 0).
+#   DISABLE_RADIX_CACHE=0|1
+#                        1 (default) adds --disable-radix-cache.
 
 set -uo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-source "$SCRIPT_DIR/../../lib.sh"
+source "$SCRIPT_DIR/../../launch_common.sh"
 
 MODEL_PATH=${MODEL_PATH:-/models/Qwen3-235B-A22B-Instruct-2507}
-HOST=${HOST:-0.0.0.0}
-PORT=${PORT:-30000}
-NUM_GPUS=${NUM_GPUS:-8}
 ENABLE_PARAS=${ENABLE_PARAS:-0}
 
-if [ "$ENABLE_PARAS" = "1" ]; then
-    : "${MEM_FRACTION_STATIC:=0.7}"
-    : "${MAX_RUNNING_REQUESTS:=1024}"
-    : "${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:=512}"
-    : "${SGLANG_ATTN_MAX_BS:=256}"
-    : "${PARAS_CONFIGURE_METHOD:=peer_access}"
-    : "${PARAS_KV_TRANSFER_METHOD:=peer_access}"
-    : "${ENABLE_CUDA_GRAPH:=0}"
-fi
-
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
-MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-256}
-ENABLE_CUDA_GRAPH=${ENABLE_CUDA_GRAPH:-1}
 
-paras_default_cvd
-
-export SGLANG_DEEPEP_BF16_DISPATCH=${SGLANG_DEEPEP_BF16_DISPATCH:-true}
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-512}
-export NVSHMEM_QP_DEPTH=${NVSHMEM_QP_DEPTH:-2048}
-
-PARAS_FLAGS=()
-if [ "$ENABLE_PARAS" = "1" ]; then
-    export SGLANG_ATTN_MAX_BS
-    export PARAS_CONFIGURE_METHOD
-    export PARAS_KV_TRANSFER_METHOD
-    PARAS_FLAGS=(
-        --enable-paras-moe
-        --paras-tp-size "$NUM_GPUS"
-        --disable-overlap-schedule
-        --disable-radix-cache
-        --max-prefill-tokens 32000
-    )
-fi
-
-paras_init_cuda_graph
+paras_launch_setup_dp_ep
 
 python -m sglang.launch_server \
     --model-path "$MODEL_PATH" \
@@ -73,7 +38,10 @@ python -m sglang.launch_server \
     --enable-dp-attention --enable-dp-lm-head \
     --moe-a2a-backend deepep --deepep-mode auto \
     --max-running-requests "$MAX_RUNNING_REQUESTS" \
+    --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
     --chunked-prefill-size -1 \
+    "${OVERLAP_FLAGS[@]}" \
+    "${RADIX_FLAGS[@]}" \
     "${CUDA_GRAPH_FLAGS[@]}" \
     "${PARAS_FLAGS[@]}" \
     "$@"
