@@ -1021,6 +1021,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # and ParasMetricsSampler.
     global_running_reqs: Optional[List[int]] = None
     global_waiting_reqs: Optional[List[int]] = None
+    global_prefilling_reqs: Optional[List[int]] = None
     global_total_decode_tokens: Optional[List[int]] = None
     global_total_prefill_tokens: Optional[List[int]] = None
     is_extend_in_batch: bool = False

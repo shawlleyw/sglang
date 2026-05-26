@@ -137,25 +137,31 @@ class DecodeAutoSwitchPolicy(ParasAutoSwitchPolicy):
 
 
 class HybridAutoSwitchPolicy(ParasAutoSwitchPolicy):
-    """Two-signal auto-switch: pending reqs (rollout-style) OR prefill tokens.
+    """Ingested-reqs signal with asymmetric smoothing and dual thresholds.
 
-    Motivation: the rollout signal undercounts during prefill spikes because
-    reqs being prefilled are in `cur_batch`, not in `running_batch.reqs` and
-    not in `waiting_queue`. During pure-prefill burst onset rollout often
-    sees running+waiting=0 and the base-class `observe()` skips the iteration
-    (value <= 0 filter), leaving the window partial and `pick_target` blind.
-    This policy adds a prefill-tokens window so prefill spikes can drive the
-    TP -> EP transition even when the req-count signal is idle.
+    Signal: total reqs in the system across all stages, gathered from every
+    DP rank:
+        S = sum(global_running_reqs) + sum(global_waiting_reqs)
+            + sum(global_prefilling_reqs)
+    In TP mode the gathered fields are unreliable post-switch, so we read
+    running_batch + waiting_queue locally (paras_parallelism_config == 'TP'
+    means a unified data plane).
 
-    Switching rules:
-      * TP -> EP: EITHER window full AND its avg > threshold (catch the burst
-        on whichever signal trips first; prefill-tokens fires faster than
-        running+waiting during burst onset).
-      * EP -> TP: BOTH signals "cold". A partial/empty window counts as cold,
-        so the policy can drop back during pure-decode quiet periods when
-        prefill_window has no fresh samples.
+    This captures the population rollout misses: reqs in mid-prefill are not
+    in running_batch.reqs (they get merged in only after process_batch_result_prefill)
+    and not in waiting_queue (they were pulled out for the EXTEND batch).
+    The global_prefilling_reqs field, added to the existing MLP-sync all-gather,
+    catches them.
 
-    Window state is cleared on every fire so successive switches are isolated.
+    Decision asymmetry:
+      * TP -> EP: fire on the LATEST observation > threshold. Burst onset is
+        a crisp jump; smoothing would lag.
+      * EP -> TP: fire on the sliding-window avg < threshold * low_ratio.
+        Decode steady-state fluctuates; smoothing prevents thrashing at the
+        boundary.
+
+    Hysteresis: low_threshold = threshold * low_ratio < threshold. The gap
+    avoids bouncing when S sits in the in-between band.
     """
 
     def __init__(
@@ -163,11 +169,11 @@ class HybridAutoSwitchPolicy(ParasAutoSwitchPolicy):
         threshold: int,
         window: int,
         cooldown_sec: float,
-        prefill_threshold: int,
+        low_ratio: float,
     ):
         super().__init__(threshold, window, cooldown_sec)
-        self.prefill_threshold = prefill_threshold
-        self.prefill_window: deque = deque(maxlen=window)
+        self.low_threshold = int(threshold * low_ratio)
+        self.low_ratio = low_ratio
 
     def observation_for_batch(
         self, scheduler: Any, batch: Optional[ScheduleBatch]
@@ -177,73 +183,60 @@ class HybridAutoSwitchPolicy(ParasAutoSwitchPolicy):
                 return None
             running_field = batch.global_running_reqs
             waiting_field = batch.global_waiting_reqs
-            if running_field is None or waiting_field is None:
+            prefilling_field = batch.global_prefilling_reqs
+            if (
+                running_field is None
+                or waiting_field is None
+                or prefilling_field is None
+            ):
                 return None
-            return int(sum(running_field)) + int(sum(waiting_field))
+            return (
+                int(sum(running_field))
+                + int(sum(waiting_field))
+                + int(sum(prefilling_field))
+            )
         rb = scheduler.running_batch
         running = len(rb.reqs) if rb is not None else 0
         waiting = len(scheduler.waiting_queue)
-        return running + waiting
-
-    def _prefill_observation(
-        self, scheduler: Any, batch: Optional[ScheduleBatch]
-    ) -> Optional[int]:
-        if batch is None or batch.forward_mode != ForwardMode.EXTEND:
-            return None
-        if batch.global_num_tokens:
-            return int(sum(batch.global_num_tokens))
-        return sum(req.seqlen for req in batch.reqs)
-
-    def observe(
-        self, scheduler: Any, batch: Optional[ScheduleBatch], now: float
-    ) -> None:
-        req_value = self.observation_for_batch(scheduler, batch)
-        if req_value is not None and req_value > 0:
-            self.window.append(req_value)
-        prefill_value = self._prefill_observation(scheduler, batch)
-        if prefill_value is not None and prefill_value > 0:
-            self.prefill_window.append(prefill_value)
+        local_prefilling = (
+            len(batch.reqs)
+            if batch is not None and batch.forward_mode == ForwardMode.EXTEND
+            else 0
+        )
+        return running + waiting + local_prefilling
 
     def pick_target(self, current_mode: str, now: float) -> Optional[str]:
         if now < self.cooldown_until:
             return None
-        req_full = len(self.window) >= self.window.maxlen
-        prefill_full = len(self.prefill_window) >= self.prefill_window.maxlen
-        if not req_full and not prefill_full:
+        if not self.window:
             return None
 
-        req_avg = sum(self.window) / len(self.window) if self.window else 0.0
-        prefill_avg = (
-            sum(self.prefill_window) / len(self.prefill_window)
-            if self.prefill_window else 0.0
-        )
-        req_hot = req_full and req_avg > self.threshold
-        prefill_hot = prefill_full and prefill_avg > self.prefill_threshold
-        req_cold = (not req_full) or req_avg < self.threshold
-        prefill_cold = (not prefill_full) or prefill_avg < self.prefill_threshold
-
         target: Optional[str] = None
-        trigger = "?"
-        if current_mode == "TP" and (req_hot or prefill_hot):
-            target = "EP"
-            trigger = "BOTH" if (req_hot and prefill_hot) else ("REQ" if req_hot else "PREFILL")
-        elif current_mode == "EP" and req_cold and prefill_cold:
-            target = "TP"
-            trigger = "BOTH_COLD"
+        trigger = ""
+        if current_mode == "TP":
+            latest = self.window[-1]
+            if latest > self.threshold:
+                target = "EP"
+                trigger = f"latest={latest} > threshold={self.threshold}"
+        else:
+            if len(self.window) < self.window.maxlen:
+                return None
+            avg = sum(self.window) / len(self.window)
+            if avg < self.low_threshold:
+                target = "TP"
+                trigger = (
+                    f"avg={avg:.2f} < low_threshold={self.low_threshold} "
+                    f"(threshold={self.threshold} * low_ratio={self.low_ratio})"
+                )
 
         if target is not None:
             logger.info(
                 f"ParaS [HybridAutoSwitchPolicy] policy fired: "
-                f"{current_mode} -> {target} at t={now:.3f} | trigger={trigger} | "
-                f"req_avg={req_avg:.2f} req_thresh={self.threshold} "
-                f"req_window={list(self.window)} | "
-                f"prefill_avg={prefill_avg:.2f} prefill_thresh={self.prefill_threshold} "
-                f"prefill_window={list(self.prefill_window)} | "
-                f"cooldown_sec={self.cooldown_sec}"
+                f"{current_mode} -> {target} at t={now:.3f} | {trigger} | "
+                f"window={list(self.window)} cooldown_sec={self.cooldown_sec}"
             )
             self.cooldown_until = now + self.cooldown_sec
             self.window.clear()
-            self.prefill_window.clear()
         return target
 
 
@@ -354,7 +347,7 @@ class SchedulerParasMixin:
                 cooldown_sec=sa.paras_auto_switch_cooldown_sec,
             )
             if sa.paras_auto_switch_policy == "hybrid":
-                policy_kwargs["prefill_threshold"] = sa.paras_auto_switch_prefill_threshold
+                policy_kwargs["low_ratio"] = sa.paras_auto_switch_low_ratio
             self._paras_auto_policy = policy_cls(**policy_kwargs)
 
         # Freeze the long-lived serving heap (weights, KV pool layouts, sampler

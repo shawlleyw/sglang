@@ -172,18 +172,17 @@ class ParasAutoSwitchDefaults:
 
     `threshold_per_gpu` is multiplied by world_size at resolution time so the
     per-GPU work that justifies switching is constant. `window` and
-    `cooldown_sec` are absolute. Prefill iterations are larger and rarer than
-    decode, so the prefill policy uses a shorter window and shorter cooldown
-    to stay reactive.
+    `cooldown_sec` are absolute.
 
-    `prefill_threshold_per_gpu` is hybrid-only: the prefill-token threshold
-    (multiplied by world_size) used as the second signal in HybridAutoSwitch.
+    `low_ratio` is hybrid-only: the EP -> TP threshold is computed as
+    `threshold * low_ratio`. A smaller ratio means stickier EP (we stay in EP
+    until the system is very quiet).
     """
 
     threshold_per_gpu: int
     window: int
     cooldown_sec: float
-    prefill_threshold_per_gpu: Optional[int] = None
+    low_ratio: Optional[float] = None
 
 
 PARAS_AUTO_SWITCH_POLICY_DEFAULTS: Dict[str, ParasAutoSwitchDefaults] = {
@@ -194,7 +193,7 @@ PARAS_AUTO_SWITCH_POLICY_DEFAULTS: Dict[str, ParasAutoSwitchDefaults] = {
         threshold_per_gpu=32,
         window=8,
         cooldown_sec=5.0,
-        prefill_threshold_per_gpu=512,
+        low_ratio=0.20,
     ),
 }
 PARAS_AUTO_SWITCH_POLICY_CHOICES = list(PARAS_AUTO_SWITCH_POLICY_DEFAULTS)
@@ -455,7 +454,7 @@ class ServerArgs:
     paras_auto_switch_threshold: Optional[int] = None
     paras_auto_switch_window: Optional[int] = None
     paras_auto_switch_cooldown_sec: Optional[float] = None
-    paras_auto_switch_prefill_threshold: Optional[int] = None
+    paras_auto_switch_low_ratio: Optional[float] = None
     paras_metrics_file: Optional[str] = None
     paras_per_step_metrics_file: Optional[str] = None
 
@@ -1564,15 +1563,8 @@ class ServerArgs:
             self.paras_auto_switch_window = defaults.window
         if self.paras_auto_switch_cooldown_sec is None:
             self.paras_auto_switch_cooldown_sec = defaults.cooldown_sec
-        if self.paras_auto_switch_prefill_threshold is None:
-            if defaults.prefill_threshold_per_gpu is not None:
-                self.paras_auto_switch_prefill_threshold = (
-                    defaults.prefill_threshold_per_gpu * self.tp_size
-                )
-            else:
-                self.paras_auto_switch_prefill_threshold = (
-                    self.paras_auto_switch_threshold * 16
-                )
+        if self.paras_auto_switch_low_ratio is None:
+            self.paras_auto_switch_low_ratio = defaults.low_ratio
         assert self.paras_auto_switch_threshold > 0, (
             "--paras-auto-switch-threshold must be positive"
         )
@@ -1582,9 +1574,13 @@ class ServerArgs:
         assert self.paras_auto_switch_cooldown_sec >= 0, (
             "--paras-auto-switch-cooldown-sec must be non-negative"
         )
-        assert self.paras_auto_switch_prefill_threshold > 0, (
-            "--paras-auto-switch-prefill-threshold must be positive"
-        )
+        if self.paras_auto_switch_policy == "hybrid":
+            assert self.paras_auto_switch_low_ratio is not None, (
+                "--paras-auto-switch-low-ratio is required for hybrid policy"
+            )
+            assert 0.0 < self.paras_auto_switch_low_ratio <= 1.0, (
+                "--paras-auto-switch-low-ratio must be in (0, 1]"
+            )
 
     def _check_paras_config(self):
         if self.enable_paras_moe:
@@ -3127,10 +3123,12 @@ class ServerArgs:
                 "(default threshold 1024 * world_size, window 8, cooldown "
                 "10s). 'rollout' fires on global pending reqs (running + "
                 "waiting; default threshold 8 * world_size, window 1, "
-                "cooldown 5s). 'hybrid' combines running+waiting reqs AND "
-                "prefill tokens with OR-to-EP / AND-to-TP logic (default "
-                "threshold 32 * world_size, prefill_threshold 512 * world_size, "
-                "window 8, cooldown 5s)."
+                "cooldown 5s). 'hybrid' fires on global ingested reqs "
+                "(running + waiting + prefilling, all-gathered across DP "
+                "ranks). TP -> EP fires on the latest observation > threshold; "
+                "EP -> TP fires on the windowed avg < threshold * low_ratio "
+                "(default threshold 32 * world_size, low_ratio 0.20, window 8, "
+                "cooldown 5s)."
             ),
         )
         parser.add_argument(
@@ -3164,14 +3162,15 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
-            "--paras-auto-switch-prefill-threshold",
-            type=int,
-            default=ServerArgs.paras_auto_switch_prefill_threshold,
+            "--paras-auto-switch-low-ratio",
+            type=float,
+            default=ServerArgs.paras_auto_switch_low_ratio,
             help=(
-                "Prefill-token threshold for the hybrid auto-switch policy. "
-                "Ignored by other policies. When unset, defaults to the "
-                "policy's prefill_threshold_per_gpu * world_size, or "
-                "16x the req-count threshold as a fallback."
+                "EP -> TP low-threshold ratio for the hybrid auto-switch "
+                "policy. EP -> TP fires when the windowed avg < threshold * "
+                "low_ratio. Smaller values make EP stickier (we stay in EP "
+                "until the system is very quiet). Ignored by other policies. "
+                "When unset, defaults to the policy's value (0.20 for hybrid)."
             ),
         )
         parser.add_argument(
