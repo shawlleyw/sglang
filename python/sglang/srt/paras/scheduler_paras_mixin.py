@@ -472,6 +472,20 @@ class SchedulerParasMixin:
             self.running_batch.filter_batch()
         self.last_batch = None
         self.cur_batch = None
+        # Release the overlap-scheduler's 2-slot batch_record_buf ring so it
+        # stops pinning pre-switch ModelWorkerBatch tensors (input_ids,
+        # out_cache_loc, ...) that point into the about-to-be-swapped EP/TP
+        # req_to_token / KV layout. Without this clear, the stale refs
+        # interact with the per-mode CUDA graph memory pool and the caching
+        # allocator's stream-reuse tracking diverges, producing sticky
+        # post-switch illegal-memory-access faults that surface at the next
+        # copy_done.synchronize() (often minutes after the actual fault) --
+        # rate-sweep v2 hybrid+r080 crash, May 2026.
+        batch_record_buf = getattr(self, "batch_record_buf", None)
+        if batch_record_buf is not None:
+            for i in range(len(batch_record_buf)):
+                batch_record_buf[i] = None
+            self.batch_record_ct = 0
 
     def _paras_auto_clear_window_on_switch(self) -> None:
         assert self._paras_auto_policy is not None
