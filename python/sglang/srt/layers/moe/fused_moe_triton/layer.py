@@ -218,7 +218,18 @@ class FusedMoE(torch.nn.Module):
             self.quant_method = quant_config.get_quant_method(self, prefix)
         if self.quant_method is None:
             from sglang.srt.layers import deep_gemm_wrapper
-            use_deep_gemm = (self.moe_ep_size > 1 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM)
+
+            # moe_ep_deepgemm_preprocess (standard->deep_gemm) hardcodes fp8 activation
+            # quantization, so DeepGEMM EP only works on the DeepEP dispatch path. For
+            # unquantized BF16 + AllReduce-EP (standard dispatch, e.g. --tp N --ep-size N)
+            # it feeds fp8 activations into the bf16 masked GEMM and trips the
+            # gemm.hpp:506 a.scalar_type()==kBFloat16 assertion. Gate DeepGEMM to the
+            # DeepEP path; all other configs fall back to the Triton MoE runner.
+            use_deep_gemm = (
+                self.moe_ep_size > 1
+                and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and get_moe_a2a_backend().is_deepep()
+            )
             self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels, use_deep_gemm=use_deep_gemm)
 
         self.skip_weights_init = skip_weights_init
