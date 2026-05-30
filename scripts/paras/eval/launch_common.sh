@@ -142,3 +142,68 @@ paras_launch_setup_tp_tp() {
     _paras_launch_overlap_radix_flags
     paras_init_cuda_graph
 }
+
+paras_launch_setup_dp_tp() {
+    _paras_launch_common_defaults
+    MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-2048}
+
+    # DP attention + TP experts (AllReduce, no DeepEP). Drop any stale DeepEP env.
+    unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
+
+    # DP attention: each rank captures graphs for its own per-rank slice.
+    MAX_REQ_PER_RANK=$((MAX_RUNNING_REQUESTS / NUM_GPUS))
+    : "${CUDA_GRAPH_MAX_BS:=$MAX_REQ_PER_RANK}"
+
+    _paras_launch_hybrid_swa_flags
+    _paras_launch_overlap_radix_flags
+    paras_init_cuda_graph
+}
+
+paras_launch_setup_tp_ep() {
+    _paras_launch_common_defaults
+    MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-2048}
+
+    # TP attention + EP-sharded experts via AllReduce (no DeepEP). Drop stale env.
+    unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
+
+    # TP attention: single global batch dispatched across TP ranks.
+    : "${CUDA_GRAPH_MAX_BS:=$MAX_RUNNING_REQUESTS}"
+
+    _paras_launch_hybrid_swa_flags
+    _paras_launch_overlap_radix_flags
+    paras_init_cuda_graph
+}
+
+paras_launch_setup_dp_tp() {
+    _paras_launch_common_defaults
+    MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-2048}
+
+    # DP attention + TP experts (AllReduce MoE, no DeepEP). Drop stale DeepEP env.
+    unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
+
+    # DP attention -> each rank captures graphs for its own per-rank slice.
+    MAX_REQ_PER_RANK=$((MAX_RUNNING_REQUESTS / NUM_GPUS))
+    : "${CUDA_GRAPH_MAX_BS:=$MAX_REQ_PER_RANK}"
+
+    _paras_launch_hybrid_swa_flags
+    _paras_launch_overlap_radix_flags
+    paras_init_cuda_graph
+}
+
+paras_launch_setup_tp_ep() {
+    _paras_launch_common_defaults
+    MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-2048}
+
+    # TP attention + AllReduce-based EP experts (--ep-size, no DeepEP). Drop stale
+    # DeepEP env. The MoE runner gates DeepGEMM to the DeepEP dispatch path
+    # (fused_moe_triton/layer.py), so this AllReduce-EP config uses the Triton
+    # MoE runner.
+    unset SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
+
+    # TP attention -> single global batch dispatched across TP ranks.
+    : "${CUDA_GRAPH_MAX_BS:=$MAX_RUNNING_REQUESTS}"
+
+    _paras_launch_hybrid_swa_flags
+    _paras_launch_overlap_radix_flags
+    paras_init_cuda_graph
+}
