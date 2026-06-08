@@ -566,7 +566,7 @@ async def async_request_sglang_generate(
                             # want to check a token was generated
                             if "text" in data and data["text"]:
                                 timestamp = time.perf_counter()
-                                generated_text = data["text"]
+                                generated_text += data["text"]  # per-step delta
                                 output_len = data["meta_info"]["completion_tokens"]
 
                                 # First token
