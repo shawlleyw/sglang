@@ -916,11 +916,16 @@ class SchedulerParasMixin:
     
     def paras_start_profile(self, output_dir: str = "/tmp/paras_configure_profile"):
         import os
-        output_dir = os.environ.get("PARAS_PROFILE_DIR", output_dir)
+        # Off by default: stop() exports a multi-MB/rank trace that blocks the
+        # EP<->TP switch for seconds under load. Enable only via PARAS_PROFILE_DIR.
+        profile_dir = os.environ.get("PARAS_PROFILE_DIR")
+        if profile_dir is None:
+            self.profiler = None
+            return
         self.profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                output_dir,
+                profile_dir,
                 worker_name=f"rank{self.tp_rank}",
             ),
             record_shapes=True,
@@ -930,5 +935,7 @@ class SchedulerParasMixin:
         self.profiler.start()
         
     def paras_stop_profile(self):
+        if self.profiler is None:
+            return
         self.profiler.stop()
         self.profiler = None
