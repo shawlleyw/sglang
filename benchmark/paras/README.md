@@ -32,7 +32,11 @@ for both cache and weights, across a configurable per-GPU volume.
 --load f            # resident fraction in (0, 1]
 ```
 
-Resident KV data per GPU = `cache_size_gb × load`. For example, `--cache-size-gb 20 --load 0.5` gives ~10 GiB resident KV per GPU. Both TP→EP and EP→TP move the same `num_resident_tokens` per source rank, so the two directions are directly comparable.
+Resident KV data per GPU = `cache_size_gb × load`. For example, `--cache-size-gb 20 --load 0.5` gives ~10 GiB resident KV per GPU.
+
+**EP→TP transfer** moves `num_resident_tokens` (= per-EP-partition cache budget) per source rank, broadcast to all W TP destinations (R replicas per head). This matches production EP→TP byte-for-byte.
+
+**TP→EP scatter** mirrors the production `intra_rank // R` head-replica dedup: after EP→TP each TP rank holds the FULL global cache (W·N tokens of its 1 head), so production scatters W·N/R tokens per rank. The bench sets `M = min(W·N/R, ep_max_tokens-1)` to mirror this while keeping per-source EP slot ranges disjoint. To hit exact production volume, run at `load ≤ R/W` (e.g. `--load 0.25` for Qwen3 at tp=8); at higher loads the bench caps short of production volume to preserve disjoint slots and v2/v3 bytewise equality.
 
 **Weights:** volume is fixed by the model preset (`num_experts`, `hidden_size`, `moe_intermediate_size`).
 

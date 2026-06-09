@@ -56,23 +56,33 @@ def offsets_in_arena(layout: KVLayout) -> dict:
 
 
 def build_scatter_routing(ctx: IPCContext, layout: KVLayout, seed: int):
-    """TP→EP routing: random TP source slots + round-robin destination ranks.
+    """TP->EP routing mirroring production scatter volume.
 
-    Per-source-rank EP slot ranges are disjoint
-    (`[1 + s*ep_max_tokens/W, ...)`) so two source ranks never write the
-    same destination slot.
+    After EP->TP each TP rank holds the FULL global cache (W*N tokens of its
+    1 head, per the layout's tp_max_tokens=W*N+1).  Production scatter
+    applies R-way head-replica dedup, so each TP rank sources
+    M_target = W*N/R tokens (= (W/R) * num_resident_tokens).
+
+    We cap M at ep_max_tokens-1 to keep per-source-rank slot ranges
+    disjoint within each destination's EP buffer (n = M/W <= ep_region
+    = ep_max_tokens/W).  This preserves v2/v3 bytewise correctness at the
+    cost of under-shooting production volume when load > R/W
+    (e.g. load=0.5, R=2 -> M = 2N instead of the 4N production value).
     """
     N = layout.num_resident_tokens
     W = ctx.world_size
-    tp_src_slots = random_resident_slots(N, layout.tp_max_tokens, ctx.rank, seed).to(ctx.device)
-    dst_ranks = (torch.arange(N, dtype=torch.int32) % W).to(ctx.device)
+    R = layout.replication_factor
+    M = min((W * N) // R, layout.ep_max_tokens - 1)
+    tp_src_slots = random_resident_slots(M, layout.tp_max_tokens, ctx.rank, seed).to(ctx.device)
+    dst_ranks = (torch.arange(M, dtype=torch.int32) % W).to(ctx.device)
     ep_region = layout.ep_max_tokens // W
-    ep_slots = torch.zeros(N, dtype=torch.int32, device=ctx.device)
+    ep_slots = torch.zeros(M, dtype=torch.int32, device=ctx.device)
     for r in range(W):
         mask = dst_ranks == r
         idx = mask.nonzero(as_tuple=False).flatten()
         n = idx.numel()
-        ep_slots[idx] = 1 + ctx.rank * ep_region + torch.arange(n, dtype=torch.int32, device=ctx.device)
+        ep_slots[idx] = 1 + ctx.rank * ep_region + torch.arange(
+            n, dtype=torch.int32, device=ctx.device)
     return tp_src_slots, dst_ranks, ep_slots
 
 
@@ -130,14 +140,14 @@ def run_scatter(ctx: IPCContext, layout: KVLayout, seed: int, method: str,
     fill_slots_bf16(tp_k, src_slots, ctx.rank, layout.heads_per_rank, layout.head_dim, 0.0)
     fill_slots_bf16(tp_v, src_slots, ctx.rank, layout.heads_per_rank, layout.head_dim, 128.0)
 
-    N = layout.num_resident_tokens
+    M = src_slots.numel()
     send_buf = recv_buf = None
     if method in ("nccl", "nccl_overlap"):
         per_token = 2 * layout.heads_per_rank * layout.head_dim
         order = torch.argsort(dst_ranks, stable=True)
         sorted_src = src_slots[order].to(torch.long)
         gathered = torch.stack([tp_k[sorted_src], tp_v[sorted_src]], dim=2)
-        send_buf = gathered.contiguous().view(N, per_token).to(torch.bfloat16).contiguous()
+        send_buf = gathered.contiguous().view(M, per_token).to(torch.bfloat16).contiguous()
         recv_buf = torch.empty_like(send_buf)
 
     timer = CudaTimer(ctx.device, warmup=warmup, iters=iters)
