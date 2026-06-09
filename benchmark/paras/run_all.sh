@@ -29,34 +29,63 @@ echo "sweep -> $OUT_DIR (NUM_GPUS=$NUM_GPUS WARMUP=$WARMUP ITERS=$ITERS)" | tee 
 
 CACHE_CONFIGS=("1.0:0.25" "1.0:0.5" "1.0:1.0" "4.0:0.5")
 METHODS=("peer_access" "nccl" "nccl_overlap")
+PEER_ACCESS_VARIANTS=("v2" "v3")
 
 for model in "${MODELS[@]}"; do
     for cfg in "${CACHE_CONFIGS[@]}"; do
         IFS=':' read -r CSZ LD <<< "$cfg"
         for METHOD in "${METHODS[@]}"; do
-            echo | tee -a "$LOG"
-            echo "[cache] model=$model cache=$CSZ load=$LD method=$METHOD" | tee -a "$LOG"
-            set +e
-            timeout 600 torchrun --nproc_per_node="$NUM_GPUS" bench_cache.py \
-                --model "$model" --tp-size "$NUM_GPUS" \
-                --cache-size-gb "$CSZ" --load "$LD" \
-                --direction both --method "$METHOD" \
-                --warmup "$WARMUP" --iters "$ITERS" \
-                --out-csv "$CACHE_CSV" 2>&1 | tee -a "$LOG" | grep -E "RUN|scatter:|transfer:|error"
-            set -e
+            if [ "$METHOD" = "peer_access" ]; then
+                VARIANTS_TO_RUN=("${PEER_ACCESS_VARIANTS[@]}")
+            else
+                VARIANTS_TO_RUN=("")
+            fi
+            for VARIANT in "${VARIANTS_TO_RUN[@]}"; do
+                if [ -n "$VARIANT" ]; then
+                    VARIANT_ARGS=(--variant "$VARIANT")
+                    TAG="${METHOD}(${VARIANT})"
+                else
+                    VARIANT_ARGS=()
+                    TAG="$METHOD"
+                fi
+                echo | tee -a "$LOG"
+                echo "[cache] model=$model cache=$CSZ load=$LD method=$TAG" | tee -a "$LOG"
+                set +e
+                timeout 600 torchrun --nproc_per_node="$NUM_GPUS" bench_cache.py \
+                    --model "$model" --tp-size "$NUM_GPUS" \
+                    --cache-size-gb "$CSZ" --load "$LD" \
+                    --direction both --method "$METHOD" "${VARIANT_ARGS[@]}" \
+                    --warmup "$WARMUP" --iters "$ITERS" \
+                    --out-csv "$CACHE_CSV" 2>&1 | tee -a "$LOG" | grep -E "RUN|scatter:|transfer:|error"
+                set -e
+            done
         done
     done
 
     for METHOD in "${METHODS[@]}"; do
-        echo | tee -a "$LOG"
-        echo "[weights] model=$model method=$METHOD" | tee -a "$LOG"
-        set +e
-        timeout 600 torchrun --nproc_per_node="$NUM_GPUS" bench_weights.py \
-            --model "$model" --tp-size "$NUM_GPUS" \
-            --kernel both --direction both --method "$METHOD" \
-            --warmup "$WARMUP" --iters "$ITERS" \
-            --out-csv "$WEIGHTS_CSV" 2>&1 | tee -a "$LOG" | grep -E "RUN|: total|error"
-        set -e
+        if [ "$METHOD" = "peer_access" ]; then
+            VARIANTS_TO_RUN=("${PEER_ACCESS_VARIANTS[@]}")
+        else
+            VARIANTS_TO_RUN=("")
+        fi
+        for VARIANT in "${VARIANTS_TO_RUN[@]}"; do
+            if [ -n "$VARIANT" ]; then
+                VARIANT_ARGS=(--variant "$VARIANT")
+                TAG="${METHOD}(${VARIANT})"
+            else
+                VARIANT_ARGS=()
+                TAG="$METHOD"
+            fi
+            echo | tee -a "$LOG"
+            echo "[weights] model=$model method=$TAG" | tee -a "$LOG"
+            set +e
+            timeout 600 torchrun --nproc_per_node="$NUM_GPUS" bench_weights.py \
+                --model "$model" --tp-size "$NUM_GPUS" \
+                --kernel both --direction both --method "$METHOD" "${VARIANT_ARGS[@]}" \
+                --warmup "$WARMUP" --iters "$ITERS" \
+                --out-csv "$WEIGHTS_CSV" 2>&1 | tee -a "$LOG" | grep -E "RUN|: total|error"
+            set -e
+        done
     done
 done
 
