@@ -158,9 +158,29 @@ def peer_access_fused_transfer_w13_v2(
     num_gates: int,
     elem_size: int = 2,
     stream=None,
+    variant: str = "v2",
+    hidden_size: int = None,
 ) -> None:
     import paras_peer_access_cuda
     stream_ptr = stream.cuda_stream if stream is not None else 0
+    if variant == "v3":
+        assert hidden_size is not None, "w13 v3 requires hidden_size"
+        I = (intermediate_per_tp_times_hidden // hidden_size) * tp_size
+        paras_peer_access_cuda.launch_peer_access_fused_transfer_w13_v3(
+            local_buffer_ptr,
+            dst_base_ptrs_tensor,
+            src_ep_offset,
+            dst_tp_offset,
+            tp_rank,
+            tp_size,
+            num_local_experts,
+            hidden_size,
+            I,
+            num_gates,
+            elem_size,
+            stream_ptr,
+        )
+        return
     paras_peer_access_cuda.launch_peer_access_fused_transfer_w13_v2(
         local_buffer_ptr,
         dst_base_ptrs_tensor,
@@ -189,9 +209,25 @@ def peer_access_fused_transfer_w2_v2(
     tp_intermediate: int,
     elem_size: int = 2,
     stream=None,
+    variant: str = "v2",
 ) -> None:
     import paras_peer_access_cuda
     stream_ptr = stream.cuda_stream if stream is not None else 0
+    if variant == "v3":
+        paras_peer_access_cuda.launch_peer_access_fused_transfer_w2_v3(
+            local_buffer_ptr,
+            dst_base_ptrs_tensor,
+            src_ep_offset,
+            dst_tp_offset,
+            tp_rank,
+            tp_size,
+            num_local_experts,
+            hidden_size,
+            full_intermediate,
+            elem_size,
+            stream_ptr,
+        )
+        return
     paras_peer_access_cuda.launch_peer_access_fused_transfer_w2_v2(
         local_buffer_ptr,
         dst_base_ptrs_tensor,
@@ -219,9 +255,29 @@ def peer_access_fused_transfer_w13_ep(
     num_gates: int,
     elem_size: int = 2,
     stream=None,
+    variant: str = "v2",
+    hidden_size: int = None,
 ) -> None:
     import paras_peer_access_cuda
     stream_ptr = stream.cuda_stream if stream is not None else 0
+    if variant == "v3":
+        assert hidden_size is not None, "w13_ep v3 requires hidden_size"
+        I = (intermediate_per_tp_times_hidden // hidden_size) * tp_size
+        paras_peer_access_cuda.launch_peer_access_fused_transfer_w13_v3_ep(
+            local_buffer_ptr,
+            peer_base_ptrs_tensor,
+            src_tp_offset,
+            dst_ep_offset,
+            tp_rank,
+            tp_size,
+            num_local_experts,
+            hidden_size,
+            I,
+            num_gates,
+            elem_size,
+            stream_ptr,
+        )
+        return
     paras_peer_access_cuda.launch_peer_access_fused_transfer_w13_ep(
         local_buffer_ptr,
         peer_base_ptrs_tensor,
@@ -250,9 +306,25 @@ def peer_access_fused_transfer_w2_ep(
     tp_intermediate: int,
     elem_size: int = 2,
     stream=None,
+    variant: str = "v2",
 ) -> None:
     import paras_peer_access_cuda
     stream_ptr = stream.cuda_stream if stream is not None else 0
+    if variant == "v3":
+        paras_peer_access_cuda.launch_peer_access_fused_transfer_w2_v3_ep(
+            local_buffer_ptr,
+            peer_base_ptrs_tensor,
+            src_tp_offset,
+            dst_ep_offset,
+            tp_rank,
+            tp_size,
+            num_local_experts,
+            hidden_size,
+            full_intermediate,
+            elem_size,
+            stream_ptr,
+        )
+        return
     paras_peer_access_cuda.launch_peer_access_fused_transfer_w2_ep(
         local_buffer_ptr,
         peer_base_ptrs_tensor,
@@ -284,10 +356,16 @@ def peer_access_kv_transfer(
     head_dim: int,
     elem_size: int = 2,
     stream=None,
+    variant: str = "v2",
 ) -> None:
     import paras_peer_access_cuda
     stream_ptr = stream.cuda_stream if stream is not None else 0
-    paras_peer_access_cuda.launch_peer_access_kv_transfer(
+    launcher = (
+        paras_peer_access_cuda.launch_peer_access_kv_transfer_v3
+        if variant == "v3"
+        else paras_peer_access_cuda.launch_peer_access_kv_transfer
+    )
+    launcher(
         local_buffer_ptr,
         dst_base_ptrs_tensor,
         local_token_indices,
@@ -318,6 +396,7 @@ def peer_access_kv_scatter(
     dst_v_offsets: List[int],
     num_local_tokens: int,
     heads_per_rank: int,
+    num_kv_heads: int,
     tp_rank: int,
     tp_size: int,
     head_dim: int,
@@ -325,6 +404,7 @@ def peer_access_kv_scatter(
     num_layers: int,
     elem_size: int = 2,
     stream=None,
+    variant: str = "v2",
 ) -> None:
     """Scatter local TP KV cache to peer EP KV buffers via NVLink for all layers.
 
@@ -370,24 +450,45 @@ def peer_access_kv_scatter(
     barrier = torch.zeros(1, device="cuda")
 
     for layer_idx in range(num_layers - 1, -1, -1):
-        paras_peer_access_cuda.launch_peer_access_kv_scatter(
-            local_buffer_ptr,
-            peer_buffer_ptrs_tensor,
-            tp_token_positions,
-            token_to_rank,
-            ep_dst_positions,
-            src_k_offsets[layer_idx],
-            src_v_offsets[layer_idx],
-            dst_k_offsets[layer_idx],
-            dst_v_offsets[layer_idx],
-            num_local_tokens,
-            heads_per_rank,
-            tp_rank,
-            tp_size,
-            head_dim,
-            elem_size,
-            stream_ptr,
-        )
+        if variant == "v3":
+            paras_peer_access_cuda.launch_peer_access_kv_scatter_v3(
+                local_buffer_ptr,
+                peer_buffer_ptrs_tensor,
+                tp_token_positions,
+                token_to_rank,
+                ep_dst_positions,
+                src_k_offsets[layer_idx],
+                src_v_offsets[layer_idx],
+                dst_k_offsets[layer_idx],
+                dst_v_offsets[layer_idx],
+                num_local_tokens,
+                num_kv_heads,
+                tp_rank,
+                tp_size,
+                head_dim,
+                elem_size,
+                stream_ptr,
+            )
+        else:
+            paras_peer_access_cuda.launch_peer_access_kv_scatter(
+                local_buffer_ptr,
+                peer_buffer_ptrs_tensor,
+                tp_token_positions,
+                token_to_rank,
+                ep_dst_positions,
+                src_k_offsets[layer_idx],
+                src_v_offsets[layer_idx],
+                dst_k_offsets[layer_idx],
+                dst_v_offsets[layer_idx],
+                num_local_tokens,
+                heads_per_rank,
+                num_kv_heads,
+                tp_rank,
+                tp_size,
+                head_dim,
+                elem_size,
+                stream_ptr,
+            )
         dist.all_reduce(barrier, group=tp_group)
 
 
