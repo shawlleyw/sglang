@@ -73,6 +73,7 @@ def build_scatter_routing(ctx: IPCContext, layout: KVLayout, seed: int):
     W = ctx.world_size
     R = layout.replication_factor
     M = min((W * N) // R, layout.ep_max_tokens - 1)
+    M = (M // W) * W
     tp_src_slots = random_resident_slots(M, layout.tp_max_tokens, ctx.rank, seed).to(ctx.device)
     dst_ranks = (torch.arange(M, dtype=torch.int32) % W).to(ctx.device)
     ep_region = layout.ep_max_tokens // W
@@ -135,20 +136,42 @@ def run_scatter(ctx: IPCContext, layout: KVLayout, seed: int, method: str,
     tp_v = ctx.buf[off["tp_v"]:off["tp_v"] + layout.tp_buffer_bytes].view(torch.bfloat16).view(
         layout.tp_max_tokens, layout.heads_per_rank, layout.head_dim
     )
+    ep_k = ctx.buf[off["ep_k"]:off["ep_k"] + layout.ep_buffer_bytes].view(torch.bfloat16).view(
+        layout.ep_max_tokens, layout.num_kv_heads, layout.head_dim
+    )
+    ep_v = ctx.buf[off["ep_v"]:off["ep_v"] + layout.ep_buffer_bytes].view(torch.bfloat16).view(
+        layout.ep_max_tokens, layout.num_kv_heads, layout.head_dim
+    )
     ctx.buf[off["ep_k"]:off["ep_k"] + layout.ep_buffer_bytes].zero_()
     ctx.buf[off["ep_v"]:off["ep_v"] + layout.ep_buffer_bytes].zero_()
     fill_slots_bf16(tp_k, src_slots, ctx.rank, layout.heads_per_rank, layout.head_dim, 0.0)
     fill_slots_bf16(tp_v, src_slots, ctx.rank, layout.heads_per_rank, layout.head_dim, 128.0)
 
     M = src_slots.numel()
+    W = ctx.world_size
+    HPR = layout.heads_per_rank
+    HD = layout.head_dim
     send_buf = recv_buf = None
+    sorted_src = None
+    ep_post_pos = None
     if method in ("nccl", "nccl_overlap"):
-        per_token = 2 * layout.heads_per_rank * layout.head_dim
+        per_token = 2 * HPR * HD
         order = torch.argsort(dst_ranks, stable=True)
         sorted_src = src_slots[order].to(torch.long)
-        gathered = torch.stack([tp_k[sorted_src], tp_v[sorted_src]], dim=2)
-        send_buf = gathered.contiguous().view(M, per_token).to(torch.bfloat16).contiguous()
+        send_buf = torch.empty(M * per_token, dtype=torch.bfloat16, device=ctx.device)
         recv_buf = torch.empty_like(send_buf)
+        ep_post_pos = (torch.arange(M // W, dtype=torch.long, device=ctx.device) + 1)
+
+    def nccl_scatter_layer():
+        send_view = send_buf.view(M, HPR, 2, HD)
+        send_view[:, :, 0, :] = tp_k[sorted_src]
+        send_view[:, :, 1, :] = tp_v[sorted_src]
+        dist.all_to_all_single(recv_buf, send_buf, group=ctx.tp_group)
+        recv_view = recv_buf.view(W, M // W, HPR, 2, HD)
+        permuted = recv_view.permute(1, 0, 2, 3, 4).contiguous().view(
+            M // W, W * HPR, 2, HD)
+        ep_k[ep_post_pos] = permuted[:, :layout.num_kv_heads, 0, :]
+        ep_v[ep_post_pos] = permuted[:, :layout.num_kv_heads, 1, :]
 
     timer = CudaTimer(ctx.device, warmup=warmup, iters=iters)
     for _ in range(timer.total_iters):
@@ -160,13 +183,13 @@ def run_scatter(ctx: IPCContext, layout: KVLayout, seed: int, method: str,
                 ctx.barrier()
         elif method == "nccl":
             for _ in range(num_layers):
-                dist.all_to_all_single(recv_buf, send_buf, group=ctx.tp_group)
+                nccl_scatter_layer()
         elif method == "nccl_overlap":
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             for i in range(num_layers):
                 with torch.cuda.stream(s1 if i % 2 == 0 else s2):
-                    dist.all_to_all_single(recv_buf, send_buf, group=ctx.tp_group)
+                    nccl_scatter_layer()
             torch.cuda.current_stream().wait_stream(s1)
             torch.cuda.current_stream().wait_stream(s2)
         else:
@@ -189,6 +212,12 @@ def run_transfer(ctx: IPCContext, layout: KVLayout, seed: int, method: str,
     ep_v = ctx.buf[off["ep_v"]:off["ep_v"] + layout.ep_buffer_bytes].view(torch.bfloat16).view(
         layout.ep_max_tokens, layout.num_kv_heads, layout.head_dim
     )
+    tp_k = ctx.buf[off["tp_k"]:off["tp_k"] + layout.tp_buffer_bytes].view(torch.bfloat16).view(
+        layout.tp_max_tokens, layout.heads_per_rank, layout.head_dim
+    )
+    tp_v = ctx.buf[off["tp_v"]:off["tp_v"] + layout.tp_buffer_bytes].view(torch.bfloat16).view(
+        layout.tp_max_tokens, layout.heads_per_rank, layout.head_dim
+    )
     ctx.buf[off["tp_k"]:off["tp_k"] + layout.tp_buffer_bytes].zero_()
     ctx.buf[off["tp_v"]:off["tp_v"] + layout.tp_buffer_bytes].zero_()
 
@@ -199,16 +228,36 @@ def run_transfer(ctx: IPCContext, layout: KVLayout, seed: int, method: str,
 
     N = layout.num_resident_tokens
     W = ctx.world_size
+    R = layout.replication_factor
+    HPR = layout.heads_per_rank
+    HD = layout.head_dim
+    NUM_HEADS_SRC = layout.num_kv_heads // HPR
     dst_token_start = int(ctx.rank * N + 1)
 
     send_buf = recv_buf = None
+    src_long = None
+    tp_post_pos = None
     if method in ("nccl", "nccl_overlap"):
-        per_token = 2 * layout.num_kv_heads * layout.head_dim
-        src_long = src_slots.to(torch.long)
-        gathered = torch.stack([ep_k[src_long], ep_v[src_long]], dim=2).contiguous()
-        send_one = gathered.view(N, per_token).to(torch.bfloat16)
-        send_buf = send_one.repeat(W, 1).contiguous()
+        send_elems = W * N * HPR * 2 * HD
+        send_buf = torch.empty(send_elems, dtype=torch.bfloat16, device=ctx.device)
         recv_buf = torch.empty_like(send_buf)
+        src_long = src_slots.to(torch.long)
+        tp_post_pos = (torch.arange(N, dtype=torch.long, device=ctx.device) + dst_token_start)
+        tp_post_pos = tp_post_pos.clamp_max(layout.tp_max_tokens - 1)
+
+    def nccl_transfer_layer():
+        gathered_k = ep_k[src_long]
+        gathered_v = ep_v[src_long]
+        stacked = torch.stack([gathered_k, gathered_v], dim=2)
+        permuted = stacked.view(N, NUM_HEADS_SRC, HPR, 2, HD).permute(1, 0, 2, 3, 4).contiguous()
+        if R > 1:
+            permuted = permuted.repeat_interleave(R, dim=0)
+        send_buf.copy_(permuted.view(-1))
+        dist.all_to_all_single(recv_buf, send_buf, group=ctx.tp_group)
+        recv_view = recv_buf.view(W, N, HPR, 2, HD)
+        post = recv_view.permute(1, 0, 2, 3, 4).contiguous().view(N, W * HPR, 2, HD)
+        tp_k[tp_post_pos] = post[:, :HPR, 0, :]
+        tp_v[tp_post_pos] = post[:, :HPR, 1, :]
 
     timer = CudaTimer(ctx.device, warmup=warmup, iters=iters)
     for _ in range(timer.total_iters):
@@ -220,13 +269,13 @@ def run_transfer(ctx: IPCContext, layout: KVLayout, seed: int, method: str,
                 ctx.barrier()
         elif method == "nccl":
             for _ in range(num_layers):
-                dist.all_to_all_single(recv_buf, send_buf, group=ctx.tp_group)
+                nccl_transfer_layer()
         elif method == "nccl_overlap":
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             for i in range(num_layers):
                 with torch.cuda.stream(s1 if i % 2 == 0 else s2):
-                    dist.all_to_all_single(recv_buf, send_buf, group=ctx.tp_group)
+                    nccl_transfer_layer()
             torch.cuda.current_stream().wait_stream(s1)
             torch.cuda.current_stream().wait_stream(s2)
         else:

@@ -138,30 +138,50 @@ def _peer_access_w2_tp_to_ep(ctx, layout, off, variant):
         )
 
 
-def _nccl_w13_send_recv(layout: WeightLayout, device) -> tuple:
-    """Pre-permuted (tp_size, E_local, num_gates, I'*H) buffer that mirrors
-    the all_to_all input shape used in paras_configure_tp_mlp_naive."""
-    elems = layout.tp_size * layout.E_local * layout.num_gates * layout.I_prime_H
-    send = torch.zeros(elems, dtype=torch.bfloat16, device=device)
+def _nccl_w13_buffers(layout: WeightLayout, device) -> dict:
+    """EP-ordered source tensor + TP-ordered staging send/recv buffers.
+
+    Matches the production paras_configure_tp_mlp_all_to_all pattern:
+      src layout (EP):   (E_local, num_gates, tp_size, I'*H)
+      send layout (TP):  (tp_size, E_local, num_gates, I'*H)
+    The pre-permute kernel `send.copy_(src.permute(2, 0, 1, 3))` is
+    run inside the timed loop alongside the all_to_all.
+    """
+    E_local = layout.E_local
+    ng = layout.num_gates
+    tps = layout.tp_size
+    ih = layout.I_prime_H
+    src = torch.zeros(E_local, ng, tps, ih, dtype=torch.bfloat16, device=device)
+    send = torch.empty(tps, E_local, ng, ih, dtype=torch.bfloat16, device=device)
     recv = torch.empty_like(send)
-    return send, recv
+    return {"src": src, "send": send, "recv": recv}
 
 
-def _nccl_w2_send_recv(layout: WeightLayout, device) -> tuple:
-    """Pre-permuted (tp_size, E_local, H, I') buffer that mirrors the w2
-    all_to_all input shape."""
-    elems = layout.tp_size * layout.E_local * layout.H * layout.I_prime
-    send = torch.zeros(elems, dtype=torch.bfloat16, device=device)
+def _nccl_w2_buffers(layout: WeightLayout, device) -> dict:
+    """EP-ordered source tensor + TP-ordered staging send/recv buffers.
+
+      src layout (EP):  (E_local, H, tp_size, I')
+      send layout (TP): (tp_size, E_local, H, I')
+    """
+    E_local = layout.E_local
+    H = layout.H
+    tps = layout.tp_size
+    Ip = layout.I_prime
+    src = torch.zeros(E_local, H, tps, Ip, dtype=torch.bfloat16, device=device)
+    send = torch.empty(tps, E_local, H, Ip, dtype=torch.bfloat16, device=device)
     recv = torch.empty_like(send)
-    return send, recv
+    return {"src": src, "send": send, "recv": recv}
 
 
-def _nccl_layer(send_buf, recv_buf, group, stream=None):
-    if stream is not None:
-        with torch.cuda.stream(stream):
-            dist.all_to_all_single(recv_buf, send_buf, group=group)
-    else:
-        dist.all_to_all_single(recv_buf, send_buf, group=group)
+def _nccl_w13_layer(bufs, group):
+    """Pre-permute src into send, all_to_all, no-op post (dp=1 case in production)."""
+    bufs["send"].copy_(bufs["src"].permute(2, 0, 1, 3))
+    dist.all_to_all_single(bufs["recv"].view(-1), bufs["send"].view(-1), group=group)
+
+
+def _nccl_w2_layer(bufs, group):
+    bufs["send"].copy_(bufs["src"].permute(2, 0, 1, 3))
+    dist.all_to_all_single(bufs["recv"].view(-1), bufs["send"].view(-1), group=group)
 
 
 def run_kernel(ctx: IPCContext, layout: WeightLayout, kernel: str, direction: str,
@@ -184,11 +204,17 @@ def run_kernel(ctx: IPCContext, layout: WeightLayout, kernel: str, direction: st
             raise SystemExit(f"bad kernel/direction: {kernel}/{direction}")
     else:
         if kernel == "w13":
-            send_buf, recv_buf = _nccl_w13_send_recv(layout, ctx.device)
+            bufs = _nccl_w13_buffers(layout, ctx.device)
+            nccl_layer = lambda: _nccl_w13_layer(bufs, ctx.tp_group)
         else:
-            send_buf, recv_buf = _nccl_w2_send_recv(layout, ctx.device)
+            bufs = _nccl_w2_buffers(layout, ctx.device)
+            nccl_layer = lambda: _nccl_w2_layer(bufs, ctx.tp_group)
         def launch_nccl(stream=None):
-            _nccl_layer(send_buf, recv_buf, ctx.tp_group, stream)
+            if stream is not None:
+                with torch.cuda.stream(stream):
+                    nccl_layer()
+            else:
+                nccl_layer()
 
     timer = CudaTimer(ctx.device, warmup=warmup, iters=iters)
     for _ in range(timer.total_iters):
