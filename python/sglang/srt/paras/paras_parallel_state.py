@@ -21,12 +21,6 @@ def get_paras_tp_group() -> GroupCoordinator:
     assert _PARAS_TP is not None, "ParaS tensor parallel group is not initialized"
     return _PARAS_TP
 
-_PARAS_DP: Optional[GroupCoordinator] = None
-
-def get_paras_dp_group() -> GroupCoordinator:
-    assert _PARAS_DP is not None, "ParaS data parallel group is not initialized"
-    return _PARAS_DP
-
 # TODO(shaoyuw): refactor code
 # The parallel size and rank can be grouped together.
 # There are 2 stages to consider:
@@ -120,32 +114,9 @@ def initialize_paras_parallel(
         scattered_x = torch.empty_like(x)
         dist.all_to_all_single(scattered_x, x, group=_PARAS_TP.device_group)
 
-    # Build the ParaS data model-parallel groups.
-    num_paras_data_model_parallel_groups: int = world_size // dp_size
-    global _PARAS_DP
-    assert _PARAS_DP is None, "ParaS data parallel group is already initialized"
-
-    # paras_dp: alias _MOE_TP when ranks match. When dp_size == 1, each paras_dp
-    # group is a singleton {rank} — same shape as _MOE_TP in the default config
-    # (where moe_tp_size == 1). _MOE_TP already contains the local rank only.
-    if dp_size == 1 and parallel_state._MOE_TP is not None and parallel_state._MOE_TP.world_size == 1:
-        _PARAS_DP = parallel_state._MOE_TP
-    else:
-        group_ranks = []
-        for i in range(num_paras_data_model_parallel_groups):
-            ranks = list(range(i, world_size, num_paras_data_model_parallel_groups))
-            group_ranks.append(ranks)
-
-        _PARAS_DP = init_model_parallel_group(
-            group_ranks,
-            get_world_group().local_rank,
-            backend,
-            use_custom_allreduce=False,
-            group_name="paras_dp",
-        )
-        x = torch.ones(128, dtype=torch.bfloat16, device=_PARAS_DP.device)
-        gathered_x = torch.zeros((x.shape[0] * _PARAS_DP_SIZE), dtype=torch.bfloat16, device=_PARAS_DP.device)
-        dist.all_gather_into_tensor(gathered_x, x, group=_PARAS_DP.device_group)
+    # The paras_dp NCCL communicator was removed: the fused dptp peer-access
+    # scatter (kernels_dptp.cu) replaced the all-gather over dp ranks.
+    # Scalar dp_size / dp_rank are still derived above for kernel parameters.
 
 def get_paras_tp_size() -> int:
     assert _PARAS_TP_SIZE is not None, "ParaS tensor parallel size is not initialized"

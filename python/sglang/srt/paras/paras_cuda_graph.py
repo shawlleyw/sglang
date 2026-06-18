@@ -176,7 +176,7 @@ def paras_memory_breakdown(device: str, gpu_id: int) -> Dict[str, Any]:
         # already-counted groups so we don't double-count shared NCCL comms.
         try:
             import sglang.srt.paras.paras_parallel_state as _paras_ps
-            for name in ("_PARAS_TP", "_PARAS_DP", "_PARAS_EP", "_PARAS_SELF"):
+            for name in ("_PARAS_TP", "_PARAS_EP", "_PARAS_SELF"):
                 g = getattr(_paras_ps, name, None)
                 if g is not None and id(g) not in seen_group_ids:
                     nccl_comm_names.append(name)

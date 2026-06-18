@@ -14,7 +14,6 @@ import torch.nn as nn
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.paras.paras_parallel_state import (
-    get_paras_dp_group,
     get_paras_dp_rank,
     get_paras_dp_size,
     get_paras_tp_group,
@@ -195,65 +194,27 @@ class ParaSMoeBlockMixin:
     def paras_configure_tp_all_gather(self, stream=None, handles=None, async_op=False, staging_suffix=""):
         handles = handles or []
 
-        paras_dp_group = get_paras_dp_group().device_group
         paras_dp_size = get_paras_dp_size()
+        if paras_dp_size > 1:
+            raise NotImplementedError(
+                "paras dp_size>1 NCCL all-gather path was removed; use the "
+                "peer_access dptp kernels (peer_access_fused_transfer_w{13,2}_dptp) instead."
+            )
 
         all_gather_handles = []
         with torch.cuda.stream(stream):
             for handle in handles:
                 handle.wait()
-            if paras_dp_size > 1:
-                mgr = get_global_paras_memory_manager()
-                w13_ep = self.ep_experts.w13_weight.data.view(
-                    self.num_local_experts,
-                    2 * self.moe_intermediate_size,
-                    self.hidden_size,
-                )
-                self.w13_ep_gathered = mgr.get_view(f"staging.w13_gather{staging_suffix}").view(
-                    self.num_local_experts * paras_dp_size,
-                    2 * self.moe_intermediate_size,
-                    self.hidden_size,
-                )
-                all_gather_handles.append(
-                    dist.all_gather_into_tensor(
-                        self.w13_ep_gathered,
-                        w13_ep,
-                        group=paras_dp_group,
-                        async_op=True,
-                    )
-                )
-
-                w2_ep = self.ep_experts.w2_weight.data.view(
-                    self.num_local_experts,
-                    self.hidden_size,
-                    self.moe_intermediate_size,
-                )
-                self.w2_ep_gathered = mgr.get_view(f"staging.w2_gather{staging_suffix}").view(
-                    self.num_local_experts * paras_dp_size,
-                    self.hidden_size,
-                    self.moe_intermediate_size,
-                )
-                all_gather_handles.append(
-                    dist.all_gather_into_tensor(
-                        self.w2_ep_gathered,
-                        w2_ep,
-                        group=paras_dp_group,
-                        async_op=True,
-                    )
-                )
-
-                self.num_local_experts *= paras_dp_size
-            else:
-                self.w13_ep_gathered = self.ep_experts.w13_weight.data.view(
-                    self.num_local_experts,
-                    2 * self.moe_intermediate_size,
-                    self.hidden_size,
-                )
-                self.w2_ep_gathered = self.ep_experts.w2_weight.data.view(
-                    self.num_local_experts,
-                    self.hidden_size,
-                    self.moe_intermediate_size,
-                )
+            self.w13_ep_gathered = self.ep_experts.w13_weight.data.view(
+                self.num_local_experts,
+                2 * self.moe_intermediate_size,
+                self.hidden_size,
+            )
+            self.w2_ep_gathered = self.ep_experts.w2_weight.data.view(
+                self.num_local_experts,
+                self.hidden_size,
+                self.moe_intermediate_size,
+            )
 
         if async_op:
             return all_gather_handles
@@ -264,9 +225,15 @@ class ParaSMoeBlockMixin:
     def paras_configure_tp_all_to_all(self, stream=None, handles=None, staging_suffix=""):
         handles = handles or []
 
+        paras_dp_size = get_paras_dp_size()
+        if paras_dp_size > 1:
+            raise NotImplementedError(
+                "paras dp_size>1 NCCL all-to-all path was removed; use the "
+                "peer_access dptp kernels (peer_access_fused_transfer_w{13,2}_dptp) instead."
+            )
+
         mgr = get_global_paras_memory_manager()
         paras_tp_size = get_paras_tp_size()
-        paras_dp_size = get_paras_dp_size()
         paras_tp_group = get_paras_tp_group().device_group
         moe_intermediate_size_after_tp = self.moe_intermediate_size // paras_tp_size
         layer_id = self._paras_layer_id
@@ -304,10 +271,7 @@ class ParaSMoeBlockMixin:
                 )
                 w13_ep_permuted.copy_(w13_ep.permute(2, 0, 1, 3))
 
-            if paras_dp_size > 1:
-                w13_tp = self.w13_ep_gathered
-            else:
-                w13_tp = mgr.get_view(tp_w13_name).reshape(self.w13_ep_gathered.shape)
+            w13_tp = mgr.get_view(tp_w13_name).reshape(self.w13_ep_gathered.shape)
             w13_handle = dist.all_to_all_single(
                 output=w13_tp,
                 input=w13_ep_permuted.view(self.w13_ep_gathered.shape),
@@ -327,10 +291,7 @@ class ParaSMoeBlockMixin:
             )
             w2_ep_permuted.copy_(w2_ep.permute(2, 0, 1, 3))
 
-            if paras_dp_size > 1:
-                w2_tp = self.w2_ep_gathered
-            else:
-                w2_tp = mgr.get_view(tp_w2_name).reshape(self.w2_ep_gathered.shape)
+            w2_tp = mgr.get_view(tp_w2_name).reshape(self.w2_ep_gathered.shape)
             w2_handle = dist.all_to_all_single(
                 output=w2_tp,
                 input=w2_ep_permuted.view(self.w2_ep_gathered.shape),
@@ -339,28 +300,7 @@ class ParaSMoeBlockMixin:
             )
 
             w13_handle.wait()
-            if paras_dp_size > 1:
-                tp_w13_shape = (self.num_global_experts, 2 * moe_intermediate_size_after_tp, self.hidden_size)
-                w13_post = mgr.get_view(f"staging.w13_pre_permute{staging_suffix}").view(
-                    paras_dp_size, paras_tp_size, -1
-                )
-                w13_post.copy_(
-                    w13_tp.view(paras_tp_size, paras_dp_size, -1).transpose(0, 1)
-                )
-                tp_w13 = mgr.get_view_as(tp_w13_name, tp_w13_shape)
-                tp_w13.copy_(w13_post.view_as(tp_w13))
-
             w2_handle.wait()
-            if paras_dp_size > 1:
-                tp_w2_shape = (self.num_global_experts, self.hidden_size, moe_intermediate_size_after_tp)
-                w2_post = mgr.get_view(f"staging.w2_pre_permute{staging_suffix}").view(
-                    paras_dp_size, paras_tp_size, -1
-                )
-                w2_post.copy_(
-                    w2_tp.view(paras_tp_size, paras_dp_size, -1).transpose(0, 1)
-                )
-                tp_w2 = mgr.get_view_as(tp_w2_name, tp_w2_shape)
-                tp_w2.copy_(w2_post.view_as(tp_w2))
 
     def _paras_gather_full_from_ep(self, local_param: nn.Parameter) -> torch.Tensor:
         """All-gather a per-rank EP-sliced Parameter into a full
