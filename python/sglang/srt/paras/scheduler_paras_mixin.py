@@ -296,6 +296,13 @@ class SchedulerParasMixin:
         # Always initialize so non-ParaS schedulers can no-op the event-loop hook
         # with a single `if self._paras_auto_policy is not None:` check.
         self._paras_auto_policy: Optional[ParasAutoSwitchPolicy] = None
+        self._paras_post_switch_iters_remaining = 0
+        self._paras_post_switch_initial_cap = int(
+            os.environ.get("PARAS_POST_SWITCH_INITIAL_CAP", "2048")
+        )
+        self._paras_post_switch_ramp_iters = int(
+            os.environ.get("PARAS_POST_SWITCH_RAMP_ITERS", "20")
+        )
 
         if not self.server_args.enable_paras_moe:
             return
@@ -845,6 +852,7 @@ class SchedulerParasMixin:
         # Phase 4: Update scheduler config and restore tokenizer
         # switch from TP to EP
         self.paras_parallelism_config = "EP"
+        self._paras_post_switch_iters_remaining = self._paras_post_switch_ramp_iters
         self.server_args.enable_dp_attention = True
         self.server_args.moe_a2a_backend = MoeA2ABackend.DEEPEP.value
         self.server_args.dp_size = self.paras_ep_size
@@ -939,3 +947,14 @@ class SchedulerParasMixin:
             return
         self.profiler.stop()
         self.profiler = None
+
+    def paras_effective_max_prefill_tokens(self) -> int:
+        if self._paras_post_switch_iters_remaining <= 0:
+            return self.max_prefill_tokens
+        ramp = max(1, self._paras_post_switch_ramp_iters)
+        cap = self._paras_post_switch_initial_cap
+        remaining = self._paras_post_switch_iters_remaining
+        progress = (ramp - remaining + 1) / ramp
+        effective = cap + int((self.max_prefill_tokens - cap) * progress)
+        self._paras_post_switch_iters_remaining -= 1
+        return max(cap, min(self.max_prefill_tokens, effective))
