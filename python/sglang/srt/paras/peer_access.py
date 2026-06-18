@@ -340,6 +340,151 @@ def peer_access_fused_transfer_w2_ep(
     )
 
 
+def peer_access_fused_transfer_w13_dptp(
+    local_buffer_ptr: int,
+    peer_base_ptrs_tensor: torch.Tensor,
+    src_ep_offset: int,
+    dst_tp_offset: int,
+    rank: int,
+    T: int,
+    G: int,
+    E_local: int,
+    H: int,
+    I: int,
+    num_gates: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    """w13 EP -> DP x TP forward (replicated scatter, canonical reorder free).
+
+    Reads each shard once and broadcasts to G dp-replicas via register-held
+    peer pointers. Destination offset is replica-invariant (canonical slot
+    e_global = rank * E_local + e), so no post-permute is required.
+    """
+    import paras_peer_access_cuda
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    paras_peer_access_cuda.launch_peer_access_fused_transfer_w13_dptp(
+        local_buffer_ptr,
+        peer_base_ptrs_tensor,
+        src_ep_offset,
+        dst_tp_offset,
+        rank,
+        T,
+        G,
+        E_local,
+        H,
+        I,
+        num_gates,
+        elem_size,
+        stream_ptr,
+    )
+
+
+def peer_access_fused_transfer_w2_dptp(
+    local_buffer_ptr: int,
+    peer_base_ptrs_tensor: torch.Tensor,
+    src_ep_offset: int,
+    dst_tp_offset: int,
+    rank: int,
+    T: int,
+    G: int,
+    E_local: int,
+    H: int,
+    I: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    """w2 EP -> DP x TP forward (replicated scatter, canonical reorder free)."""
+    import paras_peer_access_cuda
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    paras_peer_access_cuda.launch_peer_access_fused_transfer_w2_dptp(
+        local_buffer_ptr,
+        peer_base_ptrs_tensor,
+        src_ep_offset,
+        dst_tp_offset,
+        rank,
+        T,
+        G,
+        E_local,
+        H,
+        I,
+        elem_size,
+        stream_ptr,
+    )
+
+
+def peer_access_fused_transfer_w13_ep_dptp(
+    local_buffer_ptr: int,
+    peer_base_ptrs_tensor: torch.Tensor,
+    src_tp_offset: int,
+    dst_ep_offset: int,
+    rank: int,
+    T: int,
+    G: int,
+    E_local: int,
+    H: int,
+    I: int,
+    num_gates: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    """w13 DP x TP -> EP reverse (replica-local within T-group, no broadcast).
+
+    Drops redundant replicas: each dp-replica reassembles EP entirely from its
+    own T tp-peers. Single store per element (G factor not in traffic).
+    """
+    import paras_peer_access_cuda
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    paras_peer_access_cuda.launch_peer_access_fused_transfer_w13_ep_dptp(
+        local_buffer_ptr,
+        peer_base_ptrs_tensor,
+        src_tp_offset,
+        dst_ep_offset,
+        rank,
+        T,
+        G,
+        E_local,
+        H,
+        I,
+        num_gates,
+        elem_size,
+        stream_ptr,
+    )
+
+
+def peer_access_fused_transfer_w2_ep_dptp(
+    local_buffer_ptr: int,
+    peer_base_ptrs_tensor: torch.Tensor,
+    src_tp_offset: int,
+    dst_ep_offset: int,
+    rank: int,
+    T: int,
+    G: int,
+    E_local: int,
+    H: int,
+    I: int,
+    elem_size: int = 2,
+    stream=None,
+) -> None:
+    """w2 DP x TP -> EP reverse (replica-local within T-group, no broadcast)."""
+    import paras_peer_access_cuda
+    stream_ptr = stream.cuda_stream if stream is not None else 0
+    paras_peer_access_cuda.launch_peer_access_fused_transfer_w2_ep_dptp(
+        local_buffer_ptr,
+        peer_base_ptrs_tensor,
+        src_tp_offset,
+        dst_ep_offset,
+        rank,
+        T,
+        G,
+        E_local,
+        H,
+        I,
+        elem_size,
+        stream_ptr,
+    )
+
+
 def peer_access_kv_transfer(
     local_buffer_ptr: int,
     dst_base_ptrs_tensor: torch.Tensor,
