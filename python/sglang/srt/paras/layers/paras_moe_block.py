@@ -22,10 +22,14 @@ from sglang.srt.paras.paras_parallel_state import (
 )
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 from sglang.srt.paras.peer_access import (
-    peer_access_fused_transfer_w13_ep,
-    peer_access_fused_transfer_w13_v2,
+    peer_access_fused_transfer_w2_dptp,
     peer_access_fused_transfer_w2_ep,
+    peer_access_fused_transfer_w2_ep_dptp,
     peer_access_fused_transfer_w2_v2,
+    peer_access_fused_transfer_w13_dptp,
+    peer_access_fused_transfer_w13_ep,
+    peer_access_fused_transfer_w13_ep_dptp,
+    peer_access_fused_transfer_w13_v2,
 )
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.server_args import get_global_server_args
@@ -455,10 +459,10 @@ class ParaSMoeBlockMixin:
     ):
         """Launch NVLink-optimized v2 peer access kernels for this layer. NO barriers — caller manages them.
 
-        The N+1 slot design guarantees no inter-layer aliasing:
-          - Layer i reads local slot[i+1], writes to peer slot[i]
-          - Layer i+1 reads local slot[i+2], writes to peer slot[i+1]
-          - Different slots → no race → barriers only needed at sweep start/end.
+        Four-anchor layout (EP low / TP high): TP weight layer i overlaps EP
+        weight layer i+1, so the caller (paras_model) drives EP->TP in REVERSE
+        layer order with a per-layer barrier, ensuring layer i+1 is read before
+        layer i's TP weights are written.
 
         w13 layout dispatch:
           - Qwen3 (concat [g0..g_I, u0..u_I]): num_gates=2, chunk=I'*H per (e, k)
@@ -489,6 +493,29 @@ class ParaSMoeBlockMixin:
         else:
             w13_num_gates = 2
             w13_chunk_elems = moe_intermediate_size_after_tp * self.hidden_size
+
+        paras_dp_size = get_paras_dp_size()
+        if paras_dp_size > 1:
+            # Asymmetric EP -> DP x TP (G = dp_size). E_local is the EP-sharded
+            # expert count (num_experts / ep_size), distinct from num_local_experts
+            # (num_experts / tp_size). The dptp kernels read each shard once and
+            # broadcast to the G dp-replicas.
+            e_local = self.num_global_experts // (paras_dp_size * paras_tp_size)
+            peer_access_fused_transfer_w13_dptp(
+                local_buffer_ptr, dst_base_ptrs,
+                ep_w13_entry.offset_bytes, tp_w13_entry.offset_bytes,
+                paras_tp_rank, paras_tp_size, paras_dp_size,
+                e_local, self.hidden_size, self.moe_intermediate_size,
+                num_gates=w13_num_gates, elem_size=dtype_bytes, stream=stream,
+            )
+            peer_access_fused_transfer_w2_dptp(
+                local_buffer_ptr, dst_base_ptrs,
+                ep_w2_entry.offset_bytes, tp_w2_entry.offset_bytes,
+                paras_tp_rank, paras_tp_size, paras_dp_size,
+                e_local, self.hidden_size, self.moe_intermediate_size,
+                elem_size=dtype_bytes, stream=stream,
+            )
+            return
 
         peer_access_fused_transfer_w13_v2(
             local_buffer_ptr, dst_base_ptrs,
@@ -611,10 +638,12 @@ class ParaSMoeBlockMixin:
         dst_base_ptrs: torch.Tensor,
         stream=None,
     ):
-        """Launch TP→EP reverse NVLink peer access kernels for this layer.
+        """Launch TP→EP NVLink peer access kernels for this layer.
 
         NO barriers — caller manages per-layer synchronization.
-        Layer ordering must be REVERSE (N-1→0) at the model level.
+        Four-anchor layout: EP weight layer i+1 overlaps TP weight layer i, so
+        the caller drives TP->EP in FORWARD (0->N-1) layer order, ensuring layer
+        i is read before layer i+1's EP weights are written.
 
         w13 layout dispatch matches the EP→TP path (see
         ``paras_configure_tp_fused_peer_access_kernel``): GPT-OSS
@@ -645,6 +674,27 @@ class ParaSMoeBlockMixin:
         else:
             w13_num_gates = 2
             w13_chunk_elems = moe_intermediate_size_after_tp * self.hidden_size
+
+        paras_dp_size = get_paras_dp_size()
+        if paras_dp_size > 1:
+            # Asymmetric DP x TP -> EP reverse (each dp-replica reassembles EP
+            # from its own T tp-peers; redundant replicas dropped).
+            e_local = self.num_global_experts // (paras_dp_size * paras_tp_size)
+            peer_access_fused_transfer_w13_ep_dptp(
+                local_buffer_ptr, dst_base_ptrs,
+                tp_w13_entry.offset_bytes, ep_w13_entry.offset_bytes,
+                paras_tp_rank, paras_tp_size, paras_dp_size,
+                e_local, self.hidden_size, self.moe_intermediate_size,
+                num_gates=w13_num_gates, elem_size=dtype_bytes, stream=stream,
+            )
+            peer_access_fused_transfer_w2_ep_dptp(
+                local_buffer_ptr, dst_base_ptrs,
+                tp_w2_entry.offset_bytes, ep_w2_entry.offset_bytes,
+                paras_tp_rank, paras_tp_size, paras_dp_size,
+                e_local, self.hidden_size, self.moe_intermediate_size,
+                elem_size=dtype_bytes, stream=stream,
+            )
+            return
 
         peer_access_fused_transfer_w13_ep(
             local_buffer_ptr, dst_base_ptrs,
