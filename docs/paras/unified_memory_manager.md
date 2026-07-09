@@ -70,6 +70,8 @@ Each entry is 256-byte aligned. All tensors share one backing allocation.
 
 EP and TP modes use the **same total bytes** per MoE module when `ep_size == tp_size`. However, they cannot share the same physical memory during the transfer — one GPU reads its EP data while another writes TP data simultaneously. The N+1 slot design solves this.
 
+> **EP↔DP×TP:** This slot design assumes `ep_size == tp_size`, so EP and TP occupy equal bytes per layer. When the switch target is a `G·T` grid the per-GPU sizes differ (EP weights small, DP×TP weights `G×` larger; EP cache large, DP×TP cache smaller), and the equal-size slots no longer apply. The generalization replaces slots with direct per-`(mode, layer)` byte offsets in one overlapping buffer; see [unified_memory_epdptp.md](unified_memory_epdptp.md).
+
 **Physical slots**: The manager reserves N+1 identical MoE weight slots (`paras.moe_slot.0` through `paras.moe_slot.N`) for a model with N layers.
 
 **Virtual-to-physical mapping** (via `alias()`):
