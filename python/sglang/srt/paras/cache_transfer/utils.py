@@ -257,12 +257,17 @@ def do_gather_one_layer_peer_access(
     tp_size: int,
     head_dim: int,
     elem_size: int,
+    variant: str = "v2",
 ) -> None:
     """Stateless peer-access gather for one layer (EP->TP).
 
     Calls ``peer_access_kv_transfer`` from ``sglang.srt.paras.peer_access``.
     No barrier inside -- the caller is responsible for inter-layer
     synchronization.
+
+    ``variant`` selects "v2" (production baseline) or "v3" (contiguous-tile,
+    R-broadcast, half-warp K/V).  v3 supports Qwen3 presets (HEAD_DIM=128,
+    ELEM_SIZE=2, NUM_KV_HEADS=4, TP_SIZE in {4, 8}).
     """
     from sglang.srt.paras.peer_access import peer_access_kv_transfer
 
@@ -275,6 +280,7 @@ def do_gather_one_layer_peer_access(
             num_local_tokens, dst_token_start,
             num_heads, tp_rank, tp_size, head_dim,
             elem_size,
+            variant=variant,
         )
 
 
@@ -392,6 +398,7 @@ def do_scatter_one_layer_peer_access(
     paras_tp_size: int,
     head_dim: int,
     elem_size: int,
+    variant: str = "v2",
 ) -> None:
     """Pure full-attention peer-access scatter for one layer (TP->EP).
 
@@ -399,26 +406,50 @@ def do_scatter_one_layer_peer_access(
     Calls ``launch_peer_access_kv_scatter`` from ``paras_peer_access_cuda``.
     No barrier inside -- the caller is responsible for inter-layer
     synchronization.
+
+    ``variant`` selects "v2" (production baseline) or "v3" (contiguous-tile,
+    half-warp K/V).  v3 supports Qwen3 presets (HEAD_DIM=128, ELEM_SIZE=2,
+    NUM_KV_HEADS=4, TP_SIZE in {4, 8}).
     """
     import paras_peer_access_cuda
 
     if num_my_tokens > 0:
-        paras_peer_access_cuda.launch_peer_access_kv_scatter(
-            local_buffer_ptr,
-            peer_buffer_ptrs,
-            tp_token_positions[:num_my_tokens],
-            token_to_rank[:num_my_tokens],
-            ep_dst_pos_all[:num_my_tokens],
-            src_k_offset,
-            src_v_offset,
-            dst_k_offset,
-            dst_v_offset,
-            num_my_tokens,
-            heads_per_rank,
-            num_kv_heads,
-            paras_tp_rank,
-            paras_tp_size,
-            head_dim,
-            elem_size,
-            0,  # default stream
-        )
+        if variant == "v3":
+            paras_peer_access_cuda.launch_peer_access_kv_scatter_v3(
+                local_buffer_ptr,
+                peer_buffer_ptrs,
+                tp_token_positions[:num_my_tokens],
+                token_to_rank[:num_my_tokens],
+                ep_dst_pos_all[:num_my_tokens],
+                src_k_offset,
+                src_v_offset,
+                dst_k_offset,
+                dst_v_offset,
+                num_my_tokens,
+                num_kv_heads,
+                paras_tp_rank,
+                paras_tp_size,
+                head_dim,
+                elem_size,
+                0,
+            )
+        else:
+            paras_peer_access_cuda.launch_peer_access_kv_scatter(
+                local_buffer_ptr,
+                peer_buffer_ptrs,
+                tp_token_positions[:num_my_tokens],
+                token_to_rank[:num_my_tokens],
+                ep_dst_pos_all[:num_my_tokens],
+                src_k_offset,
+                src_v_offset,
+                dst_k_offset,
+                dst_v_offset,
+                num_my_tokens,
+                heads_per_rank,
+                num_kv_heads,
+                paras_tp_rank,
+                paras_tp_size,
+                head_dim,
+                elem_size,
+                0,
+            )
