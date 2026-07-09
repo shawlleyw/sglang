@@ -815,6 +815,12 @@ class SchedulerParasMixin:
             with TimeReporter("reorchestrate_cache"):
                 paras_scatter_manager.reorchestrate_cache()
 
+        # Four-anchor TP->EP: transfer weights BEFORE scattering cache. Writing
+        # EP cache overlaps TP weights in the unified buffer, so TP weights must
+        # be read (consumed by the weight transfer) before EP cache is written.
+        with TimeReporter("transfer_weights"):
+            self.tp_worker.paras_configure_ep()
+
         with TimeReporter("scatter_cache"):
             paras_scatter_manager.scatter_cache()
 
@@ -827,10 +833,6 @@ class SchedulerParasMixin:
             self.server_args.enable_custom_logit_processor,
         )
         self.waiting_queue = paras_scatter_manager.get_new_waiting_queue()
-
-        # Phase 3: Model switch (weights + attention)
-        with TimeReporter("transfer_weights"):
-            self.tp_worker.paras_configure_ep()
 
         sampler = self.tp_worker.model_runner.sampler
         sampler.tp_sync_group = self.paras_tp_attn_tp_group.device_group

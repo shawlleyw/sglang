@@ -556,9 +556,10 @@ def peer_access_kv_scatter(
     This is the reverse of peer_access_kv_transfer (EP→TP). Each local TP token
     is sent to exactly one EP rank determined by token_to_rank[t].
 
-    Layers are processed in REVERSE order (N-1 to 0) with a dist.all_reduce
-    barrier after each layer. This ensures that layer i's read from TP slot[i]
-    completes before layer (i-1)'s write to EP slot[i] (N+1 slot design).
+    Layers are processed in FORWARD order (0 to N-1) with a dist.all_reduce
+    barrier after each layer. In the four-anchor layout, writing EP cache
+    layer i+1 overlaps TP cache layer i, so layer i must be read before layer
+    i+1's EP is written.
 
     Data flow per token t:
       Source:  local TP buffer at tp_token_positions[t], heads [0, heads_per_rank)
@@ -594,7 +595,7 @@ def peer_access_kv_scatter(
     stream_ptr = stream.cuda_stream if stream is not None else 0
     barrier = torch.zeros(1, device="cuda")
 
-    for layer_idx in range(num_layers - 1, -1, -1):
+    for layer_idx in range(num_layers):
         if variant == "v3":
             paras_peer_access_cuda.launch_peer_access_kv_scatter_v3(
                 local_buffer_ptr,

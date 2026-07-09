@@ -41,8 +41,13 @@ class ParaSModelMixin:
     """
 
     def paras_configure_tp_naive(self, paras_tp_size: int, paras_tp_rank: int):
-        """Sequential (non-overlapped) EP→TP conversion for all layers."""
-        for layer in self.layers:
+        """Sequential (non-overlapped) EP→TP conversion for all layers.
+
+        Reverse layer order: the four-anchor buffer overlaps TP weight layer i
+        with EP weight layer i+1, so layer i+1 must be read before layer i's TP
+        weights are written.
+        """
+        for layer in reversed(self.layers):
             layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
             layer.paras_configure_tp_mlp(paras_tp_size, paras_tp_rank)
             layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
@@ -53,15 +58,21 @@ class ParaSModelMixin:
         staging_1 = "_1"
         staging_2 = "_2"
 
-        self.layers[0].paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
-        last_layer_handles = self.layers[0].paras_configure_tp_mlp_all_gather(
+        # Reverse layer order (N-1..0): TP weight layer i overlaps EP weight
+        # layer i+1 in the four-anchor buffer, so i+1 must be fully consumed
+        # before i's TP weights are written. The pipeline prefetches the NEXT
+        # index in the reversed walk (i-1).
+        nlayers = len(self.layers)
+        order = list(range(nlayers - 1, -1, -1))
+        self.layers[order[0]].paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
+        last_layer_handles = self.layers[order[0]].paras_configure_tp_mlp_all_gather(
             stream_1, [], async_op=True, staging_suffix=staging_1
         )
-        nlayers = len(self.layers)
-        for i, layer in enumerate(self.layers):
-            not_last_layer = i < nlayers - 1
+        for pos, i in enumerate(order):
+            layer = self.layers[i]
+            not_last_layer = pos < nlayers - 1
             if not_last_layer:
-                next_layer = self.layers[i + 1]
+                next_layer = self.layers[order[pos + 1]]
                 next_layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
                 new_handles = next_layer.paras_configure_tp_mlp_all_gather(
                     stream_2, last_layer_handles, async_op=True, staging_suffix=staging_2
@@ -91,7 +102,9 @@ class ParaSModelMixin:
         paras_tp_group = get_paras_tp_group().device_group
         barrier_tensor = torch.zeros(1, device="cuda")
 
-        for layer in self.layers:
+        # Reverse layer order: TP weight layer i overlaps EP weight layer i+1 in
+        # the four-anchor buffer, so i+1 must be read before i is written.
+        for layer in reversed(self.layers):
             layer.paras_configure_tp_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
             dist.all_reduce(barrier_tensor, group=paras_tp_group)
 
@@ -132,17 +145,19 @@ class ParaSModelMixin:
             self.paras_configure_tp_naive(paras_tp_size, paras_tp_rank)
 
     def paras_configure_ep_naive(self):
-        """Sequential TP→EP: reverse weight transfer + attn/communicator restore.
+        """Sequential TP→EP weight transfer + attn/communicator restore.
 
-        Single pass in reverse layer order, mirroring paras_configure_tp_naive.
+        Forward layer order: writing EP weight layer i+1 overlaps TP weight
+        layer i in the four-anchor buffer, so layer i must be read (i.e. layer i
+        processed) before layer i+1's EP weights are written.
         """
-        for layer in reversed(self.layers):
+        for layer in self.layers:
             layer.paras_configure_ep_attn()
             layer.paras_configure_ep_mlp_naive()
             layer.paras_configure_ep()
 
     def paras_configure_ep_peer_access(self):
-        """TP→EP via peer access kernels (reverse layer order) + attn/communicator restore."""
+        """TP→EP via peer access kernels (forward layer order) + attn/communicator restore."""
         mgr = get_global_paras_memory_manager()
 
         if not hasattr(self, '_peer_access_ctx') or self._peer_access_ctx is None:
@@ -158,7 +173,9 @@ class ParaSModelMixin:
         paras_tp_group = get_paras_tp_group().device_group
         barrier_tensor = torch.zeros(1, device="cuda")
 
-        for layer in reversed(self.layers):
+        # Forward layer order: EP weight layer i+1 overlaps TP weight layer i in
+        # the four-anchor buffer, so i must be read before i+1's EP is written.
+        for layer in self.layers:
             layer.paras_configure_ep_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
             dist.all_reduce(barrier_tensor, group=paras_tp_group)
             layer.paras_configure_ep_attn()

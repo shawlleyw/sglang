@@ -565,7 +565,7 @@ class ParaSReqScatterManager:
             torch.zeros(1, device="cuda") if method == "peer_access" else None
         )
 
-        for layer_id in range(num_layers - 1, -1, -1):
+        for layer_id in range(num_layers):
             if self.layer_specs is not None:
                 spec = self.layer_specs[layer_id]
             else:
