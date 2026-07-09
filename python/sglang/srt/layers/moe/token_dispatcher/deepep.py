@@ -161,10 +161,13 @@ class DeepEPBuffer:
                     config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
                     num_nvl_bytes,
                 )
-                num_rdma_bytes = max(
-                    config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
-                    num_rdma_bytes,
-                )
+                
+                if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                    num_rdma_bytes = max(
+                        config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
+                        num_rdma_bytes,
+                    )
+                    
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
@@ -441,7 +444,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            expert_alignment=128,
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
@@ -450,6 +453,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             num_tokens_per_expert=num_tokens_per_expert,
         )
+        
+        self.send_shape = (x[0].shape if isinstance(x, tuple) else x.shape)
+        self.recv_shape = (recv_x[0].shape if isinstance(recv_x, tuple) else recv_x.shape)
 
         return (
             recv_x,
@@ -470,7 +476,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
-            raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
+            output = hidden_states  # enable triton runner
 
         previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event

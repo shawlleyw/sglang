@@ -258,6 +258,18 @@ class CudaGraphRunner:
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
+
+        sa = model_runner.server_args
+        if sa.enable_paras_moe and sa.paras_tp_cuda_graph_bs:
+            self._paras_tp_capture_bs = sorted(
+                {bs for bs in sa.paras_tp_cuda_graph_bs if bs > 0}
+            )
+            log_info_on_rank0(
+                logger,
+                f"ParaS TP-mode cuda graph bs {self._paras_tp_capture_bs}",
+            )
+        else:
+            self._paras_tp_capture_bs = None
         if KTRANSFORMERS_AVAILABLE:
             AMXMoEWrapper.set_capture_batch_sizes(self.capture_bs)
         self.capture_forward_mode = ForwardMode.DECODE
@@ -281,7 +293,10 @@ class CudaGraphRunner:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
-        self.max_bs = max(self.capture_bs)
+        if self._paras_tp_capture_bs:
+            self.max_bs = max(max(self.capture_bs), max(self._paras_tp_capture_bs))
+        else:
+            self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
         self.model_runner.attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
@@ -458,6 +473,17 @@ class CudaGraphRunner:
             )
             torch.cuda.memory._record_memory_history()
 
+        # Memory breakdown: log pool composition before and after the capture
+        # loop so we can attribute capture cost between graph-private pools
+        # (TMS-reachable) vs default pool vs non-PyTorch driver memory.
+        from sglang.srt.paras.paras_cuda_graph import paras_log_memory_breakdown
+
+        _mem_pre = paras_log_memory_breakdown(
+            "pre-capture",
+            self.model_runner.device,
+            self.model_runner.gpu_id,
+        )
+
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
@@ -503,6 +529,38 @@ class CudaGraphRunner:
 
                     # Save gemlite cache after each capture
                     save_gemlite_cache()
+
+        _mem_post = paras_log_memory_breakdown(
+            "post-capture",
+            self.model_runner.device,
+            self.model_runner.gpu_id,
+        )
+        # Terse one-line summary is ALWAYS printed so operators can see the
+        # headline memory numbers at a glance. The detailed per-bucket
+        # breakdown (pre/post/delta) is gated behind SGLANG_PARAS_MEM_LOG=1
+        # to avoid log spam in production.
+        logger.info(
+            "ParaS[mem-summary] post-capture: "
+            f"driver_used={_mem_post['driver_used_gb']:.2f}GB  "
+            f"torch_reserved={_mem_post['torch_reserved_gb']:.2f}GB  "
+            f"non_torch={_mem_post['driver_minus_torch_gb']:.2f}GB  "
+            f"(capture-delta: driver={_mem_post['driver_used_gb'] - _mem_pre['driver_used_gb']:+.2f}GB)"
+        )
+        from sglang.srt.paras.paras_cuda_graph import paras_mem_log_enabled
+        if paras_mem_log_enabled():
+            logger.info(
+                "ParaS[mem-breakdown:capture-delta]  "
+                f"driver_used={_mem_post['driver_used_gb'] - _mem_pre['driver_used_gb']:+.3f}GB  "
+                f"torch_reserved={_mem_post['torch_reserved_gb'] - _mem_pre['torch_reserved_gb']:+.3f}GB  "
+                f"graph_pool={_mem_post['graph_pool_total_gb'] - _mem_pre['graph_pool_total_gb']:+.3f}GB  "
+                f"default_pool={_mem_post['default_pool_total_gb'] - _mem_pre['default_pool_total_gb']:+.3f}GB  "
+                f"non_torch={_mem_post['driver_minus_torch_gb'] - _mem_pre['driver_minus_torch_gb']:+.3f}GB  "
+                f"(deepep_buf={_mem_post['deepep_buffer_gb'] - _mem_pre['deepep_buffer_gb']:+.3f}GB  "
+                f"deepep_ws={_mem_post['deepep_workspace_gb'] - _mem_pre['deepep_workspace_gb']:+.3f}GB  "
+                f"nvshmem={_mem_post['nvshmem_heap_gb'] - _mem_pre['nvshmem_heap_gb']:+.3f}GB  "
+                f"nccl_est={_mem_post['nccl_scratch_est_gb'] - _mem_pre['nccl_scratch_est_gb']:+.3f}GB  "
+                f"other={_mem_post['other_non_torch_gb'] - _mem_pre['other_non_torch_gb']:+.3f}GB)"
+            )
 
         if self.enable_profile_cuda_graph:
             torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")

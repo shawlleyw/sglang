@@ -289,14 +289,37 @@ class Fp8LinearMethod(LinearMethodBase):
             else params_dtype
         )
 
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=weight_dtype
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
+        from sglang.srt.paras.paras_memory_manager import (
+            get_global_paras_memory_manager,
         )
+
+        mgr = get_global_paras_memory_manager()
+        prefix = getattr(layer, "prefix", "")
+        entry_name = f"{prefix}.weight" if prefix else None
+
+        if (
+            mgr is not None
+            and mgr.materialized
+            and entry_name is not None
+            and entry_name in mgr._entries
+        ):
+            weight = ModelWeightParameter(
+                data=mgr.get_view(entry_name),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+        else:
+            weight = ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=weight_dtype,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
         layer.register_parameter("weight", weight)
 
         # If checkpoint is serialized fp8, load them.
@@ -551,6 +574,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+        from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+
+        # ParaS integration: mirrors unquant.py — pull manager from the global
+        # accessor and look up entries by ``model.layers.{layer_id}.mlp.experts.*``.
+        # Scales are NOT in the UMM (replicated-buffer pattern, see
+        # docs/paras/paras_fp8_support.md), so they always allocate as regular
+        # torch tensors regardless of use_manager.
+        mgr = get_global_paras_memory_manager()
+        layer_id = getattr(layer, "layer_id", None)
+        use_manager = mgr is not None and mgr.materialized and layer_id is not None
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
@@ -578,8 +611,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
 
         # WEIGHTS
-        if _is_hip and _use_hip_int4:
-            # INT4 MoE weight - INT32 packed
+        w13_name = f"model.layers.{layer_id}.mlp.experts.w13_weight" if use_manager else None
+        w2_name = f"model.layers.{layer_id}.mlp.experts.w2_weight" if use_manager else None
+
+        if use_manager and w13_name in mgr._entries and w2_name in mgr._entries:
+            w13_weight = torch.nn.Parameter(
+                mgr.get_view(w13_name), requires_grad=False,
+            )
+            w2_weight = torch.nn.Parameter(
+                mgr.get_view(w2_name), requires_grad=False,
+            )
+        elif _is_hip and _use_hip_int4:
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
@@ -625,6 +667,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
+        # Scales are always allocated as regular torch tensors (never UMM-backed)
+        # so that ParaS can replace them with full-buffer slice views after init.
+        # See docs/paras/paras_fp8_support.md.
         if self.block_quant:
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(

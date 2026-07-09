@@ -66,7 +66,13 @@ from sglang.srt.paras.paras_parallel_state import (
     paras_comm_configure_tp,
     paras_comm_configure_ep,
 )
-from sglang.srt.paras.utils import paras_func, paras_memory_check
+from sglang.srt.paras.paras_memory_manager import (
+    ParaSMemoryManager,
+    _validate_paras_swa_runtime_scope,
+    get_global_paras_memory_manager,
+    set_global_paras_memory_manager,
+)
+from sglang.srt.paras.utils import paras_func
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -81,6 +87,11 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.moe_kernel_balance import (
+    MoEKernelBalanceRecorder,
+    get_global_moe_kernel_balance_recorder,
+    set_global_moe_kernel_balance_recorder,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -387,6 +398,18 @@ class ModelRunner:
                     rank=self.tp_rank,
                 )
             )
+
+            set_global_moe_kernel_balance_recorder(
+                MoEKernelBalanceRecorder.init_new(
+                    num_layers=self.model_config.num_hidden_layers,
+                    rank=self.tp_rank,
+                    world_size=torch.distributed.get_world_size(),
+                    enabled=server_args.expert_distribution_recorder_mode is not None,
+                )
+            )
+
+            if server_args.enable_expert_distribution_metrics:
+                get_global_moe_kernel_balance_recorder().start_record()
 
         # Expert parallelism
         self.eplb_manager = (
@@ -764,6 +787,22 @@ class ModelRunner:
                     ),
                 )
                 t.start()
+
+        # Construct the ParaS unified memory manager BEFORE the model is built
+        # so that create_weights() inside the model class can pull tensor views
+        # from the manager via the global accessor. The manager owns its own
+        # device/gpu_id/server_args/cpu_group state, which is the input that
+        # plan_mha_kv_capacity / plan_hybrid_swa_kv_capacity will later read.
+        if self.server_args.enable_paras_moe:
+            paras_world = get_world_group()
+            paras_manager = ParaSMemoryManager(
+                device=self.device,
+                gpu_id=self.gpu_id,
+                server_args=self.server_args,
+                cpu_group=paras_world.cpu_group if paras_world.world_size > 1 else None,
+                world_size=paras_world.world_size,
+            )
+            set_global_paras_memory_manager(paras_manager)
 
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
@@ -1571,7 +1610,16 @@ class ModelRunner:
 
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        _paras_mgr = (
+            get_global_paras_memory_manager()
+            if self.server_args.enable_paras_moe
+            else None
+        )
+        if self.server_args.enable_paras_moe:
+            # Use manager-computed EP token count (budget already accounted for weights)
+            self.max_total_num_tokens = _paras_mgr.get_ep_max_kv_tokens()
+        else:
+            self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
         if SGLANG_CI_SMALL_KV_SIZE:
             self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
 
@@ -1701,12 +1749,25 @@ class ModelRunner:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
+                paras_max_size = None
+                if self.server_args.enable_paras_moe:
+                    _, paras_max_size = _paras_mgr.plan_req_capacities(
+                        context_len=self.model_config.context_len,
+                        ep_max_num_reqs=max_num_reqs,
+                        max_running_requests=self.server_args.max_running_requests,
+                        dp_size=(
+                            self.server_args.dp_size
+                            if self.server_args.enable_dp_attention
+                            else 1
+                        ),
+                    )
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    paras_max_size=paras_max_size,
                 )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -1788,6 +1849,26 @@ class ModelRunner:
             )
         else:
             if self.is_hybrid:
+                _full_ep_k = _full_ep_v = _swa_ep_k = _swa_ep_v = None
+                if self.server_args.enable_paras_moe:
+                    _validate_paras_swa_runtime_scope(
+                        self.server_args, self.model_config
+                    )
+                    if (
+                        _paras_mgr.materialized
+                        and _paras_mgr.has_kv_cache_reserved()
+                    ):
+                        _full_ep_k, _full_ep_v = _paras_mgr.get_kv_views(
+                            num_layers=len(self.model_config.full_attention_layer_ids),
+                            mode="ep",
+                            layer_ids=self.model_config.full_attention_layer_ids,
+                        )
+                        _swa_ep_k, _swa_ep_v = _paras_mgr.get_kv_views(
+                            num_layers=len(self.model_config.swa_attention_layer_ids),
+                            mode="ep",
+                            layer_ids=self.model_config.swa_attention_layer_ids,
+                        )
+
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -1800,6 +1881,10 @@ class ModelRunner:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    full_external_k_buffers=_full_ep_k,
+                    full_external_v_buffers=_full_ep_v,
+                    swa_external_k_buffers=_swa_ep_k,
+                    swa_external_v_buffers=_swa_ep_v,
                 )
             elif config := self.mambaish_config:
                 extra_args = {}
@@ -1827,6 +1912,22 @@ class ModelRunner:
                     **extra_args,
                 )
             else:
+                # Check if ParaS manager can provide KV buffers
+                _paras_external_k = None
+                _paras_external_v = None
+                if (
+                    self.server_args.enable_paras_moe
+                    and _paras_mgr.materialized
+                    and _paras_mgr.has_kv_cache_reserved()
+                ):
+                    _paras_external_k, _paras_external_v = _paras_mgr.get_kv_views(
+                        num_layers=self.num_effective_layers,
+                        mode="ep",
+                        tp_size=1,  # EP mode: tp_size=1 for KV heads
+                        page_size=self.page_size,
+                        prefix="model",
+                    )
+
                 self.token_to_kv_pool = MHATokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1844,6 +1945,8 @@ class ModelRunner:
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
                     ),
+                    external_k_buffers=_paras_external_k,
+                    external_v_buffers=_paras_external_v,
                 )
 
         # Initialize token_to_kv_pool_allocator
@@ -1864,6 +1967,14 @@ class ModelRunner:
             else:
                 if self.page_size == 1:
                     if self.is_hybrid:
+                        if self.server_args.enable_paras_moe:
+                            paras_max_size = _paras_mgr.get_tp_max_kv_tokens()
+                            paras_max_size_swa = _paras_mgr.get_tp_max_kv_tokens(
+                                "swa"
+                            )
+                        else:
+                            paras_max_size = None
+                            paras_max_size_swa = None
                         self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                             self.full_max_total_num_tokens,
                             self.swa_max_total_num_tokens,
@@ -1871,6 +1982,8 @@ class ModelRunner:
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
+                            paras_max_size=paras_max_size,
+                            paras_max_size_swa=paras_max_size_swa,
                         )
                     else:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
@@ -1897,6 +2010,45 @@ class ModelRunner:
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+
+        # DIAGNOSTIC: Dump torch allocator segments at memory-pool-end, enabled
+        # via SGLANG_DUMP_MEM_SEGMENTS=1. Lists the N largest live allocations
+        # with their sizes, stream, and pool id. Used to compare ParaS vs
+        # baseline EP memory footprint at a fixed lifecycle point.
+        import os as _os
+        if _os.environ.get("SGLANG_DUMP_MEM_SEGMENTS", "0") == "1":
+            try:
+                import torch as _torch
+                snapshot = _torch.cuda.memory_snapshot()
+                # Per-segment info: size, allocated_size, stream, segment_type
+                # Only keep segments with actual allocations (non-zero alloc'd).
+                live = [s for s in snapshot if s.get("allocated_size", 0) > 0]
+                live.sort(key=lambda s: s["allocated_size"], reverse=True)
+                total_alloc = sum(s["allocated_size"] for s in live)
+                total_reserved = sum(s["total_size"] for s in live)
+                tag = "PARAS" if self.server_args.enable_paras_moe else "BASE"
+                logger.info(
+                    f"[MEMDUMP:{tag}] segments={len(live)} "
+                    f"total_allocated={total_alloc/1024**3:.3f}GiB "
+                    f"total_reserved={total_reserved/1024**3:.3f}GiB"
+                )
+                for i, s in enumerate(live[:20]):
+                    alloc_mb = s["allocated_size"] / 1024**2
+                    reserv_mb = s["total_size"] / 1024**2
+                    stream = s.get("stream", "?")
+                    seg_type = s.get("segment_type", "?")
+                    # Size of the largest block inside the segment.
+                    blocks = s.get("blocks", [])
+                    largest_block = max((b["size"] for b in blocks if b.get("state") == "active_allocated"), default=0)
+                    logger.info(
+                        f"[MEMDUMP:{tag}] #{i:02d} "
+                        f"alloc={alloc_mb:8.2f}MiB reserved={reserv_mb:8.2f}MiB "
+                        f"largest_block={largest_block/1024**2:7.2f}MiB "
+                        f"type={seg_type} stream={stream} "
+                        f"nblocks={len(blocks)}"
+                    )
+            except Exception as _e:
+                logger.warning(f"[MEMDUMP] failed: {_e}")
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
@@ -2024,6 +2176,11 @@ class ModelRunner:
             f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+
+        if self.server_args.enable_paras_moe and self.graph_runner is not None:
+            from sglang.srt.paras.paras_cuda_graph import paras_init_dual_cuda_graphs
+
+            paras_init_dual_cuda_graphs(self)
 
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
@@ -2163,6 +2320,10 @@ class ModelRunner:
         split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
+
+        get_global_moe_kernel_balance_recorder().set_forward_mode(
+            forward_batch.forward_mode
+        )
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
@@ -2369,7 +2530,16 @@ class ModelRunner:
     def paras_configure_helper(self):
         """Helper function for ParaS configuration."""
         # Reconfigure token_to_kv_pool_allocator, cache related stuffs are configured in scheduler (paras gather manager)
-        self.max_total_num_tokens = self.token_to_kv_pool_allocator.size
+        if self.is_hybrid:
+            self.full_max_total_num_tokens = (
+                self.token_to_kv_pool_allocator.size_full
+            )
+            self.swa_max_total_num_tokens = (
+                self.token_to_kv_pool_allocator.size_swa
+            )
+            self.max_total_num_tokens = self.full_max_total_num_tokens
+        else:
+            self.max_total_num_tokens = self.token_to_kv_pool_allocator.size
         self.max_running_requests = self.req_to_token_pool.size
 
     @paras_func
@@ -2378,21 +2548,25 @@ class ModelRunner:
         assert not self.use_mla_backend, (
             "ParaS does not support MLA backend yet."
         )
-        if paras_tp_rank == 0:
-            paras_memory_check("before paras_configure_tp")
-
         paras_comm_configure_tp()
 
-        # Import here to avoid circular imports
-        from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
+        self.token_to_kv_pool.paras_configure_tp(paras_tp_size)
 
-        assert isinstance(self.model, Qwen3MoeForCausalLM), (
-            "ParaS only supports Qwen3MoeForCausalLM model for now."
+        # Update attention backend cached state (head counts, req_to_token)
+        if hasattr(self.attn_backend, 'paras_configure_tp'):
+            self.attn_backend.paras_configure_tp(
+                paras_tp_size, self.req_to_token_pool.req_to_token
+            )
+
+        assert hasattr(self.model, 'paras_configure_tp') and hasattr(self.model, 'paras_configure_ep'), (
+            "ParaS requires model to have paras_configure_tp and paras_configure_ep methods. "
+            "Use ParaSModelMixin from sglang.srt.paras.paras_model."
         )
         self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
-        if paras_tp_rank == 0:
-            paras_memory_check("after paras_configure_tp")
+        from sglang.srt.paras.paras_cuda_graph import paras_swap_cuda_graphs
+
+        paras_swap_cuda_graphs(self, "tp")
 
     @paras_func
     def paras_configure_ep(self):
@@ -2400,9 +2574,19 @@ class ModelRunner:
         assert not self.use_mla_backend, (
             "ParaS does not support MLA backend yet."
         )
-        assert isinstance(self.token_to_kv_pool, MHATokenToKVPool)
-        self.token_to_kv_pool.paras_configure_ep()
         paras_comm_configure_ep()
+
+        self.token_to_kv_pool.paras_configure_ep()
+
+        # Update attention backend cached state for EP mode
+        if hasattr(self.attn_backend, 'paras_configure_ep'):
+            self.attn_backend.paras_configure_ep(self.req_to_token_pool.req_to_token)
+
+        self.model.paras_configure_ep()
+
+        from sglang.srt.paras.paras_cuda_graph import paras_swap_cuda_graphs
+
+        paras_swap_cuda_graphs(self, "ep")
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

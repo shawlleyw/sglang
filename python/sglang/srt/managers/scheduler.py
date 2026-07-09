@@ -62,6 +62,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.moe_kernel_balance import get_global_moe_kernel_balance_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
@@ -434,6 +435,9 @@ class Scheduler(
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
+        # Cumulative lifetime counters (never reset). Used by ParaS metrics sampler.
+        self.total_decode_tokens_lifetime: int = 0
+        self.total_prefill_tokens_lifetime: int = 0
         self.last_prefill_tokens = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
@@ -515,6 +519,28 @@ class Scheduler(
         
         # Init ParaS configuration
         self.init_paras_config()
+
+        self._paras_metrics_sampler = None
+        if server_args.paras_metrics_file:
+            from sglang.srt.managers.paras_metrics_sampler import ParasMetricsSampler
+
+            self._paras_metrics_sampler = ParasMetricsSampler(
+                self, server_args.paras_metrics_file
+            )
+            self._paras_metrics_sampler.start()
+
+        # Per-forward-step metrics sampler (synchronous, called from run_batch).
+        # Adds torch.cuda.synchronize() per step, so intended for microbench only.
+        self._paras_per_step_metrics_sampler = None
+        if server_args.paras_per_step_metrics_file:
+            from sglang.srt.managers.paras_per_step_metrics_sampler import (
+                ParasPerStepMetricsSampler,
+            )
+
+            self._paras_per_step_metrics_sampler = ParasPerStepMetricsSampler(
+                self, server_args.paras_per_step_metrics_file
+            )
+            self._paras_per_step_metrics_sampler.start()
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
@@ -686,14 +712,18 @@ class Scheduler(
             and server_args.disable_radix_cache
         ):
             if self.is_hybrid:
-                ChunkCacheClass = SWAChunkCache
+                self.tree_cache = SWAChunkCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                    sliding_window_size=self.sliding_window_size,
+                )
             else:
-                ChunkCacheClass = ChunkCache
-            self.tree_cache = ChunkCacheClass(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-            )
+                self.tree_cache = ChunkCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                )
         else:
             if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
                 # lazy import to avoid JIT overhead
@@ -922,8 +952,24 @@ class Scheduler(
             self.device
         ).stream(self.copy_stream)
 
+        # ParaS dynamically mutates self.max_running_requests at EP<->TP switches
+        # (see scheduler_paras_mixin.paras_configure_helper). FutureMap's circular
+        # buffer is sized ONCE here at boot and its invariant requires
+        # bs <= 2 * cap. Size the buffer for the LARGER of the two per-mode caps
+        # so neither direction overflows after a switch.
+        future_map_cap = self.max_running_requests
+        if self.server_args.enable_paras_moe:
+            from sglang.srt.paras.paras_memory_manager import (
+                get_global_paras_memory_manager,
+            )
+            _mgr = get_global_paras_memory_manager()
+            if _mgr is not None:
+                future_map_cap = max(
+                    _mgr.get_ep_max_running_requests(),
+                    _mgr.get_tp_max_running_requests(),
+                )
         self.future_map = FutureMap(
-            self.max_running_requests, self.device, self.spec_algorithm
+            future_map_cap, self.device, self.spec_algorithm
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -954,6 +1000,11 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                if self._paras_auto_policy is not None and self.tp_rank == 0:
+                    self.paras_auto_observe(batch)
+                    signal = self.paras_auto_pick_signal()
+                    if signal is not None:
+                        self.send_to_tokenizer.send_output(signal)
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -984,6 +1035,17 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+
+            # Mirror event_loop_normal's paras auto-switch hook. The original
+            # Task 3 commit (12e75efaa) enabled overlap for paras by adding
+            # the drain-on-switch path but forgot to port this observe/signal
+            # pair. Without it the policy never runs in overlap mode and the
+            # server never switches regardless of how low `running` drops.
+            if batch and self._paras_auto_policy is not None and self.tp_rank == 0:
+                self.paras_auto_observe(batch)
+                signal = self.paras_auto_pick_signal()
+                if signal is not None:
+                    self.send_to_tokenizer.send_output(signal)
 
             self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
@@ -1112,7 +1174,7 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
             
-            logger.info(f"Processing request: {recv_req}")
+            # logger.info(f"Processing request: {recv_req}")
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -1765,7 +1827,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             self.running_batch,
             self.new_token_ratio,
-            self.max_prefill_tokens,
+            self.paras_effective_max_prefill_tokens(),
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
@@ -1974,6 +2036,23 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_start_time = current_time
 
+        # Per-step metrics: paired CUDA Events bracketing the forward stream's
+        # kernel sequence. Recorded on `self.forward_stream` when overlap is
+        # enabled, otherwise the current (default) stream where the
+        # forward_batch_generation kernels will land. The sampler queries
+        # elapsed_time in a background drain thread so this path adds zero
+        # host stall. Non-writer ranks short-circuit via is_active().
+        if (self._paras_per_step_metrics_sampler is not None
+                and self._paras_per_step_metrics_sampler.is_active()):
+            _paras_step_stream = (
+                self.forward_stream if self.enable_overlap else None
+            )
+            _paras_step_start_event = torch.cuda.Event(enable_timing=True)
+            _paras_step_start_event.record(stream=_paras_step_stream)
+        else:
+            _paras_step_stream = None
+            _paras_step_start_event = None
+
         # Run forward
         if self.is_generation:
             batch_or_worker_batch = batch
@@ -2073,6 +2152,17 @@ class Scheduler(
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)
 
+        # Per-step metrics: record the end Event on the same stream as the
+        # start Event, then hand both to the sampler for deferred drain.
+        # No synchronize here: the drain thread queries event readiness
+        # without blocking the scheduler.
+        if _paras_step_start_event is not None:
+            _paras_step_end_event = torch.cuda.Event(enable_timing=True)
+            _paras_step_end_event.record(stream=_paras_step_stream)
+            self._paras_per_step_metrics_sampler.record(
+                batch, _paras_step_start_event, _paras_step_end_event
+            )
+
         # Capture prefill end time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
             current_time = time.perf_counter()
@@ -2136,6 +2226,18 @@ class Scheduler(
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            local_running_batch_size=(
+                len(self.running_batch.reqs) if self.running_batch else 0
+            ),
+            local_waiting_queue_size=len(self.waiting_queue),
+            local_total_decode_tokens=self.total_decode_tokens_lifetime,
+            local_total_prefill_tokens=self.total_prefill_tokens_lifetime,
+            local_prefilling_count=(
+                len(local_batch.reqs)
+                if local_batch is not None
+                and local_batch.forward_mode.is_extend()
+                else 0
+            ),
         )
 
     @staticmethod
@@ -2151,6 +2253,11 @@ class Scheduler(
         require_mlp_tp_gather: bool,
         disable_overlap_schedule: bool,
         offload_tags: set[str],
+        local_running_batch_size: int = 0,
+        local_waiting_queue_size: int = 0,
+        local_total_decode_tokens: int = 0,
+        local_total_prefill_tokens: int = 0,
+        local_prefilling_count: int = 0,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -2200,12 +2307,17 @@ class Scheduler(
                 *tbo_preparer.prepare_all_gather(
                     local_batch,
                 ),
+                local_running_batch_size,
+                local_waiting_queue_size,
+                local_total_decode_tokens,
+                local_total_prefill_tokens,
+                local_prefilling_count,
             ],
             dtype=torch.int64,
             device=device,
         )
         global_info = torch.empty(
-            (dp_size, attn_tp_size, 6),
+            (dp_size, attn_tp_size, 11),
             dtype=torch.int64,
             device=device,
         )
@@ -2218,6 +2330,11 @@ class Scheduler(
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
+        global_running_reqs = global_info[:, 0, 6].tolist()
+        global_waiting_reqs = global_info[:, 0, 7].tolist()
+        global_total_decode_tokens = global_info[:, 0, 8].tolist()
+        global_total_prefill_tokens = global_info[:, 0, 9].tolist()
+        global_prefilling_reqs = global_info[:, 0, 10].tolist()
 
         tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
             global_info[:, :, 4:6]
@@ -2239,6 +2356,11 @@ class Scheduler(
             local_batch.is_extend_in_batch = any(is_extend_in_batch)
             local_batch.tbo_split_seq_index = tbo_split_seq_index
             local_batch.global_forward_mode = global_forward_mode
+            local_batch.global_running_reqs = global_running_reqs
+            local_batch.global_waiting_reqs = global_waiting_reqs
+            local_batch.global_total_decode_tokens = global_total_decode_tokens
+            local_batch.global_total_prefill_tokens = global_total_prefill_tokens
+            local_batch.global_prefilling_reqs = global_prefilling_reqs
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
@@ -2658,10 +2780,13 @@ class Scheduler(
         action = recv_req.action
         if action == ExpertDistributionReqType.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
+            get_global_moe_kernel_balance_recorder().start_record()
         elif action == ExpertDistributionReqType.STOP_RECORD:
             get_global_expert_distribution_recorder().stop_record()
+            get_global_moe_kernel_balance_recorder().stop_record()
         elif action == ExpertDistributionReqType.DUMP_RECORD:
             get_global_expert_distribution_recorder().dump_record()
+            get_global_moe_kernel_balance_recorder().dump()
         else:
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
         return ExpertDistributionReqOutput()

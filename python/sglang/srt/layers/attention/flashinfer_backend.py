@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
@@ -126,7 +127,10 @@ class FlashInferAttnBackend(AttentionBackend):
             model_runner.server_args.multi_item_scoring_delimiter
         )
 
-        # Parse constants
+        # Parse constants (stored for ParaS recomputation in paras_configure_helper)
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.total_num_attention_heads = model_runner.model_config.num_attention_heads
+        self._get_num_kv_heads = model_runner.model_config.get_num_kv_heads
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
@@ -201,6 +205,19 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             self.workspace_buffer = global_workspace_buffer
         max_bs = model_runner.req_to_token_pool.size
+        # ParaS: when EP↔TP switching is enabled, ``req_to_token_pool`` can
+        # grow to the UMM-planned TP request capacity. Pre-size these
+        # runtime metadata buffers (``kv_indptr``, ``kv_last_page_len``,
+        # ``qo_indptr``) to the larger TP capacity so the eager metadata-setup
+        # path does not overflow after the switch. Without this,
+        # ``kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)`` raises a
+        # shape mismatch (or illegal memory access) when the TP-mode
+        # ``forward_batch.batch_size`` exceeds the original EP-local pool size.
+        # See ``docs/paras/runs/2026-04-26-flashinfer-paras-buffer-capacity.md``.
+        server_args = model_runner.server_args
+        if server_args.enable_paras_moe:
+            mgr = get_global_paras_memory_manager()
+            max_bs = max(max_bs, mgr.get_tp_max_num_reqs())
         if kv_indptr_buf is None:
             self.kv_indptr = [
                 torch.zeros(
@@ -285,6 +302,61 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+
+    # ------------------------------------------------------------------
+    # ParaS: EP↔TP attention backend reconfiguration
+    # ------------------------------------------------------------------
+
+    def paras_configure_helper(self):
+        """Recompute derived state after head counts change."""
+        # Recompute whether to use tensor cores (depends on GQA group size)
+        if hasattr(self, 'indices_updater_decode'):
+            self.decode_use_tensor_cores = should_use_tensor_core(
+                kv_cache_dtype=self.kv_cache_dtype,
+                num_attention_heads=self.indices_updater_decode.num_qo_heads,
+                num_kv_heads=self.indices_updater_decode.num_kv_heads,
+            )
+
+    def paras_configure_tp(self, paras_tp_size: int, req_to_token: "torch.Tensor"):
+        """Update cached state for TP mode after ParaS switch."""
+        num_qo_heads = self.total_num_attention_heads // paras_tp_size
+        num_kv_heads = self._get_num_kv_heads(paras_tp_size)
+        for updater_attr in ('indices_updater_decode', 'indices_updater_prefill'):
+            updater = getattr(self, updater_attr, None)
+            if updater is not None:
+                updater.num_qo_heads = num_qo_heads
+                updater.num_kv_heads = num_kv_heads
+                updater.req_to_token = req_to_token
+        self.paras_configure_helper()
+
+    def paras_configure_ep(self, req_to_token: "torch.Tensor"):
+        """Revert cached state for EP mode after ParaS switch."""
+        # EP mode uses DP attention: each rank has all heads, tp_size=1
+        num_qo_heads = self.total_num_attention_heads
+        num_kv_heads = self._get_num_kv_heads(1)
+        for updater_attr in ('indices_updater_decode', 'indices_updater_prefill'):
+            updater = getattr(self, updater_attr, None)
+            if updater is not None:
+                updater.num_qo_heads = num_qo_heads
+                updater.num_kv_heads = num_kv_heads
+                updater.req_to_token = req_to_token
+        self.paras_configure_helper()
+
+    def paras_save_cuda_graph_state(self):
+        return {
+            "decode_cuda_graph_metadata": dict(self.decode_cuda_graph_metadata),
+            "prefill_cuda_graph_metadata": dict(self.prefill_cuda_graph_metadata),
+            "draft_extend_cuda_graph_metadata": dict(
+                self.draft_extend_cuda_graph_metadata
+            ),
+        }
+
+    def paras_load_cuda_graph_state(self, state):
+        self.decode_cuda_graph_metadata = state["decode_cuda_graph_metadata"]
+        self.prefill_cuda_graph_metadata = state["prefill_cuda_graph_metadata"]
+        self.draft_extend_cuda_graph_metadata = state[
+            "draft_extend_cuda_graph_metadata"
+        ]
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
