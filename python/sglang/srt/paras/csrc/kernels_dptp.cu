@@ -242,7 +242,7 @@ void peer_access_fused_transfer_w2_dptp_tpl(
 // Dispatchers. Supported model presets (H, I):
 //   Qwen3-235B: (4096, 1536)
 //   Qwen3-30B:  (2048, 768)
-// (T, G) in {(8, 1), (4, 2), (2, 4)}, NUM_GATES in {1, 2}, ELEM_SIZE = 2,
+// (T, G) in {(8, 1), (4, 2), (2, 4), (2, 2)}, NUM_GATES in {1, 2}, ELEM_SIZE = 2,
 // BPC in {8, 16, 32, 64}.
 // =============================================================================
 
@@ -314,10 +314,12 @@ void launch_peer_access_fused_transfer_w13_dptp(
             if      (T == 8 && G == 1) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_dptp_tpl, 8, 1, 2, 2, ARGS); }
             else if (T == 4 && G == 2) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_dptp_tpl, 4, 2, 2, 2, ARGS); }
             else if (T == 2 && G == 4) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_dptp_tpl, 2, 4, 2, 2, ARGS); }
+            else if (T == 2 && G == 2) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_dptp_tpl, 2, 2, 2, 2, ARGS); }
         } else if (num_gates == 1) {
             if      (T == 8 && G == 1) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_dptp_tpl, 8, 1, 1, 2, ARGS); }
             else if (T == 4 && G == 2) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_dptp_tpl, 4, 2, 1, 2, ARGS); }
             else if (T == 2 && G == 4) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_dptp_tpl, 2, 4, 1, 2, ARGS); }
+            else if (T == 2 && G == 2) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_dptp_tpl, 2, 2, 1, 2, ARGS); }
         }
     }
 #undef ARGS
@@ -354,6 +356,7 @@ void launch_peer_access_fused_transfer_w2_dptp(
         if      (T == 8 && G == 1) { W2_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w2_dptp_tpl, 8, 1, 2, ARGS); }
         else if (T == 4 && G == 2) { W2_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w2_dptp_tpl, 4, 2, 2, ARGS); }
         else if (T == 2 && G == 4) { W2_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w2_dptp_tpl, 2, 4, 2, ARGS); }
+        else if (T == 2 && G == 2) { W2_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w2_dptp_tpl, 2, 2, 2, ARGS); }
     }
 #undef ARGS
     printf("CUDA w2_dptp unsupported combo: T=%d G=%d H=%d I=%d elem=%d bpc=%d\n",
@@ -553,10 +556,12 @@ void launch_peer_access_fused_transfer_w13_ep_dptp(
             if      (T == 8 && G == 1) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_ep_dptp_tpl, 8, 1, 2, 2, ARGS); }
             else if (T == 4 && G == 2) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_ep_dptp_tpl, 4, 2, 2, 2, ARGS); }
             else if (T == 2 && G == 4) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_ep_dptp_tpl, 2, 4, 2, 2, ARGS); }
+            else if (T == 2 && G == 2) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_ep_dptp_tpl, 2, 2, 2, 2, ARGS); }
         } else if (num_gates == 1) {
             if      (T == 8 && G == 1) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_ep_dptp_tpl, 8, 1, 1, 2, ARGS); }
             else if (T == 4 && G == 2) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_ep_dptp_tpl, 4, 2, 1, 2, ARGS); }
             else if (T == 2 && G == 4) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_ep_dptp_tpl, 2, 4, 1, 2, ARGS); }
+            else if (T == 2 && G == 2) { W13_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w13_ep_dptp_tpl, 2, 2, 1, 2, ARGS); }
         }
     }
 #undef ARGS
@@ -593,6 +598,7 @@ void launch_peer_access_fused_transfer_w2_ep_dptp(
         if      (T == 8 && G == 1) { W2_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w2_ep_dptp_tpl, 8, 1, 2, ARGS); }
         else if (T == 4 && G == 2) { W2_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w2_ep_dptp_tpl, 4, 2, 2, ARGS); }
         else if (T == 2 && G == 4) { W2_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w2_ep_dptp_tpl, 2, 4, 2, ARGS); }
+        else if (T == 2 && G == 2) { W2_DPTP_DISPATCH_PRESET(peer_access_fused_transfer_w2_ep_dptp_tpl, 2, 2, 2, ARGS); }
     }
 #undef ARGS
     printf("CUDA w2_ep_dptp unsupported combo: T=%d G=%d H=%d I=%d elem=%d bpc=%d\n",

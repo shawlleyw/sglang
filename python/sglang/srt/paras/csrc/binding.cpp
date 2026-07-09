@@ -495,8 +495,9 @@ void launch_kv_scatter_v3_py(
 }
 
 static void check_dptp_T_G(int T, int G) {
-    TORCH_CHECK((T == 8 && G == 1) || (T == 4 && G == 2) || (T == 2 && G == 4),
-                "dptp kernels require (T, G) in {(8,1), (4,2), (2,4)}; got T=",
+    TORCH_CHECK((T == 8 && G == 1) || (T == 4 && G == 2) || (T == 2 && G == 4)
+                || (T == 2 && G == 2),
+                "dptp kernels require (T, G) in {(8,1), (4,2), (2,4), (2,2)}; got T=",
                 T, " G=", G);
 }
 
