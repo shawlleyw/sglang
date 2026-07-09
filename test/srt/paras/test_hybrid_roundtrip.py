@@ -17,7 +17,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
-from sglang.srt.paras.cache_transfer import LayerCacheSpec
+from sglang.srt.paras.layers.utils import LayerCacheSpec
 from sglang.srt.paras.paras_memory_manager import ParaSMemoryManager
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.paras import paras_memory_manager as pmm

@@ -296,47 +296,55 @@ def _snapshot_local_kv(kv_pool, req_to_token_pool, reqs):
 # ---------------------------------------------------------------------------
 
 def _build_weight_manager(rank, world_size):
-    """Create ParaSMemoryManager with MoE weight slots."""
+    """Create ParaSMemoryManager with MoE weight slots via the four-anchor API.
+
+    `plan_qwen_moe_layout` stashes per-layer sizes; the ep_experts/tp_experts
+    primaries and the `model.layers.{i}.mlp.experts.{w13,w2}_weight` aliases
+    are created by the deferred four-anchor pass inside materialize().
+    """
     from sglang.srt.paras.paras_memory_manager import (
         ParaSMemoryManager,
         create_paras_moe_aliases,
+        plan_qwen_moe_layout,
         set_global_paras_memory_manager,
     )
 
     ep_size = world_size
+    tp_size = world_size
+    moe_tp_size = world_size
+    dp_size = 1
     num_local = NUM_EXPERTS // ep_size
+
+    # num_heads is not a test constant; use the Qwen3-30B-A3B value (32) that
+    # is consistent with NUM_KV_HEADS=4 (GQA 8:1) and HEAD_DIM=128. The test
+    # does not exercise attention weights, but plan_qwen_moe_layout still
+    # reserves qkv_proj/o_proj slots, so num_heads must yield valid shapes.
+    num_heads = 32
 
     mgr = ParaSMemoryManager(device=f"cuda:{rank}")
 
-    # N+1 generic physical slots
-    for slot in range(NUM_LAYERS + 1):
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w13",
-            (num_local, 2 * INTERMEDIATE, HIDDEN),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w2",
-            (num_local, HIDDEN, INTERMEDIATE),
-            torch.bfloat16,
-        )
+    # configure_method != "peer_access" reserves staging.w{13,2}_pre_permute,
+    # which paras_configure_tp_all_to_all() (called by _run_ep_to_tp_weights)
+    # needs. "all_to_all" yields the single "" suffix required by that path.
+    plan_qwen_moe_layout(
+        mgr,
+        num_layers=NUM_LAYERS,
+        num_experts=NUM_EXPERTS,
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+        num_heads=num_heads,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        ep_size=ep_size,
+        tp_size=tp_size,
+        dp_size=dp_size,
+        moe_tp_size=moe_tp_size,
+        configure_method="all_to_all",
+        prefix="model",
+    )
 
-    # 'experts' aliases → slot i+1
-    for i in range(NUM_LAYERS):
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w13"
-        ]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w2"
-        ]
-
-    # Staging buffers
-    staging_experts = num_local
-    w13_staging_shape = (staging_experts, 2 * INTERMEDIATE, HIDDEN)
-    w2_staging_shape = (staging_experts, HIDDEN, INTERMEDIATE)
-    for sfx in ("", "_1", "_2"):
-        mgr.reserve(f"staging.w13_pre_permute{sfx}", w13_staging_shape, torch.bfloat16)
-        mgr.reserve(f"staging.w2_pre_permute{sfx}", w2_staging_shape, torch.bfloat16)
+    # No reserve_kv_cache: the test drives KV through a separate
+    # MHATokenToKVPool, not through the ParaS manager.
 
     mgr.materialize()
     create_paras_moe_aliases(mgr, NUM_LAYERS)
@@ -387,7 +395,9 @@ def _run_ep_to_tp_weights(mgr, num_local, world_size):
     from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 
     tp_inter = INTERMEDIATE // world_size
-    for layer_id in range(NUM_LAYERS):
+    # Reverse layer order: TP weight layer i overlaps EP weight layer i+1 in the
+    # four-anchor buffer, so i+1 must be read before i's TP weights are written.
+    for layer_id in range(NUM_LAYERS - 1, -1, -1):
         m = object.__new__(ParaSMoeBlockMixin)
         m._paras_layer_id = layer_id
         m._paras_interleaved_w13 = False
@@ -401,6 +411,26 @@ def _run_ep_to_tp_weights(mgr, num_local, world_size):
         m.w13_ep_gathered = w13.view(num_local, 2 * INTERMEDIATE, HIDDEN)
         m.w2_ep_gathered = w2.view(num_local, HIDDEN, INTERMEDIATE)
         m.paras_configure_tp_all_to_all()
+
+
+def _run_tp_to_ep_weights(mgr, num_local, world_size):
+    """Run TP→EP reverse weight transfer (naive all_to_all path)."""
+    from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
+
+    # Forward layer order: EP weight layer i+1 overlaps TP weight layer i in the
+    # four-anchor buffer, so i must be read before i+1's EP weights are written.
+    for layer_id in range(NUM_LAYERS):
+        m = object.__new__(ParaSMoeBlockMixin)
+        m._paras_layer_id = layer_id
+        m._paras_interleaved_w13 = False
+        m.num_local_experts = num_local
+        m.num_global_experts = NUM_EXPERTS
+        m.hidden_size = HIDDEN
+        m.moe_intermediate_size = INTERMEDIATE
+        w13 = mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w13_weight")
+        w2 = mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w2_weight")
+        m.ep_experts = _MockExperts(w13, w2)
+        m.paras_configure_ep_mlp_naive()
 
 
 def _verify_weight_restoration(mgr, original_snap, rank):
@@ -441,12 +471,10 @@ class TestFullRoundTrip:
         6. Compare EP weights after round-trip with original (torch.equal)
         7. Verify no memory leak (< 1% delta)
         """
-        from sglang.srt.paras.gather_manager import (
+        from sglang.srt.paras.cache_transfer.utils import (
             gather_kv_and_permute,
-            permute_and_scatter_kv,
-        )
-        from sglang.srt.paras.scatter_manager import (
             gather_tp_kv_and_permute,
+            permute_and_scatter_kv,
             permute_and_scatter_kv_to_ep,
         )
 
@@ -726,9 +754,11 @@ class TestFullRoundTrip:
         dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN, group=tp_group)
         kv_ok = ok_tensor.item() == 1
 
-        # ---- Phase 4: Verify weight restoration ----
-        # EP weights are not modified by EP→TP transfer (it writes to tp_experts
-        # buffers), so they should still match the original.
+        # ---- Phase 4: TP→EP weight restore + verify ----
+        # In the four-anchor layout TP weights overlap EP weights, so EP->TP
+        # overwrites EP in place. A TP->EP transfer reconstructs EP; only then
+        # should the weights match the original.
+        _run_tp_to_ep_weights(weight_mgr, num_local, world_size)
         weights_ok = _verify_weight_restoration(weight_mgr, orig_weights, rank)
 
         # ---- Phase 5: Memory leak check ----
@@ -858,15 +888,13 @@ class TestSingleRequestRoundTrip:
         After TP→EP: exactly 1 rank has the request, others have empty batch.
         Verify the owning rank has correct KV data.
         """
-        from sglang.srt.paras.gather_manager import (
+        from sglang.srt.paras.cache_transfer.utils import (
             gather_kv_and_permute,
-            permute_and_scatter_kv,
-        )
-        from sglang.srt.paras.scatter_manager import (
             gather_tp_kv_and_permute,
+            permute_and_scatter_kv,
             permute_and_scatter_kv_to_ep,
-            partition_requests_for_ep,
         )
+        from sglang.srt.paras.scatter_manager import partition_requests_for_ep
 
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])

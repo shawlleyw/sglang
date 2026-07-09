@@ -109,54 +109,65 @@ def setup_paras_state(rank, world_size):
 
 
 def build_manager(rank, world_size):
-    """Create ParaSMemoryManager with N+1 slots + staging buffers."""
+    """Create ParaSMemoryManager via the four-anchor plan_qwen_moe_layout API.
+
+    The removed N+1 slot layout has been replaced by the deferred four-anchor
+    pass inside materialize(): plan_qwen_moe_layout stashes per-layer sizes,
+    materialize() creates the ep_experts / tp_experts primaries plus the
+    experts.{w13,w2}_weight aliases, and create_paras_moe_aliases is now a
+    validation shim that asserts the primaries exist.
+
+    moe_tp_size=1 (not tp_size) is required for the naive all-to-all path
+    exercised by run_naive_path / _run_ep_to_tp: paras_configure_tp_all_gather
+    views ep_experts.w13_weight as (num_local, 2*moe_intermediate_size,
+    hidden_size), which only holds when ep_w13 stores the full intermediate
+    dimension (ep_inter = intermediate_size / moe_tp_size = intermediate_size).
+
+    configure_method="all_to_all" reserves the staging.w{13,2}_pre_permute
+    buffers (single "" suffix) that both paras_configure_tp_all_to_all and
+    paras_configure_ep_mlp_naive read. The default "peer_access" reserves no
+    staging, which would break run_naive_path / test_weight_roundtrip.
+    """
     from sglang.srt.paras.paras_memory_manager import (
         ParaSMemoryManager,
         create_paras_moe_aliases,
+        plan_qwen_moe_layout,
         set_global_paras_memory_manager,
     )
 
     ep_size = world_size
+    tp_size = world_size  # DP=1: TP covers the entire world
     num_local = NUM_EXPERTS // ep_size
+
+    # Attention constants for Qwen3-30B-A3B parity. The test never exercises
+    # attention weights, but plan_qwen_moe_layout still reserves qkv_proj /
+    # o_proj slots, so these must yield valid shapes.
+    NUM_HEADS = 32
+    NUM_KV_HEADS = 4
+    HEAD_DIM = 128
 
     mgr = ParaSMemoryManager(device=f"cuda:{rank}")
 
-    # N+1 generic physical slots (non-triton shape: E_local, 2*I, H / E_local, H, I)
-    for slot in range(NUM_LAYERS + 1):
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w13",
-            (num_local, 2 * INTERMEDIATE, HIDDEN),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w2",
-            (num_local, HIDDEN, INTERMEDIATE),
-            torch.bfloat16,
-        )
-
-    # 'experts' aliases → slot i+1 (for weight loading / EP access)
-    for i in range(NUM_LAYERS):
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w13"
-        ]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w2"
-        ]
-
-    # Staging buffers for NCCL all-to-all and overlap paths
-    staging_experts = num_local
-    w13_staging_shape = (staging_experts, 2 * INTERMEDIATE, HIDDEN)
-    w2_staging_shape = (staging_experts, HIDDEN, INTERMEDIATE)
-    for sfx in ("", "_1", "_2"):
-        mgr.reserve(
-            f"staging.w13_pre_permute{sfx}", w13_staging_shape, torch.bfloat16
-        )
-        mgr.reserve(
-            f"staging.w2_pre_permute{sfx}", w2_staging_shape, torch.bfloat16
-        )
+    plan_qwen_moe_layout(
+        mgr,
+        num_layers=NUM_LAYERS,
+        num_experts=NUM_EXPERTS,
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+        num_heads=NUM_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        ep_size=ep_size,
+        tp_size=tp_size,
+        dp_size=1,
+        moe_tp_size=1,
+        quant_name=None,
+        configure_method="all_to_all",
+        prefix="model",
+    )
 
     mgr.materialize()
-    create_paras_moe_aliases(mgr, NUM_LAYERS)
+    create_paras_moe_aliases(mgr, NUM_LAYERS, prefix="model")
     set_global_paras_memory_manager(mgr)
     return mgr, num_local
 
@@ -288,7 +299,9 @@ def run_naive_path(mgr, num_local):
 
     tp_size = get_paras_tp_size()
     tp_inter = INTERMEDIATE // tp_size
-    for layer_id in range(NUM_LAYERS):
+    # EP->TP reverse: TP weight layer i overlaps EP weight layer i+1 in the
+    # four-anchor buffer, so i+1 must be read before i's TP weights are written.
+    for layer_id in reversed(range(NUM_LAYERS)):
         mixin = _make_mixin(layer_id, num_local, mgr)
         mixin.paras_configure_tp_all_to_all()
     return _read_tp_results(mgr, tp_inter)
@@ -310,15 +323,20 @@ def run_overlap_path(mgr, num_local):
     staging_1 = "_1"
     staging_2 = "_2"
 
-    layers[0].paras_configure_tp_attn(tp_size, 0)
-    last_layer_handles = layers[0].paras_configure_tp_mlp_all_gather(
+    # Reverse pipeline (N-1..0): TP weight layer i overlaps EP weight layer i+1,
+    # so i+1 must be consumed before i's TP weights are written. Prefetch walks
+    # the next reversed index (i-1).
+    nlayers = len(layers)
+    order = list(range(nlayers - 1, -1, -1))
+    layers[order[0]].paras_configure_tp_attn(tp_size, 0)
+    last_layer_handles = layers[order[0]].paras_configure_tp_mlp_all_gather(
         stream_1, [], async_op=True, staging_suffix=staging_1
     )
-    nlayers = len(layers)
-    for i, layer in enumerate(layers):
-        not_last_layer = i < nlayers - 1
+    for pos, i in enumerate(order):
+        layer = layers[i]
+        not_last_layer = pos < nlayers - 1
         if not_last_layer:
-            next_layer = layers[i + 1]
+            next_layer = layers[order[pos + 1]]
             next_layer.paras_configure_tp_attn(tp_size, 0)
             new_handles = next_layer.paras_configure_tp_mlp_all_gather(
                 stream_2,
@@ -357,7 +375,8 @@ def run_peer_access_path(mgr, num_local, peer_ctx):
     barrier_tensor = torch.zeros(1, device="cuda")
     dist.barrier(group=paras_tp_group)
 
-    for layer_id in range(NUM_LAYERS):
+    # EP->TP reverse: TP weight layer i overlaps EP weight layer i+1.
+    for layer_id in reversed(range(NUM_LAYERS)):
         mixin = _make_mixin(layer_id, num_local, mgr)
         mixin.paras_configure_tp_fused_peer_access_kernel(
             peer_ctx, dst_base_ptrs, None
@@ -384,7 +403,9 @@ def run_peer_access_reverse_path(mgr, num_local, peer_ctx):
     barrier_tensor = torch.zeros(1, device="cuda")
     dist.barrier(group=paras_tp_group)
 
-    for layer_id in reversed(range(NUM_LAYERS)):
+    # TP->EP forward: EP weight layer i+1 overlaps TP weight layer i, so i must
+    # be read before i+1's EP weights are written.
+    for layer_id in range(NUM_LAYERS):
         mixin = _make_mixin(layer_id, num_local, mgr)
         mixin.paras_configure_ep_fused_peer_access_kernel(
             peer_ctx, dst_base_ptrs, None
@@ -626,12 +647,13 @@ class TestWeightRoundTrip:
         # Restore clean EP weights
         restore_weights(self.mgr, self.snap)
 
-        # EP→TP via NCCL naive all-to-all
+        # EP→TP via NCCL naive all-to-all (reverse order, handled inside)
         run_naive_path(self.mgr, self.num_local)
 
-        # TP→EP via NCCL naive reverse — MUST be in reversed layer order
-        # to respect N+1 slot aliasing (EP slot[i+1] = TP slot[i+1])
-        for layer_id in reversed(range(NUM_LAYERS)):
+        # TP→EP via NCCL naive — FORWARD layer order: EP weight layer i+1
+        # overlaps TP weight layer i in the four-anchor buffer, so i must be
+        # read before i+1's EP weights are written.
+        for layer_id in range(NUM_LAYERS):
             mixin = _make_mixin(layer_id, self.num_local, self.mgr)
             mixin.paras_configure_ep_mlp_naive()
 
@@ -772,7 +794,9 @@ class TestTPtoEPGroundTruth:
 
     def test_nccl_reverse_vs_original(self):
         self._run_ep_to_tp()
-        for layer_id in reversed(range(NUM_LAYERS)):
+        # TP->EP forward: EP weight layer i+1 overlaps TP weight layer i, so i
+        # must be read before i+1's EP weights are written.
+        for layer_id in range(NUM_LAYERS):
             mixin = _make_mixin(layer_id, self.num_local, self.mgr)
             mixin.paras_configure_ep_mlp_naive()
         self._verify_ep_matches_original("NCCL naive reverse")

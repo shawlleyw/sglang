@@ -86,9 +86,13 @@ def setup_paras_state(rank, world_size):
 
 
 def build_manager(rank, world_size):
+    # Attention geometry not exercised by MoE-only forward paths; num_heads=32
+    # and head_dim=64 satisfy num_heads*head_dim==HIDDEN. num_kv_heads=8 mirrors
+    # GPT-OSS GQA 4:1. Symmetric switch: moe_tp_size==tp_size==ep_size==world_size.
     from sglang.srt.paras.paras_memory_manager import (
         ParaSMemoryManager,
         create_paras_moe_aliases,
+        plan_gpt_oss_moe_layout,
         set_global_paras_memory_manager,
     )
 
@@ -97,39 +101,26 @@ def build_manager(rank, world_size):
 
     mgr = ParaSMemoryManager(device=f"cuda:{rank}")
 
-    for slot in range(NUM_LAYERS + 1):
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w13",
-            (num_local, 2 * INTERMEDIATE, HIDDEN),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w2",
-            (num_local, HIDDEN, INTERMEDIATE),
-            torch.bfloat16,
-        )
-
-    for i in range(NUM_LAYERS):
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w13"
-        ]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w2"
-        ]
-
-    staging_experts = num_local
-    w13_staging_shape = (staging_experts, 2 * INTERMEDIATE, HIDDEN)
-    w2_staging_shape = (staging_experts, HIDDEN, INTERMEDIATE)
-    for sfx in ("", "_1", "_2"):
-        mgr.reserve(
-            f"staging.w13_pre_permute{sfx}", w13_staging_shape, torch.bfloat16
-        )
-        mgr.reserve(
-            f"staging.w2_pre_permute{sfx}", w2_staging_shape, torch.bfloat16
-        )
+    plan_gpt_oss_moe_layout(
+        mgr,
+        num_layers=NUM_LAYERS,
+        num_experts=NUM_EXPERTS,
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=64,
+        ep_size=ep_size,
+        tp_size=world_size,
+        dp_size=1,
+        moe_tp_size=world_size,
+        quant_name=None,
+        configure_method="peer_access",
+        prefix="model",
+    )
 
     mgr.materialize()
-    create_paras_moe_aliases(mgr, NUM_LAYERS)
+    create_paras_moe_aliases(mgr, NUM_LAYERS, prefix="model")
     set_global_paras_memory_manager(mgr)
     return mgr, num_local
 
@@ -301,7 +292,8 @@ def test_ep_tp_ep_weight_roundtrip_and_cuda_graph():
         barrier_tensor = torch.zeros(1, device="cuda")
         dist.barrier(group=paras_tp_group)
 
-        for layer_id in range(NUM_LAYERS):
+        # EP->TP reverse: TP weight i overlaps EP weight i+1 (four-anchor).
+        for layer_id in reversed(range(NUM_LAYERS)):
             mixin = _make_mixin(layer_id, num_local, mgr)
             mixin.paras_configure_tp_fused_peer_access_kernel(
                 peer_ctx, dst_base_ptrs, None
@@ -334,7 +326,8 @@ def test_ep_tp_ep_weight_roundtrip_and_cuda_graph():
         # --- TP→EP reverse weight transfer (peer access) ---
         dist.barrier(group=paras_tp_group)
         barrier_tensor.zero_()
-        for layer_id in reversed(range(NUM_LAYERS)):
+        # TP->EP forward: EP weight i+1 overlaps TP weight i (four-anchor).
+        for layer_id in range(NUM_LAYERS):
             mixin = _make_mixin(layer_id, num_local, mgr)
             mixin.paras_configure_ep_fused_peer_access_kernel(
                 peer_ctx, dst_base_ptrs, None
@@ -371,90 +364,89 @@ def test_ep_tp_ep_weight_roundtrip_and_cuda_graph():
 
 
 def build_manager_with_bias(rank, world_size):
-    """Build manager with w13/w2 weight slots, w13_bias slots, and all staging buffers."""
+    # all_to_all / naive path variant: plan_gpt_oss_moe_layout with
+    # configure_method="all_to_all" reserves staging.{w13,w2}_pre_permute for
+    # NCCL transport. Biases are no longer part of the four-anchor MoE layout;
+    # the direct reserves below preserve the test's mock-experts pattern
+    # (see _MockExpertsWithBias / fill_biases) via regular reserve() entries.
     from sglang.srt.paras.paras_memory_manager import (
         ParaSMemoryManager,
         create_paras_moe_aliases,
+        plan_gpt_oss_moe_layout,
         set_global_paras_memory_manager,
     )
 
     ep_size = world_size
     num_local = NUM_EXPERTS // ep_size
+    tp_inter = INTERMEDIATE // world_size
 
     mgr = ParaSMemoryManager(device=f"cuda:{rank}")
 
-    for slot in range(NUM_LAYERS + 1):
+    for i in range(NUM_LAYERS):
         mgr.reserve(
-            f"paras.moe_slot.{slot}.w13",
-            (num_local, 2 * INTERMEDIATE, HIDDEN),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w2",
-            (num_local, HIDDEN, INTERMEDIATE),
-            torch.bfloat16,
-        )
-
-    for slot in range(NUM_LAYERS + 1):
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w13_bias",
+            f"model.layers.{i}.mlp.experts.w13_weight_bias",
             (num_local, 2 * INTERMEDIATE),
             torch.float32,
         )
-
-    for i in range(NUM_LAYERS):
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w13"
-        ]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w2"
-        ]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight_bias"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w13_bias"
-        ]
-
-    staging_experts = num_local
-    for sfx in ("", "_1", "_2"):
         mgr.reserve(
-            f"staging.w13_pre_permute{sfx}",
-            (staging_experts, 2 * INTERMEDIATE, HIDDEN),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"staging.w2_pre_permute{sfx}",
-            (staging_experts, HIDDEN, INTERMEDIATE),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"staging.w13_bias_pre_permute{sfx}",
-            (staging_experts, 2 * INTERMEDIATE),
+            f"model.layers.{i}.mlp.tp_experts.w13_weight_bias",
+            (NUM_EXPERTS, 2 * tp_inter),
             torch.float32,
         )
 
+    plan_gpt_oss_moe_layout(
+        mgr,
+        num_layers=NUM_LAYERS,
+        num_experts=NUM_EXPERTS,
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=64,
+        ep_size=ep_size,
+        tp_size=world_size,
+        dp_size=1,
+        moe_tp_size=world_size,
+        quant_name=None,
+        configure_method="all_to_all",
+        prefix="model",
+    )
+
     mgr.materialize()
-    create_paras_moe_aliases(mgr, NUM_LAYERS)
+    create_paras_moe_aliases(mgr, NUM_LAYERS, prefix="model")
     set_global_paras_memory_manager(mgr)
     return mgr, num_local
 
 
 def fill_biases(mgr, rank):
+    # Bias is materialized statically for BOTH EP and TP and is never moved by
+    # the EP<->TP switch, so fill both static buffers at "load time".
     for layer_id in range(NUM_LAYERS):
         gen = torch.Generator(device="cpu")
         gen.manual_seed(SEED + layer_id * 100 + rank + 77)
-        b13 = mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w13_weight_bias")
-        b13.copy_(
-            torch.randn(b13.shape, generator=gen, dtype=torch.float32).to(
-                device=b13.device
+        for name in (
+            f"model.layers.{layer_id}.mlp.experts.w13_weight_bias",
+            f"model.layers.{layer_id}.mlp.tp_experts.w13_weight_bias",
+        ):
+            b = mgr.get_view(name)
+            b.copy_(
+                torch.randn(b.shape, generator=gen, dtype=torch.float32).to(
+                    device=b.device
+                )
             )
-        )
 
 
 def snapshot_biases(mgr):
     snap = {}
     for layer_id in range(NUM_LAYERS):
-        snap[layer_id] = mgr.get_view(
-            f"model.layers.{layer_id}.mlp.experts.w13_weight_bias"
-        ).clone()
+        snap[layer_id] = {
+            "ep": mgr.get_view(
+                f"model.layers.{layer_id}.mlp.experts.w13_weight_bias"
+            ).clone(),
+            "tp": mgr.get_view(
+                f"model.layers.{layer_id}.mlp.tp_experts.w13_weight_bias"
+            ).clone(),
+        }
     return snap
 
 
@@ -497,21 +489,26 @@ def _run_bias_roundtrip(interleaved_w13: bool):
         ep_weight_snap = snapshot_weights(mgr)
         ep_bias_snap = snapshot_biases(mgr)
 
-        for layer_id in range(NUM_LAYERS):
+        # EP->TP reverse: TP weight i overlaps EP weight i+1 (four-anchor).
+        for layer_id in reversed(range(NUM_LAYERS)):
             mixin = _make_mixin_with_bias(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
             )
             mixin.paras_configure_tp_all_to_all()
 
+        # Bias is static: the switch must NOT touch the TP bias buffer. It stays
+        # equal to its statically-filled value (and is non-zero).
         for layer_id in range(NUM_LAYERS):
             tp_b13 = mgr.get_view(
                 f"model.layers.{layer_id}.mlp.tp_experts.w13_weight_bias"
             )
-            assert tp_b13.abs().sum() > 0, (
-                f"Layer {layer_id} TP bias is all zeros after EP->TP all-to-all"
+            assert torch.equal(tp_b13, ep_bias_snap[layer_id]["tp"]), (
+                f"Layer {layer_id} TP bias changed during EP->TP (must be static)"
             )
+            assert tp_b13.abs().sum() > 0, f"Layer {layer_id} TP bias unexpectedly zero"
 
-        for layer_id in reversed(range(NUM_LAYERS)):
+        # TP->EP forward: EP weight i+1 overlaps TP weight i (four-anchor).
+        for layer_id in range(NUM_LAYERS):
             mixin = _make_mixin_with_bias(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
             )
@@ -533,8 +530,14 @@ def _run_bias_roundtrip(interleaved_w13: bool):
             assert torch.equal(w2_now, ep_weight_snap[layer_id][1]), (
                 f"Layer {layer_id} w2 mismatch after bias round-trip"
             )
-            assert torch.equal(b13_now, ep_bias_snap[layer_id]), (
-                f"Layer {layer_id} w13_bias mismatch after round-trip"
+            assert torch.equal(b13_now, ep_bias_snap[layer_id]["ep"]), (
+                f"Layer {layer_id} EP w13_bias changed (must be static)"
+            )
+            tp_b13_now = mgr.get_view(
+                f"model.layers.{layer_id}.mlp.tp_experts.w13_weight_bias"
+            )
+            assert torch.equal(tp_b13_now, ep_bias_snap[layer_id]["tp"]), (
+                f"Layer {layer_id} TP w13_bias changed (must be static)"
             )
 
         if rank == 0:
@@ -628,7 +631,8 @@ def _run_layout_semantics_test(interleaved_w13: bool):
         _fill_tagged_w13(mgr, rank, interleaved_w13, world_size)
         fill_biases(mgr, rank)
 
-        for layer_id in range(NUM_LAYERS):
+        # EP->TP reverse: TP weight i overlaps EP weight i+1 (four-anchor).
+        for layer_id in reversed(range(NUM_LAYERS)):
             mixin = _make_mixin_with_bias(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
             )
@@ -687,7 +691,8 @@ def _run_peer_access_layout_semantics_test(interleaved_w13: bool):
         barrier_tensor = torch.zeros(1, device="cuda")
         dist.barrier(group=paras_tp_group)
 
-        for layer_id in range(NUM_LAYERS):
+        # EP->TP reverse: TP weight i overlaps EP weight i+1 (four-anchor).
+        for layer_id in reversed(range(NUM_LAYERS)):
             mixin = _make_mixin(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
             )
@@ -702,7 +707,8 @@ def _run_peer_access_layout_semantics_test(interleaved_w13: bool):
 
         dist.barrier(group=paras_tp_group)
         barrier_tensor.zero_()
-        for layer_id in reversed(range(NUM_LAYERS)):
+        # TP->EP forward: EP weight i+1 overlaps TP weight i (four-anchor).
+        for layer_id in range(NUM_LAYERS):
             mixin = _make_mixin(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
             )
