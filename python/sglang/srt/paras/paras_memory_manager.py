@@ -269,6 +269,9 @@ class ParaSMemoryManager:
         self.ep_max_running_requests: int = 0
         self.tp_max_running_requests: int = 0
         self._kv_reserved: bool = False
+        self._paras_kv_pending: Optional[Dict] = None
+        self._paras_moe_pending: Optional[Dict] = None
+        self._deferred_weight_bytes: int = 0
         
 
     # ----- reservation ----------------------------------------------------
@@ -420,7 +423,9 @@ class ParaSMemoryManager:
                 self.ep_max_kv_tokens_swa = max(s.tokens_cap_ep for s in swa_specs)
                 self.tp_max_kv_tokens_swa = max(s.tokens_cap_tp for s in swa_specs)
 
-        # Save metadata for _create_kv_layout (called from materialize).
+        # Placed by the deferred four-anchor pass at materialize time. No
+        # ct <= ce precondition is asserted: real configs always satisfy it, and
+        # the tail anchor stays safe even if they did not.
         self._paras_kv_pending = {
             "num_layers": num_layers,
             "prefix": prefix,
@@ -532,9 +537,9 @@ class ParaSMemoryManager:
 
         ep_kv_heads = num_kv_heads
         tp_kv_heads = max(1, num_kv_heads // tp_size)
-        # (num_layers + 1) reserves one layer's K+V for the EP/TP cache-transfer
-        # overlap_gap baked into _create_kv_layout (line 783). Without this the
-        # materialized KV region exceeds kv_budget by one max-layer worth.
+        # (num_layers + 1) reserves one layer's K+V for the four-anchor cache
+        # tail overhead (the max(ct) anchor in _place_paras_run). Without it the
+        # materialized run exceeds kv_budget by ~one layer.
         ep_cell_bytes = ep_kv_heads * head_dim * (num_layers + 1) * 2 * elem_size
         tp_cell_bytes = tp_kv_heads * head_dim * (num_layers + 1) * 2 * elem_size
         ep_max_tokens = max(1, int(kv_budget_bytes // ep_cell_bytes))
@@ -632,8 +637,8 @@ class ParaSMemoryManager:
             return max(1, tt // num_layers), 0
 
         # Two-pass: pass 1 estimates full_max_tokens, pass 2 subtracts the
-        # _create_kv_layout overlap_gap (one max-layer of K+V bytes) and
-        # re-solves. Single iteration converges because overlap_gap << kv_budget.
+        # four-anchor cache tail overhead (~one max-layer of K+V bytes) and
+        # re-solves. Single iteration converges because the overhead << kv_budget.
         full_max_tokens_pass1, _ = _solve_tokens(kv_budget_bytes)
         overlap_gap_bytes = full_max_tokens_pass1 * cell_bytes
         kv_budget_bytes = max(0, kv_budget_bytes - overlap_gap_bytes)
@@ -795,9 +800,10 @@ class ParaSMemoryManager:
             entry.offset_bytes = self._align_up(offset, self.ALIGNMENT)
             offset = entry.offset_bytes + entry.size_bytes
 
-        pending = getattr(self, "_paras_kv_pending", None)
-        if pending is not None:
-            offset = self._create_kv_layout(offset, **pending)
+        moe_pending = getattr(self, "_paras_moe_pending", None)
+        kv_pending = getattr(self, "_paras_kv_pending", None)
+        if moe_pending is not None or kv_pending is not None:
+            offset = self._place_paras_run(offset, moe_pending, kv_pending)
 
         self._total_bytes = self._align_up(offset, self.ALIGNMENT)
         self._buffer = torch.empty(
@@ -810,87 +816,145 @@ class ParaSMemoryManager:
         self._materialized = True
         return self._total_bytes
 
-    # ----- KV layout creation (called from materialize) -------------------
+    # ----- unified four-anchor layout (called from materialize) -----------
 
-    def _create_kv_layout(
+    def _register_entry(
+        self,
+        name: str,
+        shape: Tuple[int, ...],
+        dtype: torch.dtype,
+        size_bytes: int,
+        offset_bytes: int,
+    ) -> LayoutEntry:
+        numel = 1
+        for d in shape:
+            numel *= d
+        elem_size = size_bytes // numel if numel else 0
+        entry = LayoutEntry(
+            name=name,
+            shape=shape,
+            dtype=dtype,
+            numel=numel,
+            element_size=elem_size,
+            size_bytes=size_bytes,
+            offset_bytes=offset_bytes,
+        )
+        self._entries[name] = entry
+        return entry
+
+    def _place_paras_run(
         self,
         offset: int,
-        *,
-        num_layers: int,
-        prefix: str,
-        layer_ep_bytes: List[int],
-        layer_tp_bytes: List[int],
-        layer_ep_shapes: List[Tuple[int, ...]],
-        layer_tp_shapes: List[Tuple[int, ...]],
-        kv_dtype: torch.dtype,
+        moe: Optional[Dict],
+        kv: Optional[Dict],
     ) -> int:
-        """Create per-layer TP and EP LayoutEntry objects at computed offsets.
+        """Place expert weights and KV cache in one four-anchor run.
 
-        Returns the byte offset past the end of the V region.
+        Orientation EP-low / TP-high. Per mode, address order is
+        ``weights | pad | cache``; the big TP weights overlap the big EP cache
+        (EP and TP are never live together), so the buffer is ~one per-mode
+        footprint plus one layer. The ``max(ct)`` tail anchor keeps every
+        layer's EP and TP cache disjoint for any per-layer sizes, given the
+        invariant ``ct[i] <= ce[i]``. Weight sub-slabs are ``[w13|w2]`` and
+        cache sub-slabs ``[k|v]``, laid identically in both modes so the
+        offset-agnostic transfer kernels stay valid.
+
+        Returns the byte offset past the end of the run.
         """
+        A = self.ALIGNMENT
+        P = self._align_up(offset, A)
+
+        meta = moe if moe is not None else kv
+        assert meta is not None, "_place_paras_run requires moe or kv pending"
+        num_layers = meta["num_layers"]
+        prefix = meta["prefix"]
         if num_layers == 0:
-            return offset
+            return P
 
-        elem_size = (
-            kv_dtype.itemsize
-            if hasattr(kv_dtype, "itemsize")
-            else torch.tensor([], dtype=kv_dtype).element_size()
-        )
-        tp_prefix = 0
-        ep_prefix = 0
-        overlap_gap = 0
-        for tp_bytes, ep_bytes in zip(layer_tp_bytes, layer_ep_bytes):
-            overlap_gap = max(overlap_gap, tp_prefix + tp_bytes - ep_prefix)
-            tp_prefix += tp_bytes
-            ep_prefix += ep_bytes
+        def au(x: int) -> int:
+            return self._align_up(x, A)
 
-        kv_region_bytes = max(sum(layer_tp_bytes), overlap_gap + sum(layer_ep_bytes))
+        if moe is not None:
+            we_slab = au(moe["ep_w13_bytes"]) + au(moe["ep_w2_bytes"])
+            wt_slab = au(moe["tp_w13_bytes"]) + au(moe["tp_w2_bytes"])
+            we = [we_slab] * num_layers
+            wt = [wt_slab] * num_layers
+        else:
+            we = [0] * num_layers
+            wt = [0] * num_layers
 
-        k_region_start = self._align_up(offset, self.ALIGNMENT)
-        v_region_start = self._align_up(
-            k_region_start + kv_region_bytes, self.ALIGNMENT
-        )
+        if kv is not None:
+            ce = [au(b) * 2 for b in kv["layer_ep_bytes"]]
+            ct = [au(b) * 2 for b in kv["layer_tp_bytes"]]
+        else:
+            ce = [0] * num_layers
+            ct = [0] * num_layers
 
-        for side, region_start in [("k", k_region_start), ("v", v_region_start)]:
-            tp_prefix = 0
-            ep_prefix = 0
+        sum_we, sum_wt, sum_ce, sum_ct = sum(we), sum(wt), sum(ce), sum(ct)
+
+        # Cache tail anchor: gap between EP and TP cache bases that keeps every
+        # layer disjoint. In every real config ct[i] <= ce[i] (num_kv_heads
+        # divides tp_size or GQA-replicates, page_size >= 1), so this reduces to
+        # max(ct). The general form is defensive headroom for ct[i] > ce[i] and
+        # costs nothing.
+        anchor, suffix = 0, 0
+        for i in range(num_layers - 1, -1, -1):
+            anchor = max(anchor, ct[i] + suffix)
+            suffix += ct[i] - ce[i]
+        anchor = au(anchor)
+
+        w_end = P + sum_we
+        tp_w_end = P + we[0] + sum_wt
+        PAD = au(max(0, tp_w_end - w_end - sum_ce + sum_ct - anchor))
+        EP_end = w_end + PAD + sum_ce
+        tc_end = EP_end + anchor
+        assert EP_end % A == 0 and tc_end % A == 0, (EP_end, tc_end)
+
+        if moe is not None:
+            dtype = moe["dtype"]
+            off = P
             for i in range(num_layers):
-                ep_shape = layer_ep_shapes[i]
-                tp_shape = layer_tp_shapes[i]
-                ep_bytes = layer_ep_bytes[i]
-                tp_bytes = layer_tp_bytes[i]
-                ep_numel = ep_shape[0] * ep_shape[1] * ep_shape[2]
-                tp_numel = tp_shape[0] * tp_shape[1] * tp_shape[2]
+                lp = f"{prefix}.layers.{i}.mlp.ep_experts"
+                self._register_entry(f"{lp}.w13_weight", moe["ep_w13_shape"], dtype, moe["ep_w13_bytes"], off)
+                self._register_entry(f"{lp}.w2_weight", moe["ep_w2_shape"], dtype, moe["ep_w2_bytes"], off + au(moe["ep_w13_bytes"]))
+                off += we[i]
+            assert off == w_end, (off, w_end)
 
-                tp_offset = region_start + tp_prefix
-                ep_offset = region_start + overlap_gap + ep_prefix
+            off = P + we[0]
+            for i in range(num_layers):
+                lp = f"{prefix}.layers.{i}.mlp.tp_experts"
+                self._register_entry(f"{lp}.w13_weight", moe["tp_w13_shape"], dtype, moe["tp_w13_bytes"], off)
+                self._register_entry(f"{lp}.w2_weight", moe["tp_w2_shape"], dtype, moe["tp_w2_bytes"], off + au(moe["tp_w13_bytes"]))
+                off += wt[i]
+            assert off == tp_w_end, (off, tp_w_end)
 
-                ep_entry = LayoutEntry(
-                    name=f"{prefix}.layers.{i}.kv.ep.{side}",
-                    shape=ep_shape,
-                    dtype=kv_dtype,
-                    numel=ep_numel,
-                    element_size=elem_size,
-                    size_bytes=ep_bytes,
-                    offset_bytes=ep_offset,
-                )
-                self._entries[f"{prefix}.layers.{i}.kv.ep.{side}"] = ep_entry
-                self._entries[f"{prefix}.layers.{i}.kv.{side}"] = ep_entry
+            for i in range(num_layers):
+                self._entries[f"{prefix}.layers.{i}.mlp.experts.w13_weight"] = self._entries[f"{prefix}.layers.{i}.mlp.ep_experts.w13_weight"]
+                self._entries[f"{prefix}.layers.{i}.mlp.experts.w2_weight"] = self._entries[f"{prefix}.layers.{i}.mlp.ep_experts.w2_weight"]
 
-                self._entries[f"{prefix}.layers.{i}.kv.tp.{side}"] = LayoutEntry(
-                    name=f"{prefix}.layers.{i}.kv.tp.{side}",
-                    shape=tp_shape,
-                    dtype=kv_dtype,
-                    numel=tp_numel,
-                    element_size=elem_size,
-                    size_bytes=tp_bytes,
-                    offset_bytes=tp_offset,
-                )
+        if kv is not None:
+            kv_dtype = kv["kv_dtype"]
+            off = w_end + PAD
+            for i in range(num_layers):
+                kb = kv["layer_ep_bytes"][i]
+                shp = kv["layer_ep_shapes"][i]
+                k = self._register_entry(f"{prefix}.layers.{i}.kv.ep.k", shp, kv_dtype, kb, off)
+                v = self._register_entry(f"{prefix}.layers.{i}.kv.ep.v", shp, kv_dtype, kb, off + au(kb))
+                self._entries[f"{prefix}.layers.{i}.kv.k"] = k
+                self._entries[f"{prefix}.layers.{i}.kv.v"] = v
+                off += ce[i]
+            assert off == EP_end, (off, EP_end)
 
-                tp_prefix += tp_bytes
-                ep_prefix += ep_bytes
+            off = tc_end - sum_ct
+            for i in range(num_layers):
+                kb = kv["layer_tp_bytes"][i]
+                shp = kv["layer_tp_shapes"][i]
+                self._register_entry(f"{prefix}.layers.{i}.kv.tp.k", shp, kv_dtype, kb, off)
+                self._register_entry(f"{prefix}.layers.{i}.kv.tp.v", shp, kv_dtype, kb, off + au(kb))
+                off += ct[i]
+            assert off == tc_end, (off, tc_end)
 
-        return v_region_start + kv_region_bytes
+        return tc_end
 
     # ----- view access ----------------------------------------------------
 
@@ -920,7 +984,7 @@ class ParaSMemoryManager:
         return byte_slice.view(entry.dtype).reshape(entry.shape)
 
     def get_view_as(
-        self, name: str, shape: tuple, dtype: torch.dtype = None
+        self, name: str, shape: tuple, dtype: Optional[torch.dtype] = None
     ) -> torch.Tensor:
         """
         Return the same bytes as *name* but with a different shape/dtype.
@@ -1064,11 +1128,14 @@ class ParaSMemoryManager:
 
     @property
     def weights_only_bytes(self) -> int:
-        """Total reserved bytes NOT including KV cache entries (for KV sizing)."""
+        """Total weight bytes NOT including KV cache entries (for KV sizing).
+
+        Includes deferred expert weights, which are placed by the four-anchor
+        pass at materialize time and so never enter ``_reservation_order``.
+        """
         return sum(
-            self._entries[n].size_bytes
-            for n in self._reservation_order
-        )
+            self._entries[n].size_bytes for n in self._reservation_order
+        ) + getattr(self, "_deferred_weight_bytes", 0)
 
     # ----- dunder ---------------------------------------------------------
 
@@ -1152,28 +1219,51 @@ def plan_qwen_moe_layout(
 
     is_fp8 = quant_name == "fp8"
     weight_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
+    elem_size = weight_dtype.itemsize
     ep_local_experts = num_experts // ep_size
-    inter_per_partition = intermediate_size // moe_tp_size
-    w13_shape = (ep_local_experts, 2 * inter_per_partition, hidden_size)
-    w2_shape = (ep_local_experts, hidden_size, inter_per_partition)
+    tp_inter = intermediate_size // tp_size
 
-    for slot in range(num_layers + 1):
-        manager.reserve(f"paras.moe_slot.{slot}.w13", w13_shape, weight_dtype)
-        manager.reserve(f"paras.moe_slot.{slot}.w2", w2_shape, weight_dtype)
+    # Shapes match the ParaS forward exactly. EP shards experts across ep_size
+    # ranks; each rank holds num_experts/ep_size experts with the FULL
+    # intermediate (paras_moe_block EP gathered view). TP holds ALL num_experts
+    # with the intermediate sharded by tp_size (the get_view_as TP view). Bytes
+    # are equal at G=1 and TP is G=ep_size/tp_size times larger for G>1; the
+    # four-anchor layout sizes EP and TP independently.
+    ep_w13_shape = (ep_local_experts, 2 * intermediate_size, hidden_size)
+    ep_w2_shape = (ep_local_experts, hidden_size, intermediate_size)
+    tp_w13_shape = (num_experts, 2 * tp_inter, hidden_size)
+    tp_w2_shape = (num_experts, hidden_size, tp_inter)
 
-    # w13 and w2 biases are NOT stored in the UMM.  Biases are replicated
-    # on every rank as one full-expert tensor per layer (see
-    # paras_moe_block.py: self._full_w{13,2}_bias), and the EP and TP
-    # forward paths read through Parameter views into that replicated
-    # storage.  Total replicated bias memory is <=0.1% of weight storage,
-    # far cheaper than the UMM-staged transport path it replaces.
+    def _shape_bytes(shape):
+        n = 1
+        for d in shape:
+            n *= d
+        return n * elem_size
 
-    # Create 'experts' aliases for create_weights() / weight loading compatibility.
-    # These point to the same LayoutEntry objects as slot i+1 — no copy, no duplication.
-    # materialize() processes _reservation_order, so aliases won't be double-processed.
-    for i in range(num_layers):
-        manager._entries[f"{prefix}.layers.{i}.mlp.experts.w13_weight"] = manager._entries[f"paras.moe_slot.{i+1}.w13"]
-        manager._entries[f"{prefix}.layers.{i}.mlp.experts.w2_weight"] = manager._entries[f"paras.moe_slot.{i+1}.w2"]
+    # Expert weights are placed by the deferred four-anchor pass at materialize
+    # time (like KV cache), not reserved in _reservation_order. Biases stay
+    # replicated per rank (paras_moe_block: self._full_w{13,2}_bias).
+    manager._paras_moe_pending = {
+        "num_layers": num_layers,
+        "prefix": prefix,
+        "dtype": weight_dtype,
+        "elem_size": elem_size,
+        "ep_w13_shape": ep_w13_shape,
+        "ep_w2_shape": ep_w2_shape,
+        "tp_w13_shape": tp_w13_shape,
+        "tp_w2_shape": tp_w2_shape,
+        "ep_w13_bytes": _shape_bytes(ep_w13_shape),
+        "ep_w2_bytes": _shape_bytes(ep_w2_shape),
+        "tp_w13_bytes": _shape_bytes(tp_w13_shape),
+        "tp_w2_bytes": _shape_bytes(tp_w2_shape),
+    }
+    # Only EP weights consume dedicated budget: TP weights overlap the EP cache
+    # in the four-anchor run (never live together), so they add no footprint
+    # beyond the balanced per-mode budget. This matches the old slot subtraction
+    # (~Σwe), so KV token capacity does not regress at G=1.
+    manager._deferred_weight_bytes = num_layers * (
+        _shape_bytes(ep_w13_shape) + _shape_bytes(ep_w2_shape)
+    )
 
     for i in range(num_layers):
         lp = f"{prefix}.layers.{i}"
@@ -1308,15 +1398,18 @@ def create_paras_moe_aliases(
     num_layers: int,
     prefix: str = "model",
 ) -> None:
-    """
-    Create ep_experts and tp_experts aliases for the N+1 slot layout.
-    Call after materialize().
+    """Call-order compatibility shim (kept so model files need no change).
 
-    ep_experts layer i → slot i+1 (same physical buffer as EP weights)
-    tp_experts layer i → slot i   (one slot before EP, for fused transfer)
+    ep_experts/tp_experts entries are now primaries created by the four-anchor
+    pass inside materialize(); this validates they exist rather than aliasing
+    the removed N+1 slots.
     """
     for i in range(num_layers):
-        manager.alias(f"{prefix}.layers.{i}.mlp.ep_experts.w13_weight", f"paras.moe_slot.{i+1}.w13")
-        manager.alias(f"{prefix}.layers.{i}.mlp.ep_experts.w2_weight", f"paras.moe_slot.{i+1}.w2")
-        manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w13_weight", f"paras.moe_slot.{i}.w13")
-        manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w2_weight", f"paras.moe_slot.{i}.w2")
+        for role in ("ep_experts", "tp_experts"):
+            for w in ("w13_weight", "w2_weight"):
+                name = f"{prefix}.layers.{i}.mlp.{role}.{w}"
+                if name not in manager._entries:
+                    raise KeyError(
+                        f"create_paras_moe_aliases: missing '{name}'. "
+                        "plan_qwen_moe_layout + materialize() must run first."
+                    )
