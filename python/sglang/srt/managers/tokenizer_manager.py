@@ -1483,17 +1483,27 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
             if isinstance(recv_obj, BatchStrOutput):
-                state.text += recv_obj.output_strs[i]
                 if state.obj.stream:
+                    # Send the per-step delta, not cumulative state.text: under
+                    # high streaming concurrency the single tokenizer loop fans
+                    # out one payload per stream per step, so cumulative text is
+                    # O(N^2) serialize/copy work that inflates TTFT delivery (see
+                    # DEBUG_TTFT_SWITCH_SPIKE.md). out_dict must NOT alias
+                    # state.text or the += below reverts to reallocating.
+                    delta_text = recv_obj.output_strs[i]
+                    state.text += delta_text
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
+                    text_to_send = delta_text
                 else:
+                    state.text += recv_obj.output_strs[i]
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids.copy()
+                    text_to_send = state.text
 
                 out_dict = {
-                    "text": state.text,
+                    "text": text_to_send,
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
@@ -1919,7 +1929,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if is_stream:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
         out = {
-            "text": state.text,
+            # Streaming clients already got every delta; send empty (not
+            # cumulative) on abort so a delta-accumulating client won't double.
+            "text": "" if is_stream else state.text,
             "output_ids": output_ids,
             "meta_info": meta_info,
         }

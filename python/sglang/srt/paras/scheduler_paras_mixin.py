@@ -137,19 +137,107 @@ class DecodeAutoSwitchPolicy(ParasAutoSwitchPolicy):
 
 
 class HybridAutoSwitchPolicy(ParasAutoSwitchPolicy):
-    """Mixed prefill+decode batches. Not yet implemented; raises at construction."""
+    """Ingested-reqs signal with asymmetric smoothing and dual thresholds.
 
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Hybrid (mixed prefill+decode) auto-switch policy is not implemented. "
-            "Use 'prefill' or 'decode'. ParaS disables chunked prefill so "
-            "ForwardMode.MIXED should not occur in practice."
-        )
+    Signal: total reqs in the system across all stages, gathered from every
+    DP rank:
+        S = sum(global_running_reqs) + sum(global_waiting_reqs)
+            + sum(global_prefilling_reqs)
+    In TP mode the gathered fields are unreliable post-switch, so we read
+    running_batch + waiting_queue locally (paras_parallelism_config == 'TP'
+    means a unified data plane).
+
+    This captures the population rollout misses: reqs in mid-prefill are not
+    in running_batch.reqs (they get merged in only after process_batch_result_prefill)
+    and not in waiting_queue (they were pulled out for the EXTEND batch).
+    The global_prefilling_reqs field, added to the existing MLP-sync all-gather,
+    catches them.
+
+    Decision asymmetry:
+      * TP -> EP: fire on the LATEST observation > threshold. Burst onset is
+        a crisp jump; smoothing would lag.
+      * EP -> TP: fire on the sliding-window avg < threshold * low_ratio.
+        Decode steady-state fluctuates; smoothing prevents thrashing at the
+        boundary.
+
+    Hysteresis: low_threshold = threshold * low_ratio < threshold. The gap
+    avoids bouncing when S sits in the in-between band.
+    """
+
+    def __init__(
+        self,
+        threshold: int,
+        window: int,
+        cooldown_sec: float,
+        low_ratio: float,
+    ):
+        super().__init__(threshold, window, cooldown_sec)
+        self.low_threshold = int(threshold * low_ratio)
+        self.low_ratio = low_ratio
 
     def observation_for_batch(
         self, scheduler: Any, batch: Optional[ScheduleBatch]
     ) -> Optional[int]:
-        raise NotImplementedError  # unreachable: __init__ raises
+        if scheduler.paras_parallelism_config == "EP":
+            if batch is None:
+                return None
+            running_field = batch.global_running_reqs
+            waiting_field = batch.global_waiting_reqs
+            prefilling_field = batch.global_prefilling_reqs
+            if (
+                running_field is None
+                or waiting_field is None
+                or prefilling_field is None
+            ):
+                return None
+            return (
+                int(sum(running_field))
+                + int(sum(waiting_field))
+                + int(sum(prefilling_field))
+            )
+        rb = scheduler.running_batch
+        running = len(rb.reqs) if rb is not None else 0
+        waiting = len(scheduler.waiting_queue)
+        local_prefilling = (
+            len(batch.reqs)
+            if batch is not None and batch.forward_mode == ForwardMode.EXTEND
+            else 0
+        )
+        return running + waiting + local_prefilling
+
+    def pick_target(self, current_mode: str, now: float) -> Optional[str]:
+        if now < self.cooldown_until:
+            return None
+        if not self.window:
+            return None
+
+        target: Optional[str] = None
+        trigger = ""
+        if current_mode == "TP":
+            latest = self.window[-1]
+            if latest > self.threshold:
+                target = "EP"
+                trigger = f"latest={latest} > threshold={self.threshold}"
+        else:
+            if len(self.window) < self.window.maxlen:
+                return None
+            avg = sum(self.window) / len(self.window)
+            if avg < self.low_threshold:
+                target = "TP"
+                trigger = (
+                    f"avg={avg:.2f} < low_threshold={self.low_threshold} "
+                    f"(threshold={self.threshold} * low_ratio={self.low_ratio})"
+                )
+
+        if target is not None:
+            logger.info(
+                f"ParaS [HybridAutoSwitchPolicy] policy fired: "
+                f"{current_mode} -> {target} at t={now:.3f} | {trigger} | "
+                f"window={list(self.window)} cooldown_sec={self.cooldown_sec}"
+            )
+            self.cooldown_until = now + self.cooldown_sec
+            self.window.clear()
+        return target
 
 
 class RolloutAutoSwitchPolicy(ParasAutoSwitchPolicy):
@@ -208,6 +296,13 @@ class SchedulerParasMixin:
         # Always initialize so non-ParaS schedulers can no-op the event-loop hook
         # with a single `if self._paras_auto_policy is not None:` check.
         self._paras_auto_policy: Optional[ParasAutoSwitchPolicy] = None
+        self._paras_post_switch_iters_remaining = 0
+        self._paras_post_switch_initial_cap = int(
+            os.environ.get("PARAS_POST_SWITCH_INITIAL_CAP", "2048")
+        )
+        self._paras_post_switch_ramp_iters = int(
+            os.environ.get("PARAS_POST_SWITCH_RAMP_ITERS", "20")
+        )
 
         if not self.server_args.enable_paras_moe:
             return
@@ -253,11 +348,14 @@ class SchedulerParasMixin:
         sa = self.server_args
         if sa.paras_auto_switch:
             policy_cls = _PARAS_AUTO_SWITCH_POLICY_CLASSES[sa.paras_auto_switch_policy]
-            self._paras_auto_policy = policy_cls(
+            policy_kwargs = dict(
                 threshold=sa.paras_auto_switch_threshold,
                 window=sa.paras_auto_switch_window,
                 cooldown_sec=sa.paras_auto_switch_cooldown_sec,
             )
+            if sa.paras_auto_switch_policy == "hybrid":
+                policy_kwargs["low_ratio"] = sa.paras_auto_switch_low_ratio
+            self._paras_auto_policy = policy_cls(**policy_kwargs)
 
         # Freeze the long-lived serving heap (weights, KV pool layouts, sampler
         # state, radix tree, attention metadata buffers) so subsequent gen-2 GC
@@ -381,6 +479,20 @@ class SchedulerParasMixin:
             self.running_batch.filter_batch()
         self.last_batch = None
         self.cur_batch = None
+        # Release the overlap-scheduler's 2-slot batch_record_buf ring so it
+        # stops pinning pre-switch ModelWorkerBatch tensors (input_ids,
+        # out_cache_loc, ...) that point into the about-to-be-swapped EP/TP
+        # req_to_token / KV layout. Without this clear, the stale refs
+        # interact with the per-mode CUDA graph memory pool and the caching
+        # allocator's stream-reuse tracking diverges, producing sticky
+        # post-switch illegal-memory-access faults that surface at the next
+        # copy_done.synchronize() (often minutes after the actual fault) --
+        # rate-sweep v2 hybrid+r080 crash, May 2026.
+        batch_record_buf = getattr(self, "batch_record_buf", None)
+        if batch_record_buf is not None:
+            for i in range(len(batch_record_buf)):
+                batch_record_buf[i] = None
+            self.batch_record_ct = 0
 
     def _paras_auto_clear_window_on_switch(self) -> None:
         assert self._paras_auto_policy is not None
@@ -740,6 +852,7 @@ class SchedulerParasMixin:
         # Phase 4: Update scheduler config and restore tokenizer
         # switch from TP to EP
         self.paras_parallelism_config = "EP"
+        self._paras_post_switch_iters_remaining = self._paras_post_switch_ramp_iters
         self.server_args.enable_dp_attention = True
         self.server_args.moe_a2a_backend = MoeA2ABackend.DEEPEP.value
         self.server_args.dp_size = self.paras_ep_size
@@ -811,11 +924,16 @@ class SchedulerParasMixin:
     
     def paras_start_profile(self, output_dir: str = "/tmp/paras_configure_profile"):
         import os
-        output_dir = os.environ.get("PARAS_PROFILE_DIR", output_dir)
+        # Off by default: stop() exports a multi-MB/rank trace that blocks the
+        # EP<->TP switch for seconds under load. Enable only via PARAS_PROFILE_DIR.
+        profile_dir = os.environ.get("PARAS_PROFILE_DIR")
+        if profile_dir is None:
+            self.profiler = None
+            return
         self.profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                output_dir,
+                profile_dir,
                 worker_name=f"rank{self.tp_rank}",
             ),
             record_shapes=True,
@@ -825,5 +943,18 @@ class SchedulerParasMixin:
         self.profiler.start()
         
     def paras_stop_profile(self):
+        if self.profiler is None:
+            return
         self.profiler.stop()
         self.profiler = None
+
+    def paras_effective_max_prefill_tokens(self) -> int:
+        if self._paras_post_switch_iters_remaining <= 0:
+            return self.max_prefill_tokens
+        ramp = max(1, self._paras_post_switch_ramp_iters)
+        cap = self._paras_post_switch_initial_cap
+        remaining = self._paras_post_switch_iters_remaining
+        progress = (ramp - remaining + 1) / ramp
+        effective = cap + int((self.max_prefill_tokens - cap) * progress)
+        self._paras_post_switch_iters_remaining -= 1
+        return max(cap, min(self.max_prefill_tokens, effective))

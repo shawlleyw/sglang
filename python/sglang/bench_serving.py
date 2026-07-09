@@ -566,7 +566,7 @@ async def async_request_sglang_generate(
                             # want to check a token was generated
                             if "text" in data and data["text"]:
                                 timestamp = time.perf_counter()
-                                generated_text = data["text"]
+                                generated_text += data["text"]  # per-step delta
                                 output_len = data["meta_info"]["completion_tokens"]
 
                                 # First token
@@ -974,13 +974,17 @@ async def get_mooncake_request_over_time(
         # This simulates a user engaging in a multi-turn conversation
 
         # Base user query constructed from hash_ids
-        user_query_base = ""
-        hash_ids = record.get("hash_ids", [])
-        for hash_id in hash_ids:
-            user_query_base += f"{hash_id}" + " ".join(
-                ["hi"] * 128
-            )  # Shorter for multi-round
-        user_query_base += "Tell me a story based on this context."
+        # PARAS-BURSTY-PATCH: mooncake prompt_text support
+        if "prompt_text" in record:
+            user_query_base = record["prompt_text"]
+        else:
+            user_query_base = ""
+            hash_ids = record.get("hash_ids", [])
+            for hash_id in hash_ids:
+                user_query_base += f"{hash_id}" + " ".join(
+                    ["hi"] * 128
+                )  # Shorter for multi-round
+            user_query_base += "Tell me a story based on this context."
 
         output_len_per_round = record.get("output_length", 256)
         chat_history = []
@@ -1670,9 +1674,17 @@ def calculate_metrics(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
-            total_input += input_requests[i].prompt_len
-            total_input_text += input_requests[i].text_prompt_len
-            total_input_vision += input_requests[i].vision_prompt_len
+            # PARAS-BURSTY-PATCH: dict-shaped input_requests support
+            _req = input_requests[i]
+            if isinstance(_req, dict):
+                _plen = int(_req.get("input_length", _req.get("prompt_len", 0)))
+                total_input += _plen
+                total_input_text += _plen
+                total_input_vision += 0
+            else:
+                total_input += _req.prompt_len
+                total_input_text += _req.text_prompt_len
+                total_input_vision += _req.vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:

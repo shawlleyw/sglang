@@ -19,6 +19,8 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 MODEL_PATH=${MODEL_PATH:-/models/Qwen3-235B-A22B-Instruct-2507}
 NUM_GPUS=${NUM_GPUS:-8}
+MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-2048}
+MAX_REQ_PER_RANK=$((MAX_RUNNING_REQUESTS / NUM_GPUS))
 BATCH_SIZE=${BATCH_SIZE:-"1 8 64 256 1 8 64 256"}
 CUDA_GRAPH_BS=${CUDA_GRAPH_BS:-"1 8 64 256"}
 INPUT_LEN=${INPUT_LEN:-10}
@@ -31,8 +33,10 @@ RUN_NAME=${RUN_NAME:-dp_ep}
 
 paras_default_cvd
 
+# DeepEP dispatch buffer per rank — match the tuned launch config:
+# MAX_RUNNING_REQUESTS / NUM_GPUS (= 256 at 2048/8). 256 is verified sufficient.
 export SGLANG_DEEPEP_BF16_DISPATCH=${SGLANG_DEEPEP_BF16_DISPATCH:-true}
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-512}
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-$MAX_REQ_PER_RANK}
 export NVSHMEM_QP_DEPTH=${NVSHMEM_QP_DEPTH:-2048}
 
 paras_init_profile
@@ -40,7 +44,6 @@ paras_init_profile
 "${LAUNCHER[@]}" python -m sglang.bench_one_batch \
     --model-path "$MODEL_PATH" \
     --trust-remote-code \
-    --disable-overlap-schedule \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --tp-size "$NUM_GPUS" --dp-size "$NUM_GPUS" --ep-size "$NUM_GPUS" \
     --enable-dp-attention --enable-dp-lm-head \

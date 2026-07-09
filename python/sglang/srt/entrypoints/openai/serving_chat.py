@@ -515,7 +515,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
                 stream_buffer = stream_buffers.get(index, "")
-                delta = content["text"][len(stream_buffer) :]
+                delta = content["text"]  # already the per-step delta
                 stream_buffers[index] = stream_buffer + delta
 
                 # Handle reasoning content

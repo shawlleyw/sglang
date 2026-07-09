@@ -1827,7 +1827,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             self.running_batch,
             self.new_token_ratio,
-            self.max_prefill_tokens,
+            self.paras_effective_max_prefill_tokens(),
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
@@ -2232,6 +2232,12 @@ class Scheduler(
             local_waiting_queue_size=len(self.waiting_queue),
             local_total_decode_tokens=self.total_decode_tokens_lifetime,
             local_total_prefill_tokens=self.total_prefill_tokens_lifetime,
+            local_prefilling_count=(
+                len(local_batch.reqs)
+                if local_batch is not None
+                and local_batch.forward_mode.is_extend()
+                else 0
+            ),
         )
 
     @staticmethod
@@ -2251,6 +2257,7 @@ class Scheduler(
         local_waiting_queue_size: int = 0,
         local_total_decode_tokens: int = 0,
         local_total_prefill_tokens: int = 0,
+        local_prefilling_count: int = 0,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -2304,12 +2311,13 @@ class Scheduler(
                 local_waiting_queue_size,
                 local_total_decode_tokens,
                 local_total_prefill_tokens,
+                local_prefilling_count,
             ],
             dtype=torch.int64,
             device=device,
         )
         global_info = torch.empty(
-            (dp_size, attn_tp_size, 10),
+            (dp_size, attn_tp_size, 11),
             dtype=torch.int64,
             device=device,
         )
@@ -2326,6 +2334,7 @@ class Scheduler(
         global_waiting_reqs = global_info[:, 0, 7].tolist()
         global_total_decode_tokens = global_info[:, 0, 8].tolist()
         global_total_prefill_tokens = global_info[:, 0, 9].tolist()
+        global_prefilling_reqs = global_info[:, 0, 10].tolist()
 
         tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
             global_info[:, :, 4:6]
@@ -2351,6 +2360,7 @@ class Scheduler(
             local_batch.global_waiting_reqs = global_waiting_reqs
             local_batch.global_total_decode_tokens = global_total_decode_tokens
             local_batch.global_total_prefill_tokens = global_total_prefill_tokens
+            local_batch.global_prefilling_reqs = global_prefilling_reqs
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:

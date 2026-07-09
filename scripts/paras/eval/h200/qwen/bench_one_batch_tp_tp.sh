@@ -37,7 +37,6 @@ paras_init_profile
 "${LAUNCHER[@]}" python -m sglang.bench_one_batch \
     --model-path "$MODEL_PATH" \
     --trust-remote-code \
-    --disable-overlap-schedule \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --tp-size "$NUM_GPUS" \
     --batch-size $BATCH_SIZE \

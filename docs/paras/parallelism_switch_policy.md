@@ -26,23 +26,24 @@ The policy is a sliding-window controller with a single threshold and a wall-clo
 | `decode` *(default)* | `ForwardMode.DECODE` | global decode batch size (= request count) | `64 * world_size` | `32` | `60 s` |
 | `prefill` | `ForwardMode.EXTEND` | global prefill token count | `1024 * world_size` | `8` | `10 s` |
 | `rollout` | (every iteration) | global running + waiting request count | `8 * world_size` | `1` | `5 s` |
-| `hybrid` | (mixed prefill+decode) | n/a | n/a | n/a | n/a |
+| `hybrid` | (every iteration) | global ingested reqs (running + waiting + prefilling) | `32 * world_size` (high); low = high × `low_ratio` (default 0.20) | `8` | `5 s` |
 
 The decode and prefill defaults follow from the EP/TP crossover band measured in `parallelism_switch.md`. Threshold scales with `world_size` (= `tp_size`) so the per-GPU work that justifies a switch is constant. Prefill iterations are larger and rarer than decode, so the prefill policy uses a shorter window and shorter cooldown to stay reactive.
 
 `rollout` is tuned for synchronous-rollout-style batch inference (GRPO post-training), where a single client submits a fixed burst of N requests (typically 512–2048), waits for all to complete, and submits the next burst. The metric is `global_running_reqs + global_waiting_reqs` rather than the per-iteration token count, because rollout cares about the **total in-flight workload** (not the size of any single forward). Low threshold (`8/GPU`) + `window=1` + short cooldown (`5 s`) make the policy react to load swings within a few seconds: TP during the boot grace window when the system is empty, EP when the burst arrives, and EP→TP again when the long-tail of slow requests drains the running batch below threshold.
 
-`hybrid` is **not implemented** — picking it raises `NotImplementedError` at startup. ParaS disables chunked prefill, so `ForwardMode.MIXED` should not occur in practice; if a mixed workload becomes relevant, this is where to add a multi-metric policy.
+`hybrid` is tuned for **interactive serving** workloads where the rollout signal undercounts during prefill bursts. Its metric is the **total ingested request count** across all pipeline stages (running + waiting + prefilling), where the per-rank prefilling count is added to the existing MLP-sync all-gather (`global_prefilling_reqs`, alongside `global_running_reqs` / `global_waiting_reqs`). This captures the population that `rollout` misses: requests in mid-prefill have been pulled from `waiting_queue` but are not yet merged into `running_batch.reqs` (the merge happens in `process_batch_result_prefill` after the forward completes). The policy applies **asymmetric smoothing with dual thresholds** — see §2.4.
 
 ### 2.2 Inputs and tunables
 
 | CLI flag | Field | Default | Meaning |
 |---|---|---|---|
 | `--paras-auto-switch` | `paras_auto_switch` | `True` (when `--enable-paras-moe`) | Master enable. |
-| `--paras-auto-switch-policy` | `paras_auto_switch_policy` | `decode` | Policy variant: `decode`, `prefill`, or `hybrid`. |
-| `--paras-auto-switch-threshold` | `paras_auto_switch_threshold` | per-policy magic × `world_size` | Single switch threshold (no hysteresis). Override the policy magic by passing this. |
+| `--paras-auto-switch-policy` | `paras_auto_switch_policy` | `decode` | Policy variant: `decode`, `prefill`, `rollout`, or `hybrid`. |
+| `--paras-auto-switch-threshold` | `paras_auto_switch_threshold` | per-policy magic × `world_size` | Switch threshold. For `decode`/`prefill`/`rollout` this is the single threshold (no hysteresis); for `hybrid` this is the **high** threshold (TP→EP) and the low threshold is derived as `threshold * low_ratio`. |
 | `--paras-auto-switch-window` | `paras_auto_switch_window` | per-policy default | Sliding-window size (iterations). |
 | `--paras-auto-switch-cooldown-sec` | `paras_auto_switch_cooldown_sec` | per-policy default | Wall-clock seconds between successive switches. |
+| `--paras-auto-switch-low-ratio` | `paras_auto_switch_low_ratio` | `0.20` (hybrid only) | Hybrid-only EP→TP threshold ratio: `low_threshold = threshold * low_ratio`. Smaller values make EP stickier (we only drop back to TP when the system is very quiet). |
 
 Defaults resolve at startup inside `ServerArgs._handle_paras_auto_switch`. Any CLI-provided value wins over the policy default. Validation requires `threshold > 0`, `window > 0`, `cooldown_sec >= 0`, and the flags only apply when `--enable-paras-moe` is set.
 
@@ -55,13 +56,13 @@ After each forward iteration that results in `process_batch_result(batch, result
 - `RolloutAutoSwitchPolicy.observation_for_batch` — observes **every iteration** and returns `running + waiting` requests globally with **mode-aware source selection**:
    - **EP mode**: rank 0 holds only its DP slice, so the per-rank running batch and waiting queue underrepresent the global state. The policy sums the MLP all-gather output (`batch.global_running_reqs` / `batch.global_waiting_reqs`) across DP ranks. If the all-gather hasn't populated yet (idle / boot), it returns `None` to skip the iteration.
    - **TP mode**: unified data plane — every rank holds the same `running_batch` after the EP→TP gather. Rank 0's local view IS the global view, so the policy reads `scheduler.running_batch.reqs` and `scheduler.waiting_queue` directly. The all-gather is unreliable in TP mode post-switch (the MLP-sync path does not repopulate the `batch.global_*` fields when DP attention is off), so the policy must **not** consult `batch.global_*` in TP mode or it would go blind and never fire back.
-- `HybridAutoSwitchPolicy.__init__` raises before any observation can happen.
+- `HybridAutoSwitchPolicy.observation_for_batch` — observes **every iteration** and returns total ingested reqs = `running + waiting + prefilling`. Mode-aware source selection mirrors `rollout`: in EP mode the policy sums `batch.global_running_reqs + batch.global_waiting_reqs + batch.global_prefilling_reqs` (the prefilling field is added to the MLP-sync all-gather by this policy); in TP mode the policy reads `scheduler.running_batch.reqs + scheduler.waiting_queue + (len(batch.reqs) if batch.forward_mode == EXTEND else 0)` directly. Unlike the symmetric `rollout`/`decode`/`prefill` policies, hybrid uses **asymmetric thresholds** and **asymmetric smoothing** in `pick_target` (see §2.4).
 
 Non-positive metric values are silently skipped. Otherwise the value is appended to the policy's `deque` (capped at `window`).
 
 ### 2.4 Decision evaluation
 
-After `paras_auto_observe`, the scheduler calls `paras_auto_pick_signal()`. Algorithm (single threshold, no hysteresis):
+After `paras_auto_observe`, the scheduler calls `paras_auto_pick_signal()`. Algorithm for `decode`/`prefill`/`rollout` (single threshold, no hysteresis):
 
 ```
 if now < cooldown_until: return None
@@ -70,6 +71,22 @@ avg = sum(window) / len(window)
 if mode == "EP" and avg < threshold:  target = "TP"
 elif mode == "TP" and avg > threshold: target = "EP"
 else: return None
+cooldown_until = now + cooldown_sec
+window.clear()
+return target
+```
+
+The `hybrid` policy overrides `pick_target` with **asymmetric smoothing** and **dual thresholds** (`high = threshold`, `low = threshold * low_ratio`):
+
+```
+if now < cooldown_until: return None
+if mode == "TP":
+    # Burst onset is crisp — fire on the latest observation, no smoothing.
+    if window[-1] > high: target = "EP"; else: return None
+else:  # mode == "EP"
+    # Decode steady-state fluctuates — smooth over the window.
+    if len(window) < window.maxlen: return None
+    if avg(window) < low: target = "TP"; else: return None
 cooldown_until = now + cooldown_sec
 window.clear()
 return target
