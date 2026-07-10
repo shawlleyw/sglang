@@ -423,9 +423,9 @@ class ParaSMemoryManager:
                 self.ep_max_kv_tokens_swa = max(s.tokens_cap_ep for s in swa_specs)
                 self.tp_max_kv_tokens_swa = max(s.tokens_cap_tp for s in swa_specs)
 
-        # Placed by the deferred four-anchor pass at materialize time. No
-        # ct <= ce precondition is asserted: real configs always satisfy it, and
-        # the tail anchor stays safe even if they did not.
+        # Placed by the deferred four-anchor pass at materialize time, which
+        # asserts the ct[i] <= ce[i] precondition its (num_layers+1) kv budget
+        # relies on (real configs always satisfy it).
         self._paras_kv_pending = {
             "num_layers": num_layers,
             "prefix": prefix,
@@ -853,13 +853,14 @@ class ParaSMemoryManager:
         Orientation EP-low / TP-high. Per mode, address order is
         ``weights | pad | cache``; the big TP weights overlap the big EP cache
         (EP and TP are never live together), so the buffer is ~one per-mode
-        footprint plus one layer. The general tail anchor
+        footprint plus one layer. The tail anchor
         ``max_i(ct[i] + sum_{k>i}(ct[k] - ce[k]))`` keeps every layer's EP and TP
-        cache disjoint for any per-layer sizes and any layer order, with no
-        ``ct <= ce`` precondition; it reduces to ``max(ct)`` in the real case
-        ``ct[i] <= ce[i]`` and still holds when ``ct[i] > ce[i]``. Weight
-        sub-slabs are ``[w13|w2]`` and cache sub-slabs ``[k|v]``, laid identically
-        in both modes so the offset-agnostic transfer kernels stay valid.
+        cache disjoint for any layer order. This method requires ``ct[i] <= ce[i]``
+        (asserted below): the address math stays safe without it, but the kv
+        budget reserves only one ``max(ct)`` tail layer, which a ``ct > ce`` layer
+        would overflow. Under that precondition the anchor reduces to ``max(ct)``.
+        Weight sub-slabs are ``[w13|w2]`` and cache sub-slabs ``[k|v]``, laid
+        identically in both modes so the offset-agnostic transfer kernels stay valid.
 
         Returns the byte offset past the end of the run.
         """
@@ -894,11 +895,25 @@ class ParaSMemoryManager:
 
         sum_we, sum_wt, sum_ce, sum_ct = sum(we), sum(wt), sum(ce), sum(ct)
 
+        # The kv budget (reserve_kv_cache) reserves exactly one tail layer
+        # (num_layers + 1 cells) for the cache tail, sized as max(ct). The general
+        # anchor below equals max(ct) only when ct[i] <= ce[i]; a ct[i] > ce[i]
+        # layer makes the suffix positive and the anchor exceed max(ct), so the
+        # materialized run would overflow the reserved kv budget. Enforce the
+        # precondition here. Real configs always satisfy it (num_kv_heads divides
+        # tp_size or GQA-replicates, page_size >= 1, so ct == ce for uniform
+        # attention and ct <= ce for hybrid).
+        assert all(ct[i] <= ce[i] for i in range(num_layers)), (
+            "four-anchor cache requires ct[i] <= ce[i] (per-layer TP cache must "
+            "not exceed EP cache); the (num_layers+1) kv budget reserves only one "
+            f"max(ct) tail layer, which a ct>ce layer would overflow. ce={ce} ct={ct}"
+        )
+
         # Cache tail anchor: gap between EP and TP cache bases that keeps every
-        # layer disjoint. In every real config ct[i] <= ce[i] (num_kv_heads
-        # divides tp_size or GQA-replicates, page_size >= 1), so this reduces to
-        # max(ct). The general form is defensive headroom for ct[i] > ce[i] and
-        # costs nothing.
+        # layer's EP and TP cache disjoint for any layer order. Under the
+        # asserted ct[i] <= ce[i] the suffix is non-positive and this reduces to
+        # max(ct); the general form is kept so the address math stays correct if
+        # the precondition is ever relaxed.
         anchor, suffix = 0, 0
         for i in range(num_layers - 1, -1, -1):
             anchor = max(anchor, ct[i] + suffix)
