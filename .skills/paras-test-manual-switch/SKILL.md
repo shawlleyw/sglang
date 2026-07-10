@@ -1,6 +1,6 @@
 ---
 name: paras-test-manual-switch
-description: Test ParaS manual EP↔TP switching for any supported model. Covers Qwen3-30B-A3B (4×A100, FlashInfer, cuda-graph) and gpt-oss-120b-bf16 (4-8×A100, Triton, cuda-graph dual capture). Drives the canonical 14-step procedure via scripts/paras/eval/paras_cmd/e2e_test.sh: kill → launch → wait → health → 5 send_prompts/configure pairs (round-trip pre-switch / TP / round-trip post-switch) → 2 inflight_switch (EP→TP, TP→EP) → check_log → kill. send_prompts and inflight_switch each fire BURST_SIZE=32 parallel diverse prompts and fail-fast on the degenerate-attractor regex. Use after any change to paras/ code or scripts/paras/eval/.
+description: Test ParaS manual EP↔TP switching for any supported model. Covers Qwen3-30B-A3B (4×A100, FlashInfer, cuda-graph) and gpt-oss-120b-bf16 (4-8×A100, Triton, cuda-graph dual capture), in both the symmetric EP↔TP layout (paras_tp_size=NUM_GPUS, dp_size=1) and the asymmetric EP↔DP×TP layout (paras_tp_size<NUM_GPUS, dp_size>1, e.g. EP=4/DP2/TP2 or EP=8/DP2/TP4). Drives the canonical 14-step procedure via scripts/paras/eval/paras_cmd/e2e_test.sh: kill → launch → wait → health → 5 send_prompts/configure pairs (round-trip pre-switch / TP / round-trip post-switch) → 2 inflight_switch (EP→TP, TP→EP) → check_log → kill. send_prompts and inflight_switch each fire BURST_SIZE=32 parallel diverse prompts and fail-fast on the degenerate-attractor regex. Use after any change to paras/ code or scripts/paras/eval/.
 ---
 
 # Test ParaS Manual EP↔TP Switch
@@ -67,6 +67,56 @@ bash scripts/paras/eval/paras_cmd/e2e_test.sh                        # steps 3-1
 
 bash scripts/paras/eval/paras_cmd/kill.sh                            # step 14
 ```
+
+## Quick Start (Qwen3-30B-A3B, Asymmetric EP↔DP×TP, dp>1)
+
+The switch target need not be symmetric. Set `--paras-tp-size T` with `T <
+NUM_GPUS` to reshard the MoE weights into `dp_size = NUM_GPUS / T` tensor-parallel
+subgroups of `T` GPUs each (`ep_size = NUM_GPUS = dp_size · T`). EP mode is
+unchanged; TP mode becomes `dp_size × T`. MoE weights reshard across the whole EP
+group, while the KV cache and requests redistribute only within each TP subgroup.
+
+`EP=4 / DP2 / TP2` on 4 GPUs:
+
+```bash
+conda activate sgl_paras
+cd /home/shaoyuw/sglang
+pip install -e python/ -q --no-deps
+
+bash scripts/paras/eval/paras_cmd/kill.sh                            # step 1
+
+# --paras-tp-size 2 with NUM_GPUS=4 gives dp_size = 4/2 = 2.
+# MEM_FRACTION_STATIC=0.6, not the symmetric 0.7: the four-anchor buffer holds
+# the larger dp_size× TP weights and dual capture records more TP-mode graphs,
+# so 0.7 leaves too little headroom and OOMs during capture.
+ENABLE_PARAS=1 PARAS_AUTO_SWITCH=0 NUM_GPUS=4 MEM_FRACTION_STATIC=0.6 \
+    bash scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh \
+    --paras-tp-size 2 \
+    2>&1 | tee /tmp/sglang_paras_test.log &                          # step 2
+
+bash scripts/paras/eval/paras_cmd/e2e_test.sh                        # steps 3-13
+bash scripts/paras/eval/paras_cmd/kill.sh                            # step 14
+```
+
+`EP=8 / DP2 / TP4` on 8 GPUs uses `NUM_GPUS=8 --paras-tp-size 4` with
+`MEM_FRACTION_STATIC=0.7` (per-rank weights halve at `T=4`, so 0.7 is enough):
+
+```bash
+ENABLE_PARAS=1 PARAS_AUTO_SWITCH=0 NUM_GPUS=8 MEM_FRACTION_STATIC=0.7 \
+    bash scripts/paras/eval/a100/qwen/launch_server_dp_ep.sh \
+    --paras-tp-size 4 \
+    2>&1 | tee /tmp/sglang_paras_test.log &
+```
+
+The 14-step procedure is identical. Confirm dp>1 took effect two ways: the server
+args log line reports `paras_tp_size=2, tp_size=4, ep_size=4`, and dual capture
+reports distinct EP and TP graph counts (`#EP graphs=52 #TP graphs=68` at
+`EP=4/DP2/TP2`; the TP count is higher because each subgroup captures a larger
+per-group batch). Validated baselines at `EP=4/DP2/TP2` on GPUs 4-7:
+`configure_tp` ~160 ms, `configure_ep` ~58 ms, EP/TP/EP-RT prompts 0/32
+degenerate, in-flight EP→TP and TP→EP both 0/32. At `dp==1` every dp>1 path
+collapses to the symmetric case, so the symmetric run still exercises the shared
+code.
 
 ## Quick Start (gpt-oss-120b-bf16, 4×A100)
 
@@ -350,8 +400,10 @@ No HTTP runtime toggle exists; the toggle is server-startup-only.
 
   | Model | GPUs | `MEM_FRACTION_STATIC` |
   |---|---|---|
-  | Qwen3-30B-A3B | 4 | **0.7** |
-  | Qwen3-30B-A3B | 8 | 0.7 |
+  | Qwen3-30B-A3B (symmetric, `paras_tp_size=NUM_GPUS`) | 4 | **0.7** |
+  | Qwen3-30B-A3B (symmetric, `paras_tp_size=NUM_GPUS`) | 8 | 0.7 |
+  | Qwen3-30B-A3B (`EP=4/DP2/TP2`, `paras_tp_size=2`) | 4 | **0.6** (four-anchor buffer holds the 2× TP weights and dual capture records more TP graphs; 0.7 OOMs during capture) |
+  | Qwen3-30B-A3B (`EP=8/DP2/TP4`, `paras_tp_size=4`) | 8 | 0.7 (per-rank weights halve at `T=4`) |
   | gpt-oss-120b-bf16 | 4 | **0.8** (model weights ≈ 57 GiB/rank; at 0.7 the static budget = 55.5 GiB → kv_budget = 0) |
   | gpt-oss-120b-bf16 | 8 | **0.7** (per-rank weight footprint halves; 0.7 leaves enough headroom) |
 
@@ -463,6 +515,39 @@ No HTTP runtime toggle exists; the toggle is server-startup-only.
    `/v1/chat/completions` (it does as of commit `099705271`). If you see
    this on a fresh clone, verify by `grep '/v1/chat/completions' lib.sh`
    and `grep '/v1/completions' lib.sh` — only the chat URL should appear.
+
+### dp>1-specific failure modes
+
+10. **`CUDA error: an illegal memory access` at the dual-capture EP→TP switch
+    (dp>1 only)**: the MoE weight switch received a peer-access context scoped
+    to the `T`-rank TP subgroup, but the dptp broadcast kernel indexes
+    `peer_buffers[d*T+t]` across all `G·T` EP ranks and keys the canonical slot
+    on the global ep rank. Confirm the weight switch uses the **global** EP-group
+    context and passes the global ep rank (see `qwen3_moe.py` peer-access
+    pre-init and `paras_moe_block.py`), not the TP-subgroup context / tp-local
+    rank. At `dp==1` the two coincide, so this reproduces only at `dp>1`.
+
+11. **Intermittent ~2/32 degenerate on in-flight TP→EP scatter (dp>1 only, ~1/11
+    runs, no log error)**: a regression that opens a **second** IPC mapping of
+    the same manager buffer (one context per transfer) reintroduces this — writes
+    through one `cudaIpcOpenMemHandle` mapping are not coherent with reads through
+    the other. The fix is a single global IPC exchange whose address list the KV
+    path slices for its subgroup (`peer_addresses[dp_base : dp_base+tp_size]`);
+    the weight path uses the full list. Do not restore per-subgroup
+    `init_peer_access` calls. Soak the failing case ~20× to confirm (a single
+    clean run is not enough, given the low rate).
+
+12. **Server boots but every switch aborts with `paras_configure_ep only
+    supports dp_size==1`**: the enable gate was re-added to
+    `scheduler_paras_mixin.py`. dp>1 is supported; the guard should be absent.
+
+13. **`EP=8` launch hangs or one rank reports `CUDA-capable device(s) is/are
+    busy or unavailable`**: a wedged GPU. `EP=8` needs all 8 GPUs healthy; a
+    single bad device (CUDA init hangs in uninterruptible `D` state) blocks the
+    whole run and cannot be worked around without a `nvidia-smi --gpu-reset` (or
+    node reboot). Verify each target GPU first with `CUDA_VISIBLE_DEVICES=<i>
+    python -c "import torch; torch.ones(1,device='cuda').item()"`; fall back to
+    `EP=4/DP2/TP2` on 4 known-good GPUs, which exercises the identical dp>1 path.
 
 ## Companion Skills
 
