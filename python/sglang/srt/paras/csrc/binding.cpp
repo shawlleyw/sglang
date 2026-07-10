@@ -501,6 +501,18 @@ static void check_dptp_T_G(int T, int G) {
                 T, " G=", G);
 }
 
+// The dptp launchers are only instantiated for elem_size==2 and the (H, I)
+// presets below; any other combo hits a printf-and-return no-op in the CUDA TU,
+// silently leaving the destination weights stale. Fail fast here instead.
+static void check_dptp_config(int T, int G, int H, int I, int elem_size) {
+    check_dptp_T_G(T, G);
+    TORCH_CHECK(elem_size == 2,
+                "dptp kernels require elem_size == 2 (bf16/fp16); got ", elem_size);
+    TORCH_CHECK((H == 4096 && I == 1536) || (H == 2048 && I == 768),
+                "dptp kernels require (H, I) in {(4096,1536), (2048,768)}; got H=",
+                H, " I=", I);
+}
+
 void launch_w13_dptp_py(
     int64_t local_buffer_ptr, torch::Tensor peer_buffer_ptrs,
     int64_t src_ep_offset, int64_t dst_tp_offset,
@@ -509,7 +521,9 @@ void launch_w13_dptp_py(
     int64_t stream_ptr
 ) {
     TORCH_CHECK(peer_buffer_ptrs.is_cuda());
-    check_dptp_T_G(T, G);
+    check_dptp_config(T, G, H, I, elem_size);
+    TORCH_CHECK(num_gates == 1 || num_gates == 2,
+                "dptp w13 requires num_gates in {1, 2}; got ", num_gates);
     launch_peer_access_fused_transfer_w13_dptp(
         local_buffer_ptr, peer_buffer_ptrs.data_ptr<int64_t>(),
         src_ep_offset, dst_tp_offset, rank, T, G,
@@ -525,7 +539,7 @@ void launch_w2_dptp_py(
     int64_t stream_ptr
 ) {
     TORCH_CHECK(peer_buffer_ptrs.is_cuda());
-    check_dptp_T_G(T, G);
+    check_dptp_config(T, G, H, I, elem_size);
     launch_peer_access_fused_transfer_w2_dptp(
         local_buffer_ptr, peer_buffer_ptrs.data_ptr<int64_t>(),
         src_ep_offset, dst_tp_offset, rank, T, G,
@@ -541,7 +555,9 @@ void launch_w13_ep_dptp_py(
     int64_t stream_ptr
 ) {
     TORCH_CHECK(peer_buffer_ptrs.is_cuda());
-    check_dptp_T_G(T, G);
+    check_dptp_config(T, G, H, I, elem_size);
+    TORCH_CHECK(num_gates == 1 || num_gates == 2,
+                "dptp w13 requires num_gates in {1, 2}; got ", num_gates);
     launch_peer_access_fused_transfer_w13_ep_dptp(
         local_buffer_ptr, peer_buffer_ptrs.data_ptr<int64_t>(),
         src_tp_offset, dst_ep_offset, rank, T, G,
@@ -557,7 +573,7 @@ void launch_w2_ep_dptp_py(
     int64_t stream_ptr
 ) {
     TORCH_CHECK(peer_buffer_ptrs.is_cuda());
-    check_dptp_T_G(T, G);
+    check_dptp_config(T, G, H, I, elem_size);
     launch_peer_access_fused_transfer_w2_ep_dptp(
         local_buffer_ptr, peer_buffer_ptrs.data_ptr<int64_t>(),
         src_tp_offset, dst_ep_offset, rank, T, G,
