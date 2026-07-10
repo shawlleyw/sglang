@@ -853,11 +853,13 @@ class ParaSMemoryManager:
         Orientation EP-low / TP-high. Per mode, address order is
         ``weights | pad | cache``; the big TP weights overlap the big EP cache
         (EP and TP are never live together), so the buffer is ~one per-mode
-        footprint plus one layer. The ``max(ct)`` tail anchor keeps every
-        layer's EP and TP cache disjoint for any per-layer sizes, given the
-        invariant ``ct[i] <= ce[i]``. Weight sub-slabs are ``[w13|w2]`` and
-        cache sub-slabs ``[k|v]``, laid identically in both modes so the
-        offset-agnostic transfer kernels stay valid.
+        footprint plus one layer. The general tail anchor
+        ``max_i(ct[i] + sum_{k>i}(ct[k] - ce[k]))`` keeps every layer's EP and TP
+        cache disjoint for any per-layer sizes and any layer order, with no
+        ``ct <= ce`` precondition; it reduces to ``max(ct)`` in the real case
+        ``ct[i] <= ce[i]`` and still holds when ``ct[i] > ce[i]``. Weight
+        sub-slabs are ``[w13|w2]`` and cache sub-slabs ``[k|v]``, laid identically
+        in both modes so the offset-agnostic transfer kernels stay valid.
 
         Returns the byte offset past the end of the run.
         """
