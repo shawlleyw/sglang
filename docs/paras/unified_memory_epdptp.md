@@ -143,10 +143,20 @@ Validated on 4×A100 (`CUDA_VISIBLE_DEVICES=4,5,6,7`):
 
 The layout `compute_layout` proof and CPU unit suite (33 checks) cover the `G>1` byte geometry.
 
+### End-to-end serving (live server, dp>1)
+
+The full scheduler switch was brought up on a live qwen3-30B server at `EP=4 / DP2 / TP2` (`--paras-tp-size 2`, 4×A100, FlashInfer, cuda-graph).
+
+**Peer access is a single global context.** One IPC exchange over the whole EP group (all GPUs) produces the peer-buffer address list, indexed by global ep rank. The weight switch uses the full list — the dptp broadcast indexes `peer_buffers[d*T+t]` across all `G·T` ranks and keys the canonical slot on the global ep rank, so it also passes the global ep rank as `R`. The KV switch stays within its TP subgroup and reuses the SAME mapping, addressing only its subgroup slice `peer_addresses[dp_base : dp_base+tp_size]` (`dp_base = dp_rank·tp_size`); no second IPC exchange. At `dp==1` the subgroup is the whole group and the slice is the full list. (`qwen3_moe.py`, `paras_parallel_state.py` getters, `paras_moe_block.py` passes global ep rank.)
+
+**Sync scoping follows the transfer scope.** MoE weights reshard across all GPUs, so the weight-transfer per-layer barrier spans the EP group (`paras_model.py`). KV cache redistributes only within a TP subgroup, so the scatter/gather per-layer barrier spans the TP subgroup. No extra cross-subgroup barrier is needed: an earlier intermittent ~1/11-run corruption of ~2/32 in-flight TP→EP requests was caused by an interim design that opened **two** IPC mappings of the same buffer (one per transfer) — cross-mapping writes were not coherent. Collapsing to the single global mapping above removed the race (dp=1 never hit it because its two groups already coincide).
+
+Manual-switch procedure (`.skills/paras-test-manual-switch`): dual capture `pools_differ=True` (#EP=52, #TP=68 graphs, cuda graph intact both modes); EP/TP/EP-RT prompts 0/32 degenerate; `configure_tp` 160 ms / `configure_ep` 58 ms; in-flight EP→TP 3/3 and TP→EP **20/20** clean; no server errors. The gate at `scheduler_paras_mixin.py:742` (`paras_dp_size == 1`) is relaxed to enable this.
+
 ## Future Work
 
 - **FP8 weights and scales.** The FP8 weight path is byte-agnostic (`elem_size = 1`) but untested, with a tighter 16-byte alignment constraint on `w2` rows. FP8 scales are pre-materialized at init and likely need no transfer kernel; verify under the `(d, t)` topology.
-- **End-to-end serving switch.** The deployment gates (`server_args.py` `tp_size == dp_size`; `scheduler_paras_mixin.py` `paras_dp_size == 1`) remain in place. Relaxing them requires validating the full scheduler switch for `dp > 1` — request partitioning, per-rank pool resizing, and forward/routing — which is beyond the transfer-layer validation above.
+- **EP=8 / DP2 / TP4 scale.** Validated at `EP=4/DP2/TP2` (the identical dp>1 code path). The `EP=8` scale needs 8 healthy GPUs; on the current box GPU 1 is driver-wedged (CUDA init hangs, no root to reset), so `EP=8` awaits a GPU reset. Flipping the harness to `EP=8` is a one-line change (`NUM_GPUS=8 --paras-tp-size 4`).
 
 ## Design Documents
 
