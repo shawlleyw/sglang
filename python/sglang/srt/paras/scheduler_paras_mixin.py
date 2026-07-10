@@ -739,7 +739,6 @@ class SchedulerParasMixin:
         if not self.paras_check():
             return
         assert self.server_args.enable_paras_moe, "ParaS parallelism is not enabled."
-        assert self.paras_dp_size == 1, "paras_configure_ep only supports dp_size==1"
         self._paras_drain_overlap_pipeline()
         torch.cuda.synchronize()
 
