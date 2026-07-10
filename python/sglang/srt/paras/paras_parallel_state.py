@@ -133,7 +133,19 @@ def get_paras_dp_size() -> int:
 def get_paras_dp_rank() -> int:
     assert _PARAS_DP_RANK is not None, "ParaS data parallel rank is not initialized"
     return _PARAS_DP_RANK
-    
+
+def get_paras_ep_group() -> GroupCoordinator:
+    assert _PARAS_EP is not None, "ParaS expert parallel group is not initialized"
+    return _PARAS_EP
+
+def get_paras_ep_size() -> int:
+    assert _PARAS_EP_SIZE is not None, "ParaS expert parallel size is not initialized"
+    return _PARAS_EP_SIZE
+
+def get_paras_ep_rank() -> int:
+    assert _PARAS_EP_RANK is not None, "ParaS expert parallel rank is not initialized"
+    return _PARAS_EP_RANK
+
 def paras_comm_configure_tp():
     # global _TP
     parallel_state._TP = _PARAS_TP
