@@ -31,7 +31,7 @@ from sglang.srt.paras.paras_memory_manager import (
     get_global_paras_memory_manager,
     plan_qwen_moe_layout,
 )
-from sglang.srt.paras.paras_parallel_state import get_paras_dp_size, get_paras_tp_group, get_paras_tp_size
+from sglang.srt.paras.paras_parallel_state import get_paras_dp_rank, get_paras_dp_size, get_paras_ep_group, get_paras_ep_size, get_paras_tp_group, get_paras_tp_size
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -211,21 +211,39 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         # Pre-initialize NVLink peer access during model init to avoid overhead at switch time.
         # cudaIpcOpenMemHandle() is slow on first call (~6s for NVLink connection setup).
         try:
-            from sglang.srt.paras.peer_access import init_peer_access
-            self._fused_peer_access_ctx = init_peer_access(
-                manager, get_paras_tp_group().device_group, get_paras_tp_size()
+            from sglang.srt.paras.peer_access import PeerAccessContext, init_peer_access
+            # One IPC exchange over the whole EP group (all GPUs). The weight
+            # switch uses the full global address list (the dptp broadcast indexes
+            # every rank by global ep rank). The KV switch stays within its TP
+            # subgroup and reuses the SAME IPC mapping, addressing only its
+            # subgroup slice [dp_base : dp_base+tp_size]; no second IPC exchange.
+            # At dp==1 the subgroup is the whole group, so the slice is the full list.
+            self._ep_peer_access_ctx = init_peer_access(
+                manager, get_paras_ep_group().device_group, get_paras_ep_size()
+            )
+            _tp = get_paras_tp_size()
+            _dp_base = get_paras_dp_rank() * _tp
+            self._fused_peer_access_ctx = PeerAccessContext(
+                peer_addresses=self._ep_peer_access_ctx.peer_addresses[_dp_base : _dp_base + _tp],
+                peer_access_enabled=True,
+                tp_group=get_paras_tp_group().device_group,
+                tp_size=_tp,
             )
             logger.info("ParaS fused peer access pre-initialized.")
         except Exception as e:
             logger.warning(f"ParaS fused peer access pre-init failed (will retry at switch): {e}")
             self._fused_peer_access_ctx = None
+            self._ep_peer_access_ctx = None
 
         self.model = Qwen3MoeModelParaS(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        # Inject pre-initialized peer access context so the switch doesn't pay 6s init cost
-        if self._fused_peer_access_ctx is not None:
-            self.model._peer_access_ctx = self._fused_peer_access_ctx
+        # Inject the global peer-access context so the switch doesn't pay 6s init cost.
+        # The weight switch reads model._peer_access_ctx (full global address list);
+        # the KV path reads the top-level _fused_peer_access_ctx (subgroup slice of
+        # the same IPC mapping).
+        if self._ep_peer_access_ctx is not None:
+            self.model._peer_access_ctx = self._ep_peer_access_ctx
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,

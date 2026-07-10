@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.paras.paras_parallel_state import (
     get_paras_dp_rank,
     get_paras_dp_size,
+    get_paras_ep_rank,
     get_paras_tp_group,
     get_paras_tp_rank,
     get_paras_tp_size,
@@ -501,17 +502,22 @@ class ParaSMoeBlockMixin:
             # (num_experts / tp_size). The dptp kernels read each shard once and
             # broadcast to the G dp-replicas.
             e_local = self.num_global_experts // (paras_dp_size * paras_tp_size)
+            # The dptp kernel indexes peer buffers by GLOBAL ep rank (dest_rank =
+            # d*T + t across dp-replicas) and keys the canonical slot on R*E_local,
+            # so R is the ep rank, not the tp-local rank. dst_base_ptrs is the
+            # EP-group peer ctx (all G*T ranks).
+            paras_ep_rank = get_paras_ep_rank()
             peer_access_fused_transfer_w13_dptp(
                 local_buffer_ptr, dst_base_ptrs,
                 ep_w13_entry.offset_bytes, tp_w13_entry.offset_bytes,
-                paras_tp_rank, paras_tp_size, paras_dp_size,
+                paras_ep_rank, paras_tp_size, paras_dp_size,
                 e_local, self.hidden_size, self.moe_intermediate_size,
                 num_gates=w13_num_gates, elem_size=dtype_bytes, stream=stream,
             )
             peer_access_fused_transfer_w2_dptp(
                 local_buffer_ptr, dst_base_ptrs,
                 ep_w2_entry.offset_bytes, tp_w2_entry.offset_bytes,
-                paras_tp_rank, paras_tp_size, paras_dp_size,
+                paras_ep_rank, paras_tp_size, paras_dp_size,
                 e_local, self.hidden_size, self.moe_intermediate_size,
                 elem_size=dtype_bytes, stream=stream,
             )
@@ -680,17 +686,21 @@ class ParaSMoeBlockMixin:
             # Asymmetric DP x TP -> EP reverse (each dp-replica reassembles EP
             # from its own T tp-peers; redundant replicas dropped).
             e_local = self.num_global_experts // (paras_dp_size * paras_tp_size)
+            # R is the GLOBAL ep rank: the reverse kernel derives dest_rank =
+            # (R // T) * T + peer and reads peer_buffers[dest_rank] over the
+            # EP-group ctx. tp-local rank would collide across dp-replicas.
+            paras_ep_rank = get_paras_ep_rank()
             peer_access_fused_transfer_w13_ep_dptp(
                 local_buffer_ptr, dst_base_ptrs,
                 tp_w13_entry.offset_bytes, ep_w13_entry.offset_bytes,
-                paras_tp_rank, paras_tp_size, paras_dp_size,
+                paras_ep_rank, paras_tp_size, paras_dp_size,
                 e_local, self.hidden_size, self.moe_intermediate_size,
                 num_gates=w13_num_gates, elem_size=dtype_bytes, stream=stream,
             )
             peer_access_fused_transfer_w2_ep_dptp(
                 local_buffer_ptr, dst_base_ptrs,
                 tp_w2_entry.offset_bytes, ep_w2_entry.offset_bytes,
-                paras_tp_rank, paras_tp_size, paras_dp_size,
+                paras_ep_rank, paras_tp_size, paras_dp_size,
                 e_local, self.hidden_size, self.moe_intermediate_size,
                 elem_size=dtype_bytes, stream=stream,
             )

@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
+from sglang.srt.paras.paras_parallel_state import get_paras_ep_group, get_paras_ep_size, get_paras_tp_group, get_paras_tp_size
 from sglang.srt.paras.peer_access import init_peer_access
 from sglang.srt.paras.utils import paras_func
 
@@ -89,24 +89,27 @@ class ParaSModelMixin:
     def paras_configure_tp_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
         mgr = get_global_paras_memory_manager()
 
+        # Weights reshard across the whole EP group (the dptp broadcast writes to
+        # dp-replicas outside the TP subgroup), so the peer ctx and per-layer
+        # barrier span the EP group, not the TP subgroup. At dp==1 they coincide.
         if not hasattr(self, '_peer_access_ctx') or self._peer_access_ctx is None:
-            tp_group_tmp = get_paras_tp_group().device_group
-            tp_size_tmp = get_paras_tp_size()
-            self._peer_access_ctx = init_peer_access(mgr, tp_group_tmp, tp_size_tmp)
+            ep_group_tmp = get_paras_ep_group().device_group
+            ep_size_tmp = get_paras_ep_size()
+            self._peer_access_ctx = init_peer_access(mgr, ep_group_tmp, ep_size_tmp)
 
         peer_ctx = self._peer_access_ctx
         dst_base_ptrs = torch.tensor(
             peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
         )
 
-        paras_tp_group = get_paras_tp_group().device_group
+        paras_ep_group = get_paras_ep_group().device_group
         barrier_tensor = torch.zeros(1, device="cuda")
 
         # Reverse layer order: TP weight layer i overlaps EP weight layer i+1 in
         # the four-anchor buffer, so i+1 must be read before i is written.
         for layer in reversed(self.layers):
             layer.paras_configure_tp_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
-            dist.all_reduce(barrier_tensor, group=paras_tp_group)
+            dist.all_reduce(barrier_tensor, group=paras_ep_group)
 
         for layer in self.layers:
             layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
@@ -160,24 +163,26 @@ class ParaSModelMixin:
         """TP→EP via peer access kernels (forward layer order) + attn/communicator restore."""
         mgr = get_global_paras_memory_manager()
 
+        # Weights reshard across the EP group; the peer ctx and per-layer barrier
+        # span the EP group, not the TP subgroup (dp==1: they coincide).
         if not hasattr(self, '_peer_access_ctx') or self._peer_access_ctx is None:
-            tp_group_tmp = get_paras_tp_group().device_group
-            tp_size_tmp = get_paras_tp_size()
-            self._peer_access_ctx = init_peer_access(mgr, tp_group_tmp, tp_size_tmp)
+            ep_group_tmp = get_paras_ep_group().device_group
+            ep_size_tmp = get_paras_ep_size()
+            self._peer_access_ctx = init_peer_access(mgr, ep_group_tmp, ep_size_tmp)
 
         peer_ctx = self._peer_access_ctx
         dst_base_ptrs = torch.tensor(
             peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
         )
 
-        paras_tp_group = get_paras_tp_group().device_group
+        paras_ep_group = get_paras_ep_group().device_group
         barrier_tensor = torch.zeros(1, device="cuda")
 
         # Forward layer order: EP weight layer i+1 overlaps TP weight layer i in
         # the four-anchor buffer, so i must be read before i+1's EP is written.
         for layer in self.layers:
             layer.paras_configure_ep_mlp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
-            dist.all_reduce(barrier_tensor, group=paras_tp_group)
+            dist.all_reduce(barrier_tensor, group=paras_ep_group)
             layer.paras_configure_ep_attn()
             layer.paras_configure_ep()
 
