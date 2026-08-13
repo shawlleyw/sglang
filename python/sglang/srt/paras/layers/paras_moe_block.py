@@ -827,9 +827,12 @@ class ParaSMoeBlockMixin:
                 )
                 return
 
-            # Multi-node TP weights are replicated. Reconstruct only the expert
-            # interval assigned to this node, using its node-local TP peers.
-            dp_expert_start = (
+            # Multi-node TP weights are replicated, but EP rank d*T+t owns only
+            # E/(G*T) experts from node interval [d*E/G, (d+1)*E/G). Shift the
+            # source base to that interval and run the production v2 reverse
+            # kernel over the T node-local peers. Experts outside the interval
+            # are never read, so no cross-node collective is needed.
+            node_expert_start = (
                 get_paras_dp_rank() * paras_tp_size * e_local
             )
             w13_expert_bytes = w13_num_gates * w13_chunk_elems * dtype_bytes
@@ -842,7 +845,7 @@ class ParaSMoeBlockMixin:
                 local_buffer_ptr,
                 dst_base_ptrs,
                 tp_w13_entry.offset_bytes
-                + dp_expert_start * w13_expert_bytes,
+                + node_expert_start * w13_expert_bytes,
                 ep_w13_entry.offset_bytes,
                 paras_tp_rank,
                 paras_tp_size,
@@ -851,12 +854,13 @@ class ParaSMoeBlockMixin:
                 num_gates=w13_num_gates,
                 elem_size=dtype_bytes,
                 stream=stream,
+                variant="v2",
             )
             peer_access_fused_transfer_w2_ep(
                 local_buffer_ptr,
                 dst_base_ptrs,
                 tp_w2_entry.offset_bytes
-                + dp_expert_start * w2_expert_bytes,
+                + node_expert_start * w2_expert_bytes,
                 ep_w2_entry.offset_bytes,
                 paras_tp_rank,
                 paras_tp_size,
@@ -866,6 +870,7 @@ class ParaSMoeBlockMixin:
                 tp_intermediate=moe_intermediate_size_after_tp,
                 elem_size=dtype_bytes,
                 stream=stream,
+                variant="v2",
             )
             return
 
