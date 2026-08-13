@@ -131,14 +131,14 @@ The change surface is in [`paras_memory_manager.py`](../../python/sglang/srt/par
 
 The asymmetric `dp=2, tp=2, ep=4` case is implemented and GPU-validated at the transfer layer, with two distinct data movements:
 
-- **MoE weights reshard across the whole EP group.** EP holds `num_experts/ep_size` experts per rank; each TP subgroup holds *all* `num_experts` (`dp_size×` more per rank than EP). The fused peer-access `dptp` kernels ([`kernels_dptp.cu`](../../python/sglang/srt/paras/csrc/kernels_dptp.cu)) read each EP shard once and broadcast it to the `G = dp_size` replicas, using the canonical slot `e_global = R·E_local + e` (`R` the global EP rank, `E_local = num_experts/(dp_size·tp_size)`). Supported `(T, G)` template pairs are `{(8,1), (4,2), (2,4), (2,2)}`; the reverse `_ep_dptp` kernels reassemble EP replica-locally within each `T`-group. The `dp > 1` NCCL all-gather / all-to-all branches in [`paras_moe_block.py`](../../python/sglang/srt/paras/layers/paras_moe_block.py) remain `NotImplementedError` — the peer-access `dptp` path replaces them.
+- **MoE weight transport depends on physical topology.** If the EP group is node-local, the fused peer-access `dptp` kernels ([`kernels_dptp.cu`](../../python/sglang/srt/paras/csrc/kernels_dptp.cu)) read each EP shard once and broadcast it to all `G = dp_size` replicas. If EP spans nodes, each node-local TP group first uses the original peer-access kernels to write its experts directly into the canonical TP interval `[dp_rank·E/G, (dp_rank+1)·E/G)`. A strided `_PARAS_DP` group then performs an in-place all-gather from that interval into the full TP tensor. No staging allocation is required. TP→EP is replica-local in both cases.
 - **KV cache and requests redistribute only within a TP subgroup.** For `ep=4, tp=2, dp=2` the two subgroups are `{0,1}` and `{2,3}`; each performs a self-contained `tp=2` KV switch over its own 2-rank NCCL group (`_PARAS_TP` scopes to the subgroup, `paras_tp_rank ∈ {0,1}`). The subgroups never exchange KV bytes. The existing `TP_SIZE`-templated KV kernels and NCCL fallback are topology-agnostic and need no `dptp` variant.
 
 Validated on 4×A100 (`CUDA_VISIBLE_DEVICES=4,5,6,7`):
 
 | Harness | Result |
 |---------|--------|
-| [`test_weight_transfer_dptp.py`](../../test/srt/paras/test_weight_transfer_dptp.py) | 3/3 — forward vs independent ground truth, DP-replica bitwise consistency, EP→DP×TP→EP round-trip |
+| [`test_weight_transfer_dptp.py`](../../test/srt/paras/test_weight_transfer_dptp.py) | 3/3 — direct dptp by default; set `PARAS_TEST_LOGICAL_MULTINODE=1` for node-local IPC + in-place DP all-gather |
 | [`test_kv_roundtrip_dptp.py`](../../test/srt/paras/test_kv_roundtrip_dptp.py) | 2/2 — intra-subgroup KV EP→TP→EP round-trip, cross-group isolation |
 
 The layout `compute_layout` proof and CPU unit suite (33 checks) cover the `G>1` byte geometry.
@@ -147,9 +147,9 @@ The layout `compute_layout` proof and CPU unit suite (33 checks) cover the `G>1`
 
 The full scheduler switch was brought up on a live qwen3-30B server at `EP=4 / DP2 / TP2` (`--paras-tp-size 2`, 4×A100, FlashInfer, cuda-graph).
 
-**Peer access is a single global context.** One IPC exchange over the whole EP group (all GPUs) produces the peer-buffer address list, indexed by global ep rank. The weight switch uses the full list — the dptp broadcast indexes `peer_buffers[d*T+t]` across all `G·T` ranks and keys the canonical slot on the global ep rank, so it also passes the global ep rank as `R`. The KV switch stays within its TP subgroup and reuses the SAME mapping, addressing only its subgroup slice `peer_addresses[dp_base : dp_base+tp_size]` (`dp_base = dp_rank·tp_size`); no second IPC exchange. At `dp==1` the subgroup is the whole group and the slice is the full list. (`qwen3_moe.py`, `paras_parallel_state.py` getters, `paras_moe_block.py` passes global ep rank.)
+**Peer access is topology-scoped.** CUDA IPC is opened only among GPUs on the same node. A node-local EP group uses one EP-wide mapping for dptp weights, with KV addressing the current TP subgroup slice. A multi-node EP group uses one TP-group mapping shared by weights and KV; `_PARAS_DP` carries cross-node weight traffic through NCCL. This avoids opening an IPC handle for a remote process and still keeps only one mapping of each peer buffer.
 
-**Sync scoping follows the transfer scope.** MoE weights reshard across all GPUs, so the weight-transfer per-layer barrier spans the EP group (`paras_model.py`). KV cache redistributes only within a TP subgroup, so the scatter/gather per-layer barrier spans the TP subgroup. No extra cross-subgroup barrier is needed: an earlier intermittent ~1/11-run corruption of ~2/32 in-flight TP→EP requests was caused by an interim design that opened **two** IPC mappings of the same buffer (one per transfer) — cross-mapping writes were not coherent. Collapsing to the single global mapping above removed the race (dp=1 never hit it because its two groups already coincide).
+**Sync scoping follows the physical transfer.** The single-node dptp path uses an EP-group barrier after each layer. The multi-node path uses a TP-group barrier after node-local peer writes, then launches the in-place DP all-gather on a second stream. The next layer's NVLink reshard overlaps that NIC collective at model level. KV cache redistribution remains scoped to the TP subgroup.
 
 Manual-switch procedure (`.skills/paras-test-manual-switch`): dual capture `pools_differ=True` (#EP=52, #TP=68 graphs, cuda graph intact both modes); EP/TP/EP-RT prompts 0/32 degenerate; `configure_tp` 160 ms / `configure_ep` 58 ms; in-flight EP→TP 3/3 and TP→EP **20/20** clean; no server errors. The gate at `scheduler_paras_mixin.py:742` (`paras_dp_size == 1`) is relaxed to enable this.
 

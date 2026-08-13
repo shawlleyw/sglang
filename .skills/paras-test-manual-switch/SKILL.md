@@ -519,23 +519,24 @@ No HTTP runtime toggle exists; the toggle is server-startup-only.
 ### dp>1-specific failure modes
 
 10. **`CUDA error: an illegal memory access` at the dual-capture EP→TP switch
-    (dp>1 only)**: the MoE weight switch received a peer-access context scoped
-    to the `T`-rank TP subgroup, but the dptp broadcast kernel indexes
-    `peer_buffers[d*T+t]` across all `G·T` EP ranks and keys the canonical slot
-    on the global ep rank. Confirm the weight switch uses the **global** EP-group
-    context and passes the global ep rank (see `qwen3_moe.py` peer-access
-    pre-init and `paras_moe_block.py`), not the TP-subgroup context / tp-local
-    rank. At `dp==1` the two coincide, so this reproduces only at `dp>1`.
+    (dp>1 only)**: the peer-access scope does not match the physical topology.
+    A node-local EP group uses one EP-wide context because the dptp kernel
+    indexes all `G*T` peers. A multi-node EP group must instead use the
+    node-local TP context; the original peer kernel writes that node's canonical
+    expert interval and the strided DP group all-gathers it. Never open CUDA IPC
+    handles for ranks on another node. Confirm `qwen3_moe.py` and
+    `paras_moe_block.py` select the path from EP-group node locality.
 
 11. **Intermittent ~2/32 degenerate on in-flight TP→EP scatter (dp>1 only, ~1/11
     runs, no log error)**: a regression that opens a **second** IPC mapping of
     the same manager buffer (one context per transfer) reintroduces this — writes
     through one `cudaIpcOpenMemHandle` mapping are not coherent with reads through
-    the other. The fix is a single global IPC exchange whose address list the KV
-    path slices for its subgroup (`peer_addresses[dp_base : dp_base+tp_size]`);
-    the weight path uses the full list. Do not restore per-subgroup
-    `init_peer_access` calls. Soak the failing case ~20× to confirm (a single
-    clean run is not enough, given the low rate).
+    the other. The fix is one IPC exchange per physical peer scope, shared by
+    weights and KV: EP-wide when EP is node-local, or TP-wide when EP spans
+    nodes. For a node-local EP group the KV path uses the current TP slice of
+    that same address list. Do not initialize separate weight and KV mappings.
+    Soak the failing case ~20x to confirm (a single clean run is not enough,
+    given the low rate).
 
 12. **Server boots but every switch aborts with `paras_configure_ep only
     supports dp_size==1`**: the enable gate was re-added to

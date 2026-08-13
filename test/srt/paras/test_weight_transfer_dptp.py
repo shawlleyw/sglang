@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Real dp=2 tp=2 ep=4 weight-transfer round-trip test (asymmetric DP x TP).
 
-Validates the dptp peer-access kernels (peer_access_fused_transfer_w{13,2}_dptp
-and their _ep_dptp reverses) at (T, G) = (tp_size, dp_size) = (2, 2), the case
-used by a real dp=2/tp=2 deployment where ep_size = dp_size * tp_size = 4.
+Validates both dp=2/tp=2 transfer topologies: direct dptp peer access
+within one node, and the logical multi-node path that combines node-local
+peer access with an in-place all-gather across DP groups.
 
 Topology (4 GPUs):
   global rank R in [0,4);  tp_rank = R % T (=R%2);  dp_rank = R // T (=R//2)
@@ -23,16 +23,18 @@ Reverse (DP x TP -> EP): each dp-replica reassembles its own EP shard from its
   T tp-peers (replica-local, no broadcast); the redundant replica is dropped.
   A correct round trip must recover the original EP weights bitwise.
 
-Peer access spans all 4 GPUs (DP x TP replicas need cross-group access), so the
-IPC handle exchange and peer_addresses are indexed by GLOBAL rank 0..3, matching
-the kernel's dest_rank = dp_rank*T + peer indexing.
+With PARAS_TEST_LOGICAL_MULTINODE=0 (default), IPC spans all four GPUs
+and exercises the dptp kernels. With it set to 1, IPC is restricted to the
+logical TP nodes {0,1}/{2,3}, while DP groups {0,2}/{1,3} perform the
+cross-node all-gather.
 
 Usage:
   CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 \
       test/srt/paras/test_weight_transfer_dptp.py
+  PARAS_TEST_LOGICAL_MULTINODE=1 CUDA_VISIBLE_DEVICES=4,5,6,7 \
+      torchrun --nproc_per_node=4 test/srt/paras/test_weight_transfer_dptp.py
 """
 
-import ctypes
 import os
 import sys
 
@@ -53,6 +55,7 @@ SEED = 42
 TP_SIZE = 2
 DP_SIZE = 2
 EP_SIZE = DP_SIZE * TP_SIZE
+LOGICAL_MULTINODE = os.environ.get("PARAS_TEST_LOGICAL_MULTINODE", "0") == "1"
 
 
 def setup_distributed():
@@ -79,13 +82,7 @@ class _SimpleGroupCoordinator:
 
 
 def setup_paras_state(rank, world_size):
-    """ParaS parallel state for dp=2/tp=2/ep=4.
-
-    The dptp kernels index destinations by GLOBAL rank (dest_rank = dp*T + t),
-    so _PARAS_TP_RANK is set to the global rank and the peer/transfer group
-    spans all 4 GPUs. paras_tp_size = T = 2 and paras_dp_size = G = 2 drive the
-    kernel template (T, G) selection.
-    """
+    """ParaS state for a physical or logical dp=2/tp=2 topology."""
     import sglang.srt.distributed.parallel_state as ps
     import sglang.srt.paras.paras_parallel_state as pps
 
@@ -94,20 +91,49 @@ def setup_paras_state(rank, world_size):
         world_group, world_size, f"cuda:{rank}", rank_in_group=rank
     )
 
-    ps._TP = world_coord
-    pps._PARAS_TP = world_coord
-    pps._PARAS_DP = _SimpleGroupCoordinator(None, DP_SIZE, f"cuda:{rank}", rank_in_group=rank // TP_SIZE)
-    pps._PARAS_SELF = _SimpleGroupCoordinator(None, 1, f"cuda:{rank}", rank_in_group=0)
+    tp_coord = None
+    for d in range(DP_SIZE):
+        ranks = list(range(d * TP_SIZE, (d + 1) * TP_SIZE))
+        group = dist.new_group(ranks=ranks)
+        if rank in ranks:
+            tp_coord = _SimpleGroupCoordinator(
+                group,
+                TP_SIZE,
+                f"cuda:{rank}",
+                rank_in_group=ranks.index(rank),
+            )
 
-    # Kernel R = global rank (0..3); T = tp shard count; G = dp replication.
+    dp_coord = None
+    for t in range(TP_SIZE):
+        ranks = list(range(t, world_size, TP_SIZE))
+        group = dist.new_group(ranks=ranks)
+        if rank in ranks:
+            dp_coord = _SimpleGroupCoordinator(
+                group,
+                DP_SIZE,
+                f"cuda:{rank}",
+                rank_in_group=ranks.index(rank),
+            )
+
+    assert tp_coord is not None and dp_coord is not None
+    ps._TP = world_coord
+    pps._PARAS_EP = world_coord
+    pps._PARAS_TP = tp_coord
+    pps._PARAS_DP = dp_coord
+    pps._PARAS_SELF = _SimpleGroupCoordinator(
+        None, 1, f"cuda:{rank}", rank_in_group=0
+    )
+
     pps._PARAS_TP_SIZE = TP_SIZE
-    pps._PARAS_TP_RANK = rank
+    pps._PARAS_TP_RANK = rank % TP_SIZE
     pps._PARAS_DP_SIZE = DP_SIZE
     pps._PARAS_DP_RANK = rank // TP_SIZE
     pps._PARAS_EP_SIZE = EP_SIZE
     pps._PARAS_EP_RANK = rank
+    pps._PARAS_EP_GROUP_IS_NODE_LOCAL = not LOGICAL_MULTINODE
+    pps._PARAS_TP_GROUP_IS_NODE_LOCAL = True
 
-    return world_group
+    return world_group, tp_coord.device_group, dp_coord.device_group
 
 
 def build_manager(rank, world_size):
@@ -209,84 +235,82 @@ def _make_mixin(layer_id, num_local_ep, mgr):
     return m
 
 
-def setup_peer_ctx(mgr, rank, world_size, world_group):
-    """IPC handle exchange across ALL 4 GPUs; peer_addresses indexed by global rank."""
-    from sglang.srt.paras.peer_access import PeerAccessContext
+class _ModelLayerAdapter:
+    """Expose the decoder-layer API used by the model-level pipeline."""
 
-    _cudart = ctypes.CDLL("libcudart.so")
-    IPC_HANDLE_SIZE = 64
+    def __init__(self, mlp):
+        self.mlp = mlp
 
-    class CudaIpcMemHandle(ctypes.Structure):
-        _fields_ = [("reserved", ctypes.c_ubyte * IPC_HANDLE_SIZE)]
+    def paras_configure_tp_mlp_fused_peer_access_kernel(
+        self, peer_ctx, dst_base_ptrs, stream
+    ):
+        return self.mlp.paras_configure_tp_fused_peer_access_kernel(
+            peer_ctx, dst_base_ptrs, stream
+        )
 
-    _cudart.cudaIpcGetMemHandle.argtypes = [ctypes.POINTER(CudaIpcMemHandle), ctypes.c_void_p]
-    _cudart.cudaIpcGetMemHandle.restype = ctypes.c_int
-    _cudart.cudaIpcOpenMemHandle.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p),
-        CudaIpcMemHandle,
-        ctypes.c_uint,
-    ]
-    _cudart.cudaIpcOpenMemHandle.restype = ctypes.c_int
+    def paras_configure_tp_mlp_dp_all_gather(self, stream):
+        return self.mlp.paras_configure_tp_dp_all_gather(stream)
 
-    local_handle = CudaIpcMemHandle()
-    ret = _cudart.cudaIpcGetMemHandle(
-        ctypes.byref(local_handle), ctypes.c_void_p(mgr._buffer.data_ptr())
+
+def setup_peer_ctx(mgr, peer_group, peer_size):
+    """Exchange IPC handles over the physical node-local peer group."""
+    from sglang.srt.paras.peer_access import init_peer_access
+
+    return init_peer_access(mgr, peer_group, peer_size)
+
+
+def run_forward(mgr, num_local_ep, peer_ctx, world_group, tp_group):
+    """EP -> DP x TP through the selected topology path."""
+    dst_base_ptrs = torch.tensor(
+        peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
     )
-    assert ret == 0, f"cudaIpcGetMemHandle failed (cuda error {ret})"
-
-    handle_tensor = torch.tensor(
-        list(local_handle.reserved), dtype=torch.uint8, device=f"cuda:{rank}"
-    )
-    all_handles = torch.zeros(
-        world_size * IPC_HANDLE_SIZE, dtype=torch.uint8, device=f"cuda:{rank}"
-    )
-    dist.all_gather_into_tensor(all_handles, handle_tensor, group=world_group)
-
-    peer_addresses = []
-    for r in range(world_size):
-        if r == rank:
-            peer_addresses.append(mgr._buffer.data_ptr())
-        else:
-            raw_list = all_handles[r * IPC_HANDLE_SIZE : (r + 1) * IPC_HANDLE_SIZE].cpu().tolist()
-            remote_handle = CudaIpcMemHandle()
-            for idx, val in enumerate(raw_list):
-                remote_handle.reserved[idx] = val
-            remote_ptr = ctypes.c_void_p()
-            ret = _cudart.cudaIpcOpenMemHandle(ctypes.byref(remote_ptr), remote_handle, 1)
-            assert ret == 0, f"cudaIpcOpenMemHandle rank {r} failed (cuda error {ret})"
-            peer_addresses.append(remote_ptr.value)
-
-    return PeerAccessContext(
-        peer_addresses=peer_addresses,
-        peer_access_enabled=True,
-        tp_group=world_group,
-        tp_size=world_size,
-    )
-
-
-def run_forward(mgr, num_local_ep, peer_ctx, world_group):
-    """EP -> DP x TP via dptp kernels; reverse layer order + per-layer barrier."""
-    dst_base_ptrs = torch.tensor(peer_ctx.peer_addresses, dtype=torch.int64, device="cuda")
-    barrier_tensor = torch.zeros(1, device="cuda")
     dist.barrier(group=world_group)
 
-    for layer_id in reversed(range(NUM_LAYERS)):
-        mixin = _make_mixin(layer_id, num_local_ep, mgr)
-        mixin.paras_configure_tp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
-        dist.all_reduce(barrier_tensor, op=dist.ReduceOp.SUM, group=world_group)
+    if LOGICAL_MULTINODE:
+        from sglang.srt.paras.layers.paras_model import ParaSModelMixin
+
+        model = object.__new__(ParaSModelMixin)
+        model.layers = [
+            _ModelLayerAdapter(
+                _make_mixin(layer_id, num_local_ep, mgr)
+            )
+            for layer_id in range(NUM_LAYERS)
+        ]
+        model._paras_configure_tp_peer_access_multinode(
+            peer_ctx, dst_base_ptrs
+        )
+    else:
+        barrier_tensor = torch.zeros(1, device="cuda")
+        for layer_id in reversed(range(NUM_LAYERS)):
+            mixin = _make_mixin(layer_id, num_local_ep, mgr)
+            mixin.paras_configure_tp_fused_peer_access_kernel(
+                peer_ctx, dst_base_ptrs, None
+            )
+            dist.all_reduce(
+                barrier_tensor,
+                op=dist.ReduceOp.SUM,
+                group=world_group,
+            )
     torch.cuda.synchronize()
 
 
-def run_reverse(mgr, num_local_ep, peer_ctx, world_group):
-    """DP x TP -> EP via _ep_dptp kernels; forward layer order + per-layer barrier."""
-    dst_base_ptrs = torch.tensor(peer_ctx.peer_addresses, dtype=torch.int64, device="cuda")
+def run_reverse(mgr, num_local_ep, peer_ctx, world_group, tp_group):
+    """DP x TP -> EP through the selected topology path."""
+    dst_base_ptrs = torch.tensor(
+        peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+    )
     barrier_tensor = torch.zeros(1, device="cuda")
+    barrier_group = tp_group if LOGICAL_MULTINODE else world_group
     dist.barrier(group=world_group)
 
     for layer_id in range(NUM_LAYERS):
         mixin = _make_mixin(layer_id, num_local_ep, mgr)
-        mixin.paras_configure_ep_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, None)
-        dist.all_reduce(barrier_tensor, op=dist.ReduceOp.SUM, group=world_group)
+        mixin.paras_configure_ep_fused_peer_access_kernel(
+            peer_ctx, dst_base_ptrs, None
+        )
+        dist.all_reduce(
+            barrier_tensor, op=dist.ReduceOp.SUM, group=barrier_group
+        )
     torch.cuda.synchronize()
 
 
@@ -371,18 +395,20 @@ def main():
     rank, world_size = setup_distributed()
     passed = failed = 0
     try:
-        world_group = setup_paras_state(rank, world_size)
+        world_group, tp_group, _ = setup_paras_state(rank, world_size)
         mgr, num_local_ep = build_manager(rank, world_size)
         fill_ep_weights(mgr, rank)
         snap = snapshot_weights(mgr)
-        peer_ctx = setup_peer_ctx(mgr, rank, world_size, world_group)
+        peer_group = tp_group if LOGICAL_MULTINODE else world_group
+        peer_size = TP_SIZE if LOGICAL_MULTINODE else world_size
+        peer_ctx = setup_peer_ctx(mgr, peer_group, peer_size)
 
         # === Test 1: EP -> DP x TP forward vs independent ground truth ===
         if rank == 0:
             print("\n=== Forward EP -> DPxTP (dptp) vs ground truth ===", flush=True)
         restore_weights(mgr, snap)
         exp_w13, exp_w2, _ = build_forward_ground_truth(snap, rank, world_group)
-        run_forward(mgr, num_local_ep, peer_ctx, world_group)
+        run_forward(mgr, num_local_ep, peer_ctx, world_group, tp_group)
         actual = read_tp_results(mgr)
         try:
             for layer_id in range(NUM_LAYERS):
@@ -423,8 +449,8 @@ def main():
         if rank == 0:
             print("\n=== Round trip EP -> DPxTP -> EP (dptp) ===", flush=True)
         restore_weights(mgr, snap)
-        run_forward(mgr, num_local_ep, peer_ctx, world_group)
-        run_reverse(mgr, num_local_ep, peer_ctx, world_group)
+        run_forward(mgr, num_local_ep, peer_ctx, world_group, tp_group)
+        run_reverse(mgr, num_local_ep, peer_ctx, world_group, tp_group)
         ep_actual = read_ep_results(mgr)
         try:
             for layer_id in range(NUM_LAYERS):
@@ -442,7 +468,12 @@ def main():
             total = passed + failed
             print(f"\n{'=' * 60}")
             print(f"RESULTS: {passed}/{total} passed, {failed}/{total} failed")
-            print("SUCCESS: dp=2 tp=2 ep=4 dptp switch validated!" if failed == 0 else "FAILED")
+            topology = "logical multi-node" if LOGICAL_MULTINODE else "single-node dptp"
+            print(
+                f"SUCCESS: dp=2 tp=2 ep=4 {topology} switch validated!"
+                if failed == 0
+                else "FAILED"
+            )
             print(f"{'=' * 60}", flush=True)
 
         if failed > 0:

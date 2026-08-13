@@ -118,6 +118,8 @@ def _setup_paras_state(rank, world_size):
     pps._PARAS_DP_RANK = 0
     pps._PARAS_EP_SIZE = world_size
     pps._PARAS_EP_RANK = rank
+    pps._PARAS_EP_GROUP_IS_NODE_LOCAL = True
+    pps._PARAS_TP_GROUP_IS_NODE_LOCAL = True
 
     return tp_group
 

@@ -59,8 +59,10 @@ After transfer, the expected value at any destination position is computed by kn
 ### Asymmetric DP×TP (dp_size > 1)
 
 Two harnesses cover the `EP ↔ DP×TP` case (`ep_size = dp_size · tp_size`), where
-MoE weights reshard across the whole EP group while the KV cache redistributes
-only within each TP subgroup:
+MoE weights reshard across the logical EP group while the KV cache redistributes
+only within each TP subgroup. On one node the dptp kernels perform the weight
+reshard directly. Across nodes, node-local peer access writes each node's final
+expert interval and a strided DP all-gather replicates those intervals:
 
 | Harness | Runs | Ground truth |
 |---------|------|--------------|
@@ -71,10 +73,11 @@ Run them directly (both self-check and exit non-zero on failure):
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 test/srt/paras/test_weight_transfer_dptp.py
+PARAS_TEST_LOGICAL_MULTINODE=1 CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 test/srt/paras/test_weight_transfer_dptp.py
 CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 test/srt/paras/test_kv_roundtrip_dptp.py
 ```
 
-The kernels admit `(T, G) = (tp_size, dp_size)` in `{(8,1), (4,2), (2,4), (2,2)}`;
+The node-local dptp kernels admit `(T, G) = (tp_size, dp_size)` in `{(8,1), (4,2), (2,4), (2,2)}`;
 `EP=4/DP2/TP2` uses `(2,2)` and `EP=8/DP2/TP4` uses `(4,2)`. The full live serving
 switch at `dp>1` is covered by [`paras-test-manual-switch`](file:///home/shaoyuw/sglang/.skills/paras-test-manual-switch/SKILL.md).
 

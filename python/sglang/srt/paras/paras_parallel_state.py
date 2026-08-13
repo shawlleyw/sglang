@@ -3,10 +3,11 @@ import torch.distributed as dist
 from typing import Optional
 
 from sglang.srt.distributed.parallel_state import (
-    get_world_group,
-    init_model_parallel_group,
-    get_bool_env_var,
     GroupCoordinator,
+    get_bool_env_var,
+    get_world_group,
+    in_the_same_node_as,
+    init_model_parallel_group,
 )
 import sglang.srt.distributed.parallel_state as parallel_state
 import sglang.srt.layers.dp_attention as dp_attention
@@ -15,11 +16,23 @@ _PARAS_EP: Optional[GroupCoordinator] = None
 
 _PARAS_TP: Optional[GroupCoordinator] = None
 
+_PARAS_DP: Optional[GroupCoordinator] = None
+
 _PARAS_SELF: Optional[GroupCoordinator] = None
+
+_PARAS_EP_GROUP_IS_NODE_LOCAL: Optional[bool] = None
+
+_PARAS_TP_GROUP_IS_NODE_LOCAL: Optional[bool] = None
+
 
 def get_paras_tp_group() -> GroupCoordinator:
     assert _PARAS_TP is not None, "ParaS tensor parallel group is not initialized"
     return _PARAS_TP
+
+
+def get_paras_dp_group() -> GroupCoordinator:
+    assert _PARAS_DP is not None, "ParaS data parallel group is not initialized"
+    return _PARAS_DP
 
 # TODO(shaoyuw): refactor code
 # The parallel size and rank can be grouped together.
@@ -114,9 +127,50 @@ def initialize_paras_parallel(
         scattered_x = torch.empty_like(x)
         dist.all_to_all_single(scattered_x, x, group=_PARAS_TP.device_group)
 
-    # The paras_dp NCCL communicator was removed: the fused dptp peer-access
-    # scatter (kernels_dptp.cu) replaced the all-gather over dp ranks.
-    # Scalar dp_size / dp_rank are still derived above for kernel parameters.
+    # Build strided DP groups. Ranks with the same TP-local rank exchange their
+    # node-local expert blocks when the EP group spans multiple nodes.
+    num_paras_data_model_parallel_groups = world_size // dp_size
+    global _PARAS_DP
+    assert _PARAS_DP is None, "ParaS data parallel group is already initialized"
+
+    if (
+        dp_size == 1
+        and parallel_state._MOE_TP is not None
+        and parallel_state._MOE_TP.world_size == 1
+    ):
+        _PARAS_DP = parallel_state._MOE_TP
+    else:
+        group_ranks = []
+        for i in range(num_paras_data_model_parallel_groups):
+            group_ranks.append(
+                list(range(i, world_size, num_paras_data_model_parallel_groups))
+            )
+
+        _PARAS_DP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="paras_dp",
+        )
+        x = torch.ones(128, dtype=torch.bfloat16, device=_PARAS_DP.device)
+        gathered_x = torch.empty(
+            x.shape[0] * _PARAS_DP_SIZE,
+            dtype=x.dtype,
+            device=_PARAS_DP.device,
+        )
+        dist.all_gather_into_tensor(gathered_x, x, group=_PARAS_DP.device_group)
+
+    global _PARAS_EP_GROUP_IS_NODE_LOCAL, _PARAS_TP_GROUP_IS_NODE_LOCAL
+    _PARAS_EP_GROUP_IS_NODE_LOCAL = all(in_the_same_node_as(_PARAS_EP.cpu_group))
+    _PARAS_TP_GROUP_IS_NODE_LOCAL = all(in_the_same_node_as(_PARAS_TP.cpu_group))
+    if not _PARAS_EP_GROUP_IS_NODE_LOCAL:
+        assert dp_size > 1, (
+            "ParaS requires dp_size > 1 when the EP group spans multiple nodes"
+        )
+        assert _PARAS_TP_GROUP_IS_NODE_LOCAL, (
+            "ParaS multi-node switching requires each TP group to fit within one node"
+        )
 
 def get_paras_tp_size() -> int:
     assert _PARAS_TP_SIZE is not None, "ParaS tensor parallel size is not initialized"
@@ -133,6 +187,21 @@ def get_paras_dp_size() -> int:
 def get_paras_dp_rank() -> int:
     assert _PARAS_DP_RANK is not None, "ParaS data parallel rank is not initialized"
     return _PARAS_DP_RANK
+
+
+def is_paras_ep_group_node_local() -> bool:
+    assert _PARAS_EP_GROUP_IS_NODE_LOCAL is not None, (
+        "ParaS EP group topology is not initialized"
+    )
+    return _PARAS_EP_GROUP_IS_NODE_LOCAL
+
+
+def is_paras_tp_group_node_local() -> bool:
+    assert _PARAS_TP_GROUP_IS_NODE_LOCAL is not None, (
+        "ParaS TP group topology is not initialized"
+    )
+    return _PARAS_TP_GROUP_IS_NODE_LOCAL
+
 
 def get_paras_ep_group() -> GroupCoordinator:
     assert _PARAS_EP is not None, "ParaS expert parallel group is not initialized"

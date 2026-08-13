@@ -14,12 +14,14 @@ import torch.nn as nn
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.paras.paras_parallel_state import (
+    get_paras_dp_group,
     get_paras_dp_rank,
     get_paras_dp_size,
     get_paras_ep_rank,
     get_paras_tp_group,
     get_paras_tp_rank,
     get_paras_tp_size,
+    is_paras_ep_group_node_local,
 )
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 from sglang.srt.paras.peer_access import (
@@ -497,29 +499,84 @@ class ParaSMoeBlockMixin:
 
         paras_dp_size = get_paras_dp_size()
         if paras_dp_size > 1:
-            # Asymmetric EP -> DP x TP (G = dp_size). E_local is the EP-sharded
-            # expert count (num_experts / ep_size), distinct from num_local_experts
-            # (num_experts / tp_size). The dptp kernels read each shard once and
-            # broadcast to the G dp-replicas.
-            e_local = self.num_global_experts // (paras_dp_size * paras_tp_size)
-            # The dptp kernel indexes peer buffers by GLOBAL ep rank (dest_rank =
-            # d*T + t across dp-replicas) and keys the canonical slot on R*E_local,
-            # so R is the ep rank, not the tp-local rank. dst_base_ptrs is the
-            # EP-group peer ctx (all G*T ranks).
-            paras_ep_rank = get_paras_ep_rank()
-            peer_access_fused_transfer_w13_dptp(
-                local_buffer_ptr, dst_base_ptrs,
-                ep_w13_entry.offset_bytes, tp_w13_entry.offset_bytes,
-                paras_ep_rank, paras_tp_size, paras_dp_size,
-                e_local, self.hidden_size, self.moe_intermediate_size,
-                num_gates=w13_num_gates, elem_size=dtype_bytes, stream=stream,
+            e_local = self.num_global_experts // (
+                paras_dp_size * paras_tp_size
             )
-            peer_access_fused_transfer_w2_dptp(
-                local_buffer_ptr, dst_base_ptrs,
-                ep_w2_entry.offset_bytes, tp_w2_entry.offset_bytes,
-                paras_ep_rank, paras_tp_size, paras_dp_size,
-                e_local, self.hidden_size, self.moe_intermediate_size,
-                elem_size=dtype_bytes, stream=stream,
+            if is_paras_ep_group_node_local():
+                # A single-node dptp launch broadcasts each EP shard directly
+                # to every DP replica.
+                paras_ep_rank = get_paras_ep_rank()
+                peer_access_fused_transfer_w13_dptp(
+                    local_buffer_ptr,
+                    dst_base_ptrs,
+                    ep_w13_entry.offset_bytes,
+                    tp_w13_entry.offset_bytes,
+                    paras_ep_rank,
+                    paras_tp_size,
+                    paras_dp_size,
+                    e_local,
+                    self.hidden_size,
+                    self.moe_intermediate_size,
+                    num_gates=w13_num_gates,
+                    elem_size=dtype_bytes,
+                    stream=stream,
+                )
+                peer_access_fused_transfer_w2_dptp(
+                    local_buffer_ptr,
+                    dst_base_ptrs,
+                    ep_w2_entry.offset_bytes,
+                    tp_w2_entry.offset_bytes,
+                    paras_ep_rank,
+                    paras_tp_size,
+                    paras_dp_size,
+                    e_local,
+                    self.hidden_size,
+                    self.moe_intermediate_size,
+                    elem_size=dtype_bytes,
+                    stream=stream,
+                )
+                return
+
+            # Multi-node: reshard the current node's EP experts into their final
+            # canonical TP interval. A subsequent in-place DP all-gather fills
+            # the other node intervals without a staging allocation.
+            dp_expert_start = (
+                get_paras_dp_rank() * paras_tp_size * e_local
+            )
+            w13_expert_bytes = w13_num_gates * w13_chunk_elems * dtype_bytes
+            w2_expert_bytes = (
+                self.hidden_size
+                * moe_intermediate_size_after_tp
+                * dtype_bytes
+            )
+            peer_access_fused_transfer_w13_v2(
+                local_buffer_ptr,
+                dst_base_ptrs,
+                ep_w13_entry.offset_bytes,
+                tp_w13_entry.offset_bytes
+                + dp_expert_start * w13_expert_bytes,
+                paras_tp_rank,
+                paras_tp_size,
+                e_local,
+                w13_chunk_elems,
+                num_gates=w13_num_gates,
+                elem_size=dtype_bytes,
+                stream=stream,
+            )
+            peer_access_fused_transfer_w2_v2(
+                local_buffer_ptr,
+                dst_base_ptrs,
+                ep_w2_entry.offset_bytes,
+                tp_w2_entry.offset_bytes
+                + dp_expert_start * w2_expert_bytes,
+                paras_tp_rank,
+                paras_tp_size,
+                e_local,
+                hidden_size=self.hidden_size,
+                full_intermediate=self.moe_intermediate_size,
+                tp_intermediate=moe_intermediate_size_after_tp,
+                elem_size=dtype_bytes,
+                stream=stream,
             )
             return
 
@@ -541,6 +598,55 @@ class ParaSMoeBlockMixin:
             tp_intermediate=moe_intermediate_size_after_tp,
             elem_size=dtype_bytes, stream=stream,
         )
+
+    def paras_configure_tp_dp_all_gather(self, stream=None):
+        """Replicate this node's final TP expert interval across DP ranks.
+
+        The local input is already stored at the NCCL in-place position within
+        the full TP output tensor, so the collective needs no staging buffer.
+        """
+
+        assert get_paras_dp_size() > 1
+        assert not is_paras_ep_group_node_local()
+
+        mgr = get_global_paras_memory_manager()
+        layer_id = self._paras_layer_id
+        experts_per_dp_rank = self.num_global_experts // get_paras_dp_size()
+        expert_start = get_paras_dp_rank() * experts_per_dp_rank
+        dp_group = get_paras_dp_group().device_group
+
+        tp_w13 = mgr.get_view_as(
+            f"model.layers.{layer_id}.mlp.tp_experts.w13_weight",
+            (
+                self.num_global_experts,
+                2 * (self.moe_intermediate_size // get_paras_tp_size()),
+                self.hidden_size,
+            ),
+        )
+        tp_w2 = mgr.get_view_as(
+            f"model.layers.{layer_id}.mlp.tp_experts.w2_weight",
+            (
+                self.num_global_experts,
+                self.hidden_size,
+                self.moe_intermediate_size // get_paras_tp_size(),
+            ),
+        )
+
+        handles = []
+        with torch.cuda.stream(stream):
+            for output in (tp_w13, tp_w2):
+                local = output.narrow(
+                    0, expert_start, experts_per_dp_rank
+                )
+                handles.append(
+                    dist.all_gather_into_tensor(
+                        output,
+                        local,
+                        group=dp_group,
+                        async_op=True,
+                    )
+                )
+        return handles
 
     # ------------------------------------------------------------------
     # TP→EP reverse weight redistribution helpers
@@ -683,26 +789,83 @@ class ParaSMoeBlockMixin:
 
         paras_dp_size = get_paras_dp_size()
         if paras_dp_size > 1:
-            # Asymmetric DP x TP -> EP reverse (each dp-replica reassembles EP
-            # from its own T tp-peers; redundant replicas dropped).
-            e_local = self.num_global_experts // (paras_dp_size * paras_tp_size)
-            # R is the GLOBAL ep rank: the reverse kernel derives dest_rank =
-            # (R // T) * T + peer and reads peer_buffers[dest_rank] over the
-            # EP-group ctx. tp-local rank would collide across dp-replicas.
-            paras_ep_rank = get_paras_ep_rank()
-            peer_access_fused_transfer_w13_ep_dptp(
-                local_buffer_ptr, dst_base_ptrs,
-                tp_w13_entry.offset_bytes, ep_w13_entry.offset_bytes,
-                paras_ep_rank, paras_tp_size, paras_dp_size,
-                e_local, self.hidden_size, self.moe_intermediate_size,
-                num_gates=w13_num_gates, elem_size=dtype_bytes, stream=stream,
+            e_local = self.num_global_experts // (
+                paras_dp_size * paras_tp_size
             )
-            peer_access_fused_transfer_w2_ep_dptp(
-                local_buffer_ptr, dst_base_ptrs,
-                tp_w2_entry.offset_bytes, ep_w2_entry.offset_bytes,
-                paras_ep_rank, paras_tp_size, paras_dp_size,
-                e_local, self.hidden_size, self.moe_intermediate_size,
-                elem_size=dtype_bytes, stream=stream,
+            if is_paras_ep_group_node_local():
+                # Each single-node DP replica reconstructs its own EP shard
+                # from the ranks in its TP subgroup.
+                paras_ep_rank = get_paras_ep_rank()
+                peer_access_fused_transfer_w13_ep_dptp(
+                    local_buffer_ptr,
+                    dst_base_ptrs,
+                    tp_w13_entry.offset_bytes,
+                    ep_w13_entry.offset_bytes,
+                    paras_ep_rank,
+                    paras_tp_size,
+                    paras_dp_size,
+                    e_local,
+                    self.hidden_size,
+                    self.moe_intermediate_size,
+                    num_gates=w13_num_gates,
+                    elem_size=dtype_bytes,
+                    stream=stream,
+                )
+                peer_access_fused_transfer_w2_ep_dptp(
+                    local_buffer_ptr,
+                    dst_base_ptrs,
+                    tp_w2_entry.offset_bytes,
+                    ep_w2_entry.offset_bytes,
+                    paras_ep_rank,
+                    paras_tp_size,
+                    paras_dp_size,
+                    e_local,
+                    self.hidden_size,
+                    self.moe_intermediate_size,
+                    elem_size=dtype_bytes,
+                    stream=stream,
+                )
+                return
+
+            # Multi-node TP weights are replicated. Reconstruct only the expert
+            # interval assigned to this node, using its node-local TP peers.
+            dp_expert_start = (
+                get_paras_dp_rank() * paras_tp_size * e_local
+            )
+            w13_expert_bytes = w13_num_gates * w13_chunk_elems * dtype_bytes
+            w2_expert_bytes = (
+                self.hidden_size
+                * moe_intermediate_size_after_tp
+                * dtype_bytes
+            )
+            peer_access_fused_transfer_w13_ep(
+                local_buffer_ptr,
+                dst_base_ptrs,
+                tp_w13_entry.offset_bytes
+                + dp_expert_start * w13_expert_bytes,
+                ep_w13_entry.offset_bytes,
+                paras_tp_rank,
+                paras_tp_size,
+                e_local,
+                w13_chunk_elems,
+                num_gates=w13_num_gates,
+                elem_size=dtype_bytes,
+                stream=stream,
+            )
+            peer_access_fused_transfer_w2_ep(
+                local_buffer_ptr,
+                dst_base_ptrs,
+                tp_w2_entry.offset_bytes
+                + dp_expert_start * w2_expert_bytes,
+                ep_w2_entry.offset_bytes,
+                paras_tp_rank,
+                paras_tp_size,
+                e_local,
+                hidden_size=self.hidden_size,
+                full_intermediate=self.moe_intermediate_size,
+                tp_intermediate=moe_intermediate_size_after_tp,
+                elem_size=dtype_bytes,
+                stream=stream,
             )
             return
 

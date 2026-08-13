@@ -59,9 +59,17 @@ class ParaSDecoderLayerMixin:
     def paras_configure_tp_mlp_all_to_all(self, stream, handles, staging_suffix=""):
         return self.mlp.paras_configure_tp_all_to_all(stream, handles, staging_suffix)
 
-    def paras_configure_tp_mlp_fused_peer_access_kernel(self, peer_ctx, dst_base_ptrs, stream):
+    def paras_configure_tp_mlp_fused_peer_access_kernel(
+        self, peer_ctx, dst_base_ptrs, stream
+    ):
         """Launch fused kernels for this layer (no barriers — model level manages them)."""
-        return self.mlp.paras_configure_tp_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
+        return self.mlp.paras_configure_tp_fused_peer_access_kernel(
+            peer_ctx, dst_base_ptrs, stream
+        )
+
+    def paras_configure_tp_mlp_dp_all_gather(self, stream):
+        """Replicate the node-local TP expert interval across DP ranks."""
+        return self.mlp.paras_configure_tp_dp_all_gather(stream)
 
     def paras_configure_ep_attn(self):
         """Restore attention from TP→EP for this layer (mirrors paras_configure_tp_attn)."""
