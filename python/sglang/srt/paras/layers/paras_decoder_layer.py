@@ -25,7 +25,11 @@ class ParaSDecoderLayerMixin:
     """
 
     def paras_init_layer(
-        self, config, layer_id: int, is_layer_sparse: bool, is_previous_layer_sparse: bool
+        self,
+        config,
+        layer_id: int,
+        is_layer_sparse: bool,
+        is_previous_layer_sparse: bool,
     ):
         """
         Initialize dual EP/TP communicator contexts.
@@ -49,40 +53,43 @@ class ParaSDecoderLayerMixin:
         if hasattr(self.self_attn, "paras_configure_tp"):
             self.self_attn.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
-    def paras_configure_tp_mlp(self, paras_tp_size: int, paras_tp_rank: int):
-        self.mlp.paras_configure_tp_all_gather()
-        self.mlp.paras_configure_tp_all_to_all()
+    def paras_reshard_ep_to_tp_nccl(self):
+        self.mlp.paras_reshard_ep_to_tp_nccl()
 
-    def paras_configure_tp_mlp_all_gather(self, stream, handles, async_op=False, staging_suffix=""):
-        return self.mlp.paras_configure_tp_all_gather(stream, handles, async_op, staging_suffix)
+    def paras_reshard_ep_to_tp_peer(self, dst_base_ptrs, stream):
+        self.mlp.paras_reshard_ep_to_tp_peer(dst_base_ptrs, stream)
 
-    def paras_configure_tp_mlp_all_to_all(self, stream, handles, staging_suffix=""):
-        return self.mlp.paras_configure_tp_all_to_all(stream, handles, staging_suffix)
-
-    def paras_configure_tp_mlp_fused_peer_access_kernel(
-        self, peer_ctx, dst_base_ptrs, stream
-    ):
-        """Launch fused kernels for this layer (no barriers — model level manages them)."""
-        return self.mlp.paras_configure_tp_fused_peer_access_kernel(
-            peer_ctx, dst_base_ptrs, stream
+    def paras_broadcast_ep_to_dptp_peer(self, dst_base_ptrs, ep_rank, dp_size, stream):
+        self.mlp.paras_broadcast_ep_to_dptp_peer(
+            dst_base_ptrs, ep_rank, dp_size, stream
         )
 
-    def paras_configure_tp_mlp_dp_all_gather(self, stream):
-        """Replicate the node-local TP expert interval across DP ranks."""
-        return self.mlp.paras_configure_tp_dp_all_gather(stream)
+    def paras_reshard_ep_to_tp_node_peer(self, dst_base_ptrs, dp_rank, dp_size, stream):
+        self.mlp.paras_reshard_ep_to_tp_node_peer(
+            dst_base_ptrs, dp_rank, dp_size, stream
+        )
+
+    def paras_all_gather_tp_weights(self, stream):
+        return self.mlp.paras_all_gather_tp_weights(stream)
 
     def paras_configure_ep_attn(self):
         """Restore attention from TP→EP for this layer (mirrors paras_configure_tp_attn)."""
         if hasattr(self.self_attn, "paras_configure_ep"):
             self.self_attn.paras_configure_ep()
 
-    def paras_configure_ep_mlp_naive(self):
-        """Reverse MoE weights from TP→EP via NCCL all-to-all for this layer."""
-        self.mlp.paras_configure_ep_mlp_naive()
+    def paras_reshard_tp_to_ep_nccl(self):
+        self.mlp.paras_reshard_tp_to_ep_nccl()
 
-    def paras_configure_ep_mlp_fused_peer_access_kernel(self, peer_ctx, dst_base_ptrs, stream):
-        """Launch reverse fused kernels for this layer (no barriers — model level manages them)."""
-        return self.mlp.paras_configure_ep_fused_peer_access_kernel(peer_ctx, dst_base_ptrs, stream)
+    def paras_reshard_tp_to_ep_peer(self, dst_base_ptrs, stream):
+        self.mlp.paras_reshard_tp_to_ep_peer(dst_base_ptrs, stream)
+
+    def paras_reshard_dptp_to_ep_peer(self, dst_base_ptrs, ep_rank, dp_size, stream):
+        self.mlp.paras_reshard_dptp_to_ep_peer(dst_base_ptrs, ep_rank, dp_size, stream)
+
+    def paras_reshard_tp_to_ep_node_peer(self, dst_base_ptrs, dp_rank, dp_size, stream):
+        self.mlp.paras_reshard_tp_to_ep_node_peer(
+            dst_base_ptrs, dp_rank, dp_size, stream
+        )
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):

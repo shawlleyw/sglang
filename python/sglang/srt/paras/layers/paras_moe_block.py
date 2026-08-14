@@ -5,6 +5,7 @@ Extracted from Qwen3MoeSparseMoeBlockParaS to enable any MoE model
 to inherit ParaS parallelism-switching logic (EP ↔ TP).
 """
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -17,11 +18,9 @@ from sglang.srt.paras.paras_parallel_state import (
     get_paras_dp_group,
     get_paras_dp_rank,
     get_paras_dp_size,
-    get_paras_ep_rank,
     get_paras_tp_group,
     get_paras_tp_rank,
     get_paras_tp_size,
-    is_paras_ep_group_node_local,
 )
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 from sglang.srt.paras.peer_access import (
@@ -37,6 +36,30 @@ from sglang.srt.paras.peer_access import (
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, set_weight_attrs
+
+
+@dataclass(frozen=True)
+class _WeightTransferLayout:
+    local_buffer_ptr: int
+    ep_w13_offset: int
+    ep_w2_offset: int
+    tp_w13_offset: int
+    tp_w2_offset: int
+    tp_size: int
+    tp_rank: int
+    tp_intermediate: int
+    dtype_bytes: int
+    w13_num_gates: int
+    w13_chunk_elems: int
+    hidden_size: int
+
+    @property
+    def w13_expert_bytes(self) -> int:
+        return self.w13_num_gates * self.w13_chunk_elems * self.dtype_bytes
+
+    @property
+    def w2_expert_bytes(self) -> int:
+        return self.hidden_size * self.tp_intermediate * self.dtype_bytes
 
 
 class ParaSMoeBlockMixin:
@@ -198,46 +221,11 @@ class ParaSMoeBlockMixin:
     # Weight redistribution helpers
     # ------------------------------------------------------------------
 
-    def paras_configure_tp_all_gather(self, stream=None, handles=None, async_op=False, staging_suffix=""):
-        handles = handles or []
-
-        paras_dp_size = get_paras_dp_size()
-        if paras_dp_size > 1:
-            raise NotImplementedError(
-                "paras dp_size>1 NCCL all-gather path was removed; use the "
-                "peer_access dptp kernels (peer_access_fused_transfer_w{13,2}_dptp) instead."
-            )
-
-        all_gather_handles = []
-        with torch.cuda.stream(stream):
-            for handle in handles:
-                handle.wait()
-            self.w13_ep_gathered = self.ep_experts.w13_weight.data.view(
-                self.num_local_experts,
-                2 * self.moe_intermediate_size,
-                self.hidden_size,
-            )
-            self.w2_ep_gathered = self.ep_experts.w2_weight.data.view(
-                self.num_local_experts,
-                self.hidden_size,
-                self.moe_intermediate_size,
-            )
-
-        if async_op:
-            return all_gather_handles
-        else:
-            for handle in all_gather_handles:
-                handle.wait()
-
-    def paras_configure_tp_all_to_all(self, stream=None, handles=None, staging_suffix=""):
-        handles = handles or []
-
-        paras_dp_size = get_paras_dp_size()
-        if paras_dp_size > 1:
-            raise NotImplementedError(
-                "paras dp_size>1 NCCL all-to-all path was removed; use the "
-                "peer_access dptp kernels (peer_access_fused_transfer_w{13,2}_dptp) instead."
-            )
+    def paras_reshard_ep_to_tp_nccl(self):
+        """Reshard one EP layer into TP layout with NCCL all-to-all."""
+        assert (
+            get_paras_dp_size() == 1
+        ), "The ParaS NCCL weight transfer supports only dp_size=1"
 
         mgr = get_global_paras_memory_manager()
         paras_tp_size = get_paras_tp_size()
@@ -246,68 +234,70 @@ class ParaSMoeBlockMixin:
         layer_id = self._paras_layer_id
         tp_w13_name = f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"
         tp_w2_name = f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"
-
-        with torch.cuda.stream(stream):
-            for handle in handles:
-                handle.wait()
-
-            if self._paras_interleaved_w13:
-                w13_ep = self.w13_ep_gathered.view(
-                    self.num_local_experts,
-                    paras_tp_size,
-                    2 * moe_intermediate_size_after_tp * self.hidden_size,
-                )
-                w13_ep_permuted = mgr.get_view(
-                    f"staging.w13_pre_permute{staging_suffix}"
-                ).view(
-                    paras_tp_size,
-                    self.num_local_experts,
-                    2 * moe_intermediate_size_after_tp * self.hidden_size,
-                )
-                w13_ep_permuted.copy_(w13_ep.permute(1, 0, 2))
-            else:
-                w13_ep = self.w13_ep_gathered.view(
-                    self.num_local_experts,
-                    2,
-                    paras_tp_size,
-                    moe_intermediate_size_after_tp * self.hidden_size,
-                )
-                w13_ep_permuted = mgr.get_view(f"staging.w13_pre_permute{staging_suffix}").view(
-                    paras_tp_size, self.num_local_experts, 2,
-                    moe_intermediate_size_after_tp * self.hidden_size,
-                )
-                w13_ep_permuted.copy_(w13_ep.permute(2, 0, 1, 3))
-
-            w13_tp = mgr.get_view(tp_w13_name).reshape(self.w13_ep_gathered.shape)
-            w13_handle = dist.all_to_all_single(
-                output=w13_tp,
-                input=w13_ep_permuted.view(self.w13_ep_gathered.shape),
-                group=paras_tp_group,
-                async_op=True,
-            )
-
-            w2_ep = self.w2_ep_gathered.view(
+        w13_ep_gathered = self.ep_experts.w13_weight.data.view(
+            self.num_local_experts,
+            2 * self.moe_intermediate_size,
+            self.hidden_size,
+        )
+        if self._paras_interleaved_w13:
+            w13_ep = w13_ep_gathered.view(
                 self.num_local_experts,
-                self.hidden_size,
                 paras_tp_size,
-                moe_intermediate_size_after_tp,
+                2 * moe_intermediate_size_after_tp * self.hidden_size,
             )
-            w2_ep_permuted = mgr.get_view(f"staging.w2_pre_permute{staging_suffix}").view(
-                paras_tp_size, self.num_local_experts, self.hidden_size,
-                moe_intermediate_size_after_tp,
+            w13_ep_permuted = mgr.get_view("staging.w13_pre_permute").view(
+                paras_tp_size,
+                self.num_local_experts,
+                2 * moe_intermediate_size_after_tp * self.hidden_size,
             )
-            w2_ep_permuted.copy_(w2_ep.permute(2, 0, 1, 3))
+            w13_ep_permuted.copy_(w13_ep.permute(1, 0, 2))
+        else:
+            w13_ep = w13_ep_gathered.view(
+                self.num_local_experts,
+                2,
+                paras_tp_size,
+                moe_intermediate_size_after_tp * self.hidden_size,
+            )
+            w13_ep_permuted = mgr.get_view("staging.w13_pre_permute").view(
+                paras_tp_size,
+                self.num_local_experts,
+                2,
+                moe_intermediate_size_after_tp * self.hidden_size,
+            )
+            w13_ep_permuted.copy_(w13_ep.permute(2, 0, 1, 3))
 
-            w2_tp = mgr.get_view(tp_w2_name).reshape(self.w2_ep_gathered.shape)
-            w2_handle = dist.all_to_all_single(
-                output=w2_tp,
-                input=w2_ep_permuted.view(self.w2_ep_gathered.shape),
-                group=paras_tp_group,
-                async_op=True,
-            )
+        w13_tp = mgr.get_view(tp_w13_name).reshape(w13_ep_gathered.shape)
+        dist.all_to_all_single(
+            output=w13_tp,
+            input=w13_ep_permuted.view(w13_ep_gathered.shape),
+            group=paras_tp_group,
+        )
 
-            w13_handle.wait()
-            w2_handle.wait()
+        w2_ep_gathered = self.ep_experts.w2_weight.data.view(
+            self.num_local_experts,
+            self.hidden_size,
+            self.moe_intermediate_size,
+        )
+        w2_ep = w2_ep_gathered.view(
+            self.num_local_experts,
+            self.hidden_size,
+            paras_tp_size,
+            moe_intermediate_size_after_tp,
+        )
+        w2_ep_permuted = mgr.get_view("staging.w2_pre_permute").view(
+            paras_tp_size,
+            self.num_local_experts,
+            self.hidden_size,
+            moe_intermediate_size_after_tp,
+        )
+        w2_ep_permuted.copy_(w2_ep.permute(2, 0, 1, 3))
+
+        w2_tp = mgr.get_view(tp_w2_name).reshape(w2_ep_gathered.shape)
+        dist.all_to_all_single(
+            output=w2_tp,
+            input=w2_ep_permuted.view(w2_ep_gathered.shape),
+            group=paras_tp_group,
+        )
 
     def _paras_gather_full_from_ep(self, local_param: nn.Parameter) -> torch.Tensor:
         """All-gather a per-rank EP-sliced Parameter into a full
@@ -351,9 +341,7 @@ class ParaSMoeBlockMixin:
         paras_tp_size = get_paras_tp_size()
         paras_tp_rank = get_paras_tp_rank()
 
-        full_w13_bias = self._paras_gather_full_from_ep(
-            self.ep_experts.w13_weight_bias
-        )
+        full_w13_bias = self._paras_gather_full_from_ep(self.ep_experts.w13_weight_bias)
         i_per_tp = self.moe_intermediate_size // paras_tp_size
         tp_w13_bias = full_w13_bias[
             :,
@@ -421,8 +409,9 @@ class ParaSMoeBlockMixin:
             two_i_blocks_per_tp = 2 * i_blocks_per_tp
             tp_w13_scale = full_w13_scale[
                 :,
-                paras_tp_rank * two_i_blocks_per_tp
-                : (paras_tp_rank + 1) * two_i_blocks_per_tp,
+                paras_tp_rank
+                * two_i_blocks_per_tp : (paras_tp_rank + 1)
+                * two_i_blocks_per_tp,
                 :,
             ].contiguous()
         else:
@@ -454,152 +443,161 @@ class ParaSMoeBlockMixin:
         set_weight_attrs(tp_w2_param, self.tp_experts.extra_weight_attrs)
         self.tp_experts.register_parameter(scale_name_w2, tp_w2_param)
 
-    def paras_configure_tp_fused_peer_access_kernel(
-        self,
-        peer_ctx,
-        dst_base_ptrs: torch.Tensor,
-        stream=None,
-    ):
-        """Launch NVLink-optimized v2 peer access kernels for this layer. NO barriers — caller manages them.
-
-        Four-anchor layout (EP low / TP high): TP weight layer i overlaps EP
-        weight layer i+1, so the caller (paras_model) drives EP->TP in REVERSE
-        layer order with a per-layer barrier, ensuring layer i+1 is read before
-        layer i's TP weights are written.
-
-        w13 layout dispatch:
-          - Qwen3 (concat [g0..g_I, u0..u_I]): num_gates=2, chunk=I'*H per (e, k)
-          - GPT-OSS (interleaved [g0,u0,g1,u1,...]): num_gates=1, chunk=2*I'*H per
-            (e,) since each rank's slab is 2*I'*H contiguous interleaved bytes.
-            The kernel copies contiguous bytes regardless of interpretation, so
-            the interleaving is preserved end-to-end with no .cu changes.
-        """
+    def _paras_weight_transfer_layout(self) -> _WeightTransferLayout:
         mgr = get_global_paras_memory_manager()
-        paras_tp_size = get_paras_tp_size()
-        paras_tp_rank = get_paras_tp_rank()
+        tp_size = get_paras_tp_size()
         layer_id = self._paras_layer_id
-        moe_intermediate_size_after_tp = self.moe_intermediate_size // paras_tp_size
+        if self.moe_intermediate_size % tp_size != 0:
+            raise ValueError(
+                "ParaS weight transfer requires moe_intermediate_size to be "
+                f"divisible by tp_size, got {self.moe_intermediate_size=} and "
+                f"{tp_size=}"
+            )
+        tp_intermediate = self.moe_intermediate_size // tp_size
 
-        ep_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.ep_experts.w13_weight"]
+        ep_w13_entry = mgr._entries[
+            f"model.layers.{layer_id}.mlp.ep_experts.w13_weight"
+        ]
         ep_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.ep_experts.w2_weight"]
-
-        # TP alias entries — uniform lookup, no layer_id branching
-        tp_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"]
+        tp_w13_entry = mgr._entries[
+            f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"
+        ]
         tp_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"]
-
-        local_buffer_ptr = mgr._buffer.data_ptr()
-        dtype_bytes = ep_w13_entry.dtype.itemsize
 
         if self._paras_interleaved_w13:
             w13_num_gates = 1
-            w13_chunk_elems = 2 * moe_intermediate_size_after_tp * self.hidden_size
+            w13_chunk_elems = 2 * tp_intermediate * self.hidden_size
         else:
             w13_num_gates = 2
-            w13_chunk_elems = moe_intermediate_size_after_tp * self.hidden_size
+            w13_chunk_elems = tp_intermediate * self.hidden_size
 
-        paras_dp_size = get_paras_dp_size()
-        if paras_dp_size > 1:
-            e_local = self.num_global_experts // (
-                paras_dp_size * paras_tp_size
-            )
-            if is_paras_ep_group_node_local():
-                # A single-node dptp launch broadcasts each EP shard directly
-                # to every DP replica.
-                paras_ep_rank = get_paras_ep_rank()
-                peer_access_fused_transfer_w13_dptp(
-                    local_buffer_ptr,
-                    dst_base_ptrs,
-                    ep_w13_entry.offset_bytes,
-                    tp_w13_entry.offset_bytes,
-                    paras_ep_rank,
-                    paras_tp_size,
-                    paras_dp_size,
-                    e_local,
-                    self.hidden_size,
-                    self.moe_intermediate_size,
-                    num_gates=w13_num_gates,
-                    elem_size=dtype_bytes,
-                    stream=stream,
-                )
-                peer_access_fused_transfer_w2_dptp(
-                    local_buffer_ptr,
-                    dst_base_ptrs,
-                    ep_w2_entry.offset_bytes,
-                    tp_w2_entry.offset_bytes,
-                    paras_ep_rank,
-                    paras_tp_size,
-                    paras_dp_size,
-                    e_local,
-                    self.hidden_size,
-                    self.moe_intermediate_size,
-                    elem_size=dtype_bytes,
-                    stream=stream,
-                )
-                return
+        return _WeightTransferLayout(
+            local_buffer_ptr=mgr._buffer.data_ptr(),
+            ep_w13_offset=ep_w13_entry.offset_bytes,
+            ep_w2_offset=ep_w2_entry.offset_bytes,
+            tp_w13_offset=tp_w13_entry.offset_bytes,
+            tp_w2_offset=tp_w2_entry.offset_bytes,
+            tp_size=tp_size,
+            tp_rank=get_paras_tp_rank(),
+            tp_intermediate=tp_intermediate,
+            dtype_bytes=ep_w13_entry.dtype.itemsize,
+            w13_num_gates=w13_num_gates,
+            w13_chunk_elems=w13_chunk_elems,
+            hidden_size=self.hidden_size,
+        )
 
-            # Multi-node: reshard the current node's EP experts into their final
-            # canonical TP interval. A subsequent in-place DP all-gather fills
-            # the other node intervals without a staging allocation.
-            dp_expert_start = (
-                get_paras_dp_rank() * paras_tp_size * e_local
+    def _paras_experts_per_ep_rank(
+        self, layout: _WeightTransferLayout, dp_size: int
+    ) -> int:
+        ep_size = dp_size * layout.tp_size
+        if self.num_global_experts % ep_size != 0:
+            raise ValueError(
+                "ParaS weight transfer requires num_global_experts to be "
+                f"divisible by dp_size * tp_size, got {self.num_global_experts=}, "
+                f"{dp_size=}, and tp_size={layout.tp_size}"
             )
-            w13_expert_bytes = w13_num_gates * w13_chunk_elems * dtype_bytes
-            w2_expert_bytes = (
-                self.hidden_size
-                * moe_intermediate_size_after_tp
-                * dtype_bytes
-            )
-            peer_access_fused_transfer_w13_v2(
-                local_buffer_ptr,
-                dst_base_ptrs,
-                ep_w13_entry.offset_bytes,
-                tp_w13_entry.offset_bytes
-                + dp_expert_start * w13_expert_bytes,
-                paras_tp_rank,
-                paras_tp_size,
-                e_local,
-                w13_chunk_elems,
-                num_gates=w13_num_gates,
-                elem_size=dtype_bytes,
-                stream=stream,
-            )
-            peer_access_fused_transfer_w2_v2(
-                local_buffer_ptr,
-                dst_base_ptrs,
-                ep_w2_entry.offset_bytes,
-                tp_w2_entry.offset_bytes
-                + dp_expert_start * w2_expert_bytes,
-                paras_tp_rank,
-                paras_tp_size,
-                e_local,
-                hidden_size=self.hidden_size,
-                full_intermediate=self.moe_intermediate_size,
-                tp_intermediate=moe_intermediate_size_after_tp,
-                elem_size=dtype_bytes,
-                stream=stream,
-            )
-            return
+        return self.num_global_experts // ep_size
 
+    def _paras_reshard_ep_to_tp_peer(
+        self,
+        dst_base_ptrs: torch.Tensor,
+        num_local_experts: int,
+        dst_expert_start: int,
+        stream=None,
+    ):
+        layout = self._paras_weight_transfer_layout()
         peer_access_fused_transfer_w13_v2(
-            local_buffer_ptr, dst_base_ptrs,
-            ep_w13_entry.offset_bytes, tp_w13_entry.offset_bytes,
-            paras_tp_rank, paras_tp_size,
-            self.num_local_experts,
-            w13_chunk_elems,
-            num_gates=w13_num_gates, elem_size=dtype_bytes, stream=stream,
+            layout.local_buffer_ptr,
+            dst_base_ptrs,
+            layout.ep_w13_offset,
+            layout.tp_w13_offset + dst_expert_start * layout.w13_expert_bytes,
+            layout.tp_rank,
+            layout.tp_size,
+            num_local_experts,
+            layout.w13_chunk_elems,
+            num_gates=layout.w13_num_gates,
+            elem_size=layout.dtype_bytes,
+            stream=stream,
         )
         peer_access_fused_transfer_w2_v2(
-            local_buffer_ptr, dst_base_ptrs,
-            ep_w2_entry.offset_bytes, tp_w2_entry.offset_bytes,
-            paras_tp_rank, paras_tp_size,
-            self.num_local_experts,
-            hidden_size=self.hidden_size,
+            layout.local_buffer_ptr,
+            dst_base_ptrs,
+            layout.ep_w2_offset,
+            layout.tp_w2_offset + dst_expert_start * layout.w2_expert_bytes,
+            layout.tp_rank,
+            layout.tp_size,
+            num_local_experts,
+            hidden_size=layout.hidden_size,
             full_intermediate=self.moe_intermediate_size,
-            tp_intermediate=moe_intermediate_size_after_tp,
-            elem_size=dtype_bytes, stream=stream,
+            tp_intermediate=layout.tp_intermediate,
+            elem_size=layout.dtype_bytes,
+            stream=stream,
         )
 
-    def paras_configure_tp_dp_all_gather(self, stream=None):
+    def paras_reshard_ep_to_tp_peer(self, dst_base_ptrs: torch.Tensor, stream=None):
+        self._paras_reshard_ep_to_tp_peer(
+            dst_base_ptrs,
+            num_local_experts=self.num_local_experts,
+            dst_expert_start=0,
+            stream=stream,
+        )
+
+    def paras_broadcast_ep_to_dptp_peer(
+        self,
+        dst_base_ptrs: torch.Tensor,
+        ep_rank: int,
+        dp_size: int,
+        stream=None,
+    ):
+        layout = self._paras_weight_transfer_layout()
+        num_local_experts = self._paras_experts_per_ep_rank(layout, dp_size)
+        peer_access_fused_transfer_w13_dptp(
+            layout.local_buffer_ptr,
+            dst_base_ptrs,
+            layout.ep_w13_offset,
+            layout.tp_w13_offset,
+            ep_rank,
+            layout.tp_size,
+            dp_size,
+            num_local_experts,
+            layout.hidden_size,
+            self.moe_intermediate_size,
+            num_gates=layout.w13_num_gates,
+            elem_size=layout.dtype_bytes,
+            stream=stream,
+        )
+        peer_access_fused_transfer_w2_dptp(
+            layout.local_buffer_ptr,
+            dst_base_ptrs,
+            layout.ep_w2_offset,
+            layout.tp_w2_offset,
+            ep_rank,
+            layout.tp_size,
+            dp_size,
+            num_local_experts,
+            layout.hidden_size,
+            self.moe_intermediate_size,
+            elem_size=layout.dtype_bytes,
+            stream=stream,
+        )
+
+    def paras_reshard_ep_to_tp_node_peer(
+        self,
+        dst_base_ptrs: torch.Tensor,
+        dp_rank: int,
+        dp_size: int,
+        stream=None,
+    ):
+        layout = self._paras_weight_transfer_layout()
+        num_local_experts = self._paras_experts_per_ep_rank(layout, dp_size)
+        self._paras_reshard_ep_to_tp_peer(
+            dst_base_ptrs,
+            num_local_experts=num_local_experts,
+            dst_expert_start=dp_rank * layout.tp_size * num_local_experts,
+            stream=stream,
+        )
+
+    def paras_all_gather_tp_weights(self, stream=None):
         """Replicate this node's final TP expert interval across DP ranks.
 
         The local input is already stored at the NCCL in-place position within
@@ -607,7 +605,6 @@ class ParaSMoeBlockMixin:
         """
 
         assert get_paras_dp_size() > 1
-        assert not is_paras_ep_group_node_local()
 
         mgr = get_global_paras_memory_manager()
         layer_id = self._paras_layer_id
@@ -635,9 +632,7 @@ class ParaSMoeBlockMixin:
         handles = []
         with torch.cuda.stream(stream):
             for output in (tp_w13, tp_w2):
-                local = output.narrow(
-                    0, expert_start, experts_per_dp_rank
-                )
+                local = output.narrow(0, expert_start, experts_per_dp_rank)
                 handles.append(
                     dist.all_gather_into_tensor(
                         output,
@@ -652,19 +647,14 @@ class ParaSMoeBlockMixin:
     # TP→EP reverse weight redistribution helpers
     # ------------------------------------------------------------------
 
-    def paras_configure_ep_mlp_naive(self):
-        """Naive TP→EP reverse weight transfer via NCCL all_to_all (inverse of EP→TP).
-
-        Reads from TP slot[i], all_to_all, inverse permute, writes to EP slot[i+1].
-        Currently only supports dp_size==1.
-        """
+    def paras_reshard_tp_to_ep_nccl(self):
+        """Reshard one TP layer into EP layout with NCCL all-to-all."""
         mgr = get_global_paras_memory_manager()
         paras_tp_size = get_paras_tp_size()
         paras_tp_group = get_paras_tp_group().device_group
-        paras_dp_size = get_paras_dp_size()
-        assert paras_dp_size == 1, (
-            "paras_configure_ep_mlp_naive only supports dp_size==1"
-        )
+        assert (
+            get_paras_dp_size() == 1
+        ), "The ParaS NCCL weight transfer supports only dp_size=1"
 
         moe_inter_tp = self.moe_intermediate_size // paras_tp_size
         layer_id = self._paras_layer_id
@@ -677,11 +667,13 @@ class ParaSMoeBlockMixin:
         )
         if self._paras_interleaved_w13:
             tp_w13_for_a2a = tp_w13.view(
-                paras_tp_size, self.num_local_experts,
+                paras_tp_size,
+                self.num_local_experts,
                 2 * moe_inter_tp * self.hidden_size,
             )
             staging_w13 = mgr.get_view("staging.w13_pre_permute").view(
-                paras_tp_size, self.num_local_experts,
+                paras_tp_size,
+                self.num_local_experts,
                 2 * moe_inter_tp * self.hidden_size,
             )
             dist.all_to_all_single(
@@ -690,17 +682,22 @@ class ParaSMoeBlockMixin:
                 group=paras_tp_group,
             )
             ep_w13 = self.ep_experts.w13_weight.data.view(
-                self.num_local_experts, paras_tp_size,
+                self.num_local_experts,
+                paras_tp_size,
                 2 * moe_inter_tp * self.hidden_size,
             )
             ep_w13.copy_(staging_w13.permute(1, 0, 2))
         else:
             tp_w13_for_a2a = tp_w13.view(
-                paras_tp_size, self.num_local_experts, 2,
+                paras_tp_size,
+                self.num_local_experts,
+                2,
                 moe_inter_tp * self.hidden_size,
             )
             staging_w13 = mgr.get_view("staging.w13_pre_permute").view(
-                paras_tp_size, self.num_local_experts, 2,
+                paras_tp_size,
+                self.num_local_experts,
+                2,
                 moe_inter_tp * self.hidden_size,
             )
             dist.all_to_all_single(
@@ -709,7 +706,9 @@ class ParaSMoeBlockMixin:
                 group=paras_tp_group,
             )
             ep_w13 = self.ep_experts.w13_weight.data.view(
-                self.num_local_experts, 2, paras_tp_size,
+                self.num_local_experts,
+                2,
+                paras_tp_size,
                 moe_inter_tp * self.hidden_size,
             )
             ep_w13.copy_(staging_w13.permute(1, 2, 0, 3))
@@ -720,12 +719,16 @@ class ParaSMoeBlockMixin:
             (self.num_global_experts, self.hidden_size, moe_inter_tp),
         )
         tp_w2_for_a2a = tp_w2.view(
-            paras_tp_size, self.num_local_experts, self.hidden_size,
+            paras_tp_size,
+            self.num_local_experts,
+            self.hidden_size,
             moe_inter_tp,
         )
 
         staging_w2 = mgr.get_view("staging.w2_pre_permute").view(
-            paras_tp_size, self.num_local_experts, self.hidden_size,
+            paras_tp_size,
+            self.num_local_experts,
+            self.hidden_size,
             moe_inter_tp,
         )
         dist.all_to_all_single(
@@ -735,7 +738,9 @@ class ParaSMoeBlockMixin:
         )
 
         ep_w2 = self.ep_experts.w2_weight.data.view(
-            self.num_local_experts, self.hidden_size, paras_tp_size,
+            self.num_local_experts,
+            self.hidden_size,
+            paras_tp_size,
             moe_inter_tp,
         )
         ep_w2.copy_(staging_w2.permute(1, 2, 0, 3))
@@ -744,153 +749,103 @@ class ParaSMoeBlockMixin:
         # are views into self._full_*_bias which was populated in full on
         # every rank at load time.
 
-    def paras_configure_ep_fused_peer_access_kernel(
+    def _paras_reshard_tp_to_ep_peer(
         self,
-        peer_ctx,
         dst_base_ptrs: torch.Tensor,
+        num_local_experts: int,
+        src_expert_start: int,
         stream=None,
     ):
-        """Launch TP→EP NVLink peer access kernels for this layer.
-
-        NO barriers — caller manages per-layer synchronization.
-        Four-anchor layout: EP weight layer i+1 overlaps TP weight layer i, so
-        the caller drives TP->EP in FORWARD (0->N-1) layer order, ensuring layer
-        i is read before layer i+1's EP weights are written.
-
-        w13 layout dispatch matches the EP→TP path (see
-        ``paras_configure_tp_fused_peer_access_kernel``): GPT-OSS
-        interleaved layout uses ``num_gates=1`` and
-        ``chunk=2*I'*H`` so the contiguous (g,u) pairs stay contiguous.
-        """
-        mgr = get_global_paras_memory_manager()
-        paras_tp_size = get_paras_tp_size()
-        paras_tp_rank = get_paras_tp_rank()
-        layer_id = self._paras_layer_id
-        moe_intermediate_size_after_tp = self.moe_intermediate_size // paras_tp_size
-
-        # Biases require no TP->EP transport: ep_experts views into
-        # self._full_*_bias which was populated in full on every rank at
-        # load time.
-
-        tp_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.tp_experts.w13_weight"]
-        tp_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.tp_experts.w2_weight"]
-        ep_w13_entry = mgr._entries[f"model.layers.{layer_id}.mlp.ep_experts.w13_weight"]
-        ep_w2_entry = mgr._entries[f"model.layers.{layer_id}.mlp.ep_experts.w2_weight"]
-
-        local_buffer_ptr = mgr._buffer.data_ptr()
-        dtype_bytes = tp_w13_entry.dtype.itemsize
-
-        if self._paras_interleaved_w13:
-            w13_num_gates = 1
-            w13_chunk_elems = 2 * moe_intermediate_size_after_tp * self.hidden_size
-        else:
-            w13_num_gates = 2
-            w13_chunk_elems = moe_intermediate_size_after_tp * self.hidden_size
-
-        paras_dp_size = get_paras_dp_size()
-        if paras_dp_size > 1:
-            e_local = self.num_global_experts // (
-                paras_dp_size * paras_tp_size
-            )
-            if is_paras_ep_group_node_local():
-                # Each single-node DP replica reconstructs its own EP shard
-                # from the ranks in its TP subgroup.
-                paras_ep_rank = get_paras_ep_rank()
-                peer_access_fused_transfer_w13_ep_dptp(
-                    local_buffer_ptr,
-                    dst_base_ptrs,
-                    tp_w13_entry.offset_bytes,
-                    ep_w13_entry.offset_bytes,
-                    paras_ep_rank,
-                    paras_tp_size,
-                    paras_dp_size,
-                    e_local,
-                    self.hidden_size,
-                    self.moe_intermediate_size,
-                    num_gates=w13_num_gates,
-                    elem_size=dtype_bytes,
-                    stream=stream,
-                )
-                peer_access_fused_transfer_w2_ep_dptp(
-                    local_buffer_ptr,
-                    dst_base_ptrs,
-                    tp_w2_entry.offset_bytes,
-                    ep_w2_entry.offset_bytes,
-                    paras_ep_rank,
-                    paras_tp_size,
-                    paras_dp_size,
-                    e_local,
-                    self.hidden_size,
-                    self.moe_intermediate_size,
-                    elem_size=dtype_bytes,
-                    stream=stream,
-                )
-                return
-
-            # Multi-node TP weights are replicated, but EP rank d*T+t owns only
-            # E/(G*T) experts from node interval [d*E/G, (d+1)*E/G). Shift the
-            # source base to that interval and run the production v2 reverse
-            # kernel over the T node-local peers. Experts outside the interval
-            # are never read, so no cross-node collective is needed.
-            node_expert_start = (
-                get_paras_dp_rank() * paras_tp_size * e_local
-            )
-            w13_expert_bytes = w13_num_gates * w13_chunk_elems * dtype_bytes
-            w2_expert_bytes = (
-                self.hidden_size
-                * moe_intermediate_size_after_tp
-                * dtype_bytes
-            )
-            peer_access_fused_transfer_w13_ep(
-                local_buffer_ptr,
-                dst_base_ptrs,
-                tp_w13_entry.offset_bytes
-                + node_expert_start * w13_expert_bytes,
-                ep_w13_entry.offset_bytes,
-                paras_tp_rank,
-                paras_tp_size,
-                e_local,
-                w13_chunk_elems,
-                num_gates=w13_num_gates,
-                elem_size=dtype_bytes,
-                stream=stream,
-                variant="v2",
-            )
-            peer_access_fused_transfer_w2_ep(
-                local_buffer_ptr,
-                dst_base_ptrs,
-                tp_w2_entry.offset_bytes
-                + node_expert_start * w2_expert_bytes,
-                ep_w2_entry.offset_bytes,
-                paras_tp_rank,
-                paras_tp_size,
-                e_local,
-                hidden_size=self.hidden_size,
-                full_intermediate=self.moe_intermediate_size,
-                tp_intermediate=moe_intermediate_size_after_tp,
-                elem_size=dtype_bytes,
-                stream=stream,
-                variant="v2",
-            )
-            return
-
+        layout = self._paras_weight_transfer_layout()
         peer_access_fused_transfer_w13_ep(
-            local_buffer_ptr, dst_base_ptrs,
-            tp_w13_entry.offset_bytes, ep_w13_entry.offset_bytes,
-            paras_tp_rank, paras_tp_size,
-            self.num_local_experts,
-            w13_chunk_elems,
-            num_gates=w13_num_gates, elem_size=dtype_bytes, stream=stream,
+            layout.local_buffer_ptr,
+            dst_base_ptrs,
+            layout.tp_w13_offset + src_expert_start * layout.w13_expert_bytes,
+            layout.ep_w13_offset,
+            layout.tp_rank,
+            layout.tp_size,
+            num_local_experts,
+            layout.w13_chunk_elems,
+            num_gates=layout.w13_num_gates,
+            elem_size=layout.dtype_bytes,
+            stream=stream,
         )
         peer_access_fused_transfer_w2_ep(
-            local_buffer_ptr, dst_base_ptrs,
-            tp_w2_entry.offset_bytes, ep_w2_entry.offset_bytes,
-            paras_tp_rank, paras_tp_size,
-            self.num_local_experts,
-            hidden_size=self.hidden_size,
+            layout.local_buffer_ptr,
+            dst_base_ptrs,
+            layout.tp_w2_offset + src_expert_start * layout.w2_expert_bytes,
+            layout.ep_w2_offset,
+            layout.tp_rank,
+            layout.tp_size,
+            num_local_experts,
+            hidden_size=layout.hidden_size,
             full_intermediate=self.moe_intermediate_size,
-            tp_intermediate=moe_intermediate_size_after_tp,
-            elem_size=dtype_bytes, stream=stream,
+            tp_intermediate=layout.tp_intermediate,
+            elem_size=layout.dtype_bytes,
+            stream=stream,
+        )
+
+    def paras_reshard_tp_to_ep_peer(self, dst_base_ptrs: torch.Tensor, stream=None):
+        self._paras_reshard_tp_to_ep_peer(
+            dst_base_ptrs,
+            num_local_experts=self.num_local_experts,
+            src_expert_start=0,
+            stream=stream,
+        )
+
+    def paras_reshard_dptp_to_ep_peer(
+        self,
+        dst_base_ptrs: torch.Tensor,
+        ep_rank: int,
+        dp_size: int,
+        stream=None,
+    ):
+        layout = self._paras_weight_transfer_layout()
+        num_local_experts = self._paras_experts_per_ep_rank(layout, dp_size)
+        peer_access_fused_transfer_w13_ep_dptp(
+            layout.local_buffer_ptr,
+            dst_base_ptrs,
+            layout.tp_w13_offset,
+            layout.ep_w13_offset,
+            ep_rank,
+            layout.tp_size,
+            dp_size,
+            num_local_experts,
+            layout.hidden_size,
+            self.moe_intermediate_size,
+            num_gates=layout.w13_num_gates,
+            elem_size=layout.dtype_bytes,
+            stream=stream,
+        )
+        peer_access_fused_transfer_w2_ep_dptp(
+            layout.local_buffer_ptr,
+            dst_base_ptrs,
+            layout.tp_w2_offset,
+            layout.ep_w2_offset,
+            ep_rank,
+            layout.tp_size,
+            dp_size,
+            num_local_experts,
+            layout.hidden_size,
+            self.moe_intermediate_size,
+            elem_size=layout.dtype_bytes,
+            stream=stream,
+        )
+
+    def paras_reshard_tp_to_ep_node_peer(
+        self,
+        dst_base_ptrs: torch.Tensor,
+        dp_rank: int,
+        dp_size: int,
+        stream=None,
+    ):
+        layout = self._paras_weight_transfer_layout()
+        num_local_experts = self._paras_experts_per_ep_rank(layout, dp_size)
+        self._paras_reshard_tp_to_ep_peer(
+            dst_base_ptrs,
+            num_local_experts=num_local_experts,
+            src_expert_start=dp_rank * layout.tp_size * num_local_experts,
+            stream=stream,
         )
 
     # ------------------------------------------------------------------

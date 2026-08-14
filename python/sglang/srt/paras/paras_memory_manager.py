@@ -36,6 +36,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.paras.weight_transfer import (
+    WeightTransferMethod,
+    resolve_weight_transfer_method,
+)
+
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
@@ -1193,6 +1198,39 @@ def get_global_paras_memory_manager() -> Optional[ParaSMemoryManager]:
 # Qwen MoE layout planning
 # ---------------------------------------------------------------------------
 
+
+def _validate_moe_parallel_layout(
+    *,
+    num_experts: int,
+    intermediate_size: int,
+    num_heads: int,
+    ep_size: int,
+    tp_size: int,
+    dp_size: int,
+) -> None:
+    if min(ep_size, tp_size, dp_size) <= 0:
+        raise ValueError(
+            "ParaS parallel sizes must be positive, got "
+            f"{ep_size=}, {tp_size=}, and {dp_size=}"
+        )
+    if ep_size != dp_size * tp_size:
+        raise ValueError(
+            "ParaS requires ep_size == dp_size * tp_size, got "
+            f"{ep_size=}, {dp_size=}, and {tp_size=}"
+        )
+    for name, value, divisor in (
+        ("num_experts", num_experts, ep_size),
+        ("intermediate_size", intermediate_size, tp_size),
+        ("num_heads", num_heads, tp_size),
+    ):
+        if value % divisor != 0:
+            parallel_size = "ep_size" if name == "num_experts" else "tp_size"
+            raise ValueError(
+                f"ParaS requires {name} to be divisible by {parallel_size}, "
+                f"got {value} and {divisor}"
+            )
+
+
 def plan_qwen_moe_layout(
     manager: ParaSMemoryManager,
     *,
@@ -1210,7 +1248,7 @@ def plan_qwen_moe_layout(
     quant_name: Optional[str] = None,
     fp8_block_size: Optional[int] = None,
     num_fused_shared_experts: int = 0,
-    configure_method: str = "peer_access",
+    configure_method: str = WeightTransferMethod.DIRECT.value,
     prefix: str = "model",
 ) -> None:
     """
@@ -1233,6 +1271,20 @@ def plan_qwen_moe_layout(
       modifying the original full weight and enables efficient in-place operations.
     """
     _validate_v1_scope(num_fused_shared_experts, quant_name)
+    _validate_moe_parallel_layout(
+        num_experts=num_experts,
+        intermediate_size=intermediate_size,
+        num_heads=num_heads,
+        ep_size=ep_size,
+        tp_size=tp_size,
+        dp_size=dp_size,
+    )
+    transfer_method = resolve_weight_transfer_method(configure_method)
+    if transfer_method is WeightTransferMethod.NCCL and dp_size != 1:
+        raise ValueError(
+            "The ParaS NCCL weight transfer supports only dp_size=1; "
+            "use method='direct' for DP x TP configurations"
+        )
 
     is_fp8 = quant_name == "fp8"
     weight_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
@@ -1319,23 +1371,13 @@ def plan_qwen_moe_layout(
             weight_dtype,
         )
 
-    if configure_method != "peer_access":
+    if transfer_method is WeightTransferMethod.NCCL:
         staging_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
-        staging_experts = (num_experts // ep_size) * dp_size
+        staging_experts = num_experts // ep_size
         w13_shape = (staging_experts, 2 * intermediate_size, hidden_size)
         w2_shape = (staging_experts, hidden_size, intermediate_size)
-
-        if configure_method == "overlap":
-            suffixes = ("_1", "_2")
-        else:
-            suffixes = ("",)
-
-        for sfx in suffixes:
-            manager.reserve(f"staging.w13_pre_permute{sfx}", w13_shape, staging_dtype)
-            manager.reserve(f"staging.w2_pre_permute{sfx}", w2_shape, staging_dtype)
-            if dp_size > 1:
-                manager.reserve(f"staging.w13_gather{sfx}", w13_shape, staging_dtype)
-                manager.reserve(f"staging.w2_gather{sfx}", w2_shape, staging_dtype)
+        manager.reserve("staging.w13_pre_permute", w13_shape, staging_dtype)
+        manager.reserve("staging.w2_pre_permute", w2_shape, staging_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -1359,15 +1401,15 @@ def plan_gpt_oss_moe_layout(
     quant_name: Optional[str] = None,
     fp8_block_size: Optional[int] = None,
     num_fused_shared_experts: int = 0,
-    configure_method: str = "peer_access",
+    configure_method: str = WeightTransferMethod.DIRECT.value,
     prefix: str = "model",
 ) -> None:
     """Reserve all weight tensors for a GPT-OSS sparse-MoE model.
 
     GPT-OSS shares the Qwen3-MoE layout exactly for the tensors ParaS
-    manages: w13/w2 expert weights (N+1 slot layout for EP<->TP switch),
-    QKV/O attention projections, FP8 weight scales, and pre-permute /
-    gather staging buffers for non-peer_access transfer methods.  Both
+    manages: w13/w2 expert weights (four-anchor EP<->TP layout), QKV/O
+    attention projections, FP8 weight scales, and the pre-permute buffers
+    used by the NCCL fallback. Both
     models are pure sparse MoE with no shared experts and identical
     attention projection geometry.
 

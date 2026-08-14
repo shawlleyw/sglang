@@ -98,7 +98,7 @@ paras_launch_setup_dp_ep() {
     PARAS_FLAGS=()
     if [ "$ENABLE_PARAS" = "1" ]; then
         : "${SGLANG_ATTN_MAX_BS:=$MAX_REQ_PER_RANK}"
-        : "${PARAS_CONFIGURE_METHOD:=peer_access}"
+        : "${PARAS_CONFIGURE_METHOD:=direct}"
         : "${PARAS_KV_TRANSFER_METHOD:=peer_access}"
         : "${PARAS_DISABLE_PEER_ACCESS:=0}"
         export SGLANG_ATTN_MAX_BS PARAS_CONFIGURE_METHOD PARAS_KV_TRANSFER_METHOD PARAS_DISABLE_PEER_ACCESS

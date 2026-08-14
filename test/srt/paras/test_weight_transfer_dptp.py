@@ -120,9 +120,7 @@ def setup_paras_state(rank, world_size):
     pps._PARAS_EP = world_coord
     pps._PARAS_TP = tp_coord
     pps._PARAS_DP = dp_coord
-    pps._PARAS_SELF = _SimpleGroupCoordinator(
-        None, 1, f"cuda:{rank}", rank_in_group=0
-    )
+    pps._PARAS_SELF = _SimpleGroupCoordinator(None, 1, f"cuda:{rank}", rank_in_group=0)
 
     pps._PARAS_TP_SIZE = TP_SIZE
     pps._PARAS_TP_RANK = rank % TP_SIZE
@@ -163,7 +161,7 @@ def build_manager(rank, world_size):
         dp_size=DP_SIZE,
         moe_tp_size=TP_SIZE,
         quant_name=None,
-        configure_method="peer_access",
+        configure_method="direct",
         prefix="model",
     )
     mgr.materialize()
@@ -206,8 +204,12 @@ def snapshot_weights(mgr):
 
 def restore_weights(mgr, snap):
     for layer_id in range(NUM_LAYERS):
-        mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w13_weight").copy_(snap[layer_id][0])
-        mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w2_weight").copy_(snap[layer_id][1])
+        mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w13_weight").copy_(
+            snap[layer_id][0]
+        )
+        mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w2_weight").copy_(
+            snap[layer_id][1]
+        )
 
 
 class _MockExperts:
@@ -241,15 +243,50 @@ class _ModelLayerAdapter:
     def __init__(self, mlp):
         self.mlp = mlp
 
-    def paras_configure_tp_mlp_fused_peer_access_kernel(
-        self, peer_ctx, dst_base_ptrs, stream
-    ):
-        return self.mlp.paras_configure_tp_fused_peer_access_kernel(
-            peer_ctx, dst_base_ptrs, stream
+    def paras_reshard_ep_to_tp_node_peer(self, dst_base_ptrs, dp_rank, dp_size, stream):
+        return self.mlp.paras_reshard_ep_to_tp_node_peer(
+            dst_base_ptrs, dp_rank, dp_size, stream
         )
 
-    def paras_configure_tp_mlp_dp_all_gather(self, stream):
-        return self.mlp.paras_configure_tp_dp_all_gather(stream)
+    def paras_broadcast_ep_to_dptp_peer(self, dst_base_ptrs, ep_rank, dp_size, stream):
+        self.mlp.paras_broadcast_ep_to_dptp_peer(
+            dst_base_ptrs, ep_rank, dp_size, stream
+        )
+
+    def paras_all_gather_tp_weights(self, stream):
+        return self.mlp.paras_all_gather_tp_weights(stream)
+
+    def paras_reshard_dptp_to_ep_peer(self, dst_base_ptrs, ep_rank, dp_size, stream):
+        self.mlp.paras_reshard_dptp_to_ep_peer(dst_base_ptrs, ep_rank, dp_size, stream)
+
+    def paras_reshard_tp_to_ep_node_peer(self, dst_base_ptrs, dp_rank, dp_size, stream):
+        self.mlp.paras_reshard_tp_to_ep_node_peer(
+            dst_base_ptrs, dp_rank, dp_size, stream
+        )
+
+    def paras_configure_tp_attn(self, paras_tp_size, paras_tp_rank):
+        pass
+
+    def paras_configure_tp(self, paras_tp_size, paras_tp_rank):
+        pass
+
+    def paras_configure_ep_attn(self):
+        pass
+
+    def paras_configure_ep(self):
+        pass
+
+
+def _make_model(mgr, num_local_ep, peer_ctx):
+    from sglang.srt.paras.layers.paras_model import ParaSModelMixin
+
+    model = object.__new__(ParaSModelMixin)
+    model.layers = [
+        _ModelLayerAdapter(_make_mixin(layer_id, num_local_ep, mgr))
+        for layer_id in range(NUM_LAYERS)
+    ]
+    model._peer_access_ctx = peer_ctx
+    return model
 
 
 def setup_peer_ctx(mgr, peer_group, peer_size):
@@ -259,59 +296,18 @@ def setup_peer_ctx(mgr, peer_group, peer_size):
     return init_peer_access(mgr, peer_group, peer_size)
 
 
-def run_forward(mgr, num_local_ep, peer_ctx, world_group, tp_group):
+def run_forward(mgr, num_local_ep, peer_ctx, world_group):
     """EP -> DP x TP through the selected topology path."""
-    dst_base_ptrs = torch.tensor(
-        peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
-    )
     dist.barrier(group=world_group)
-
-    if LOGICAL_MULTINODE:
-        from sglang.srt.paras.layers.paras_model import ParaSModelMixin
-
-        model = object.__new__(ParaSModelMixin)
-        model.layers = [
-            _ModelLayerAdapter(
-                _make_mixin(layer_id, num_local_ep, mgr)
-            )
-            for layer_id in range(NUM_LAYERS)
-        ]
-        model._paras_configure_tp_peer_access_multinode(
-            peer_ctx, dst_base_ptrs
-        )
-    else:
-        barrier_tensor = torch.zeros(1, device="cuda")
-        for layer_id in reversed(range(NUM_LAYERS)):
-            mixin = _make_mixin(layer_id, num_local_ep, mgr)
-            mixin.paras_configure_tp_fused_peer_access_kernel(
-                peer_ctx, dst_base_ptrs, None
-            )
-            dist.all_reduce(
-                barrier_tensor,
-                op=dist.ReduceOp.SUM,
-                group=world_group,
-            )
-    torch.cuda.synchronize()
+    model = _make_model(mgr, num_local_ep, peer_ctx)
+    model.paras_configure_tp(TP_SIZE, dist.get_rank() % TP_SIZE, method="direct")
 
 
-def run_reverse(mgr, num_local_ep, peer_ctx, world_group, tp_group):
+def run_reverse(mgr, num_local_ep, peer_ctx, world_group):
     """DP x TP -> EP through the selected topology path."""
-    dst_base_ptrs = torch.tensor(
-        peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
-    )
-    barrier_tensor = torch.zeros(1, device="cuda")
-    barrier_group = tp_group if LOGICAL_MULTINODE else world_group
     dist.barrier(group=world_group)
-
-    for layer_id in range(NUM_LAYERS):
-        mixin = _make_mixin(layer_id, num_local_ep, mgr)
-        mixin.paras_configure_ep_fused_peer_access_kernel(
-            peer_ctx, dst_base_ptrs, None
-        )
-        dist.all_reduce(
-            barrier_tensor, op=dist.ReduceOp.SUM, group=barrier_group
-        )
-    torch.cuda.synchronize()
+    model = _make_model(mgr, num_local_ep, peer_ctx)
+    model.paras_configure_ep(method="direct")
 
 
 def read_tp_results(mgr):
@@ -373,7 +369,9 @@ def build_forward_ground_truth(snap, rank, world_group):
 
         gate_shard = full_w13[:, tp_rank * tp_inter : (tp_rank + 1) * tp_inter, :]
         up_shard = full_w13[
-            :, INTERMEDIATE + tp_rank * tp_inter : INTERMEDIATE + (tp_rank + 1) * tp_inter, :
+            :,
+            INTERMEDIATE + tp_rank * tp_inter : INTERMEDIATE + (tp_rank + 1) * tp_inter,
+            :,
         ]
         exp_w13[layer_id] = torch.cat([gate_shard, up_shard], dim=1)
         exp_w2[layer_id] = full_w2[:, :, tp_rank * tp_inter : (tp_rank + 1) * tp_inter]
@@ -408,14 +406,21 @@ def main():
             print("\n=== Forward EP -> DPxTP (dptp) vs ground truth ===", flush=True)
         restore_weights(mgr, snap)
         exp_w13, exp_w2, _ = build_forward_ground_truth(snap, rank, world_group)
-        run_forward(mgr, num_local_ep, peer_ctx, world_group, tp_group)
+        run_forward(mgr, num_local_ep, peer_ctx, world_group)
         actual = read_tp_results(mgr)
         try:
             for layer_id in range(NUM_LAYERS):
-                _assert_equal(actual[layer_id][0], exp_w13[layer_id], "w13 fwd", rank, layer_id)
-                _assert_equal(actual[layer_id][1], exp_w2[layer_id], "w2 fwd", rank, layer_id)
+                _assert_equal(
+                    actual[layer_id][0], exp_w13[layer_id], "w13 fwd", rank, layer_id
+                )
+                _assert_equal(
+                    actual[layer_id][1], exp_w2[layer_id], "w2 fwd", rank, layer_id
+                )
             if rank == 0:
-                print("  [OK] forward dptp: bitwise match ground truth all layers", flush=True)
+                print(
+                    "  [OK] forward dptp: bitwise match ground truth all layers",
+                    flush=True,
+                )
             passed += 1
         except AssertionError as e:
             print(f"  [FAIL] forward: {e}", flush=True)
@@ -429,7 +434,9 @@ def main():
                 for which in (0, 1):
                     buf = actual[layer_id][which].contiguous()
                     peer = torch.empty_like(buf)
-                    partner = (rank + TP_SIZE) % world_size  # same tp_rank, other dp replica
+                    partner = (
+                        rank + TP_SIZE
+                    ) % world_size  # same tp_rank, other dp replica
                     # exchange with dp partner
                     if rank < partner:
                         dist.send(buf, dst=partner, group=world_group)
@@ -437,7 +444,13 @@ def main():
                     else:
                         dist.recv(peer, src=partner, group=world_group)
                         dist.send(buf, dst=partner, group=world_group)
-                    _assert_equal(buf, peer, f"dp-replica w{'13' if which==0 else '2'}", rank, layer_id)
+                    _assert_equal(
+                        buf,
+                        peer,
+                        f"dp-replica w{'13' if which==0 else '2'}",
+                        rank,
+                        layer_id,
+                    )
             if rank == 0:
                 print("  [OK] dp replicas bitwise identical all layers", flush=True)
             passed += 1
@@ -449,13 +462,25 @@ def main():
         if rank == 0:
             print("\n=== Round trip EP -> DPxTP -> EP (dptp) ===", flush=True)
         restore_weights(mgr, snap)
-        run_forward(mgr, num_local_ep, peer_ctx, world_group, tp_group)
-        run_reverse(mgr, num_local_ep, peer_ctx, world_group, tp_group)
+        run_forward(mgr, num_local_ep, peer_ctx, world_group)
+        run_reverse(mgr, num_local_ep, peer_ctx, world_group)
         ep_actual = read_ep_results(mgr)
         try:
             for layer_id in range(NUM_LAYERS):
-                _assert_equal(ep_actual[layer_id][0], snap[layer_id][0], "w13 roundtrip", rank, layer_id)
-                _assert_equal(ep_actual[layer_id][1], snap[layer_id][1], "w2 roundtrip", rank, layer_id)
+                _assert_equal(
+                    ep_actual[layer_id][0],
+                    snap[layer_id][0],
+                    "w13 roundtrip",
+                    rank,
+                    layer_id,
+                )
+                _assert_equal(
+                    ep_actual[layer_id][1],
+                    snap[layer_id][1],
+                    "w2 roundtrip",
+                    rank,
+                    layer_id,
+                )
             if rank == 0:
                 print("  [OK] round trip: EP recovered bitwise all layers", flush=True)
             passed += 1

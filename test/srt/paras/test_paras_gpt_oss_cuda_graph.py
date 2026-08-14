@@ -117,7 +117,7 @@ def build_manager(rank, world_size):
         dp_size=1,
         moe_tp_size=world_size,
         quant_name=None,
-        configure_method="peer_access",
+        configure_method="direct",
         prefix="model",
     )
 
@@ -297,9 +297,7 @@ def test_ep_tp_ep_weight_roundtrip_and_cuda_graph():
         # EP->TP reverse: TP weight i overlaps EP weight i+1 (four-anchor).
         for layer_id in reversed(range(NUM_LAYERS)):
             mixin = _make_mixin(layer_id, num_local, mgr)
-            mixin.paras_configure_tp_fused_peer_access_kernel(
-                peer_ctx, dst_base_ptrs, None
-            )
+            mixin.paras_reshard_ep_to_tp_peer(dst_base_ptrs, None)
             dist.all_reduce(barrier_tensor, op=dist.ReduceOp.SUM, group=paras_tp_group)
 
         # --- TP eager forward ---
@@ -331,9 +329,7 @@ def test_ep_tp_ep_weight_roundtrip_and_cuda_graph():
         # TP->EP forward: EP weight i+1 overlaps TP weight i (four-anchor).
         for layer_id in range(NUM_LAYERS):
             mixin = _make_mixin(layer_id, num_local, mgr)
-            mixin.paras_configure_ep_fused_peer_access_kernel(
-                peer_ctx, dst_base_ptrs, None
-            )
+            mixin.paras_reshard_tp_to_ep_peer(dst_base_ptrs, None)
             dist.all_reduce(barrier_tensor, op=dist.ReduceOp.SUM, group=paras_tp_group)
 
         # --- Verify EP weights restored ---
@@ -367,7 +363,7 @@ def test_ep_tp_ep_weight_roundtrip_and_cuda_graph():
 
 def build_manager_with_bias(rank, world_size):
     # all_to_all / naive path variant: plan_gpt_oss_moe_layout with
-    # configure_method="all_to_all" reserves staging.{w13,w2}_pre_permute for
+    # configure_method="nccl" reserves staging.{w13,w2}_pre_permute for
     # NCCL transport. Biases are no longer part of the four-anchor MoE layout;
     # the direct reserves below preserve the test's mock-experts pattern
     # (see _MockExpertsWithBias / fill_biases) via regular reserve() entries.
@@ -410,7 +406,7 @@ def build_manager_with_bias(rank, world_size):
         dp_size=1,
         moe_tp_size=world_size,
         quant_name=None,
-        configure_method="all_to_all",
+        configure_method="nccl",
         prefix="model",
     )
 
@@ -496,7 +492,7 @@ def _run_bias_roundtrip(interleaved_w13: bool):
             mixin = _make_mixin_with_bias(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
             )
-            mixin.paras_configure_tp_all_to_all()
+            mixin.paras_reshard_ep_to_tp_nccl()
 
         # Bias is static: the switch must NOT touch the TP bias buffer. It stays
         # equal to its statically-filled value (and is non-zero).
@@ -514,7 +510,7 @@ def _run_bias_roundtrip(interleaved_w13: bool):
             mixin = _make_mixin_with_bias(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
             )
-            mixin.paras_configure_ep_mlp_naive()
+            mixin.paras_reshard_tp_to_ep_nccl()
 
         for layer_id in range(NUM_LAYERS):
             w13_now = mgr.get_view(
@@ -638,7 +634,7 @@ def _run_layout_semantics_test(interleaved_w13: bool):
             mixin = _make_mixin_with_bias(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
             )
-            mixin.paras_configure_tp_all_to_all()
+            mixin.paras_reshard_ep_to_tp_nccl()
 
         _assert_tp_w13_layout(mgr, rank, world_size, interleaved_w13)
 
@@ -665,8 +661,8 @@ def test_gpt_oss_w13_layout_semantics_interleaved():
 def _run_peer_access_layout_semantics_test(interleaved_w13: bool):
     """Same semantics check as _run_layout_semantics_test but via peer_access.
 
-    Verifies that ``paras_configure_tp_fused_peer_access_kernel`` produces
-    the same TP layout as the NCCL ``paras_configure_tp_all_to_all`` path
+    Verifies that ``paras_reshard_ep_to_tp_peer`` produces the same TP layout
+    as the NCCL ``paras_reshard_ep_to_tp_nccl`` path
     for both concat and interleaved w13 layouts.
     """
     rank, world_size = setup_distributed()
@@ -698,9 +694,7 @@ def _run_peer_access_layout_semantics_test(interleaved_w13: bool):
             mixin = _make_mixin(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
             )
-            mixin.paras_configure_tp_fused_peer_access_kernel(
-                peer_ctx, dst_base_ptrs, None
-            )
+            mixin.paras_reshard_ep_to_tp_peer(dst_base_ptrs, None)
             dist.all_reduce(
                 barrier_tensor, op=dist.ReduceOp.SUM, group=paras_tp_group
             )
@@ -714,9 +708,7 @@ def _run_peer_access_layout_semantics_test(interleaved_w13: bool):
             mixin = _make_mixin(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
             )
-            mixin.paras_configure_ep_fused_peer_access_kernel(
-                peer_ctx, dst_base_ptrs, None
-            )
+            mixin.paras_reshard_tp_to_ep_peer(dst_base_ptrs, None)
             dist.all_reduce(
                 barrier_tensor, op=dist.ReduceOp.SUM, group=paras_tp_group
             )

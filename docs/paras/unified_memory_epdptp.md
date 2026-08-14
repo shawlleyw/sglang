@@ -1,14 +1,14 @@
 # ParaS Unified Memory Layout for EP↔DP×TP
 
-**Status:** Implemented in [`paras_memory_manager.py`](../../python/sglang/srt/paras/paras_memory_manager.py) (`_place_paras_run`) and the switch orchestration (`paras_model.py`, `gather_manager.py`, `scatter_manager.py`, `peer_access.py`, `scheduler_paras_mixin.py`). Address math proven in [`benchmark/paras/paras_layout.py`](../../benchmark/paras/paras_layout.py) (`compute_layout` + `check_safe`, 40k-case fuzz); validated on 4 GPUs by `test_roundtrip.py` (EP↔TP↔EP round-trip, KV + weights + no-leak) and `test_weight_transfer.py` (NCCL and peer-access kernels, both directions, bitwise-exact).
+**Status:** Implemented in [`paras_memory_manager.py`](../../python/sglang/srt/paras/paras_memory_manager.py) (`_place_paras_run`) and the switch orchestration (`paras_model.py`, `gather_manager.py`, `scatter_manager.py`, `peer_access.py`, `scheduler_paras_mixin.py`). Address math is exercised by [`benchmark/paras/paras_layout.py`](../../benchmark/paras/paras_layout.py) (`compute_layout` + `check_safe`, 40k-case fuzz); `test_weight_transfer.py` validates NCCL and direct EP4↔TP4 in both directions, while `test_weight_transfer_dptp.py` validates both EP4↔DP2×TP2 topologies.
 
-**Scope:** This document extends the [ParaS Unified Memory Manager](unified_memory_manager.md) to the asymmetric EP↔(DP×TP) case and replaces the `N+1` identical MoE weight slots. It works for any `ep_size ≥ tp_size`, with uniform or hybrid (sliding-window + full) attention cache.
+**Scope:** This document describes the layout that replaced the `N+1` identical MoE weight slots. It supports `ep_size ≥ tp_size` with uniform or hybrid (sliding-window + full) attention cache, subject to the production capacity invariant `ct[i] ≤ ce[i]` described below.
 
-**Two refinements landed during implementation.** (1) The cache tail anchor is the general `ANCHOR = max_i(ct_i + Σ_{k>i}(ct_k − ce_k))`, which reduces to `max(ct)` when `ct_i ≤ ce_i` but also tolerates `ct_i > ce_i` (from GQA head-division flooring when `num_kv_heads % tp_size ≠ 0`), so no `ct ≤ ce` precondition is required. (2) The per-layer shapes match the ParaS forward exactly: EP holds `num_experts/ep_size` experts with the **full** intermediate; TP holds **all** `num_experts` with the intermediate sharded by `tp_size` (equal bytes at `G=1`, TP `G`× larger for `G>1`). The switch loop orders are flipped from the old slot design: EP→TP runs cache-then-weights in **reverse** layer order; TP→EP runs weights-then-cache in **forward** order.
+**Two refinements landed during implementation.** (1) The address formula retains the general cache tail anchor `ANCHOR = max_i(ct_i + Σ_{k>i}(ct_k − ce_k))`, but the production KV budget reserves one `max(ct)` tail layer and therefore enforces `ct[i] ≤ ce[i]`; under that invariant the formula reduces to `max(ct)`. (2) The per-layer shapes match the ParaS forward exactly: EP holds `num_experts/ep_size` experts with the **full** intermediate; TP holds **all** `num_experts` with the intermediate sharded by `tp_size` (equal bytes at `G=1`, TP `G`× larger for `G>1`). The switch loop orders are flipped from the old slot design: EP→TP runs cache-then-weights in **reverse** layer order; TP→EP runs weights-then-cache in **forward** order.
 
 ## Overview
 
-The [unified memory manager](unified_memory_manager.md) holds all persistent ParaS state in one contiguous `uint8` buffer and switches between Expert Parallelism (EP) and Tensor Parallelism (TP) by reinterpreting the same bytes. The current layout reserves `N+1` identical MoE weight slots and aliases EP and TP onto neighboring slots, which is correct only when EP and TP occupy the same bytes per layer (`SE == ST`).
+The [unified memory manager](unified_memory_manager.md) holds all persistent ParaS state in one contiguous `uint8` buffer and switches between Expert Parallelism (EP) and Tensor Parallelism (TP) by reinterpreting the same bytes. The former layout reserved `N+1` identical MoE weight slots and aliased EP and TP onto neighboring slots, which was correct only when EP and TP occupied the same bytes per layer (`SE == ST`).
 
 EP↔(DP×TP) breaks that. On a `W = G·T` grid (`G = dp_size`, `T = tp_size`, `ep_size = W`), EP weights are small (experts sharded across all `W` ranks) while DP×TP weights are `G` times larger (sharded across only `T`); the KV cache runs the other way, EP large and TP small. This design packs both interpretations into one combined `[weights | cache]` run in which the large TP weights overlap the EP cache, so the buffer is the shared per-mode footprint `B` plus **one layer**.
 
@@ -57,15 +57,21 @@ def compute_layout(we, wt, ce, ct, align=ALIGN, P=0):
     N = len(we)
     we = [_au(x) for x in we]; wt = [_au(x) for x in wt]
     ce = [_au(x) for x in ce]; ct = [_au(x) for x in ct]
-    assert all(ct[i] <= ce[i] for i in range(N))            # the one invariant
     sum_we, sum_wt, sum_ce, sum_ct = sum(we), sum(wt), sum(ce), sum(ct)
-    max_ct = max(ct)
+
+    # The address formula is general; production currently enforces ct <= ce
+    # because reserve_kv_cache budgets only a max(ct) tail layer.
+    assert all(ct[i] <= ce[i] for i in range(N))
+    anchor, suffix = 0, 0
+    for i in range(N - 1, -1, -1):
+        anchor = max(anchor, ct[i] + suffix)
+        suffix += ct[i] - ce[i]
 
     w_end    = P + sum_we
     tp_w_end = P + we[0] + sum_wt
-    PAD      = _au(max(0, tp_w_end - w_end - sum_ce + sum_ct - max_ct))
+    PAD      = _au(max(0, tp_w_end - w_end - sum_ce + sum_ct - anchor))
     EP_end   = w_end + PAD + sum_ce
-    tc_end   = EP_end + max_ct
+    tc_end   = EP_end + anchor
 
     addr = {}
     off = P
@@ -116,7 +122,7 @@ Rounding (token flooring + 256-byte alignment) adds a token-scale term far below
 
 ## Integration
 
-The change surface is in [`paras_memory_manager.py`](../../python/sglang/srt/paras/paras_memory_manager.py). Consumers key off entry names (`experts`, `ep_experts`, `tp_experts`) and `.offset_bytes`, so the contract to preserve is the names, not the offsets. Note the four-anchor places **EP low / TP high** (the mirror of today's slots), so the transfer offsets are assigned accordingly.
+The change surface is in [`paras_memory_manager.py`](../../python/sglang/srt/paras/paras_memory_manager.py). Consumers key off entry names (`experts`, `ep_experts`, `tp_experts`) and `.offset_bytes`, so the contract to preserve is the names, not the offsets. The four-anchor places **EP low / TP high**, the mirror of the former slot layout, so transfer offsets are assigned accordingly.
 
 | Function | Change |
 |----------|--------|
@@ -175,7 +181,7 @@ The full scheduler switch was brought up on a live qwen3-30B server at `EP=4 / D
 
 **Peer access is topology-scoped.** CUDA IPC is opened only among GPUs on the same node. A node-local EP group uses one EP-wide mapping for dptp weights, with KV addressing the current TP subgroup slice. A multi-node EP group uses one TP-group mapping shared by weights and KV; `_PARAS_DP` carries cross-node EP→DP×TP weight traffic through NCCL. The reverse DP×TP→EP path stays within each TP group. This avoids opening an IPC handle for a remote process and still keeps only one mapping of each peer buffer.
 
-**Sync scoping follows the physical transfer.** The single-node dptp path uses an EP-group barrier after each layer. The multi-node EP→DP×TP path uses a TP-group barrier after node-local peer writes, then launches the in-place DP all-gather on a second stream. The next layer.s NVLink reshard overlaps that NIC collective at model level. The reverse DP×TP→EP path uses only TP-group barriers and node-local peer writes. KV cache redistribution remains scoped to the TP subgroup.
+**Sync scoping follows the physical transfer.** The single-node dptp path uses an EP-group barrier after each layer. The multi-node EP→DP×TP path uses a TP-group barrier after node-local peer writes, then launches the in-place DP all-gather on a second stream. The next layer's NVLink reshard overlaps that NIC collective at model level. The reverse DP×TP→EP path uses only TP-group barriers and node-local peer writes. KV cache redistribution remains scoped to the TP subgroup.
 
 Manual-switch procedure (`.skills/paras-test-manual-switch`): dual capture `pools_differ=True` (#EP=52, #TP=68 graphs, cuda graph intact both modes); EP/TP/EP-RT prompts 0/32 degenerate; `configure_tp` 160 ms / `configure_ep` 58 ms; in-flight EP→TP 3/3 and TP→EP **20/20** clean; no server errors. The gate at `scheduler_paras_mixin.py:742` (`paras_dp_size == 1`) is relaxed to enable this.
 
@@ -188,7 +194,7 @@ Manual-switch procedure (`.skills/paras-test-manual-switch`): dual capture `pool
 
 | Document | Contents |
 |----------|----------|
-| [`unified_memory_manager.md`](unified_memory_manager.md) | Base allocator, lifecycle, and the slot layout this design replaces. |
+| [`unified_memory_manager.md`](unified_memory_manager.md) | Current allocator lifecycle, four-anchor placement, views, and invariants. |
 | [`parallelism_switch.md`](parallelism_switch.md) | Runtime EP↔TP switch control flow, race-safety invariants, and verified performance. |
 | [`nvlink_peer_access_weight_transfer.md`](nvlink_peer_access_weight_transfer.md) | NVLink weight-transfer kernel design, synchronization, and tuning. |
 | [`nvlink_peer_access_kv_cache_transfer.md`](nvlink_peer_access_kv_cache_transfer.md) | KV-cache transfer kernels and NCCL fallback. |

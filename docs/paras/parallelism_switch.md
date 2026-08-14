@@ -51,32 +51,35 @@ Both directions transform the model's runtime state between EP and TP layouts:
 |--------|----------------|-----------------|
 | Requests | Gather local subsets into global set (simple concat) | **Partition** global set into disjoint subsets (load-balancing problem) |
 | KV cache | Head-split: all heads → subset heads | **Head-gather**: subset heads → all heads |
-| MoE weights | all-to-all redistribution | **Reverse all-to-all** (EP weights destroyed during EP→TP; see N+1 Slot section) |
-| Layer order | Forward (0, 1, ..., N-1) | **Reverse** (N-1, ..., 0) |
+| MoE weights | Reshard EP experts into TP views | Reconstruct the owned EP experts from TP shards |
+| Layer order | **Reverse** (N-1, ..., 0) | Forward (0, 1, ..., N-1) |
 
 ## The Unified Memory Manager
 
 The foundation of fast switching. Allocates ALL persistent GPU memory — expert weights, attention weights, KV cache — in a single contiguous buffer at model init time.
 
-**Key insight**: EP and TP layouts use the **same total bytes** per layer. An expert with shape `(E_local, 2I, H)` in EP becomes `(E_total, 2I/tp, H)` in TP — same bytes, different interpretation. The switch overwrites the same physical memory with the new layout, avoiding any allocation or deallocation.
+**Key insight**: EP and TP are never live simultaneously. The manager can
+therefore overlap their persistent regions and reinterpret one allocation
+without allocating during a switch. When `dp_size > 1`, TP expert weights are
+larger per GPU while the TP cache is smaller; the combined layout balances the
+two differences.
 
-### N+1 Slot Design
+### Four-Anchor Design
 
-Prevents read/write races during transfer. For N model layers, N+1 slots are allocated:
+The manager places EP weights, TP weights, EP cache, and TP cache as four
+contiguous blocks with direct per-layer offsets. TP weights can overlap EP
+cache because only one mode is live at rest.
 
+```text
+EP -> TP: cache N-1..0, then weights N-1..0
+TP -> EP: weights 0..N-1, then cache 0..N-1
 ```
-Slots:  [ 0 | 1 | 2 | ... | N ]
-TP:       0   1   2         N-1      ← layer i TP in slot[i]
-EP:           0   1         N-2  N-1 ← layer i EP in slot[i+1]
-```
 
-**EP→TP** reads from slot[i+1] (EP), writes to slot[i] (TP). Forward order is safe.
+Those phase and layer orders ensure every source region is consumed before an
+overlapping destination can overwrite it. TP->EP therefore performs a real
+reverse transfer; changing expert pointers alone cannot restore EP data.
 
-**TP→EP** reads from slot[i] (TP), writes to slot[i+1] (EP). **Reverse order is required** because slot[i+1] = layer (i+1)'s TP source.
-
-**Critical implication**: EP→TP **destroys EP weight data** in slots 1..N-1 (each becomes the next layer's TP target). TP→EP cannot use a pointer swap — it must perform an actual reverse weight transfer to reconstruct EP data.
-
-See: `unified_memory_manager.md`
+See: `unified_memory_manager.md`, `unified_memory_epdptp.md`
 
 ## NVLink Peer Access Transfers
 
@@ -85,9 +88,14 @@ Custom CUDA kernels write directly to peer GPU memory via NVLink, avoiding NCCL'
 ### EP→TP Direction
 
 **Weight transfer** (`peer_access_fused_transfer_w13_v2`, `peer_access_fused_transfer_w2_v2`):
-- Reads EP weights from local buffer, writes TP weight slices to each peer's TP slot via NVLink
+- Handles the `dp_size=1` EP-to-TP reshard over node-local IPC
 - Fused kernel — one launch per layer handles all peers
 - 1.57× faster than NCCL sequential
+
+For a DPxTP target, a node-local EP group uses the DPTP broadcast kernels. A
+multi-node EP group first reshards its node-owned expert interval across the TP
+group and then runs an in-place all-gather across the DP group. See
+`nvlink_peer_access_weight_transfer.md` for the complete strategy matrix.
 
 **KV cache transfer** (`peer_access_kv_transfer`):
 - Reads EP KV cache from scattered token positions, writes to each peer's TP KV slot
@@ -99,7 +107,7 @@ Custom CUDA kernels write directly to peer GPU memory via NVLink, avoiding NCCL'
 
 **Weight transfer** (`peer_access_fused_transfer_w13_ep`, `peer_access_fused_transfer_w2_ep`):
 - Structural mirror of EP→TP v2 kernels with swapped src/dst
-- Reverse layer order (N-1→0) with per-layer barrier
+- Forward layer order (0→N-1) with a per-layer barrier
 
 **KV cache scatter** (`peer_access_kv_scatter`):
 - Reads local TP KV, writes to peer EP buffers at correct head slot
@@ -127,13 +135,15 @@ See: `exploration_notes_kv_cache_peer_access.md` §2
 
 ### EP→TP
 
-**Weight transfer**: `all_to_all_single` with optional pipelining (overlap method).
+**Weight transfer**: sequential `all_to_all_single` with one pre-permute
+staging buffer per expert weight. This fallback supports `dp_size=1` only.
 
 **KV cache transfer**: `gather_kv_and_permute` → `repeat_interleave` (for head replication) → `all_to_all_single` → `permute_and_scatter_kv`.
 
 ### TP→EP
 
-**Weight transfer**: Reverse all-to-all (inverse permute + `all_to_all_single`), layers in reverse order.
+**Weight transfer**: Reverse all-to-all (`all_to_all_single` + inverse
+permute), layers in forward order.
 
 **KV cache scatter**: A single unified code path handles both R=1 and R>1. With head replication, each subgroup member sends a disjoint 1/R token slice. On the receive side, contiguous subgroup chunks naturally concatenate via reshape — the only conditional is:
 ```python
@@ -232,8 +242,8 @@ Unlimited round-trips are supported without explicit state caching:
 
 | Component | Why it works |
 |-----------|-------------|
-| **Weight aliases** | `ep_experts` → slot[i+1] and `tp_experts` → slot[i] are permanent. Each direction reconstructs its target slots from the source. |
-| **KV aliases** | Same principle: `kv.ep` → slot[i+1], `kv.tp` → slot[i]. |
+| **Weight views** | `ep_experts` and `tp_experts` have permanent four-anchor entries. Each direction reconstructs its target views from the source. |
+| **KV views** | `kv.ep` and `kv.tp` have permanent four-anchor entries and are rebound after data movement. |
 | **Communication groups** | Created at init (PARAS_TP, PARAS_DP, PARAS_EP), never destroyed. |
 | **Dual LayerCommunicator** | EP and TP communicator objects co-exist. The switch swaps which one is active. |
 | **QKV weights** | Full (EP) and sharded (TP) weight views are permanent. |
@@ -247,7 +257,7 @@ Unlimited round-trips are supported without explicit state caching:
 | Request gather/partition | 16ms | <1ms |
 | Cache reorchestrate | 2ms | 1ms |
 | KV cache transfer | 46ms | 3ms (empty batch) |
-| Weight transfer (peer_access) | 78ms | 70ms |
+| Weight transfer (direct) | 78ms | 70ms |
 | Attention + config | 20ms | 11ms |
 | **Total** | **163ms** | **88ms** |
 
@@ -279,7 +289,7 @@ Unlimited round-trips are supported without explicit state caching:
 
 | Document | Contents |
 |----------|----------|
-| `unified_memory_manager.md` | Contiguous buffer allocation, N+1 slot design, alias system, KV cache integration |
+| `unified_memory_manager.md` | Contiguous allocation, four-anchor layout, views, and KV integration |
 | `nvlink_peer_access_weight_transfer.md` | w13/w2 CUDA kernels (EP→TP + TP→EP reverse), data flow, performance comparison |
 | `nvlink_peer_access_kv_cache_transfer.md` | Fused K+V kernel (EP→TP + TP→EP scatter), head replication, NCCL fallback |
 | `nvlink_peer_access_guielines.md` | NVLink store optimization guidelines (grid config, vectorization, alignment) |

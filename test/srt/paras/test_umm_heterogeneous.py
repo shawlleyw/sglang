@@ -46,8 +46,8 @@ def _assert_four_anchor_cache(mgr, num_layers, prefix="model"):
         return (e.offset_bytes, e.size_bytes)
 
     # Global orientation: the TP cache region base sits above the EP cache base.
-    # (Per-layer tk>ek need not hold when ct>ce; the clobber checks below cover
-    # correctness for that case.)
+    # Per-layer ranges can still overlap across modes; the clobber checks below
+    # validate the production transfer orders.
     assert rng("tp", 0, "k")[0] > rng("ep", 0, "k")[0], "TP cache base must sit above EP"
     for i in range(num_layers):
         ek, ev = rng("ep", i, "k"), rng("ep", i, "v")

@@ -4,11 +4,9 @@ Compares three transport methods per direction:
     peer_access  - production fused CUDA kernels
                    (peer_access_fused_transfer_w{13,2}_v2 for EP→TP,
                     peer_access_fused_transfer_w{13,2}_ep for TP→EP).
-    nccl         - production NCCL all_to_all_single per layer
-                   (mirrors paras_configure_tp_mlp_naive).
-    nccl_overlap - same NCCL pattern, pipelined across 2 streams to overlap
-                   layer N's all_to_all with layer N+1's pre-permute
-                   (mirrors paras_configure_tp_overlap).
+    nccl         - production NCCL all_to_all_single fallback per layer.
+    nccl_overlap - benchmark-only two-stream NCCL baseline; production no
+                   longer exposes this method.
 
 Layer count comes from the model preset (`num_hidden_layers`); one timed
 iteration is one full per-direction switch across all layers.
@@ -141,7 +139,7 @@ def _peer_access_w2_tp_to_ep(ctx, layout, off, variant):
 def _nccl_w13_buffers(layout: WeightLayout, device) -> dict:
     """EP-ordered source tensor + TP-ordered staging send/recv buffers.
 
-    Matches the production paras_configure_tp_mlp_all_to_all pattern:
+    Matches the production paras_reshard_ep_to_tp_nccl pattern:
       src layout (EP):   (E_local, num_gates, tp_size, I'*H)
       send layout (TP):  (tp_size, E_local, num_gates, I'*H)
     The pre-permute kernel `send.copy_(src.permute(2, 0, 1, 3))` is

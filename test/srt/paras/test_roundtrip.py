@@ -325,9 +325,8 @@ def _build_weight_manager(rank, world_size):
 
     mgr = ParaSMemoryManager(device=f"cuda:{rank}")
 
-    # configure_method != "peer_access" reserves staging.w{13,2}_pre_permute,
-    # which paras_configure_tp_all_to_all() (called by _run_ep_to_tp_weights)
-    # needs. "all_to_all" yields the single "" suffix required by that path.
+    # The NCCL method reserves the pre-permute staging buffers used by the
+    # weight round-trip below.
     plan_qwen_moe_layout(
         mgr,
         num_layers=NUM_LAYERS,
@@ -341,7 +340,7 @@ def _build_weight_manager(rank, world_size):
         tp_size=tp_size,
         dp_size=dp_size,
         moe_tp_size=moe_tp_size,
-        configure_method="all_to_all",
+        configure_method="nccl",
         prefix="model",
     )
 
@@ -393,7 +392,7 @@ class _MockExperts:
 
 
 def _run_ep_to_tp_weights(mgr, num_local, world_size):
-    """Run EP→TP weight transfer (naive all_to_all path)."""
+    """Run the NCCL EP→TP weight transfer."""
     from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 
     tp_inter = INTERMEDIATE // world_size
@@ -412,11 +411,11 @@ def _run_ep_to_tp_weights(mgr, num_local, world_size):
         m.ep_experts = _MockExperts(w13, w2)
         m.w13_ep_gathered = w13.view(num_local, 2 * INTERMEDIATE, HIDDEN)
         m.w2_ep_gathered = w2.view(num_local, HIDDEN, INTERMEDIATE)
-        m.paras_configure_tp_all_to_all()
+        m.paras_reshard_ep_to_tp_nccl()
 
 
 def _run_tp_to_ep_weights(mgr, num_local, world_size):
-    """Run TP→EP reverse weight transfer (naive all_to_all path)."""
+    """Run the NCCL TP→EP weight transfer."""
     from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 
     # Forward layer order: EP weight layer i+1 overlaps TP weight layer i in the
@@ -432,7 +431,7 @@ def _run_tp_to_ep_weights(mgr, num_local, world_size):
         w13 = mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w13_weight")
         w2 = mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w2_weight")
         m.ep_experts = _MockExperts(w13, w2)
-        m.paras_configure_ep_mlp_naive()
+        m.paras_reshard_tp_to_ep_nccl()
 
 
 def _verify_weight_restoration(mgr, original_snap, rank):

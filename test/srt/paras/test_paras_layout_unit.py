@@ -33,10 +33,11 @@ def _build(num_layers=6, num_experts=64, hidden=2048, inter=1536,
            num_heads=32, num_kv_heads=4, head_dim=128, ep=2, tp=2,
            ep_tokens=8000, tp_tokens=16000, with_kv=True):
     mgr = ParaSMemoryManager(device="cpu")
+    dp = ep // tp
     plan_qwen_moe_layout(
         mgr, num_layers=num_layers, num_experts=num_experts, hidden_size=hidden,
         intermediate_size=inter, num_heads=num_heads, num_kv_heads=num_kv_heads,
-        head_dim=head_dim, ep_size=ep, tp_size=tp, dp_size=1, moe_tp_size=tp,
+        head_dim=head_dim, ep_size=ep, tp_size=tp, dp_size=dp, moe_tp_size=tp,
         prefix="model",
     )
     if with_kv:

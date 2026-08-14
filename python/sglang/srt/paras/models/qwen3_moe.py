@@ -41,6 +41,7 @@ from sglang.srt.paras.paras_parallel_state import (
     is_paras_ep_group_node_local,
 )
 from sglang.srt.paras.utils import paras_func
+from sglang.srt.paras.weight_transfer import resolve_weight_transfer_method
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
@@ -170,8 +171,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         moe_tp_size = get_moe_tensor_parallel_world_size()
         dp_size = get_paras_dp_size()
 
-        import os
-        configure_method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
+        configure_method = resolve_weight_transfer_method()
 
         plan_qwen_moe_layout(
             manager,
@@ -396,9 +396,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
-        import os
-        method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
-        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank, method=method)
+        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
     @paras_func
     def paras_configure_ep(self):

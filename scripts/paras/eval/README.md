@@ -177,7 +177,7 @@ Models present:
 `launch_server_dp_ep.sh` for both qwen and gptoss accepts `ENABLE_PARAS=1`, which:
 
 1. Adds `--enable-paras-moe --paras-tp-size $NUM_GPUS` to the launch command. Overlap scheduling remains enabled; `SchedulerParasMixin._paras_drain_overlap_pipeline` drains any in-flight overlap-queued batch before each EP↔TP switch.
-2. Sets canonical ParaS env vars (`PARAS_CONFIGURE_METHOD=peer_access`, `PARAS_KV_TRANSFER_METHOD=peer_access`, etc. — see table below).
+2. Sets canonical ParaS env vars (`PARAS_CONFIGURE_METHOD=direct`, `PARAS_KV_TRANSFER_METHOD=peer_access`, etc. — see table below).
 3. User-supplied env vars on the same line override every ParaS default.
 4. `PARAS_AUTO_SWITCH=0` additionally appends `--no-paras-auto-switch` (use this when driving manual switches via `/paras_configure_{tp,ep}`).
 
@@ -214,7 +214,7 @@ Every var below honors the standard `${VAR:-default}` pattern: `VAR=N bash launc
 |---|---|---|
 | `ENABLE_PARAS` | `0` | `1` enables paras mode |
 | `PARAS_AUTO_SWITCH` | `1` | `0` adds `--no-paras-auto-switch` for manual `/paras_configure_*` testing |
-| `PARAS_CONFIGURE_METHOD` | `peer_access` | `peer_access` or `naive` (NCCL all-to-all) |
+| `PARAS_CONFIGURE_METHOD` | `direct` | `direct` or `nccl` (`dp_size=1` only) |
 | `PARAS_KV_TRANSFER_METHOD` | `peer_access` | `peer_access` or `naive` |
 | `PARAS_DISABLE_PEER_ACCESS` | `0` | `1` force-disables peer-access pre-init at boot |
 | `SGLANG_ATTN_MAX_BS` | `MAX_REQ_PER_RANK` | attention batch-size cap (must be ≥ per-rank attn batch) |
