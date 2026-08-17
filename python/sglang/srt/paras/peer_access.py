@@ -1,7 +1,10 @@
-"""Peer access initialization and buffer address exchange for ParaS NVLink transfers.
+"""TP-local peer access for ParaS intra-node NVLink transfers.
 
 Exchanges managed-buffer base addresses via CUDA IPC so that kernels on any
-rank can directly write to peer GPU memory via NVLink stores.
+rank can directly write to peer GPU memory via NVLink stores. The context is
+deliberately scoped to one TP group: when ``dp_size > 1``, it must not exchange
+or open IPC handles for ranks in another TP instance. Cross-DP-rank weight
+communication is performed separately by the DP-group NCCL all-gather.
 
 NOTE: We intentionally do NOT call cudaDeviceEnablePeerAccess(). The
 cudaIpcOpenMemHandle() with cudaIpcMemLazyEnablePeerAccess flag is sufficient
@@ -51,6 +54,10 @@ def exchange_buffer_addresses_ipc(
     local_buffer_ptr: int, tp_group, world_size: int, rank: int
 ) -> List[int]:
     """Exchange managed-buffer addresses using CUDA IPC handles.
+
+    ``world_size`` and ``rank`` are local to ``tp_group``. This function must
+    never receive the global, EP, or DP group because CUDA IPC mappings are
+    used only for the TP-local resharding step.
 
     Unlike ``exchange_buffer_addresses`` (raw ``data_ptr()``), this works
     across separate OS processes (torchrun / sglang server) because each
@@ -104,7 +111,12 @@ def exchange_buffer_addresses_ipc(
 
 @dataclass
 class PeerAccessContext:
-    """Holds all state needed for peer-access weight transfers."""
+    """Holds state for peer-access transfers within one TP instance only.
+
+    No peer address from another DP rank is present here. For ``dp_size > 1``,
+    the caller completes the local reshard first and then uses the DP process
+    group to all-gather the resulting expert intervals across TP instances.
+    """
 
     peer_addresses: List[int]  # Buffer base addresses for each rank
     peer_access_enabled: bool  # Whether peer access was successfully initialized
@@ -113,9 +125,11 @@ class PeerAccessContext:
 
 
 def init_peer_access(manager, tp_group, tp_size: int) -> PeerAccessContext:
-    """Initialize peer access for ParaS weight transfers.
+    """Initialize TP-local peer access for ParaS weight transfers.
 
     Call once after ``manager.materialize()`` and before the first EP→TP switch.
+    ``tp_group`` must contain exactly the ranks in the caller's TP instance;
+    cross-DP-rank communication is intentionally outside this context.
 
     Args:
         manager: :class:`ParaSMemoryManager` (must be materialized).

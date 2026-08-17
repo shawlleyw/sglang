@@ -15,6 +15,10 @@ expert interval to every TP instance. TP -> EP needs only the inverse local
 reshard: each TP instance reads its ``dp_rank``-owned expert interval and
 ignores the other replicated experts.
 
+The peer-access context is therefore TP-local even when ``dp_size > 1``. It
+contains CUDA IPC mappings only for ranks in one TP instance; the DP all-gather
+is the sole cross-DP-rank communication in the EP -> TP direction.
+
 CausalLM Integration Pattern:
 ===============================
 For a CausalLM class to support ParaS, define these methods:
