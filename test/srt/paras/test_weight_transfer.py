@@ -3,7 +3,7 @@
 Weight transfer tests for both EP→TP and TP→EP directions.
 
 Tests that weight redistribution produces correct results:
-  1. EP→TP: direct vs NCCL bitwise comparison (w13, w2 separately)
+  1. EP→TP: peer_access vs NCCL bitwise comparison (w13, w2 separately)
   2. TP→EP: MoE pointer swap verification
   3. EP→TP→EP: round-trip bitwise match
 
@@ -117,7 +117,7 @@ def build_manager(rank, world_size):
     validation shim that asserts the primaries exist.
 
     moe_tp_size=1 keeps each EP expert's full intermediate dimension. The NCCL
-    method reserves one pre-permute buffer per weight; the direct method needs
+    method reserves one pre-permute buffer per weight; peer_access needs
     no staging.
     """
     from sglang.srt.paras.paras_memory_manager import (
@@ -154,7 +154,7 @@ def build_manager(rank, world_size):
         dp_size=1,
         moe_tp_size=1,
         quant_name=None,
-        configure_method="nccl",
+        intra_node_weight_transfer_method="nccl",
         prefix="model",
     )
 
@@ -242,17 +242,25 @@ class _ModelLayerAdapter:
     def __init__(self, mlp):
         self.mlp = mlp
 
-    def paras_reshard_ep_to_tp_nccl(self):
-        self.mlp.paras_reshard_ep_to_tp_nccl()
+    def paras_reshard_ep_to_tp_intra_node_nccl(self, dp_rank, dp_size):
+        self.mlp.paras_reshard_ep_to_tp_intra_node_nccl(dp_rank, dp_size)
 
-    def paras_reshard_ep_to_tp_peer(self, dst_base_ptrs, stream):
-        self.mlp.paras_reshard_ep_to_tp_peer(dst_base_ptrs, stream)
+    def paras_reshard_ep_to_tp_intra_node_peer_access(
+        self, dst_base_ptrs, dp_rank, dp_size, stream
+    ):
+        self.mlp.paras_reshard_ep_to_tp_intra_node_peer_access(
+            dst_base_ptrs, dp_rank, dp_size, stream
+        )
 
-    def paras_reshard_tp_to_ep_nccl(self):
-        self.mlp.paras_reshard_tp_to_ep_nccl()
+    def paras_reshard_tp_to_ep_intra_node_nccl(self, dp_rank, dp_size):
+        self.mlp.paras_reshard_tp_to_ep_intra_node_nccl(dp_rank, dp_size)
 
-    def paras_reshard_tp_to_ep_peer(self, dst_base_ptrs, stream):
-        self.mlp.paras_reshard_tp_to_ep_peer(dst_base_ptrs, stream)
+    def paras_reshard_tp_to_ep_intra_node_peer_access(
+        self, dst_base_ptrs, dp_rank, dp_size, stream
+    ):
+        self.mlp.paras_reshard_tp_to_ep_intra_node_peer_access(
+            dst_base_ptrs, dp_rank, dp_size, stream
+        )
 
     def paras_configure_tp_attn(self, paras_tp_size, paras_tp_rank):
         pass
@@ -304,11 +312,11 @@ def run_nccl_path(mgr, num_local):
     tp_size = get_paras_tp_size()
     tp_inter = INTERMEDIATE // tp_size
     model = _make_model(mgr, num_local)
-    model.paras_configure_tp(tp_size, get_paras_tp_rank(), method="nccl")
+    model.paras_configure_tp(tp_size, get_paras_tp_rank(), intra_node_method="nccl")
     return _read_tp_results(mgr, tp_inter)
 
 
-def run_direct_path(mgr, num_local, peer_ctx):
+def run_peer_access_path(mgr, num_local, peer_ctx):
     from sglang.srt.paras.paras_parallel_state import (
         get_paras_tp_rank,
         get_paras_tp_size,
@@ -317,19 +325,21 @@ def run_direct_path(mgr, num_local, peer_ctx):
     tp_size = get_paras_tp_size()
     tp_inter = INTERMEDIATE // tp_size
     model = _make_model(mgr, num_local, peer_ctx)
-    model.paras_configure_tp(tp_size, get_paras_tp_rank(), method="direct")
+    model.paras_configure_tp(
+        tp_size, get_paras_tp_rank(), intra_node_method="peer_access"
+    )
     return _read_tp_results(mgr, tp_inter)
 
 
-def run_direct_reverse_path(mgr, num_local, peer_ctx):
+def run_peer_access_reverse_path(mgr, num_local, peer_ctx):
     model = _make_model(mgr, num_local, peer_ctx)
-    model.paras_configure_ep(method="direct")
+    model.paras_configure_ep(intra_node_method="peer_access")
     return _read_ep_results(mgr)
 
 
 def run_nccl_reverse_path(mgr, num_local):
     model = _make_model(mgr, num_local)
-    model.paras_configure_ep(method="nccl")
+    model.paras_configure_ep(intra_node_method="nccl")
     return _read_ep_results(mgr)
 
 
@@ -525,7 +535,7 @@ class TestWeightRoundTrip:
 
 
 class TestEPtoTPGroundTruth:
-    """Verify NCCL and direct EP→TP against independent ground truth."""
+    """Verify NCCL and peer_access EP→TP against independent ground truth."""
 
     def __init__(self, rank, world_size, mgr, num_local, snap, tp_group, peer_ctx):
         self.rank = rank
@@ -601,14 +611,14 @@ class TestEPtoTPGroundTruth:
         actual = run_nccl_path(self.mgr, self.num_local)
         self._verify_against_ground_truth(actual, "NCCL")
 
-    def test_direct_vs_ground_truth(self):
+    def test_peer_access_vs_ground_truth(self):
         restore_weights(self.mgr, self.snap)
-        actual = run_direct_path(self.mgr, self.num_local, self.peer_ctx)
-        self._verify_against_ground_truth(actual, "direct")
+        actual = run_peer_access_path(self.mgr, self.num_local, self.peer_ctx)
+        self._verify_against_ground_truth(actual, "peer_access")
 
 
 class TestTPtoEPGroundTruth:
-    """Verify NCCL and direct TP→EP recover the original EP weights."""
+    """Verify NCCL and peer_access TP→EP recover the original EP weights."""
 
     def __init__(self, rank, world_size, mgr, num_local, snap, peer_ctx):
         self.rank = rank
@@ -651,10 +661,10 @@ class TestTPtoEPGroundTruth:
         run_nccl_reverse_path(self.mgr, self.num_local)
         self._verify_ep_matches_original("NCCL reverse")
 
-    def test_direct_reverse_vs_original(self):
+    def test_peer_access_reverse_vs_original(self):
         self._run_ep_to_tp()
-        run_direct_reverse_path(self.mgr, self.num_local, self.peer_ctx)
-        self._verify_ep_matches_original("direct reverse")
+        run_peer_access_reverse_path(self.mgr, self.num_local, self.peer_ctx)
+        self._verify_ep_matches_original("peer_access reverse")
 
 
 # ---------------------------------------------------------------------------
@@ -675,13 +685,13 @@ def main():
 
         peer_ctx = setup_peer_ctx(mgr, rank, world_size, tp_group)
 
-        # --- EP→TP ground truth: NCCL + direct ---
+        # --- EP→TP ground truth: NCCL + peer_access ---
         if rank == 0:
             print("\n=== TestEPtoTPGroundTruth ===", flush=True)
         gt_ep_tp = TestEPtoTPGroundTruth(
             rank, world_size, mgr, num_local, snap, tp_group, peer_ctx
         )
-        for name in ("test_nccl_vs_ground_truth", "test_direct_vs_ground_truth"):
+        for name in ("test_nccl_vs_ground_truth", "test_peer_access_vs_ground_truth"):
             try:
                 getattr(gt_ep_tp, name)()
                 passed += 1
@@ -689,7 +699,7 @@ def main():
                 print(f"  [FAIL] {name}: {e}", flush=True)
                 failed += 1
 
-        # --- TP→EP ground truth: NCCL reverse + direct reverse ---
+        # --- TP→EP ground truth: NCCL reverse + peer_access reverse ---
         if rank == 0:
             print("\n=== TestTPtoEPGroundTruth ===", flush=True)
         gt_tp_ep = TestTPtoEPGroundTruth(
@@ -697,7 +707,7 @@ def main():
         )
         for name in (
             "test_nccl_reverse_vs_original",
-            "test_direct_reverse_vs_original",
+            "test_peer_access_reverse_vs_original",
         ):
             try:
                 getattr(gt_tp_ep, name)()

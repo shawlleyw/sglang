@@ -598,7 +598,7 @@ class SchedulerParasMixin:
         if self._paras_auto_policy is not None:
             self._paras_auto_clear_window_on_switch()
 
-        # switch from EP to DP x TP
+        # Switch from one wide EP group to multiple TP instances.
         self.paras_parallelism_config = "TP"
         self.server_args.enable_dp_attention = False
         # Store the string value (matching ServerArgs dataclass), not the Enum.

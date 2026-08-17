@@ -1,38 +1,21 @@
 #!/usr/bin/env python3
-"""Real dp=2 tp=2 ep=4 weight-transfer round-trip test (asymmetric DP x TP).
-
-Validates both dp=2/tp=2 transfer topologies: direct dptp peer access
-within one node, and the logical multi-node path that combines node-local
-peer access with an in-place all-gather across DP groups.
+"""EP4 <-> two TP2 instances across both local transports and w13 layouts.
 
 Topology (4 GPUs):
-  global rank R in [0,4);  tp_rank = R % T (=R%2);  dp_rank = R // T (=R//2)
-  EP mode:     4 ranks, each holds num_experts/ep_size = num_experts/4 experts,
-               full intermediate (moe_tp_size=2 means ep stores 2 shards worth).
-  DP x TP mode: each rank holds ALL num_experts experts, tp-sharded on the
-               intermediate dim by tp_rank, and REPLICATED across dp_rank
-               (ranks R and R+T carry identical TP data).
+  global rank R in [0,4); tp_rank = R % 2; dp_rank = R // 2.
+  EP mode: each rank holds num_experts/4 experts with the full intermediate.
+  TP mode: each rank holds all experts, sharded on the intermediate dimension
+  by tp_rank and replicated across the two dp ranks.
 
-Forward (EP -> DP x TP), source rank R, shard t, expert e (0..E_local):
-  canonical global expert g = R * E_local + e lands at TP slot g on every
-  destination rank d*T + t (d in [0,G)); each such rank receives shard t only.
-  So rank dr ends up with TP[g] = shard (dr % T) of EP-source(g) for all g,
-  identical across the two dp replicas.
-
-Reverse (DP x TP -> EP): each dp-replica reassembles its own EP shard from its
-  T tp-peers (replica-local, no broadcast); the redundant replica is dropped.
-  A correct round trip must recover the original EP weights bitwise.
-
-With PARAS_TEST_LOGICAL_MULTINODE=0 (default), IPC spans all four GPUs
-and exercises the dptp kernels. With it set to 1, IPC is restricted to the
-logical TP nodes {0,1}/{2,3}, while DP groups {0,2}/{1,3} perform the
-cross-node all-gather.
+EP -> TP reshards each dp rank's expert interval within its local TP2 instance
+using either NCCL or peer_access, then performs an in-place NCCL all-gather
+across DP ranks. TP -> EP reads only the interval owned by dp_rank and
+reconstructs it from local TP peers; the
+other replicated experts are ignored.
 
 Usage:
   CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 \
-      test/srt/paras/test_weight_transfer_dptp.py
-  PARAS_TEST_LOGICAL_MULTINODE=1 CUDA_VISIBLE_DEVICES=4,5,6,7 \
-      torchrun --nproc_per_node=4 test/srt/paras/test_weight_transfer_dptp.py
+      test/srt/paras/test_weight_transfer_tp_instances.py
 """
 
 import os
@@ -45,17 +28,16 @@ _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.join(_TEST_DIR, "..", "..", "..")
 sys.path.insert(0, os.path.join(_ROOT_DIR, "python"))
 
-# ---- test constants (Qwen3-30B-A3B geometry; H,I are dptp-dispatch presets) ----
+# ---- test constants (small Qwen-compatible geometry) ----
 NUM_LAYERS = 8
 HIDDEN = 2048
-INTERMEDIATE = 768  # (H=2048, I=768) is a supported dptp preset
+INTERMEDIATE = 768
 NUM_EXPERTS = 64
 SEED = 42
 
 TP_SIZE = 2
 DP_SIZE = 2
 EP_SIZE = DP_SIZE * TP_SIZE
-LOGICAL_MULTINODE = os.environ.get("PARAS_TEST_LOGICAL_MULTINODE", "0") == "1"
 
 
 def setup_distributed():
@@ -82,7 +64,7 @@ class _SimpleGroupCoordinator:
 
 
 def setup_paras_state(rank, world_size):
-    """ParaS state for a physical or logical dp=2/tp=2 topology."""
+    """ParaS state for two TP2 instances connected by DP groups."""
     import sglang.srt.distributed.parallel_state as ps
     import sglang.srt.paras.paras_parallel_state as pps
 
@@ -128,13 +110,13 @@ def setup_paras_state(rank, world_size):
     pps._PARAS_DP_RANK = rank // TP_SIZE
     pps._PARAS_EP_SIZE = EP_SIZE
     pps._PARAS_EP_RANK = rank
-    pps._PARAS_EP_GROUP_IS_NODE_LOCAL = not LOGICAL_MULTINODE
+    pps._PARAS_EP_GROUP_IS_NODE_LOCAL = True
     pps._PARAS_TP_GROUP_IS_NODE_LOCAL = True
 
     return world_group, tp_coord.device_group, dp_coord.device_group
 
 
-def build_manager(rank, world_size):
+def build_manager(rank):
     from sglang.srt.paras.paras_memory_manager import (
         ParaSMemoryManager,
         create_paras_moe_aliases,
@@ -161,15 +143,14 @@ def build_manager(rank, world_size):
         dp_size=DP_SIZE,
         moe_tp_size=TP_SIZE,
         quant_name=None,
-        configure_method="direct",
+        intra_node_weight_transfer_method="nccl",
         prefix="model",
     )
     mgr.materialize()
     create_paras_moe_aliases(mgr, NUM_LAYERS, prefix="model")
     set_global_paras_memory_manager(mgr)
 
-    e_local = NUM_EXPERTS // EP_SIZE
-    return mgr, e_local
+    return mgr
 
 
 def fill_ep_weights(mgr, rank):
@@ -218,15 +199,13 @@ class _MockExperts:
         self.w2_weight = torch.nn.Parameter(w2_view, requires_grad=False)
 
 
-def _make_mixin(layer_id, num_local_ep, mgr):
+def _make_mixin(layer_id, mgr, interleaved_w13):
     from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 
     m = object.__new__(ParaSMoeBlockMixin)
     m._paras_layer_id = layer_id
-    m._paras_interleaved_w13 = False
-    # num_local_experts is the TP-mode count (num_experts/tp_size); the dptp
-    # path uses num_global_experts and computes E_local internally.
-    m.num_local_experts = NUM_EXPERTS // TP_SIZE
+    m._paras_interleaved_w13 = interleaved_w13
+    m.num_local_experts = NUM_EXPERTS // EP_SIZE
     m.num_global_experts = NUM_EXPERTS
     m.hidden_size = HIDDEN
     m.moe_intermediate_size = INTERMEDIATE
@@ -238,29 +217,31 @@ def _make_mixin(layer_id, num_local_ep, mgr):
 
 
 class _ModelLayerAdapter:
-    """Expose the decoder-layer API used by the model-level pipeline."""
+    """Expose the three transfer operations used by model orchestration."""
 
     def __init__(self, mlp):
         self.mlp = mlp
 
-    def paras_reshard_ep_to_tp_node_peer(self, dst_base_ptrs, dp_rank, dp_size, stream):
-        return self.mlp.paras_reshard_ep_to_tp_node_peer(
+    def paras_reshard_ep_to_tp_intra_node_nccl(self, dp_rank, dp_size):
+        self.mlp.paras_reshard_ep_to_tp_intra_node_nccl(dp_rank, dp_size)
+
+    def paras_reshard_ep_to_tp_intra_node_peer_access(
+        self, dst_base_ptrs, dp_rank, dp_size, stream
+    ):
+        self.mlp.paras_reshard_ep_to_tp_intra_node_peer_access(
             dst_base_ptrs, dp_rank, dp_size, stream
         )
 
-    def paras_broadcast_ep_to_dptp_peer(self, dst_base_ptrs, ep_rank, dp_size, stream):
-        self.mlp.paras_broadcast_ep_to_dptp_peer(
-            dst_base_ptrs, ep_rank, dp_size, stream
-        )
+    def paras_all_gather_tp_inter_node(self, dp_rank, dp_size):
+        return self.mlp.paras_all_gather_tp_inter_node(dp_rank, dp_size)
 
-    def paras_all_gather_tp_weights(self, stream):
-        return self.mlp.paras_all_gather_tp_weights(stream)
+    def paras_reshard_tp_to_ep_intra_node_nccl(self, dp_rank, dp_size):
+        self.mlp.paras_reshard_tp_to_ep_intra_node_nccl(dp_rank, dp_size)
 
-    def paras_reshard_dptp_to_ep_peer(self, dst_base_ptrs, ep_rank, dp_size, stream):
-        self.mlp.paras_reshard_dptp_to_ep_peer(dst_base_ptrs, ep_rank, dp_size, stream)
-
-    def paras_reshard_tp_to_ep_node_peer(self, dst_base_ptrs, dp_rank, dp_size, stream):
-        self.mlp.paras_reshard_tp_to_ep_node_peer(
+    def paras_reshard_tp_to_ep_intra_node_peer_access(
+        self, dst_base_ptrs, dp_rank, dp_size, stream
+    ):
+        self.mlp.paras_reshard_tp_to_ep_intra_node_peer_access(
             dst_base_ptrs, dp_rank, dp_size, stream
         )
 
@@ -277,12 +258,12 @@ class _ModelLayerAdapter:
         pass
 
 
-def _make_model(mgr, num_local_ep, peer_ctx):
+def _make_model(mgr, peer_ctx, interleaved_w13):
     from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 
     model = object.__new__(ParaSModelMixin)
     model.layers = [
-        _ModelLayerAdapter(_make_mixin(layer_id, num_local_ep, mgr))
+        _ModelLayerAdapter(_make_mixin(layer_id, mgr, interleaved_w13))
         for layer_id in range(NUM_LAYERS)
     ]
     model._peer_access_ctx = peer_ctx
@@ -296,18 +277,22 @@ def setup_peer_ctx(mgr, peer_group, peer_size):
     return init_peer_access(mgr, peer_group, peer_size)
 
 
-def run_forward(mgr, num_local_ep, peer_ctx, world_group):
-    """EP -> DP x TP through the selected topology path."""
+def run_forward(mgr, peer_ctx, world_group, intra_node_method, interleaved_w13):
+    """EP -> replicated TP through local reshard plus DP all-gather."""
     dist.barrier(group=world_group)
-    model = _make_model(mgr, num_local_ep, peer_ctx)
-    model.paras_configure_tp(TP_SIZE, dist.get_rank() % TP_SIZE, method="direct")
+    model = _make_model(mgr, peer_ctx, interleaved_w13)
+    model.paras_configure_tp(
+        TP_SIZE,
+        dist.get_rank() % TP_SIZE,
+        intra_node_method=intra_node_method,
+    )
 
 
-def run_reverse(mgr, num_local_ep, peer_ctx, world_group):
-    """DP x TP -> EP through the selected topology path."""
+def run_reverse(mgr, peer_ctx, world_group, intra_node_method, interleaved_w13):
+    """Replicated TP -> EP through a TP-local owned-interval reshard."""
     dist.barrier(group=world_group)
-    model = _make_model(mgr, num_local_ep, peer_ctx)
-    model.paras_configure_ep(method="direct")
+    model = _make_model(mgr, peer_ctx, interleaved_w13)
+    model.paras_configure_ep(intra_node_method=intra_node_method)
 
 
 def read_tp_results(mgr):
@@ -338,14 +323,14 @@ def read_ep_results(mgr):
     return out
 
 
-def build_forward_ground_truth(snap, rank, world_group):
-    """Expected DP x TP tensors on this rank after the forward switch.
+def build_forward_ground_truth(snap, rank, world_group, interleaved_w13):
+    """Expected replicated TP tensors on this rank after the forward switch.
 
     Each rank holds ALL num_experts experts, tp-sharded by tp_rank = rank % T.
     Global expert g comes from EP source rank g // E_local, local index
-    g % E_local. w13 EP layout is (E_local, num_gates=2, T, I', H) flattened to
-    (E_local, 2*I, H) with the gate/up concat; tp_rank selects shard
-    [tp_rank*I' : (tp_rank+1)*I'] of each of gate and up. w2 EP layout is
+    g % E_local. For concatenated w13, tp_rank selects its slice from each gate
+    and up half. For interleaved w13, it selects the contiguous paired
+    gate-and-up slice. w2 EP layout is
     (E_local, H, I) and tp_rank selects columns [tp_rank*I' : (tp_rank+1)*I'].
     Replicas (same tp_rank, different dp_rank) are identical.
     """
@@ -367,16 +352,25 @@ def build_forward_ground_truth(snap, rank, world_group):
         full_w13 = torch.cat(gathered_w13, dim=0)
         full_w2 = torch.cat(gathered_w2, dim=0)
 
-        gate_shard = full_w13[:, tp_rank * tp_inter : (tp_rank + 1) * tp_inter, :]
-        up_shard = full_w13[
-            :,
-            INTERMEDIATE + tp_rank * tp_inter : INTERMEDIATE + (tp_rank + 1) * tp_inter,
-            :,
-        ]
-        exp_w13[layer_id] = torch.cat([gate_shard, up_shard], dim=1)
+        if interleaved_w13:
+            exp_w13[layer_id] = full_w13[
+                :,
+                2 * tp_rank * tp_inter : 2 * (tp_rank + 1) * tp_inter,
+                :,
+            ]
+        else:
+            gate_shard = full_w13[:, tp_rank * tp_inter : (tp_rank + 1) * tp_inter, :]
+            up_shard = full_w13[
+                :,
+                INTERMEDIATE
+                + tp_rank * tp_inter : INTERMEDIATE
+                + (tp_rank + 1) * tp_inter,
+                :,
+            ]
+            exp_w13[layer_id] = torch.cat([gate_shard, up_shard], dim=1)
         exp_w2[layer_id] = full_w2[:, :, tp_rank * tp_inter : (tp_rank + 1) * tp_inter]
 
-    return exp_w13, exp_w2, E_local
+    return exp_w13, exp_w2
 
 
 def _assert_equal(actual, expected, tag, rank, layer_id):
@@ -394,108 +388,144 @@ def main():
     passed = failed = 0
     try:
         world_group, tp_group, _ = setup_paras_state(rank, world_size)
-        mgr, num_local_ep = build_manager(rank, world_size)
+        mgr = build_manager(rank)
         fill_ep_weights(mgr, rank)
         snap = snapshot_weights(mgr)
-        peer_group = tp_group if LOGICAL_MULTINODE else world_group
-        peer_size = TP_SIZE if LOGICAL_MULTINODE else world_size
-        peer_ctx = setup_peer_ctx(mgr, peer_group, peer_size)
+        peer_ctx = None
+        for interleaved_w13 in (False, True):
+            exp_w13, exp_w2 = build_forward_ground_truth(
+                snap, rank, world_group, interleaved_w13
+            )
+            layout_name = "interleaved" if interleaved_w13 else "concatenated"
 
-        # === Test 1: EP -> DP x TP forward vs independent ground truth ===
-        if rank == 0:
-            print("\n=== Forward EP -> DPxTP (dptp) vs ground truth ===", flush=True)
-        restore_weights(mgr, snap)
-        exp_w13, exp_w2, _ = build_forward_ground_truth(snap, rank, world_group)
-        run_forward(mgr, num_local_ep, peer_ctx, world_group)
-        actual = read_tp_results(mgr)
-        try:
-            for layer_id in range(NUM_LAYERS):
-                _assert_equal(
-                    actual[layer_id][0], exp_w13[layer_id], "w13 fwd", rank, layer_id
-                )
-                _assert_equal(
-                    actual[layer_id][1], exp_w2[layer_id], "w2 fwd", rank, layer_id
-                )
-            if rank == 0:
-                print(
-                    "  [OK] forward dptp: bitwise match ground truth all layers",
-                    flush=True,
-                )
-            passed += 1
-        except AssertionError as e:
-            print(f"  [FAIL] forward: {e}", flush=True)
-            failed += 1
+            for intra_node_method in ("nccl", "peer_access"):
+                if intra_node_method == "peer_access" and peer_ctx is None:
+                    peer_ctx = setup_peer_ctx(mgr, tp_group, TP_SIZE)
 
-        # === Test 2: dp replicas identical (rank R and R+T carry same TP data) ===
-        if rank == 0:
-            print("\n=== DP-replica consistency ===", flush=True)
-        try:
-            for layer_id in range(NUM_LAYERS):
-                for which in (0, 1):
-                    buf = actual[layer_id][which].contiguous()
-                    peer = torch.empty_like(buf)
-                    partner = (
-                        rank + TP_SIZE
-                    ) % world_size  # same tp_rank, other dp replica
-                    # exchange with dp partner
-                    if rank < partner:
-                        dist.send(buf, dst=partner, group=world_group)
-                        dist.recv(peer, src=partner, group=world_group)
-                    else:
-                        dist.recv(peer, src=partner, group=world_group)
-                        dist.send(buf, dst=partner, group=world_group)
-                    _assert_equal(
-                        buf,
-                        peer,
-                        f"dp-replica w{'13' if which==0 else '2'}",
-                        rank,
-                        layer_id,
+                if rank == 0:
+                    print(
+                        f"\n=== {layout_name} / {intra_node_method}: EP -> replicated TP ===",
+                        flush=True,
                     )
-            if rank == 0:
-                print("  [OK] dp replicas bitwise identical all layers", flush=True)
-            passed += 1
-        except AssertionError as e:
-            print(f"  [FAIL] dp-replica: {e}", flush=True)
-            failed += 1
+                restore_weights(mgr, snap)
+                run_forward(
+                    mgr,
+                    peer_ctx,
+                    world_group,
+                    intra_node_method,
+                    interleaved_w13,
+                )
+                actual = read_tp_results(mgr)
+                try:
+                    for layer_id in range(NUM_LAYERS):
+                        _assert_equal(
+                            actual[layer_id][0],
+                            exp_w13[layer_id],
+                            "w13 fwd",
+                            rank,
+                            layer_id,
+                        )
+                        _assert_equal(
+                            actual[layer_id][1],
+                            exp_w2[layer_id],
+                            "w2 fwd",
+                            rank,
+                            layer_id,
+                        )
+                    if rank == 0:
+                        print(
+                            "  [OK] forward matches memory-manager TP views",
+                            flush=True,
+                        )
+                    passed += 1
+                except AssertionError as e:
+                    print(
+                        f"  [FAIL] {intra_node_method} forward: {e}",
+                        flush=True,
+                    )
+                    failed += 1
 
-        # === Test 3: full EP -> DPxTP -> EP round trip recovers original EP ===
-        if rank == 0:
-            print("\n=== Round trip EP -> DPxTP -> EP (dptp) ===", flush=True)
-        restore_weights(mgr, snap)
-        run_forward(mgr, num_local_ep, peer_ctx, world_group)
-        run_reverse(mgr, num_local_ep, peer_ctx, world_group)
-        ep_actual = read_ep_results(mgr)
-        try:
-            for layer_id in range(NUM_LAYERS):
-                _assert_equal(
-                    ep_actual[layer_id][0],
-                    snap[layer_id][0],
-                    "w13 roundtrip",
-                    rank,
-                    layer_id,
+                try:
+                    for layer_id in range(NUM_LAYERS):
+                        for which in (0, 1):
+                            buf = actual[layer_id][which].contiguous()
+                            peer = torch.empty_like(buf)
+                            partner = (rank + TP_SIZE) % world_size
+                            if rank < partner:
+                                dist.send(buf, dst=partner, group=world_group)
+                                dist.recv(peer, src=partner, group=world_group)
+                            else:
+                                dist.recv(peer, src=partner, group=world_group)
+                                dist.send(buf, dst=partner, group=world_group)
+                            _assert_equal(
+                                buf,
+                                peer,
+                                f"dp-replica w{'13' if which == 0 else '2'}",
+                                rank,
+                                layer_id,
+                            )
+                    if rank == 0:
+                        print("  [OK] DP replicas are bitwise identical", flush=True)
+                    passed += 1
+                except AssertionError as e:
+                    print(
+                        f"  [FAIL] {intra_node_method} DP replicas: {e}",
+                        flush=True,
+                    )
+                    failed += 1
+
+                restore_weights(mgr, snap)
+                run_forward(
+                    mgr,
+                    peer_ctx,
+                    world_group,
+                    intra_node_method,
+                    interleaved_w13,
                 )
-                _assert_equal(
-                    ep_actual[layer_id][1],
-                    snap[layer_id][1],
-                    "w2 roundtrip",
-                    rank,
-                    layer_id,
+                run_reverse(
+                    mgr,
+                    peer_ctx,
+                    world_group,
+                    intra_node_method,
+                    interleaved_w13,
                 )
-            if rank == 0:
-                print("  [OK] round trip: EP recovered bitwise all layers", flush=True)
-            passed += 1
-        except AssertionError as e:
-            print(f"  [FAIL] roundtrip: {e}", flush=True)
-            failed += 1
+                ep_actual = read_ep_results(mgr)
+                try:
+                    for layer_id in range(NUM_LAYERS):
+                        _assert_equal(
+                            ep_actual[layer_id][0],
+                            snap[layer_id][0],
+                            "w13 roundtrip",
+                            rank,
+                            layer_id,
+                        )
+                        _assert_equal(
+                            ep_actual[layer_id][1],
+                            snap[layer_id][1],
+                            "w2 roundtrip",
+                            rank,
+                            layer_id,
+                        )
+                    if rank == 0:
+                        print(
+                            "  [OK] memory-manager EP views recovered bitwise",
+                            flush=True,
+                        )
+                    passed += 1
+                except AssertionError as e:
+                    print(
+                        f"  [FAIL] {intra_node_method} roundtrip: {e}",
+                        flush=True,
+                    )
+                    failed += 1
 
         dist.barrier()
         if rank == 0:
             total = passed + failed
             print(f"\n{'=' * 60}")
             print(f"RESULTS: {passed}/{total} passed, {failed}/{total} failed")
-            topology = "logical multi-node" if LOGICAL_MULTINODE else "single-node dptp"
             print(
-                f"SUCCESS: dp=2 tp=2 ep=4 {topology} switch validated!"
+                "SUCCESS: ep=4 with dp=2 tp=2 instances validated!"
                 if failed == 0
                 else "FAILED"
             )

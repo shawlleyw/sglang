@@ -128,27 +128,6 @@ void launch_peer_access_kv_scatter_v3(
     int, int, int, int, int, int,
     cudaStream_t);
 
-// dptp launchers (kernels_dptp.cu)
-void launch_peer_access_fused_transfer_w13_dptp(
-    int64_t, int64_t*, int64_t, int64_t,
-    int, int, int, int, int, int, int, int,
-    cudaStream_t);
-
-void launch_peer_access_fused_transfer_w2_dptp(
-    int64_t, int64_t*, int64_t, int64_t,
-    int, int, int, int, int, int, int,
-    cudaStream_t);
-
-void launch_peer_access_fused_transfer_w13_ep_dptp(
-    int64_t, int64_t*, int64_t, int64_t,
-    int, int, int, int, int, int, int, int,
-    cudaStream_t);
-
-void launch_peer_access_fused_transfer_w2_ep_dptp(
-    int64_t, int64_t*, int64_t, int64_t,
-    int, int, int, int, int, int, int,
-    cudaStream_t);
-
 // Python-facing wrappers: accept torch tensors
 void launch_peer_access_fused_transfer_w13_v2_py(
     int64_t local_buffer_ptr,
@@ -494,93 +473,6 @@ void launch_kv_scatter_v3_py(
         reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
-static void check_dptp_T_G(int T, int G) {
-    TORCH_CHECK((T == 8 && G == 1) || (T == 4 && G == 2) || (T == 2 && G == 4)
-                || (T == 2 && G == 2),
-                "dptp kernels require (T, G) in {(8,1), (4,2), (2,4), (2,2)}; got T=",
-                T, " G=", G);
-}
-
-// The dptp launchers are only instantiated for elem_size==2 and the (H, I)
-// presets below; any other combo hits a printf-and-return no-op in the CUDA TU,
-// silently leaving the destination weights stale. Fail fast here instead.
-static void check_dptp_config(int T, int G, int H, int I, int elem_size) {
-    check_dptp_T_G(T, G);
-    TORCH_CHECK(elem_size == 2,
-                "dptp kernels require elem_size == 2 (bf16/fp16); got ", elem_size);
-    TORCH_CHECK((H == 4096 && I == 1536) || (H == 2048 && I == 768),
-                "dptp kernels require (H, I) in {(4096,1536), (2048,768)}; got H=",
-                H, " I=", I);
-}
-
-void launch_w13_dptp_py(
-    int64_t local_buffer_ptr, torch::Tensor peer_buffer_ptrs,
-    int64_t src_ep_offset, int64_t dst_tp_offset,
-    int rank, int T, int G, int E_local,
-    int H, int I, int num_gates, int elem_size,
-    int64_t stream_ptr
-) {
-    TORCH_CHECK(peer_buffer_ptrs.is_cuda());
-    check_dptp_config(T, G, H, I, elem_size);
-    TORCH_CHECK(num_gates == 1 || num_gates == 2,
-                "dptp w13 requires num_gates in {1, 2}; got ", num_gates);
-    launch_peer_access_fused_transfer_w13_dptp(
-        local_buffer_ptr, peer_buffer_ptrs.data_ptr<int64_t>(),
-        src_ep_offset, dst_tp_offset, rank, T, G,
-        E_local, H, I, num_gates, elem_size,
-        reinterpret_cast<cudaStream_t>(stream_ptr));
-}
-
-void launch_w2_dptp_py(
-    int64_t local_buffer_ptr, torch::Tensor peer_buffer_ptrs,
-    int64_t src_ep_offset, int64_t dst_tp_offset,
-    int rank, int T, int G, int E_local,
-    int H, int I, int elem_size,
-    int64_t stream_ptr
-) {
-    TORCH_CHECK(peer_buffer_ptrs.is_cuda());
-    check_dptp_config(T, G, H, I, elem_size);
-    launch_peer_access_fused_transfer_w2_dptp(
-        local_buffer_ptr, peer_buffer_ptrs.data_ptr<int64_t>(),
-        src_ep_offset, dst_tp_offset, rank, T, G,
-        E_local, H, I, elem_size,
-        reinterpret_cast<cudaStream_t>(stream_ptr));
-}
-
-void launch_w13_ep_dptp_py(
-    int64_t local_buffer_ptr, torch::Tensor peer_buffer_ptrs,
-    int64_t src_tp_offset, int64_t dst_ep_offset,
-    int rank, int T, int G, int E_local,
-    int H, int I, int num_gates, int elem_size,
-    int64_t stream_ptr
-) {
-    TORCH_CHECK(peer_buffer_ptrs.is_cuda());
-    check_dptp_config(T, G, H, I, elem_size);
-    TORCH_CHECK(num_gates == 1 || num_gates == 2,
-                "dptp w13 requires num_gates in {1, 2}; got ", num_gates);
-    launch_peer_access_fused_transfer_w13_ep_dptp(
-        local_buffer_ptr, peer_buffer_ptrs.data_ptr<int64_t>(),
-        src_tp_offset, dst_ep_offset, rank, T, G,
-        E_local, H, I, num_gates, elem_size,
-        reinterpret_cast<cudaStream_t>(stream_ptr));
-}
-
-void launch_w2_ep_dptp_py(
-    int64_t local_buffer_ptr, torch::Tensor peer_buffer_ptrs,
-    int64_t src_tp_offset, int64_t dst_ep_offset,
-    int rank, int T, int G, int E_local,
-    int H, int I, int elem_size,
-    int64_t stream_ptr
-) {
-    TORCH_CHECK(peer_buffer_ptrs.is_cuda());
-    check_dptp_config(T, G, H, I, elem_size);
-    launch_peer_access_fused_transfer_w2_ep_dptp(
-        local_buffer_ptr, peer_buffer_ptrs.data_ptr<int64_t>(),
-        src_tp_offset, dst_ep_offset, rank, T, G,
-        E_local, H, I, elem_size,
-        reinterpret_cast<cudaStream_t>(stream_ptr));
-}
-
 PYBIND11_MODULE(paras_peer_access_cuda, m) {
     m.doc() = "ParaS CUDA peer access transfer kernels (v2 baseline + v3 contiguous-tile)";
     m.def("launch_peer_access_fused_transfer_w13_v2", &launch_peer_access_fused_transfer_w13_v2_py,
@@ -607,12 +499,4 @@ PYBIND11_MODULE(paras_peer_access_cuda, m) {
           "v3 KV cache EP->TP transfer (R-broadcast, half-warp K/V)");
     m.def("launch_peer_access_kv_scatter_v3", &launch_kv_scatter_v3_py,
           "v3 KV cache TP->EP scatter (contiguous-tile, half-warp K/V)");
-    m.def("launch_peer_access_fused_transfer_w13_dptp", &launch_w13_dptp_py,
-          "dptp w13 EP->DPxTP forward (replicated scatter, broadcast write)");
-    m.def("launch_peer_access_fused_transfer_w2_dptp", &launch_w2_dptp_py,
-          "dptp w2 EP->DPxTP forward (replicated scatter, broadcast write)");
-    m.def("launch_peer_access_fused_transfer_w13_ep_dptp", &launch_w13_ep_dptp_py,
-          "dptp w13 DPxTP->EP reverse (replica-local within T-group, no broadcast)");
-    m.def("launch_peer_access_fused_transfer_w2_ep_dptp", &launch_w2_ep_dptp_py,
-          "dptp w2 DPxTP->EP reverse (replica-local within T-group, no broadcast)");
 }

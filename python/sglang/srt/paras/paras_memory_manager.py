@@ -37,8 +37,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.paras.weight_transfer import (
-    WeightTransferMethod,
-    resolve_weight_transfer_method,
+    IntraNodeWeightTransferMethod,
+    resolve_intra_node_weight_transfer_method,
 )
 
 if TYPE_CHECKING:
@@ -1248,7 +1248,9 @@ def plan_qwen_moe_layout(
     quant_name: Optional[str] = None,
     fp8_block_size: Optional[int] = None,
     num_fused_shared_experts: int = 0,
-    configure_method: str = WeightTransferMethod.DIRECT.value,
+    intra_node_weight_transfer_method: str = (
+        IntraNodeWeightTransferMethod.PEER_ACCESS.value
+    ),
     prefix: str = "model",
 ) -> None:
     """
@@ -1279,12 +1281,9 @@ def plan_qwen_moe_layout(
         tp_size=tp_size,
         dp_size=dp_size,
     )
-    transfer_method = resolve_weight_transfer_method(configure_method)
-    if transfer_method is WeightTransferMethod.NCCL and dp_size != 1:
-        raise ValueError(
-            "The ParaS NCCL weight transfer supports only dp_size=1; "
-            "use method='direct' for DP x TP configurations"
-        )
+    intra_node_method = resolve_intra_node_weight_transfer_method(
+        intra_node_weight_transfer_method
+    )
 
     is_fp8 = quant_name == "fp8"
     weight_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
@@ -1371,7 +1370,7 @@ def plan_qwen_moe_layout(
             weight_dtype,
         )
 
-    if transfer_method is WeightTransferMethod.NCCL:
+    if intra_node_method is IntraNodeWeightTransferMethod.NCCL:
         staging_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
         staging_experts = num_experts // ep_size
         w13_shape = (staging_experts, 2 * intermediate_size, hidden_size)
@@ -1401,7 +1400,9 @@ def plan_gpt_oss_moe_layout(
     quant_name: Optional[str] = None,
     fp8_block_size: Optional[int] = None,
     num_fused_shared_experts: int = 0,
-    configure_method: str = WeightTransferMethod.DIRECT.value,
+    intra_node_weight_transfer_method: str = (
+        IntraNodeWeightTransferMethod.PEER_ACCESS.value
+    ),
     prefix: str = "model",
 ) -> None:
     """Reserve all weight tensors for a GPT-OSS sparse-MoE model.
@@ -1443,7 +1444,7 @@ def plan_gpt_oss_moe_layout(
         quant_name=quant_name,
         fp8_block_size=fp8_block_size,
         num_fused_shared_experts=num_fused_shared_experts,
-        configure_method=configure_method,
+        intra_node_weight_transfer_method=intra_node_weight_transfer_method,
         prefix=prefix,
     )
 

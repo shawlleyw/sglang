@@ -24,8 +24,8 @@ sys.path.insert(0, os.path.join(_ROOT_DIR, "python"))
 
 from sglang.srt.paras.peer_access import (  # noqa: E402
     exchange_buffer_addresses_ipc,
-    peer_access_fused_transfer_w13_ep,
-    peer_access_fused_transfer_w2_ep,
+    peer_access_reshard_w13_tp_to_ep_intra_node,
+    peer_access_reshard_w2_tp_to_ep_intra_node,
 )
 
 TP_SIZE = 4
@@ -146,7 +146,7 @@ def _run_group(buffer, peer_ptrs, tp_rank, dp_rank):
         ("v2", W13_V2_EP_OFFSET, W2_V2_EP_OFFSET),
         ("v3", W13_V3_EP_OFFSET, W2_V3_EP_OFFSET),
     ):
-        peer_access_fused_transfer_w13_ep(
+        peer_access_reshard_w13_tp_to_ep_intra_node(
             buffer.data_ptr(),
             peer_ptrs,
             W13_TP_OFFSET + node_expert_start * W13_EXPERT_BYTES,
@@ -161,7 +161,7 @@ def _run_group(buffer, peer_ptrs, tp_rank, dp_rank):
             variant=variant,
             hidden_size=HIDDEN,
         )
-        peer_access_fused_transfer_w2_ep(
+        peer_access_reshard_w2_tp_to_ep_intra_node(
             buffer.data_ptr(),
             peer_ptrs,
             W2_TP_OFFSET + node_expert_start * W2_EXPERT_BYTES,

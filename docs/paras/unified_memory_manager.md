@@ -13,8 +13,8 @@ The manager covers:
 - EP and TP expert weights for every MoE layer.
 - Attention weights that need stable EP and TP views.
 - EP and TP KV-cache views, including hybrid full/sliding-window layouts.
-- One optional pair of weight-permutation staging buffers for the NCCL
-  fallback.
+- One optional pair of weight-permutation staging buffers for NCCL
+  intra-node resharding.
 
 Every entry is 256-byte aligned. Model parameters remain ordinary PyTorch
 `Parameter` objects backed by views of the manager buffer.
@@ -36,7 +36,11 @@ entry:
 
 ```python
 manager = ParaSMemoryManager(device="cuda")
-plan_qwen_moe_layout(manager, ..., configure_method="direct")
+plan_qwen_moe_layout(
+    manager,
+    ...,
+    intra_node_weight_transfer_method="peer_access",
+)
 manager.reserve_kv_cache(...)
 manager.materialize()
 create_paras_moe_aliases(manager, num_layers)
@@ -83,7 +87,7 @@ budget reserved by `reserve_kv_cache`. `materialize` enforces the condition
 before assigning the combined run.
 
 The complete offset derivation and safety proof are in
-[`unified_memory_epdptp.md`](unified_memory_epdptp.md).
+[`unified_memory_ep_tp.md`](unified_memory_ep_tp.md).
 
 ## Transfer Order
 
@@ -94,29 +98,42 @@ The overlapping layout imposes one order per direction:
 | EP -> TP | cache, then expert weights | reverse (`N-1` to `0`) |
 | TP -> EP | expert weights, then cache | forward (`0` to `N-1`) |
 
-Within a direct expert-weight phase, every layer is fenced across the physical
-IPC peer group before the next layer can reuse overlapping regions. Attention
-and communicator state are activated only after all expert weights finish
-moving.
+Within a peer-access expert-weight phase, every layer is fenced across the
+physical TP peer group before overlapping regions can be reused. NCCL local
+resharding is ordered by its TP-group all-to-all. Attention and communicator
+state are activated only after all expert weights finish moving.
 
 ## Weight Transfer Methods
 
-`PARAS_CONFIGURE_METHOD` accepts exactly two values:
+`PARAS_INTRA_NODE_WEIGHT_TRANSFER_METHOD` accepts exactly two values:
 
-- `direct` (default): topology-aware CUDA IPC transfer. A node-local DPxTP
-  target uses the DPTP broadcast kernels. A multi-node target performs a
-  TP-local reshard into the node-owned expert interval, followed by an in-place
-  all-gather over the DP group.
-- `nccl`: sequential permutation plus `all_to_all_single`. This fallback is
-  supported only when `dp_size == 1`.
+- `peer_access` (default): TP-local CUDA IPC resharding.
+- `nccl`: TP-local permutation plus `all_to_all_single`.
+
+The setting controls only the intra-node TP reshard. Both values support
+`dp_size > 1`. After EP -> TP local resharding, an in-place NCCL all-gather
+over the DP group replicates the owned expert intervals across TP instances.
+TP -> EP selects the local `dp_rank` interval and uses no DP collective.
 
 Unknown values fail while planning the layout. Only `nccl` reserves
-`staging.w13_pre_permute` and `staging.w2_pre_permute`; the removed overlap
-method and its duplicate staging sets have no compatibility aliases.
+`staging.w13_pre_permute` and `staging.w2_pre_permute`. The removed
+`direct` and overlap names have no compatibility aliases.
 
 See
 [`nvlink_peer_access_weight_transfer.md`](nvlink_peer_access_weight_transfer.md)
 for the topology matrix and synchronization details.
+
+## Verification
+
+The memory manager is covered at both layout and transfer levels:
+
+- `test_paras_layout_unit.py` plans, materializes, and checks the real
+  four-anchor offsets, aliases, overlap, alignment, and switch-order safety.
+- `test_weight_transfer_method.py` materializes NCCL staging with
+  `ep_size=4`, `tp_size=2`, and `dp_size=2`.
+- `test_weight_transfer.py` and `test_weight_transfer_tp_instances.py`
+  perform GPU transfers through materialized manager EP/TP views and verify
+  bitwise forward and round-trip results.
 
 ## KV Cache Integration
 
@@ -137,7 +154,7 @@ The manager validates the conditions needed by the transfer kernels and the
 overlapping layout:
 
 - Expert and intermediate dimensions divide the configured parallel sizes.
-- `ep_size = dp_size * tp_size` for a DPxTP target.
+- `ep_size = dp_size * tp_size` when multiple TP instances are configured.
 - Per-layer TP cache bytes do not exceed EP cache bytes.
 - EP and TP regions for the same layer are disjoint while that layer is in
   flight.
@@ -155,4 +172,4 @@ The CPU reference implementation and fuzz checks live in
 | `layers/paras_model.py` | Method selection, topology selection, ordering, and synchronization |
 | `layers/paras_moe_block.py` | Expert-weight views and transfer primitives |
 | `gather_manager.py` / `scatter_manager.py` | EP/TP request and KV-cache movement |
-| `unified_memory_epdptp.md` | Offset derivation, proof, and DPxTP ownership mapping |
+| `unified_memory_ep_tp.md` | Offset derivation, proof, and multiple-TP-instance ownership |

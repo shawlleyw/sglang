@@ -79,23 +79,30 @@ Those phase and layer orders ensure every source region is consumed before an
 overlapping destination can overwrite it. TP->EP therefore performs a real
 reverse transfer; changing expert pointers alone cannot restore EP data.
 
-See: `unified_memory_manager.md`, `unified_memory_epdptp.md`
+See: `unified_memory_manager.md`, `unified_memory_ep_tp.md`
 
-## NVLink Peer Access Transfers
+## Weight And KV Transfer Transports
 
-Custom CUDA kernels write directly to peer GPU memory via NVLink, avoiding NCCL's staging buffers and kernel launch overhead.
+`PARAS_INTRA_NODE_WEIGHT_TRANSFER_METHOD` selects `peer_access` or `nccl`
+for the TP-local expert-weight reshard. Inter-node expert replication always
+uses a DP-group NCCL all-gather. KV transfer has its own
+`PARAS_KV_TRANSFER_METHOD` setting.
+
+The peer-access weight and KV kernels write directly to peer GPU memory via
+NVLink, avoiding NCCL staging and collective launch overhead.
 
 ### EP→TP Direction
 
-**Weight transfer** (`peer_access_fused_transfer_w13_v2`, `peer_access_fused_transfer_w2_v2`):
-- Handles the `dp_size=1` EP-to-TP reshard over node-local IPC
-- Fused kernel — one launch per layer handles all peers
-- 1.57× faster than NCCL sequential
+**Weight transfer** (`peer_access_reshard_w13_ep_to_tp_intra_node`,
+`peer_access_reshard_w2_ep_to_tp_intra_node`):
+- Reshards the `dp_rank`-owned expert interval over TP-local IPC
+- Runs an in-place DP all-gather when `dp_size > 1`
+- Overlaps the next layer's intra-node reshard with the current layer's
+  inter-node replication
 
-For a DPxTP target, a node-local EP group uses the DPTP broadcast kernels. A
-multi-node EP group first reshards its node-owned expert interval across the TP
-group and then runs an in-place all-gather across the DP group. See
-`nvlink_peer_access_weight_transfer.md` for the complete strategy matrix.
+Every TP instance uses the same algorithm. CUDA IPC is always scoped to the TP
+group; no dedicated multiple-instance kernel or EP-wide IPC mapping exists.
+See `nvlink_peer_access_weight_transfer.md` for the complete flow.
 
 **KV cache transfer** (`peer_access_kv_transfer`):
 - Reads EP KV cache from scattered token positions, writes to each peer's TP KV slot
@@ -105,9 +112,11 @@ group and then runs an in-place all-gather across the DP group. See
 
 ### TP→EP Direction
 
-**Weight transfer** (`peer_access_fused_transfer_w13_ep`, `peer_access_fused_transfer_w2_ep`):
-- Structural mirror of EP→TP v2 kernels with swapped src/dst
-- Forward layer order (0→N-1) with a per-layer barrier
+**Weight transfer** (`peer_access_reshard_w13_tp_to_ep_intra_node`,
+`peer_access_reshard_w2_tp_to_ep_intra_node`):
+- Reads only the expert interval owned by `dp_rank`
+- Reassembles that interval within the local TP group; no DP collective
+- Uses forward layer order (0→N-1) with a per-layer TP-group barrier
 
 **KV cache scatter** (`peer_access_kv_scatter`):
 - Reads local TP KV, writes to peer EP buffers at correct head slot
@@ -131,19 +140,22 @@ Cross-process NVLink stores require mapping peer GPU memory into the local addre
 
 See: `exploration_notes_kv_cache_peer_access.md` §2
 
-## NCCL Fallback Path
+## NCCL Paths
 
-### EP→TP
+For expert weights, NCCL is an alternative intra-node transport selected by
+`PARAS_INTRA_NODE_WEIGHT_TRANSFER_METHOD=nccl`.
 
-**Weight transfer**: sequential `all_to_all_single` with one pre-permute
-staging buffer per expert weight. This fallback supports `dp_size=1` only.
+- **EP -> TP:** Each TP group permutes one EP rank's weights into the shared
+  staging views and runs `all_to_all_single` into its `dp_rank`-owned TP
+  interval. With multiple TP instances, the normal DP-group all-gather then
+  replicates all intervals.
+- **TP -> EP:** Each TP group reads only its owned TP interval, runs the reverse
+  `all_to_all_single`, and inverse-permutes into EP views. No DP collective
+  runs in this direction.
 
-**KV cache transfer**: `gather_kv_and_permute` → `repeat_interleave` (for head replication) → `all_to_all_single` → `permute_and_scatter_kv`.
-
-### TP→EP
-
-**Weight transfer**: Reverse all-to-all (`all_to_all_single` + inverse
-permute), layers in forward order.
+The KV-cache NCCL fallback remains independent: EP -> TP uses
+`gather_kv_and_permute`, head replication, `all_to_all_single`, and
+`permute_and_scatter_kv`; TP -> EP uses the corresponding scatter path.
 
 **KV cache scatter**: A single unified code path handles both R=1 and R>1. With head replication, each subgroup member sends a disjoint 1/R token slice. On the receive side, contiguous subgroup chunks naturally concatenate via reshape — the only conditional is:
 ```python
@@ -257,7 +269,7 @@ Unlimited round-trips are supported without explicit state caching:
 | Request gather/partition | 16ms | <1ms |
 | Cache reorchestrate | 2ms | 1ms |
 | KV cache transfer | 46ms | 3ms (empty batch) |
-| Weight transfer (direct) | 78ms | 70ms |
+| Weight transfer (peer_access) | 78ms | 70ms |
 | Attention + config | 20ms | 11ms |
 | **Total** | **163ms** | **88ms** |
 
@@ -270,12 +282,15 @@ Unlimited round-trips are supported without explicit state caching:
 | In-flight requests during TP→EP switch | ✅ Coherent completion |
 | Full round-trip EP→TP→EP | ✅ Identical to original EP |
 
-### Gated Test Coverage (91 tests)
+### Gated Test Coverage
 
 | Suite | Tests | Verified Against |
 |-------|-------|-----------------|
 | Layer cache spec + KV budget (CPU) | 14 | Formula parity and heterogeneous layer-spec invariants |
 | Unified memory manager heterogeneous layout (CPU) | 5 | Union-layout bookkeeping |
+| Unified memory manager four-anchor layout (CPU) | 13 | Materialized offsets, aliases, overlap, and switch safety |
+| Weight transfer EP4 <-> TP4 (GPU) | 6 | NCCL and peer_access ground truth and round trip |
+| Weight transfer EP4 <-> DP2/TP2 (GPU) | 12 | Both local transports and w13 layouts, DP replication, and manager-backed round trip |
 | SWA allocator (CPU) | 8 | Allocator invariants |
 | SWA pool rebind (CPU) | 9 | Buffer rebinding invariants |
 | Hybrid round-trip (CPU) | 26 | Per-layer K/V rebinding and SWA warning behavior |
@@ -317,7 +332,8 @@ Both launch scripts under [`scripts/paras/eval/`](file:///home/shaoyuw/sglang/sc
 
 1. **Head replication under SWA remains rare**: MHA replication is fully tested. Hybrid SWA replication is validated at replication factor 2 by the dedicated SWA cache-transfer suite, but production GPT-OSS / Gemma configs usually satisfy `num_kv_heads >= paras_tp_size`, so `SWACacheTransfer` emits a warning when replication is active to encourage end-to-end validation of the rare configuration.
 
-2. **`dp_size > 1`**: Currently only `paras_dp_size == 1` is supported.
+2. **Physical multi-node coverage**: `dp_size=2, tp_size=2` is validated on
+   four local A100s; a two-node, eight-rank TP4 deployment remains to be run.
 
 3. **FP8 support**: Kernels and memory manager support FP8 weights but FP8 KV cache is not yet wired through.
 

@@ -63,7 +63,7 @@ from sglang.srt.paras.paras_parallel_state import (
     get_paras_tp_size,
 )
 from sglang.srt.paras.utils import paras_func
-from sglang.srt.paras.weight_transfer import resolve_weight_transfer_method
+from sglang.srt.paras.weight_transfer import resolve_intra_node_weight_transfer_method
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
@@ -306,7 +306,7 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
         moe_tp_size = get_moe_tensor_parallel_world_size()
         dp_size = get_paras_dp_size()
 
-        configure_method = resolve_weight_transfer_method()
+        intra_node_method = resolve_intra_node_weight_transfer_method()
 
         plan_gpt_oss_moe_layout(
             manager,
@@ -324,7 +324,7 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
             quant_name=quant_name,
             fp8_block_size=fp8_block_size,
             num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
-            configure_method=configure_method,
+            intra_node_weight_transfer_method=intra_node_method,
             prefix="model",
         )
 

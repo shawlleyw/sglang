@@ -21,7 +21,7 @@ heads_per_rank = num_kv_heads / tp_size.
 
 Usage:
   CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 \
-      test/srt/paras/test_kv_roundtrip_dptp.py
+      test/srt/paras/test_kv_roundtrip_tp_instances.py
 """
 
 import os

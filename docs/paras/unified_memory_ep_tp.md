@@ -1,6 +1,12 @@
-# ParaS Unified Memory Layout for EP↔DP×TP
+# ParaS Unified Memory Layout for EP↔TP With Multiple TP Instances
 
-**Status:** Implemented in [`paras_memory_manager.py`](../../python/sglang/srt/paras/paras_memory_manager.py) (`_place_paras_run`) and the switch orchestration (`paras_model.py`, `gather_manager.py`, `scatter_manager.py`, `peer_access.py`, `scheduler_paras_mixin.py`). Address math is exercised by [`benchmark/paras/paras_layout.py`](../../benchmark/paras/paras_layout.py) (`compute_layout` + `check_safe`, 40k-case fuzz); `test_weight_transfer.py` validates NCCL and direct EP4↔TP4 in both directions, while `test_weight_transfer_dptp.py` validates both EP4↔DP2×TP2 topologies.
+**Status:** Implemented in
+[`paras_memory_manager.py`](../../python/sglang/srt/paras/paras_memory_manager.py)
+and the switch orchestration. The CPU layout tests validate materialized
+four-anchor offsets. `test_weight_transfer.py` validates both intra-node
+transports for EP4 <-> TP4, and `test_weight_transfer_tp_instances.py`
+validates both transports plus the DP all-gather for EP4 <-> two TP2
+instances.
 
 **Scope:** This document describes the layout that replaced the `N+1` identical MoE weight slots. It supports `ep_size ≥ tp_size` with uniform or hybrid (sliding-window + full) attention cache, subject to the production capacity invariant `ct[i] ≤ ce[i]` described below.
 
@@ -10,7 +16,7 @@
 
 The [unified memory manager](unified_memory_manager.md) holds all persistent ParaS state in one contiguous `uint8` buffer and switches between Expert Parallelism (EP) and Tensor Parallelism (TP) by reinterpreting the same bytes. The former layout reserved `N+1` identical MoE weight slots and aliased EP and TP onto neighboring slots, which was correct only when EP and TP occupied the same bytes per layer (`SE == ST`).
 
-EP↔(DP×TP) breaks that. On a `W = G·T` grid (`G = dp_size`, `T = tp_size`, `ep_size = W`), EP weights are small (experts sharded across all `W` ranks) while DP×TP weights are `G` times larger (sharded across only `T`); the KV cache runs the other way, EP large and TP small. This design packs both interpretations into one combined `[weights | cache]` run in which the large TP weights overlap the EP cache, so the buffer is the shared per-mode footprint `B` plus **one layer**.
+Multiple TP instances break that. On a `W = G·T` grid (`G = dp_size`, `T = tp_size`, `ep_size = W`), EP weights are small (experts sharded across all `W` ranks) while each TP instance uses a TP layout that is `G` times larger (experts sharded across only `T` ranks); the KV cache runs the other way, EP large and TP small. This design packs both interpretations into one combined `[weights | cache]` run in which the large TP weights overlap the EP cache, so the buffer is the shared per-mode footprint `B` plus **one layer**.
 
 ## Background
 
@@ -133,62 +139,64 @@ The change surface is in [`paras_memory_manager.py`](../../python/sglang/srt/par
 | `_compute_kv_budget_bytes` | Use per-mode elastic budgets so the EP and TP footprints match `B`. |
 | `reserve_kv_cache` / `_create_kv_layout` | Fold the cache block into the combined run. |
 
-## DP×TP (`dp_size > 1`) Status
+## Multiple TP Instances (`dp_size > 1`)
 
 Let `G = dp_size`, `T = tp_size`, `E` be the global expert count, and
-`L = E/(G*T)` be the number of experts owned by one wide-EP rank. Logical DP
-rank `d` corresponds to the node-local TP group whose global ranks are
-`{d*T, ..., d*T+T-1}`.
+`L = E/(G*T)` be the experts owned by one EP rank. Logical DP rank `d`
+identifies the TP instance whose ranks are `{d*T, ..., d*T+T-1}`.
 
-- **EP→DP×TP on one node.** The fused peer-access `dptp` kernels
-  ([`kernels_dptp.cu`](../../python/sglang/srt/paras/csrc/kernels_dptp.cu))
-  read each EP shard once and broadcast it to all `G` replicas.
-- **EP→DP×TP across nodes.** Each node-local TP group writes its `E/G`
-  experts directly into the canonical TP interval `[d*E/G, (d+1)*E/G)`.
-  A strided `_PARAS_DP` group then performs an in-place all-gather from that
-  interval into the full TP tensor. No staging allocation is required.
-- **DP×TP→EP across nodes.** No cross-node collective is required. Every TP
-  replica begins with all `E` experts, but group `d` shifts its source base
-  to expert `d*T*L = d*E/G` and launches the reverse peer-access kernel with
-  exactly `L` experts per destination. Local peer `t` receives global
-  experts `[(d*T+t)*L, (d*T+t+1)*L)`; experts outside the node's interval are
-  never read. The `T` source ranks contribute their intermediate-dimension
-  shards to those `T` EP destinations over node-local IPC. This is the
-  required drop-then-intra-node-reshard operation.
-- **KV cache and requests redistribute only within a TP subgroup.** For `ep=4, tp=2, dp=2` the two subgroups are `{0,1}` and `{2,3}`; each performs a self-contained `tp=2` KV switch over its own 2-rank NCCL group (`_PARAS_TP` scopes to the subgroup, `paras_tp_rank ∈ {0,1}`). The subgroups never exchange KV bytes. The existing `TP_SIZE`-templated KV kernels and NCCL fallback are topology-agnostic and need no `dptp` variant.
+Every topology uses the same algorithm:
 
-The production multi-node reverse path explicitly uses the baseline v2 direct
-access kernel. The v3 reverse kernel has the same local-peer and source-offset
-mapping, so it can implement the same operation independently in every TP
-group without a `G` parameter. Its compiled dispatch is narrower, however:
-`T in {4, 8}`, `elem_size == 2`, and the existing `(H, I)` model presets.
-Consequently v3 supports the tested `DP2×TP4` mapping but cannot run the
-`DP2×TP2` configuration, and production does not currently select it.
+- **EP -> TP, intra-node phase.** TP instance `d` reshards the EP experts
+  held by its `T` ranks into `[d*E/G, (d+1)*E/G)`. The configured
+  `peer_access` or `nccl` method controls only this TP-local operation.
+- **EP -> TP, inter-node phase.** When `G > 1`, the strided `_PARAS_DP`
+  groups perform in-place NCCL all-gathers from those intervals into the full
+  TP tensors. All TP instances then hold identical TP weights.
+- **TP -> EP.** No DP collective is required. TP instance `d` reads only
+  `[d*E/G, (d+1)*E/G)` and reconstructs the full intermediate dimension
+  through its selected TP-local transport. Other TP expert intervals are
+  ignored when EP views are activated.
+- **KV cache and requests.** These redistribute only within a TP instance. For
+  `ep=4, tp=2, dp=2`, `{0,1}` and `{2,3}` perform independent TP2 KV
+  switches; DP groups do not exchange KV bytes.
 
-Validated on 4×A100:
+The reverse operation is more than a pointer change: owned experts still need
+TP-local reconstruction. "Dropping" means skipping replicated TP experts owned
+by other DP ranks; no buffer is freed because EP and TP are stable views in
+the unified allocation.
 
-| Harness | Result |
-|---------|--------|
-| [`test_weight_transfer_dptp.py`](../../test/srt/paras/test_weight_transfer_dptp.py) | 3/3 — direct dptp by default; logical multi-node mode validates TP-local IPC, in-place DP all-gather, and v2 TP→EP expert dropping |
-| [`test_weight_transfer_multinode_reverse.py`](../../test/srt/paras/test_weight_transfer_multinode_reverse.py) | Both logical DP ranks at `DP2×TP4` — v2 and v3 select only the node-owned expert interval and reconstruct all four EP shards bitwise |
-| [`test_kv_roundtrip_dptp.py`](../../test/srt/paras/test_kv_roundtrip_dptp.py) | 2/2 — intra-subgroup KV EP→TP→EP round-trip, cross-group isolation |
+Validated on 4xA100:
 
-The layout `compute_layout` proof and CPU unit suite (33 checks) cover the `G>1` byte geometry.
+| Harness | Coverage |
+|---------|----------|
+| [`test_weight_transfer.py`](../../test/srt/paras/test_weight_transfer.py) | EP4 <-> TP4 through peer_access and NCCL |
+| [`test_weight_transfer_tp_instances.py`](../../test/srt/paras/test_weight_transfer_tp_instances.py) | EP4 <-> two TP2 instances through both local transports and w13 layouts, DP all-gather, replica equality, and manager-backed bitwise round trip |
+| [`test_weight_transfer_multinode_reverse.py`](../../test/srt/paras/test_weight_transfer_multinode_reverse.py) | Both logical DP ranks select only their owned interval with v2 and v3 kernels |
+| [`test_kv_roundtrip_tp_instances.py`](../../test/srt/paras/test_kv_roundtrip_tp_instances.py) | TP-instance KV round trip and cross-instance isolation |
 
-### End-to-end serving (live server, dp>1)
+**Intra-node communication is always TP-local.** The weight method selects
+`peer_access` or `nccl` within `_PARAS_TP`; `_PARAS_DP` always uses
+NCCL and carries only EP -> TP weight replication. CUDA IPC is never opened
+for remote processes.
 
-The full scheduler switch was brought up on a live qwen3-30B server at `EP=4 / DP2 / TP2` (`--paras-tp-size 2`, 4×A100, FlashInfer, cuda-graph).
+**Synchronization follows the selected local transport.** Peer writes use a
+TP-group visibility fence; NCCL all-to-all completion is stream ordered. On
+EP -> TP, the inter-node stream waits for the local layer and launches the DP
+all-gather while the intra-node stream starts the next layer. TP -> EP remains
+local to the TP group.
 
-**Peer access is topology-scoped.** CUDA IPC is opened only among GPUs on the same node. A node-local EP group uses one EP-wide mapping for dptp weights, with KV addressing the current TP subgroup slice. A multi-node EP group uses one TP-group mapping shared by weights and KV; `_PARAS_DP` carries cross-node EP→DP×TP weight traffic through NCCL. The reverse DP×TP→EP path stays within each TP group. This avoids opening an IPC handle for a remote process and still keeps only one mapping of each peer buffer.
+### End-to-end serving
 
-**Sync scoping follows the physical transfer.** The single-node dptp path uses an EP-group barrier after each layer. The multi-node EP→DP×TP path uses a TP-group barrier after node-local peer writes, then launches the in-place DP all-gather on a second stream. The next layer's NVLink reshard overlaps that NIC collective at model level. The reverse DP×TP→EP path uses only TP-group barriers and node-local peer writes. KV cache redistribution remains scoped to the TP subgroup.
-
-Manual-switch procedure (`.skills/paras-test-manual-switch`): dual capture `pools_differ=True` (#EP=52, #TP=68 graphs, cuda graph intact both modes); EP/TP/EP-RT prompts 0/32 degenerate; `configure_tp` 160 ms / `configure_ep` 58 ms; in-flight EP→TP 3/3 and TP→EP **20/20** clean; no server errors. The gate at `scheduler_paras_mixin.py:742` (`paras_dp_size == 1`) is relaxed to enable this.
+The full scheduler switch was validated on qwen3-30B at `EP=4`, `dp_size=2`,
+`tp_size=2` with FlashInfer and CUDA graphs. Both TP instances use the same
+weights after the forward DP all-gather, and the reverse switch restores the
+four EP shards without inter-node communication.
 
 ## Future Work
 
 - **FP8 weights and scales.** The FP8 weight path is byte-agnostic (`elem_size = 1`) but untested, with a tighter 16-byte alignment constraint on `w2` rows. FP8 scales are pre-materialized at init and likely need no transfer kernel; verify under the `(d, t)` topology.
-- **Physical EP=8 / DP2 / TP4 scale.** The reverse ownership mapping is validated by emulating both DP ranks on one TP4 group, but the full eight-rank, two-node switch still needs an end-to-end run.
+- **Physical EP=8 with two TP4 instances.** The reverse ownership mapping is validated by emulating both DP ranks on one TP4 group, but the full eight-rank, two-node switch still needs an end-to-end run.
 
 ## Design Documents
 

@@ -1,6 +1,20 @@
 """
 Reusable ParaS model-level mixin.
 
+Weight-transfer topology
+========================
+
+EP uses one wide expert-parallel group. TP means a tensor-parallel weight
+layout, and ``dp_size`` is the number of independent TP instances. In a
+multi-node deployment every TP instance is contained within one node, while
+the DP group connects ranks with the same ``tp_rank`` across TP instances.
+
+EP -> TP first reshards the experts owned by ``dp_rank`` within the local TP
+group. When ``dp_size > 1``, an in-place DP all-gather then replicates every
+expert interval to every TP instance. TP -> EP needs only the inverse local
+reshard: each TP instance reads its ``dp_rank``-owned expert interval and
+ignores the other replicated experts.
+
 CausalLM Integration Pattern:
 ===============================
 For a CausalLM class to support ParaS, define these methods:
@@ -28,18 +42,14 @@ from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manage
 from sglang.srt.paras.paras_parallel_state import (
     get_paras_dp_rank,
     get_paras_dp_size,
-    get_paras_ep_group,
-    get_paras_ep_rank,
-    get_paras_ep_size,
     get_paras_tp_group,
     get_paras_tp_size,
-    is_paras_ep_group_node_local,
 )
 from sglang.srt.paras.peer_access import init_peer_access
 from sglang.srt.paras.utils import paras_func
 from sglang.srt.paras.weight_transfer import (
-    WeightTransferMethod,
-    resolve_weight_transfer_method,
+    IntraNodeWeightTransferMethod,
+    resolve_intra_node_weight_transfer_method,
 )
 
 
@@ -51,112 +61,131 @@ class ParaSModelMixin:
       - self.layers — list/ModuleList of decoder layers supporting paras methods
     """
 
-    def _paras_transfer_ep_to_tp_nccl(self):
-        for layer in reversed(self.layers):
-            layer.paras_reshard_ep_to_tp_nccl()
-
-    def _paras_transfer_tp_to_ep_nccl(self):
-        for layer in self.layers:
-            layer.paras_reshard_tp_to_ep_nccl()
-
-    def _paras_weight_peer_scope(self):
-        if is_paras_ep_group_node_local():
-            return (
-                get_paras_ep_group().device_group,
-                get_paras_ep_size(),
-            )
-
-        assert (
-            get_paras_dp_size() > 1
-        ), "ParaS multi-node switching requires dp_size > 1"
-        return (
-            get_paras_tp_group().device_group,
-            get_paras_tp_size(),
-        )
-
-    def _paras_weight_peer_context(self):
+    def _paras_intra_node_peer_access_state(self):
         mgr = get_global_paras_memory_manager()
-        peer_group, peer_size = self._paras_weight_peer_scope()
-        if not hasattr(self, "_peer_access_ctx") or self._peer_access_ctx is None:
-            self._peer_access_ctx = init_peer_access(mgr, peer_group, peer_size)
-        return self._peer_access_ctx, peer_group
-
-    def _paras_transfer_ep_to_tp_multinode(self, dst_base_ptrs):
         tp_group = get_paras_tp_group().device_group
-        dp_size = get_paras_dp_size()
+        tp_size = get_paras_tp_size()
+        if not hasattr(self, "_peer_access_ctx") or self._peer_access_ctx is None:
+            self._peer_access_ctx = init_peer_access(mgr, tp_group, tp_size)
+        dst_base_ptrs = torch.tensor(
+            self._peer_access_ctx.peer_addresses,
+            dtype=torch.int64,
+            device="cuda",
+        )
+        return dst_base_ptrs, tp_group
+
+    def _paras_reshard_ep_to_tp_intra_node(
+        self,
+        layer,
+        intra_node_method,
+        dp_rank,
+        dp_size,
+        dst_base_ptrs,
+        stream,
+    ):
+        if intra_node_method is IntraNodeWeightTransferMethod.PEER_ACCESS:
+            layer.paras_reshard_ep_to_tp_intra_node_peer_access(
+                dst_base_ptrs, dp_rank, dp_size, stream
+            )
+        else:
+            layer.paras_reshard_ep_to_tp_intra_node_nccl(dp_rank, dp_size)
+
+    def _paras_reshard_tp_to_ep_intra_node(
+        self,
+        layer,
+        intra_node_method,
+        dp_rank,
+        dp_size,
+        dst_base_ptrs,
+        stream,
+    ):
+        if intra_node_method is IntraNodeWeightTransferMethod.PEER_ACCESS:
+            layer.paras_reshard_tp_to_ep_intra_node_peer_access(
+                dst_base_ptrs, dp_rank, dp_size, stream
+            )
+        else:
+            layer.paras_reshard_tp_to_ep_intra_node_nccl(dp_rank, dp_size)
+
+    def _paras_transfer_ep_to_tp(self, intra_node_method):
         dp_rank = get_paras_dp_rank()
-        peer_stream = torch.cuda.Stream()
-        gather_stream = torch.cuda.Stream()
-        barrier_tensor = torch.zeros(1, device="cuda")
+        dp_size = get_paras_dp_size()
+        dst_base_ptrs = None
+        peer_group = None
+        barrier_tensor = None
+        if intra_node_method is IntraNodeWeightTransferMethod.PEER_ACCESS:
+            dst_base_ptrs, peer_group = self._paras_intra_node_peer_access_state()
+            barrier_tensor = torch.zeros(1, device="cuda")
+
+        if dp_size == 1:
+            for layer in reversed(self.layers):
+                self._paras_reshard_ep_to_tp_intra_node(
+                    layer,
+                    intra_node_method,
+                    dp_rank,
+                    dp_size,
+                    dst_base_ptrs,
+                    None,
+                )
+                if peer_group is not None:
+                    dist.all_reduce(barrier_tensor, group=peer_group)
+            return
+
+        intra_node_stream = torch.cuda.Stream()
+        inter_node_stream = torch.cuda.Stream()
         gather_handles = []
 
         # Reverse layer order preserves the four-anchor source/destination
-        # hazard. The gather stream consumes layer i while the peer stream
-        # reshards layer i-1, keeping NIC and NVLink work in flight together.
+        # hazard. The DP all-gather consumes layer i while the local reshard
+        # prepares layer i-1, overlapping inter-node and intra-node traffic.
         for layer in reversed(self.layers):
-            with torch.cuda.stream(peer_stream):
-                layer.paras_reshard_ep_to_tp_node_peer(
-                    dst_base_ptrs, dp_rank, dp_size, peer_stream
+            with torch.cuda.stream(intra_node_stream):
+                self._paras_reshard_ep_to_tp_intra_node(
+                    layer,
+                    intra_node_method,
+                    dp_rank,
+                    dp_size,
+                    dst_base_ptrs,
+                    intra_node_stream,
                 )
-                dist.all_reduce(barrier_tensor, group=tp_group)
-                peer_done = torch.cuda.Event()
-                peer_done.record(peer_stream)
+                if peer_group is not None:
+                    dist.all_reduce(barrier_tensor, group=peer_group)
+                intra_node_done = torch.cuda.Event()
+                intra_node_done.record(intra_node_stream)
 
-            with torch.cuda.stream(gather_stream):
-                gather_stream.wait_event(peer_done)
-                gather_handles.extend(layer.paras_all_gather_tp_weights(gather_stream))
+            with torch.cuda.stream(inter_node_stream):
+                inter_node_stream.wait_event(intra_node_done)
+                gather_handles.extend(
+                    layer.paras_all_gather_tp_inter_node(dp_rank, dp_size)
+                )
 
         for handle in gather_handles:
             handle.wait()
 
         current_stream = torch.cuda.current_stream()
-        current_stream.wait_stream(peer_stream)
-        current_stream.wait_stream(gather_stream)
+        current_stream.wait_stream(intra_node_stream)
+        current_stream.wait_stream(inter_node_stream)
 
-    def _paras_transfer_ep_to_tp_direct(self):
-        peer_ctx, barrier_group = self._paras_weight_peer_context()
-        dst_base_ptrs = torch.tensor(
-            peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
-        )
-        dp_size = get_paras_dp_size()
-
-        if not is_paras_ep_group_node_local():
-            self._paras_transfer_ep_to_tp_multinode(dst_base_ptrs)
-            return
-
-        barrier_tensor = torch.zeros(1, device="cuda")
-        ep_rank = get_paras_ep_rank()
-        for layer in reversed(self.layers):
-            if dp_size == 1:
-                layer.paras_reshard_ep_to_tp_peer(dst_base_ptrs, None)
-            else:
-                layer.paras_broadcast_ep_to_dptp_peer(
-                    dst_base_ptrs, ep_rank, dp_size, None
-                )
-            dist.all_reduce(barrier_tensor, group=barrier_group)
-
-    def _paras_transfer_tp_to_ep_direct(self):
-        peer_ctx, barrier_group = self._paras_weight_peer_context()
-        dst_base_ptrs = torch.tensor(
-            peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
-        )
-        barrier_tensor = torch.zeros(1, device="cuda")
-        dp_size = get_paras_dp_size()
-        ep_rank = get_paras_ep_rank()
+    def _paras_transfer_tp_to_ep(self, intra_node_method):
         dp_rank = get_paras_dp_rank()
+        dp_size = get_paras_dp_size()
+        dst_base_ptrs = None
+        peer_group = None
+        barrier_tensor = None
+        if intra_node_method is IntraNodeWeightTransferMethod.PEER_ACCESS:
+            dst_base_ptrs, peer_group = self._paras_intra_node_peer_access_state()
+            barrier_tensor = torch.zeros(1, device="cuda")
 
         for layer in self.layers:
-            if dp_size == 1:
-                layer.paras_reshard_tp_to_ep_peer(dst_base_ptrs, None)
-            elif is_paras_ep_group_node_local():
-                layer.paras_reshard_dptp_to_ep_peer(
-                    dst_base_ptrs, ep_rank, dp_size, None
-                )
-            else:
-                layer.paras_reshard_tp_to_ep_node_peer(
-                    dst_base_ptrs, dp_rank, dp_size, None
-                )
-            dist.all_reduce(barrier_tensor, group=barrier_group)
+            self._paras_reshard_tp_to_ep_intra_node(
+                layer,
+                intra_node_method,
+                dp_rank,
+                dp_size,
+                dst_base_ptrs,
+                None,
+            )
+            if peer_group is not None:
+                dist.all_reduce(barrier_tensor, group=peer_group)
 
     def _paras_activate_tp(self, paras_tp_size: int, paras_tp_rank: int):
         for layer in self.layers:
@@ -190,19 +219,15 @@ class ParaSModelMixin:
                 layer.paras_finalize_attn_views(paras_tp_size, paras_tp_rank)
 
     @paras_func
-    def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int, method=None):
-        transfer_method = resolve_weight_transfer_method(method)
-        if transfer_method is WeightTransferMethod.DIRECT:
-            self._paras_transfer_ep_to_tp_direct()
-        else:
-            self._paras_transfer_ep_to_tp_nccl()
+    def paras_configure_tp(
+        self, paras_tp_size: int, paras_tp_rank: int, intra_node_method=None
+    ):
+        intra_node_method = resolve_intra_node_weight_transfer_method(intra_node_method)
+        self._paras_transfer_ep_to_tp(intra_node_method)
         self._paras_activate_tp(paras_tp_size, paras_tp_rank)
 
     @paras_func
-    def paras_configure_ep(self, method=None):
-        transfer_method = resolve_weight_transfer_method(method)
-        if transfer_method is WeightTransferMethod.DIRECT:
-            self._paras_transfer_tp_to_ep_direct()
-        else:
-            self._paras_transfer_tp_to_ep_nccl()
+    def paras_configure_ep(self, intra_node_method=None):
+        intra_node_method = resolve_intra_node_weight_transfer_method(intra_node_method)
+        self._paras_transfer_tp_to_ep(intra_node_method)
         self._paras_activate_ep()

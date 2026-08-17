@@ -53,41 +53,31 @@ class ParaSDecoderLayerMixin:
         if hasattr(self.self_attn, "paras_configure_tp"):
             self.self_attn.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
-    def paras_reshard_ep_to_tp_nccl(self):
-        self.mlp.paras_reshard_ep_to_tp_nccl()
+    def paras_reshard_ep_to_tp_intra_node_nccl(self, dp_rank, dp_size):
+        self.mlp.paras_reshard_ep_to_tp_intra_node_nccl(dp_rank, dp_size)
 
-    def paras_reshard_ep_to_tp_peer(self, dst_base_ptrs, stream):
-        self.mlp.paras_reshard_ep_to_tp_peer(dst_base_ptrs, stream)
-
-    def paras_broadcast_ep_to_dptp_peer(self, dst_base_ptrs, ep_rank, dp_size, stream):
-        self.mlp.paras_broadcast_ep_to_dptp_peer(
-            dst_base_ptrs, ep_rank, dp_size, stream
-        )
-
-    def paras_reshard_ep_to_tp_node_peer(self, dst_base_ptrs, dp_rank, dp_size, stream):
-        self.mlp.paras_reshard_ep_to_tp_node_peer(
+    def paras_reshard_ep_to_tp_intra_node_peer_access(
+        self, dst_base_ptrs, dp_rank, dp_size, stream
+    ):
+        self.mlp.paras_reshard_ep_to_tp_intra_node_peer_access(
             dst_base_ptrs, dp_rank, dp_size, stream
         )
 
-    def paras_all_gather_tp_weights(self, stream):
-        return self.mlp.paras_all_gather_tp_weights(stream)
+    def paras_all_gather_tp_inter_node(self, dp_rank, dp_size):
+        return self.mlp.paras_all_gather_tp_inter_node(dp_rank, dp_size)
 
     def paras_configure_ep_attn(self):
         """Restore attention from TP→EP for this layer (mirrors paras_configure_tp_attn)."""
         if hasattr(self.self_attn, "paras_configure_ep"):
             self.self_attn.paras_configure_ep()
 
-    def paras_reshard_tp_to_ep_nccl(self):
-        self.mlp.paras_reshard_tp_to_ep_nccl()
+    def paras_reshard_tp_to_ep_intra_node_nccl(self, dp_rank, dp_size):
+        self.mlp.paras_reshard_tp_to_ep_intra_node_nccl(dp_rank, dp_size)
 
-    def paras_reshard_tp_to_ep_peer(self, dst_base_ptrs, stream):
-        self.mlp.paras_reshard_tp_to_ep_peer(dst_base_ptrs, stream)
-
-    def paras_reshard_dptp_to_ep_peer(self, dst_base_ptrs, ep_rank, dp_size, stream):
-        self.mlp.paras_reshard_dptp_to_ep_peer(dst_base_ptrs, ep_rank, dp_size, stream)
-
-    def paras_reshard_tp_to_ep_node_peer(self, dst_base_ptrs, dp_rank, dp_size, stream):
-        self.mlp.paras_reshard_tp_to_ep_node_peer(
+    def paras_reshard_tp_to_ep_intra_node_peer_access(
+        self, dst_base_ptrs, dp_rank, dp_size, stream
+    ):
+        self.mlp.paras_reshard_tp_to_ep_intra_node_peer_access(
             dst_base_ptrs, dp_rank, dp_size, stream
         )
 

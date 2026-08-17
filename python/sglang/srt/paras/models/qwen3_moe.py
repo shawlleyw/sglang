@@ -32,16 +32,12 @@ from sglang.srt.paras.paras_memory_manager import (
     plan_qwen_moe_layout,
 )
 from sglang.srt.paras.paras_parallel_state import (
-    get_paras_dp_rank,
     get_paras_dp_size,
-    get_paras_ep_group,
-    get_paras_ep_size,
     get_paras_tp_group,
     get_paras_tp_size,
-    is_paras_ep_group_node_local,
 )
 from sglang.srt.paras.utils import paras_func
-from sglang.srt.paras.weight_transfer import resolve_weight_transfer_method
+from sglang.srt.paras.weight_transfer import resolve_intra_node_weight_transfer_method
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
@@ -161,7 +157,10 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             qn = quant_config.get_name()
             if qn == "fp8":
                 quant_name = "fp8"
-                if hasattr(quant_config, "weight_block_size") and quant_config.weight_block_size:
+                if (
+                    hasattr(quant_config, "weight_block_size")
+                    and quant_config.weight_block_size
+                ):
                     fp8_block_size = quant_config.weight_block_size[0]
 
         head_dim = getattr(
@@ -171,7 +170,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         moe_tp_size = get_moe_tensor_parallel_world_size()
         dp_size = get_paras_dp_size()
 
-        configure_method = resolve_weight_transfer_method()
+        intra_node_method = resolve_intra_node_weight_transfer_method()
 
         plan_qwen_moe_layout(
             manager,
@@ -189,7 +188,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             quant_name=quant_name,
             fp8_block_size=fp8_block_size,
             num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
-            configure_method=configure_method,
+            intra_node_weight_transfer_method=intra_node_method,
             prefix="model",
         )
 
@@ -216,55 +215,32 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
 
-        # Pre-initialize NVLink peer access during model init to avoid overhead at switch time.
-        # cudaIpcOpenMemHandle() is slow on first call (~6s for NVLink connection setup).
+        # Pre-initialize the TP-local CUDA IPC mapping. Every weight-transfer
+        # path reshards only within this TP group; DP replication uses NCCL.
+        # cudaIpcOpenMemHandle() is slow on first use, so initialize it here.
         try:
-            from sglang.srt.paras.peer_access import (
-                PeerAccessContext,
-                init_peer_access,
-            )
+            from sglang.srt.paras.peer_access import init_peer_access
 
-            _tp = get_paras_tp_size()
-            if is_paras_ep_group_node_local():
-                # Single-node dptp kernels address every EP rank. KV reuses the
-                # same IPC mapping through the current TP subgroup's slice.
-                self._weight_peer_access_ctx = init_peer_access(
-                    manager,
-                    get_paras_ep_group().device_group,
-                    get_paras_ep_size(),
-                )
-                _dp_base = get_paras_dp_rank() * _tp
-                self._fused_peer_access_ctx = PeerAccessContext(
-                    peer_addresses=self._weight_peer_access_ctx.peer_addresses[
-                        _dp_base : _dp_base + _tp
-                    ],
-                    peer_access_enabled=True,
-                    tp_group=get_paras_tp_group().device_group,
-                    tp_size=_tp,
-                )
-            else:
-                # CUDA IPC is node-local. Multi-node weight and KV transfers
-                # share the TP-group mapping; the DP communicator supplies the
-                # cross-node weight replication.
-                self._weight_peer_access_ctx = init_peer_access(
-                    manager,
-                    get_paras_tp_group().device_group,
-                    _tp,
-                )
-                self._fused_peer_access_ctx = self._weight_peer_access_ctx
+            self._fused_peer_access_ctx = init_peer_access(
+                manager,
+                get_paras_tp_group().device_group,
+                get_paras_tp_size(),
+            )
             logger.info("ParaS fused peer access pre-initialized.")
         except Exception as e:
-            logger.warning(f"ParaS fused peer access pre-init failed (will retry at switch): {e}")
+            logger.warning(
+                "ParaS fused peer access pre-init failed (will retry at switch): %s",
+                e,
+            )
             self._fused_peer_access_ctx = None
-            self._weight_peer_access_ctx = None
 
         self.model = Qwen3MoeModelParaS(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         # Inject the pre-initialized node-local mapping so the switch does not
         # pay the IPC setup cost on its first request.
-        if self._weight_peer_access_ctx is not None:
-            self.model._peer_access_ctx = self._weight_peer_access_ctx
+        if self._fused_peer_access_ctx is not None:
+            self.model._peer_access_ctx = self._fused_peer_access_ctx
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,

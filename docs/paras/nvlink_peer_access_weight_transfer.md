@@ -1,132 +1,140 @@
-# Direct Expert Weight Transfer for ParaS
+# Expert Weight Transfer for ParaS
 
 ## Scope
 
-ParaS switches expert weights between a wide expert-parallel layout and either
-one tensor-parallel group or multiple data-parallel replicas of a TP group. The
-runtime exposes two weight-transfer methods through `PARAS_CONFIGURE_METHOD`:
+ParaS switches expert weights between one wide expert-parallel layout and one
+or more instances of the same tensor-parallel layout. The setting
+`PARAS_INTRA_NODE_WEIGHT_TRANSFER_METHOD` selects only the transport used to
+reshard weights inside each node-local TP group:
 
-- `direct` (default): topology-aware CUDA IPC kernels, with a cross-node DP
-  all-gather where required.
-- `nccl`: a sequential `all_to_all_single` fallback for `dp_size=1`.
+- `peer_access` (default): CUDA IPC kernels write the TP-local result directly
+  into peer memory.
+- `nccl`: a TP-group `all_to_all_single` uses one pre-permute staging buffer
+  per weight.
 
-Unknown method names fail during memory planning. The removed NCCL overlap
-method has no compatibility alias or staging-buffer reservations.
+Both methods support one or multiple TP instances. When multiple TP instances
+exist, EP -> TP always follows the selected local reshard with a DP-group NCCL
+all-gather. TP -> EP never requires an inter-node collective.
 
-## Tensor Layouts
+Unknown method names fail during memory planning. The removed `direct` name
+has no compatibility alias.
+
+## Topology Contract
 
 Let `G = dp_size`, `T = tp_size`, `E` be the global expert count, and
-`L = E/(G*T)`. Each wide-EP rank owns `L` experts with the full intermediate
-dimension. Each DPxTP rank owns all `E` experts, but only its `I/T`
-intermediate shard.
+`L = E/(G*T)`. EP uses one group of `G*T` ranks; each EP rank owns `L`
+experts with the full intermediate dimension. Each TP rank owns all `E`
+experts and one `I/T` intermediate shard. There are `G` independent TP
+instances, selected by `dp_rank`.
 
-The four-anchor memory layout registers separate EP and TP views for every
-layer. EP->TP processes layers in reverse order; TP->EP processes them in
-forward order. Those orders prevent a destination layer from overwriting a
-source layer that has not yet been consumed. See
-[`unified_memory_epdptp.md`](unified_memory_epdptp.md) for the address proof.
+In a multi-node deployment, every TP instance must be contained within one
+node. A DP group connects ranks with the same `tp_rank` across TP instances.
+CUDA IPC and the NCCL all-to-all are therefore scoped to the local TP group.
+The DP group is used only for EP -> TP replication.
 
-## Direct Strategy Matrix
+The four-anchor memory layout registers stable EP and TP views for every layer.
+EP -> TP processes layers in reverse order; TP -> EP processes them in forward
+order. See [`unified_memory_ep_tp.md`](unified_memory_ep_tp.md) for the
+address proof.
 
-### EP -> TP, `G = 1`
+## EP -> TP
 
-The baseline v2 kernel reads each local EP expert, selects the intermediate
-shard for every TP peer, and writes it directly into that peer's TP view.
+### Intra-node reshard
 
-- w13: `peer_access_fused_transfer_w13_v2`
-- w2: `peer_access_fused_transfer_w2_v2`
-
-### EP -> DPxTP, node-local EP group
-
-The DPTP kernels address all `G*T` ranks through one node-local IPC mapping.
-Each EP shard is read once and broadcast into the corresponding expert range
-of every DP replica.
-
-- w13: `peer_access_fused_transfer_w13_dptp`
-- w2: `peer_access_fused_transfer_w2_dptp`
-
-### EP -> DPxTP, multi-node EP group
-
-Each node first performs a TP-local IPC reshard into its canonical expert
-interval `[d*E/G, (d+1)*E/G)`. A strided DP group then runs an in-place
-all-gather from that interval into the full TP tensor.
-
-The model uses two CUDA streams:
+Every `dp_rank` reshards only the expert interval owned by its TP instance:
 
 ```text
-IPC stream:  reshard N-1 | reshard N-2 | reshard N-3
-DP stream:                 gather N-1  | gather N-2
+experts_per_dp_rank = E / G
+expert_start = dp_rank * experts_per_dp_rank
+expert_end = expert_start + experts_per_dp_rank
 ```
 
-For each layer, a TP-group all-reduce fences all peer writes. A CUDA event then
-makes the DP stream wait for that layer's node-local interval. The next layer's
-IPC reshard can overlap the current layer's NIC collective because they use
-disjoint layer regions and different links.
+The layer APIs make the transport explicit:
 
-The DP all-gather input is already located at the calling DP rank's output
-offset. This is NCCL's in-place all-gather layout and needs no staging buffer.
+- `paras_reshard_ep_to_tp_intra_node_peer_access`
+- `paras_reshard_ep_to_tp_intra_node_nccl`
 
-### TP -> EP, `G = 1`
+The peer-access path launches:
 
-The reverse v2 kernels assemble each rank's full EP experts from the
-intermediate shards stored on its TP peers.
+- `peer_access_reshard_w13_ep_to_tp_intra_node`
+- `peer_access_reshard_w2_ep_to_tp_intra_node`
 
-- w13: `peer_access_fused_transfer_w13_ep`
-- w2: `peer_access_fused_transfer_w2_ep`
+The NCCL path permutes the local EP tensor into
+`staging.w13_pre_permute` or `staging.w2_pre_permute`, then runs a TP-group
+`all_to_all_single` directly into the same owned interval of the TP view.
+The staging size is one EP rank's weights and does not grow with `dp_size`.
 
-### DPxTP -> EP, node-local EP group
+### Inter-node replication
 
-The reverse DPTP kernels reconstruct the EP shard owned by every rank in the
-wide node-local group.
+When `dp_size > 1`, ranks with the same `tp_rank` run an in-place
+`all_gather_into_tensor` over their DP group for w13 and w2. After the
+collective, every TP instance holds the complete TP layout. This phase always
+uses NCCL, independent of the selected intra-node method.
 
-### DPxTP -> EP, multi-node EP group
+The model pipelines two CUDA streams across layers:
 
-TP weights are replicated across DP groups, so no cross-node collective is
-needed. Node `d` ignores experts outside `[d*E/G, (d+1)*E/G)`, shifts the TP
-source base to that interval, and runs the baseline reverse kernel across its
-`T` local peers. Each EP rank receives exactly `L` full experts.
+```text
+intra-node stream: reshard N-1 | reshard N-2 | reshard N-3
+inter-node stream:               gather N-1  | gather N-2
+```
 
-## Synchronization
+A CUDA event releases each DP all-gather after its local reshard. Peer-access
+writes additionally use a TP-group collective as a remote-write visibility
+fence. NCCL local resharding needs no extra fence because its all-to-all
+completion is already ordered on the intra-node stream.
 
-Direct kernels write remote GPU memory, so CUDA stream ordering on one rank is
-not enough. After every layer, the model issues an all-reduce on the physical
-peer group:
+For `dp_size=1`, the local interval is the full expert range and the DP
+all-gather is skipped.
 
-- EP group for a node-local wide-EP transfer.
-- TP group for a multi-node transfer.
+## TP -> EP
 
-The collective is ordered after the local kernel and does not complete until
-every peer has submitted its writes. This fences the current layer before the
-next layer can reuse overlapping four-anchor regions. The multi-node forward
-path records a CUDA event after that fence for the DP all-gather stream.
+TP weights are already replicated across DP ranks. Each `dp_rank` selects
+only its owned interval, then reconstructs the full intermediate dimension
+inside its local TP group through one of:
 
-## NCCL Fallback
+- `paras_reshard_tp_to_ep_intra_node_peer_access`
+- `paras_reshard_tp_to_ep_intra_node_nccl`
 
-The `nccl` method supports `dp_size=1` only. EP->TP permutes each local EP
-weight into `staging.w13_pre_permute` or `staging.w2_pre_permute`, then runs
-`all_to_all_single` directly into the TP view. TP->EP runs the inverse
-all-to-all and permutation. There is one staging set and one sequential layer
-walk; no overlap method or dual staging suffixes remain.
+The peer-access path launches:
+
+- `peer_access_reshard_w13_tp_to_ep_intra_node`
+- `peer_access_reshard_w2_tp_to_ep_intra_node`
+
+Experts outside the owned interval are not copied. They remain in the inactive
+TP view and are ignored after EP views are activated. This is a logical drop,
+not a deallocation operation.
+
+## Memory Manager Integration
+
+Both transports read and write typed views backed by the same
+`ParaSMemoryManager` allocation:
+
+- EP source/destination views use `ep_experts.*` entries.
+- TP source/destination views use `tp_experts.*` entries.
+- Only the NCCL intra-node method reserves the two staging entries.
+- The DP all-gather writes directly into the full TP views.
+
+The GPU tests do not substitute standalone allocations. They call
+`plan_qwen_moe_layout`, `materialize`, and `create_paras_moe_aliases`,
+then validate the materialized TP views and the recovered EP views.
 
 ## Kernel Versions
 
-The production Python path selects v2 for the baseline local reshard. The v3
-reverse mapping can select a multi-node node-owned interval through its source
-offset and expert count, but its compiled presets support only `T in {4, 8}`
-and BF16 model presets. The v3 forward mapping cannot consume a DP-gathered
-expert order without a `G`-aware mapping. See the DPxTP status section in
-[`unified_memory_epdptp.md`](unified_memory_epdptp.md).
+Production peer-access switching selects v2 for TP-local reshards. The v3
+wrappers remain available for isolated kernel benchmarking and reverse
+ownership tests. No multi-TP-instance kernel variant is required because
+cross-instance replication belongs to the DP all-gather.
 
 ## File Map
 
 | File | Responsibility |
 |------|----------------|
-| `paras/layers/paras_model.py` | Method selection, topology, layer order, streams, events, and barriers |
-| `paras/layers/paras_decoder_layer.py` | Thin layer-level transfer interface |
-| `paras/layers/paras_moe_block.py` | Tensor views and topology-specific transfer primitives |
-| `paras/peer_access.py` | CUDA IPC initialization and Python kernel wrappers |
+| `paras/layers/paras_model.py` | Intra-node method selection, inter-node orchestration, streams, events, and peer fences |
+| `paras/layers/paras_decoder_layer.py` | Layer-level transport-specific transfer interface |
+| `paras/layers/paras_moe_block.py` | Expert intervals, memory-manager views, local reshards, and DP all-gather |
+| `paras/weight_transfer.py` | Intra-node method enum and environment resolution |
+| `paras/peer_access.py` | CUDA IPC initialization and semantic kernel wrappers |
 | `paras/csrc/peer_access_transfer.cu` | Baseline v2 forward/reverse kernels |
-| `paras/csrc/kernels_dptp.cu` | Node-local DPxTP forward/reverse kernels |
 | `paras/paras_memory_manager.py` | Four-anchor EP/TP views and optional NCCL staging |
-| `test/srt/paras/test_weight_transfer.py` | EP4 <-> TP4 NCCL/direct correctness |
-| `test/srt/paras/test_weight_transfer_dptp.py` | EP4 <-> DP2xTP2 node-local and logical multi-node correctness |
+| `test/srt/paras/test_weight_transfer.py` | EP4 <-> TP4, NCCL and peer_access |
+| `test/srt/paras/test_weight_transfer_tp_instances.py` | EP4 <-> two TP2 instances, both local transports and w13 layouts plus DP all-gather |
