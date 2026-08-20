@@ -1,7 +1,10 @@
-"""Peer access initialization and buffer address exchange for ParaS NVLink transfers.
+"""TP-local peer access for ParaS intra-node NVLink transfers.
 
 Exchanges managed-buffer base addresses via CUDA IPC so that kernels on any
-rank can directly write to peer GPU memory via NVLink stores.
+rank can directly write to peer GPU memory via NVLink stores. The context is
+deliberately scoped to one TP group: when ``dp_size > 1``, it must not exchange
+or open IPC handles for ranks in another TP instance. Cross-DP-rank weight
+communication is performed separately by the DP-group NCCL all-gather.
 
 NOTE: We intentionally do NOT call cudaDeviceEnablePeerAccess(). The
 cudaIpcOpenMemHandle() with cudaIpcMemLazyEnablePeerAccess flag is sufficient
@@ -52,6 +55,10 @@ def exchange_buffer_addresses_ipc(
 ) -> List[int]:
     """Exchange managed-buffer addresses using CUDA IPC handles.
 
+    ``world_size`` and ``rank`` are local to ``tp_group``. This function must
+    never receive the global, EP, or DP group because CUDA IPC mappings are
+    used only for the TP-local resharding step.
+
     Unlike ``exchange_buffer_addresses`` (raw ``data_ptr()``), this works
     across separate OS processes (torchrun / sglang server) because each
     rank opens a cross-process IPC mapping for every remote buffer.
@@ -91,20 +98,25 @@ def exchange_buffer_addresses_ipc(
                 remote_handle,
                 1,  # cudaIpcMemLazyEnablePeerAccess
             )
-            assert ret == 0, (
-                f"cudaIpcOpenMemHandle for rank {r} failed (cuda error {ret})"
-            )
+            assert (
+                ret == 0
+            ), f"cudaIpcOpenMemHandle for rank {r} failed (cuda error {ret})"
             peer_addresses.append(remote_ptr.value)
 
-    assert all(a != 0 for a in peer_addresses), (
-        f"Some IPC buffer addresses are null: {peer_addresses}"
-    )
+    assert all(
+        a != 0 for a in peer_addresses
+    ), f"Some IPC buffer addresses are null: {peer_addresses}"
     return peer_addresses
 
 
 @dataclass
 class PeerAccessContext:
-    """Holds all state needed for peer-access weight transfers."""
+    """Holds state for peer-access transfers within one TP instance only.
+
+    No peer address from another DP rank is present here. For ``dp_size > 1``,
+    the caller completes the local reshard first and then uses the DP process
+    group to all-gather the resulting expert intervals across TP instances.
+    """
 
     peer_addresses: List[int]  # Buffer base addresses for each rank
     peer_access_enabled: bool  # Whether peer access was successfully initialized
@@ -113,9 +125,11 @@ class PeerAccessContext:
 
 
 def init_peer_access(manager, tp_group, tp_size: int) -> PeerAccessContext:
-    """Initialize peer access for ParaS weight transfers.
+    """Initialize TP-local peer access for ParaS weight transfers.
 
     Call once after ``manager.materialize()`` and before the first EP→TP switch.
+    ``tp_group`` must contain exactly the ranks in the caller's TP instance;
+    cross-DP-rank communication is intentionally outside this context.
 
     Args:
         manager: :class:`ParaSMemoryManager` (must be materialized).
@@ -129,9 +143,7 @@ def init_peer_access(manager, tp_group, tp_size: int) -> PeerAccessContext:
 
     local_ptr = manager._buffer.data_ptr()
     rank = dist.get_rank(group=tp_group)
-    peer_addresses = exchange_buffer_addresses_ipc(
-        local_ptr, tp_group, tp_size, rank
-    )
+    peer_addresses = exchange_buffer_addresses_ipc(local_ptr, tp_group, tp_size, rank)
 
     logger.info(
         "ParaS peer access initialized (IPC). Buffer addresses: %s",
@@ -146,7 +158,7 @@ def init_peer_access(manager, tp_group, tp_size: int) -> PeerAccessContext:
     )
 
 
-def peer_access_fused_transfer_w13_v2(
+def peer_access_reshard_w13_ep_to_tp_intra_node(
     local_buffer_ptr: int,
     dst_base_ptrs_tensor: torch.Tensor,
     src_ep_offset: int,
@@ -162,6 +174,7 @@ def peer_access_fused_transfer_w13_v2(
     hidden_size: int = None,
 ) -> None:
     import paras_peer_access_cuda
+
     stream_ptr = stream.cuda_stream if stream is not None else 0
     if variant == "v3":
         assert hidden_size is not None, "w13 v3 requires hidden_size"
@@ -196,7 +209,7 @@ def peer_access_fused_transfer_w13_v2(
     )
 
 
-def peer_access_fused_transfer_w2_v2(
+def peer_access_reshard_w2_ep_to_tp_intra_node(
     local_buffer_ptr: int,
     dst_base_ptrs_tensor: torch.Tensor,
     src_ep_offset: int,
@@ -212,6 +225,7 @@ def peer_access_fused_transfer_w2_v2(
     variant: str = "v2",
 ) -> None:
     import paras_peer_access_cuda
+
     stream_ptr = stream.cuda_stream if stream is not None else 0
     if variant == "v3":
         paras_peer_access_cuda.launch_peer_access_fused_transfer_w2_v3(
@@ -243,7 +257,7 @@ def peer_access_fused_transfer_w2_v2(
     )
 
 
-def peer_access_fused_transfer_w13_ep(
+def peer_access_reshard_w13_tp_to_ep_intra_node(
     local_buffer_ptr: int,
     peer_base_ptrs_tensor: torch.Tensor,
     src_tp_offset: int,
@@ -259,6 +273,7 @@ def peer_access_fused_transfer_w13_ep(
     hidden_size: int = None,
 ) -> None:
     import paras_peer_access_cuda
+
     stream_ptr = stream.cuda_stream if stream is not None else 0
     if variant == "v3":
         assert hidden_size is not None, "w13_ep v3 requires hidden_size"
@@ -293,7 +308,7 @@ def peer_access_fused_transfer_w13_ep(
     )
 
 
-def peer_access_fused_transfer_w2_ep(
+def peer_access_reshard_w2_tp_to_ep_intra_node(
     local_buffer_ptr: int,
     peer_base_ptrs_tensor: torch.Tensor,
     src_tp_offset: int,
@@ -309,6 +324,7 @@ def peer_access_fused_transfer_w2_ep(
     variant: str = "v2",
 ) -> None:
     import paras_peer_access_cuda
+
     stream_ptr = stream.cuda_stream if stream is not None else 0
     if variant == "v3":
         paras_peer_access_cuda.launch_peer_access_fused_transfer_w2_v3_ep(
@@ -359,6 +375,7 @@ def peer_access_kv_transfer(
     variant: str = "v2",
 ) -> None:
     import paras_peer_access_cuda
+
     stream_ptr = stream.cuda_stream if stream is not None else 0
     launcher = (
         paras_peer_access_cuda.launch_peer_access_kv_transfer_v3
@@ -411,9 +428,10 @@ def peer_access_kv_scatter(
     This is the reverse of peer_access_kv_transfer (EP→TP). Each local TP token
     is sent to exactly one EP rank determined by token_to_rank[t].
 
-    Layers are processed in REVERSE order (N-1 to 0) with a dist.all_reduce
-    barrier after each layer. This ensures that layer i's read from TP slot[i]
-    completes before layer (i-1)'s write to EP slot[i] (N+1 slot design).
+    Layers are processed in FORWARD order (0 to N-1) with a dist.all_reduce
+    barrier after each layer. In the overlapped layout, writing EP cache
+    layer i+1 overlaps TP cache layer i, so layer i must be read before layer
+    i+1's EP is written.
 
     Data flow per token t:
       Source:  local TP buffer at tp_token_positions[t], heads [0, heads_per_rank)
@@ -449,7 +467,7 @@ def peer_access_kv_scatter(
     stream_ptr = stream.cuda_stream if stream is not None else 0
     barrier = torch.zeros(1, device="cuda")
 
-    for layer_idx in range(num_layers - 1, -1, -1):
+    for layer_idx in range(num_layers):
         if variant == "v3":
             paras_peer_access_cuda.launch_peer_access_kv_scatter_v3(
                 local_buffer_ptr,
@@ -490,6 +508,3 @@ def peer_access_kv_scatter(
                 stream_ptr,
             )
         dist.all_reduce(barrier, group=tp_group)
-
-
-

@@ -118,7 +118,7 @@ class TestEPtoTPReplication:
 
         all_ok = verify_ep_to_tp(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            tp_view_tokens,
+            tp_view_tokens, token_offset=1,
         )
         _save_evidence("ep_to_tp_replication_peer_access", all_ok, rank)
         assert all_ok, f"EP→TP peer_access (R={R}) failed on rank {rank}"
@@ -203,7 +203,7 @@ class TestTPtoEPReplication:
 
         all_ok = verify_tp_to_ep(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            token_partition,
+            token_partition, token_offset=1,
         )
         _save_evidence("tp_to_ep_replication_peer_access", all_ok, rank)
         assert all_ok, f"TP→EP peer_access (R={R}) failed on rank {rank}"

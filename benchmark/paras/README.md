@@ -19,9 +19,9 @@ for both cache and weights, across a configurable per-GPU volume.
 
 ## Methods
 
-- **`peer_access`** — production fused CUDA kernels with per-layer `dist.all_reduce` barrier (matches `paras_configure_tp_peer_access` / `peer_access_kv_scatter` per-layer pattern).
-- **`nccl`** — `dist.all_to_all_single` per layer, single stream (mirrors `paras_configure_tp_mlp_naive` / `do_scatter_one_layer_nccl`).
-- **`nccl_overlap`** — same `dist.all_to_all_single` pattern, pipelined across **two CUDA streams** so layer N's all_to_all overlaps with layer N+1's launch overhead (mirrors `paras_configure_tp_overlap`).
+- **`peer_access`** — fused CUDA peer-access kernels with per-layer synchronization.
+- **`nccl`** — `dist.all_to_all_single` per layer, matching the production sequential fallback.
+- **`nccl_overlap`** — benchmark-only two-stream NCCL baseline; it is not a production transfer method.
 
 ## Volume control
 

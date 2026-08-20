@@ -132,42 +132,64 @@ Because ParaS's formula ignored pre-existing consumption, it gave itself ~1.7 GB
 
 ### Fix
 
-Replace ParaS's budget formula with the baseline formula, computed before UMM allocation:
+ParaS preserves baseline's outer static-memory contract, then solves the two
+mode footprints together before allocating the UMM:
 
 ```python
 avail_now_bytes        = get_available_gpu_memory(...)  # via cudaMemGetInfo
 dynamic_reserve_bytes  = total_gpu_bytes * (1 - mem_fraction_static)
-umm_budget_bytes       = avail_now_bytes - dynamic_reserve_bytes
-kv_budget_bytes        = umm_budget_bytes - manager.weights_only_bytes
+static_headroom_bytes  = avail_now_bytes - dynamic_reserve_bytes
+umm_budget_bytes       = static_headroom_bytes - non_umm_static_bytes
+
+ep_kv_budget_bytes     = B - sum(ep_expert_bytes)
+tp_kv_budget_bytes     = B - sum(tp_expert_bytes)
+planned_umm_bytes      = fixed_umm_bytes + exact_overlapped_layout_bytes(...)
+assert planned_umm_bytes <= umm_budget_bytes
 ```
 
-This is the same formula baseline uses, applied at the point ParaS needs it (before the UMM is planned).
+The planner binary-searches the largest common base footprint `B`. This
+matters when `dp_size > 1`: each TP rank holds `dp_size` times its EP expert
+weight bytes, so those extra TP weights reduce the TP KV-cache budget. Giving
+both modes the old single cache-byte budget would let the materialized UMM
+exceed `mem_fraction_static`. When the EP and TP weight footprints match,
+both modes retain equal cache bytes; TP still exposes more tokens because each
+token has fewer local KV heads.
+
+The exact geometry helper accounts for the fixed UMM prefix, all 256-byte
+alignment, and the overlapped layout head/tail overhead. `materialize` uses the
+same helper and rejects any result above the planned byte limit before calling
+`torch.empty`.
 
 ### Allocation order (no waste)
 
-Naively, you might worry that ParaS allocates weights first, then computes the KV budget from "what's left" — which would waste memory if the weight allocation itself disturbs `avail_now`. It doesn't. The actual order in `Qwen3MoeForCausalLMParaS.__init__`:
+The actual order in `Qwen3MoeForCausalLMParaS.__init__` is:
 
 | Step | Code | GPU memory side-effect |
 |---|---|---|
 | 1 | `manager = ParaSMemoryManager()` | none (empty planner) |
-| 2 | `plan_qwen_moe_layout(...)` | none — **metadata only** (reserves slot names + shapes in `_reservation_order`) |
+| 2 | `plan_qwen_moe_layout(...)` | none; records ordinary and deferred expert metadata |
 | 3 | `get_available_gpu_memory(distributed=True, empty_cache=True)` | none (read-only) |
-| 4 | Compute `umm_budget` and `kv_budget` from formula above | none (arithmetic) |
-| 5 | `manager.reserve_kv_cache(ep_max_tokens=...)` | none — still metadata only |
-| 6 | **`manager.materialize()`** — **single `torch.empty(total_bytes, dtype=uint8)`** | **the only GPU allocation.** Allocates weights + KV together, sized exactly to the budget |
+| 4 | Solve exact EP and TP cache capacities under `umm_budget_bytes` | none (arithmetic) |
+| 5 | `manager.reserve_kv_cache(...)` | none; records the selected per-layer views |
+| 6 | **`manager.materialize()`** | **the only GPU allocation.** Allocates the exact combined footprint once |
 
-Key property: `plan_qwen_moe_layout` and `reserve_kv_cache` are **pure bookkeeping** — they populate `LayoutEntry` metadata in `manager._entries` and `manager._reservation_order` but never call `torch.empty`. The entire UMM is physically allocated by a single `torch.empty` call at step 6.
+Planning and cache reservation are pure bookkeeping, so the availability
+reading is untouched by ParaS's own allocation. No interim allocations are
+freed, and the final size is checked against the same byte limit used by the
+planner.
 
-This means:
-1. `avail_now` at step 3 is untouched by ParaS's own plan (no circular dependency).
-2. The UMM size at step 6 is the sum of `weights_only_bytes + kv_slot_bytes`, exactly matching what the budget allowed.
-3. No interim allocations are freed; nothing is wasted.
-
-Baseline sglang has the inverse ordering: weights allocated first via HuggingFace weight-loading (real `torch.empty` per parameter), then `avail_now` measured post-weight-load, then KV allocator sized. ParaS has to plan weights first (to know `weights_only_bytes`) but defers physical allocation until after the budget is final.
+Baseline sglang has the inverse ordering: weights are allocated first, then
+available memory is measured post-weight-load, and finally its KV allocator is
+sized. ParaS must plan both mode-specific weight and KV views first because all
+of them share one physical allocation.
 
 ### Result
 
-`driver_used` dropped from 57.77 GB to 56.30 GB (−1.46 GB per GPU). `#tokens` in the KV pool dropped from 347,857 → 332,225 (still larger than baseline's 329,048 by only 3,177 tokens — that difference is the N+1 KV slot overhead, which is architectural, not a budget bug).
+The original outer-budget correction dropped `driver_used` from 57.77 GB to
+56.30 GB (−1.46 GB per GPU) and reduced the KV pool from 347,857 to
+332,225 tokens. Those measurements predate the overlapped layout. The current
+planner additionally reduces TP capacity when multiple TP instances make TP
+expert weights larger than EP expert weights.
 
 Round-trip EP↔TP switches verified identical output before/after.
 

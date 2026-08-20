@@ -118,6 +118,8 @@ def _setup_paras_state(rank, world_size):
     pps._PARAS_DP_RANK = 0
     pps._PARAS_EP_SIZE = world_size
     pps._PARAS_EP_RANK = rank
+    pps._PARAS_EP_GROUP_IS_NODE_LOCAL = True
+    pps._PARAS_TP_GROUP_IS_NODE_LOCAL = True
 
     return tp_group
 
@@ -223,7 +225,7 @@ def cleanup_global_manager():
 
 
 def setup_memory_manager(rank, world_size, num_kv_heads, tokens_per_rank):
-    """Create ParaSMemoryManager with N+1 KV slots.
+    """Create a manager with equal-byte EP and TP KV capacities.
 
     Returns (mgr, ep_max_tokens, tp_max_tokens).
     """
@@ -241,7 +243,10 @@ def setup_memory_manager(rank, world_size, num_kv_heads, tokens_per_rank):
         (total_tokens * heads_per_rank + num_kv_heads - 1) // num_kv_heads
     )
     ep_max_tokens = max(ep_max_tokens, min_ep_for_tp)
-    tp_max_tokens = (ep_max_tokens + PAGE_SIZE) * num_kv_heads // heads_per_rank
+    tp_max_tokens = (
+        (ep_max_tokens + PAGE_SIZE) * num_kv_heads // heads_per_rank
+        - PAGE_SIZE
+    )
 
     mgr = ParaSMemoryManager(device=f"cuda:{rank}")
     mgr.reserve_kv_cache(
@@ -251,6 +256,7 @@ def setup_memory_manager(rank, world_size, num_kv_heads, tokens_per_rank):
         num_kv_heads=num_kv_heads,
         head_dim=HEAD_DIM,
         kv_dtype=DTYPE,
+        tp_size=world_size,
         page_size=PAGE_SIZE,
     )
     mgr.materialize()
@@ -416,7 +422,7 @@ def do_ep_to_tp_gather(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
         2 * splited_size * tokens_per_rank[r] for r in range(world_size)
     ]
 
-    for lid in range(NUM_LAYERS):
+    for lid in range(NUM_LAYERS - 1, -1, -1):
         ep_k = mgr.get_view(f"model.layers.{lid}.kv.ep.k")
         ep_v = mgr.get_view(f"model.layers.{lid}.kv.ep.v")
 
@@ -507,7 +513,7 @@ def do_tp_to_ep_scatter(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
         ep_dst_positions=ep_dst_positions,
     )
 
-    for layer_id in reversed(range(NUM_LAYERS)):
+    for layer_id in range(NUM_LAYERS):
         spec = LayerCacheSpec(
             layer_id=layer_id,
             kind="full",
@@ -550,15 +556,23 @@ def do_ep_to_tp_gather_peer_access(mgr, rank, world_size, num_kv_heads,
     dst_base_ptrs = torch.tensor(
         peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
     )
+    # Production reserves slot 0 in both pools. Stage this fixture's compact
+    # source data into slots [1, num_local] before invoking the real kernel.
+    for layer_id in range(NUM_LAYERS):
+        ep_k = mgr.get_view(f"model.layers.{layer_id}.kv.ep.k")
+        ep_v = mgr.get_view(f"model.layers.{layer_id}.kv.ep.v")
+        ep_k[1 : num_local + 1].copy_(ep_k[:num_local].clone())
+        ep_v[1 : num_local + 1].copy_(ep_v[:num_local].clone())
+
     local_token_indices = torch.arange(
-        num_local, dtype=torch.int32, device="cuda"
+        1, num_local + 1, dtype=torch.int32, device="cuda"
     )
-    dst_token_start = sum(tokens_per_rank[:rank])
+    dst_token_start = sum(tokens_per_rank[:rank]) + 1
     elem_size = 2  # bfloat16
 
     barrier_tensor = torch.zeros(1, device="cuda")
 
-    for layer_id in range(NUM_LAYERS):
+    for layer_id in range(NUM_LAYERS - 1, -1, -1):
         src_k_offset = mgr._entries[
             f"model.layers.{layer_id}.kv.ep.k"
         ].offset_bytes
@@ -583,8 +597,8 @@ def do_ep_to_tp_gather_peer_access(mgr, rank, world_size, num_kv_heads,
                 elem_size,
             )
 
-        # Per-layer barrier: ensures all ranks finish writing before next
-        # layer reads (TP slot i is EP slot i+1 in the N+1 design).
+        # The reverse layer order and barrier preserve unread EP sources in
+        # the overlapped layout.
         dist.all_reduce(barrier_tensor, group=tp_group)
 
     torch.cuda.synchronize()
@@ -622,8 +636,22 @@ def do_tp_to_ep_scatter_peer_access(mgr, rank, world_size, num_kv_heads,
     )
 
     # Global token indices (identity mapping in this test)
+    # Production reserves slot 0 in both pools. Stage compact TP fixture data
+    # into slots [1, total_tokens] and route to EP destinations starting at 1.
+    for layer_id in range(NUM_LAYERS):
+        tp_k = mgr.get_view_as(
+            f"model.layers.{layer_id}.kv.tp.k",
+            (tp_view_tokens, heads_per_rank, HEAD_DIM),
+        )
+        tp_v = mgr.get_view_as(
+            f"model.layers.{layer_id}.kv.tp.v",
+            (tp_view_tokens, heads_per_rank, HEAD_DIM),
+        )
+        tp_k[1 : total_tokens + 1].copy_(tp_k[:total_tokens].clone())
+        tp_v[1 : total_tokens + 1].copy_(tp_v[:total_tokens].clone())
+
     global_token_indices = torch.arange(
-        total_tokens, dtype=torch.int64, device="cuda"
+        1, total_tokens + 1, dtype=torch.int64, device="cuda"
     )
 
     # -- Replication-aware token selection (from scatter_manager) ----------
@@ -647,7 +675,7 @@ def do_tp_to_ep_scatter_peer_access(mgr, rank, world_size, num_kv_heads,
         for local_idx, global_idx in enumerate(my_slice):
             my_global_indices.append(global_idx)
             my_dst_ranks.append(e)
-            my_ep_dst_pos.append(my_start + local_idx)
+            my_ep_dst_pos.append(my_start + local_idx + 1)
 
     num_my_tokens = len(my_global_indices)
 
@@ -692,12 +720,12 @@ def do_tp_to_ep_scatter_peer_access(mgr, rank, world_size, num_kv_heads,
     )
     elem_size = 2  # bfloat16
 
-    # Launch kernel per layer in REVERSE order with per-layer barrier,
-    # matching the N+1 slot design (same pattern as scatter_manager).
+    # Forward layer order and a per-layer barrier preserve unread TP sources
+    # in the overlapped layout.
     import paras_peer_access_cuda as _pa_cuda
 
     barrier_tensor = torch.zeros(1, device="cuda")
-    for layer_idx in range(NUM_LAYERS - 1, -1, -1):
+    for layer_idx in range(NUM_LAYERS):
         if num_my_tokens > 0:
             _pa_cuda.launch_peer_access_kv_scatter(
                 local_buffer_ptr,
@@ -745,7 +773,7 @@ def _save_evidence(test_name, passed, rank):
 # ---------------------------------------------------------------------------
 
 def verify_ep_to_tp(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-                    tp_view_tokens):
+                    tp_view_tokens, token_offset=0):
     """Verify EP→TP gather result against ground truth patterns.
 
     Works for both R=1 (no replication) and R>1 (head replication).
@@ -775,8 +803,9 @@ def verify_ep_to_tp(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
             n = tokens_per_rank[src]
             expected_k = make_pattern(src, lid, real_head, n).to(device)
             expected_v = make_pattern(src, lid, real_head + 50, n).to(device)
-            actual_k = tp_k[offset:offset + n, 0, :]
-            actual_v = tp_v[offset:offset + n, 0, :]
+            start = token_offset + offset
+            actual_k = tp_k[start:start + n, 0, :]
+            actual_v = tp_v[start:start + n, 0, :]
             if not torch.equal(actual_k, expected_k):
                 all_ok = False
                 if rank == 0:
@@ -793,7 +822,7 @@ def verify_ep_to_tp(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
 
 
 def verify_tp_to_ep(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-                    token_partition):
+                    token_partition, token_offset=0):
     """Verify TP→EP scatter result against ground truth patterns.
 
     Works for both R=1 (no replication) and R>1 (head replication).
@@ -809,7 +838,9 @@ def verify_tp_to_ep(mgr, rank, world_size, num_kv_heads, tokens_per_rank,
     count = len(my_tokens)
     device = f"cuda:{rank}"
 
-    ep_dst = torch.arange(count, dtype=torch.int64, device=device)
+    ep_dst = torch.arange(
+        token_offset, token_offset + count, dtype=torch.int64, device=device
+    )
 
     all_ok = True
     for lid in range(NUM_LAYERS):
@@ -953,7 +984,7 @@ class TestEPtoTPStandalone:
 
         all_ok = verify_ep_to_tp(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            tp_view_tokens,
+            tp_view_tokens, token_offset=1,
         )
         _save_evidence("ep_to_tp_peer_access_no_replication", all_ok, rank)
         assert all_ok, f"EP→TP peer_access (no replication) failed on rank {rank}"
@@ -1069,7 +1100,7 @@ class TestTPtoEPStandalone:
 
         all_ok = verify_tp_to_ep(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            token_partition,
+            token_partition, token_offset=1,
         )
         _save_evidence(
             "tp_to_ep_peer_access_no_replication", all_ok, rank
@@ -1099,7 +1130,7 @@ class TestTPtoEPStandalone:
 
 
 def verify_ep_to_tp_sharded(mgr, rank, world_size, num_kv_heads,
-                            tokens_per_rank, tp_view_tokens):
+                            tokens_per_rank, tp_view_tokens, token_offset=0):
     """Verify EP→TP gather for heads_per_rank > 1.
 
     TP rank r owns heads ``[r*heads_per_rank, (r+1)*heads_per_rank)``
@@ -1132,8 +1163,9 @@ def verify_ep_to_tp_sharded(mgr, rank, world_size, num_kv_heads,
                 n = tokens_per_rank[src]
                 expected_k = make_pattern(src, lid, global_head, n).to(device)
                 expected_v = make_pattern(src, lid, global_head + 50, n).to(device)
-                actual_k = tp_k[offset:offset + n, lh, :]
-                actual_v = tp_v[offset:offset + n, lh, :]
+                start = token_offset + offset
+                actual_k = tp_k[start:start + n, lh, :]
+                actual_v = tp_v[start:start + n, lh, :]
                 if not torch.equal(actual_k, expected_k):
                     all_ok = False
                     if rank == 0:
@@ -1156,7 +1188,7 @@ def verify_ep_to_tp_sharded(mgr, rank, world_size, num_kv_heads,
 
 
 def verify_tp_to_ep_sharded(mgr, rank, world_size, num_kv_heads,
-                            tokens_per_rank, token_partition):
+                            tokens_per_rank, token_partition, token_offset=0):
     """Verify TP→EP scatter for heads_per_rank > 1.
 
     EP rank ``e`` receives ``token_partition[e]`` tokens.  For each global
@@ -1176,7 +1208,9 @@ def verify_tp_to_ep_sharded(mgr, rank, world_size, num_kv_heads,
     count = len(my_tokens)
     device = f"cuda:{rank}"
 
-    ep_dst = torch.arange(count, dtype=torch.int64, device=device)
+    ep_dst = torch.arange(
+        token_offset, token_offset + count, dtype=torch.int64, device=device
+    )
 
     all_ok = True
     for lid in range(NUM_LAYERS):
@@ -1257,7 +1291,7 @@ class TestShardedHeads:
 
         all_ok = verify_ep_to_tp_sharded(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            tp_view_tokens,
+            tp_view_tokens, token_offset=1,
         )
         _save_evidence("ep_to_tp_peer_access_sharded_heads", all_ok, rank)
         assert all_ok, (
@@ -1297,7 +1331,7 @@ class TestShardedHeads:
 
         all_ok = verify_tp_to_ep_sharded(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,
-            token_partition,
+            token_partition, token_offset=1,
         )
         _save_evidence(
             "tp_to_ep_peer_access_sharded_heads", all_ok, rank

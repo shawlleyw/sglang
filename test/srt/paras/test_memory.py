@@ -65,7 +65,7 @@ class TestHeadNumRestoration:
         assert pool.head_num == original_head_num
 
         # Switch to TP: head_num should be sharded
-        pool.paras_configure_tp(tp_size=world_size, paras_tp_rank=rank)
+        pool.paras_configure_tp(paras_tp_size=world_size)
         sharded = original_head_num // world_size
         assert pool.head_num == sharded, (
             f"After TP: expected head_num={sharded}, got {pool.head_num}"
@@ -112,7 +112,7 @@ class TestMemoryLeak:
 
         # Cycle TP↔EP multiple times
         for _ in range(5):
-            pool.paras_configure_tp(tp_size=world_size, paras_tp_rank=rank)
+            pool.paras_configure_tp(paras_tp_size=world_size)
             pool.paras_configure_ep()
 
         torch.cuda.synchronize()

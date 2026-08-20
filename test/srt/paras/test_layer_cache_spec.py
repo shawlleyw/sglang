@@ -39,7 +39,7 @@ class TestLayerCacheSpecFrozen:
 
     def test_layer_cache_spec_is_frozen(self):
         """Mutation of LayerCacheSpec should raise FrozenInstanceError."""
-        from sglang.srt.paras.cache_transfer import LayerCacheSpec
+        from sglang.srt.paras.layers.utils import LayerCacheSpec
 
         spec = LayerCacheSpec(
             layer_id=0,
@@ -76,7 +76,7 @@ class TestClassifyLayersFromConfigMixed:
 
     def test_classify_mixed_full_and_swa(self):
         """Classify 6 layers: 2 full + 4 SWA."""
-        from sglang.srt.paras.cache_transfer import classify_layers_from_config
+        from sglang.srt.paras.layers.utils import classify_layers_from_config
 
         # Mock HF config with layer_types
         class MockConfig:
@@ -142,7 +142,7 @@ class TestClassifyLayersFromConfigAllFull:
 
     def test_classify_all_full_no_layer_types(self):
         """Classify 4 layers as all-full when layer_types is absent."""
-        from sglang.srt.paras.cache_transfer import classify_layers_from_config
+        from sglang.srt.paras.layers.utils import classify_layers_from_config
 
         class MockConfig:
             num_hidden_layers = 4
@@ -186,7 +186,7 @@ class TestClassifyLayersFromConfigAllSWA:
 
     def test_classify_all_swa(self):
         """Classify 3 layers as all-SWA."""
-        from sglang.srt.paras.cache_transfer import classify_layers_from_config
+        from sglang.srt.paras.layers.utils import classify_layers_from_config
 
         class MockConfig:
             num_hidden_layers = 3
@@ -230,7 +230,7 @@ class TestClassifyLayersFromConfigNoLayerTypes:
 
     def test_classify_layer_types_none(self):
         """Classify layers when layer_types is explicitly None."""
-        from sglang.srt.paras.cache_transfer import classify_layers_from_config
+        from sglang.srt.paras.layers.utils import classify_layers_from_config
 
         class MockConfig:
             num_hidden_layers = 2
@@ -267,7 +267,7 @@ class TestG15ViolationMismatchedHeads:
 
     def test_g15_violation_raises_value_error(self):
         """Mismatched num_kv_heads should raise ValueError with 'uniform' in message."""
-        from sglang.srt.paras.cache_transfer import validate_layer_specs, LayerCacheSpec
+        from sglang.srt.paras.layers.utils import validate_layer_specs, LayerCacheSpec
 
         # Create specs with mismatched num_kv_heads
         specs = [
@@ -308,7 +308,7 @@ class TestG7ViolationTPSizeExceedsHeads:
 
     def test_g7_violation_raises_value_error(self):
         """tp_size > num_kv_heads with SWA should raise ValueError with 'tp_size' in message."""
-        from sglang.srt.paras.cache_transfer import validate_layer_specs, LayerCacheSpec
+        from sglang.srt.paras.layers.utils import validate_layer_specs, LayerCacheSpec
 
         # Create specs with SWA and tp_size > num_kv_heads
         specs = [
@@ -340,7 +340,7 @@ class TestG7ViolationTPSizeExceedsHeads:
 
     def test_g7_violation_in_classify_layers(self):
         """classify_layers_from_config should also enforce G7."""
-        from sglang.srt.paras.cache_transfer import classify_layers_from_config
+        from sglang.srt.paras.layers.utils import classify_layers_from_config
 
         class MockConfig:
             num_hidden_layers = 2

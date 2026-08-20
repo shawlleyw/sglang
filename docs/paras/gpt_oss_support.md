@@ -70,7 +70,7 @@ a simple split.
 
 When EP→TP switches the w13 tensor via all-to-all redistribution, the
 interleaved pairs must stay together inside each rank's I/TP-size slab.
-`paras_configure_tp_all_to_all` in `paras_moe_block.py:295-320` handles this
+`paras_reshard_ep_to_tp_intra_node_nccl` in `paras_moe_block.py` handles this
 by viewing the EP tensor as `(num_local_experts, paras_tp_size, 2 *
 I_per_tp_rank * H)` — one contiguous block per (local expert, destination
 rank) pair — before the all-to-all. The `self._paras_interleaved_w13` flag
@@ -206,21 +206,21 @@ GptOssForCausalLMParaS                          (paras/models/gpt_oss.py:206)
 
 GptOssModelParaS(ParaSModelMixin, GptOssModel)
 ├── ParaSModelMixin                             (paras/layers/paras_model.py)
-│   └── paras_configure_tp_naive / _overlap / _peer_access
+│   └── intra-node transport selection / inter-node all-gather
 └── GptOssModel                                 (models/gpt_oss.py:549)
 
 GptOssDecoderLayerParaS(ParaSDecoderLayerMixin, GptOssDecoderLayer)
 ├── ParaSDecoderLayerMixin                      (paras/layers/paras_decoder_layer.py)
 │   ├── dual LayerCommunicator (EP + TP)
-│   ├── paras_configure_tp_attn / tp_mlp
-│   └── paras_configure_ep_attn / ep_mlp
+│   ├── explicit EP→TP reshard primitives
+│   └── explicit TP→EP reshard primitives
 └── GptOssDecoderLayer                          (models/gpt_oss.py:422)
 
 GptOssSparseMoeBlockParaS(ParaSMoeBlockMixin, GptOssSparseMoeBlock)
 ├── ParaSMoeBlockMixin                          (paras/layers/paras_moe_block.py)
 │   ├── paras_init_moe (with interleaved_w13=True)
 │   ├── dual experts (ep_experts + tp_experts)
-│   ├── paras_configure_tp_all_gather / all_to_all
+│   ├── peer_access and NCCL intra-node reshard launchers
 │   └── paras_forward (dispatches to forward_normal vs forward_deepep)
 └── GptOssSparseMoeBlock                        (models/gpt_oss.py:98)
 
@@ -847,15 +847,14 @@ should be addressed before those configurations are used:
 
 - `ep_num_redundant_experts > 0` with bias-bearing models will fail the
   assertion `local_b.shape[0] == self.num_local_experts` in
-  `paras_configure_tp_all_to_all`. The default is 0 and gpt-oss-120b uses
+  `paras_reshard_ep_to_tp_intra_node_nccl`. The default is 0 and gpt-oss-120b uses
   0. A full fix would compute the expected local size from
   `num_local_experts + ep_num_redundant_experts` and adjust the
   `all_gather_into_tensor` shape math accordingly.
-- `PARAS_CONFIGURE_METHOD=peer_access` is now supported for GPT-OSS. The
+- `PARAS_INTRA_NODE_WEIGHT_TRANSFER_METHOD=peer_access` is supported for GPT-OSS. The
   v2 / `_ep` peer-access kernels in `paras/csrc/peer_access_transfer.cu`
-  handle the interleaved w13 layout without `.cu` changes — the call
-  sites in `paras_configure_tp_fused_peer_access_kernel` and
-  `paras_configure_ep_fused_peer_access_kernel` branch on
+  handle the interleaved w13 layout without `.cu` changes — the
+  peer-access reshard launchers branch on
   `_paras_interleaved_w13` and pass `num_gates=1` together with a
   doubled per-chunk extent (`2 * I' * H` instead of `I' * H`). Each
   rank's `2*I'*H` contiguous interleaved `(g_k, u_k)` slab is then
@@ -864,8 +863,8 @@ should be addressed before those configurations are used:
   contract; they are loaded full on every rank at init time and exposed
   to the EP and TP forward paths via Parameter views into
   `_full_w{13,2}_bias` (see `paras_finalize_moe_bias_views`). End-to-end
-  validation: 4×A100, gpt-oss-120b-bf16, `PARAS_CONFIGURE_METHOD=peer_access`,
-  switch latency ~270 ms (vs ~600–900 ms for the previous naive default),
+  validation: 4×A100, gpt-oss-120b-bf16, `PARAS_INTRA_NODE_WEIGHT_TRANSFER_METHOD=peer_access`,
+  switch latency ~270 ms (vs ~600–900 ms for the NCCL baseline),
   three-prompt EP/TP/EP-RT batches and in-flight EP↔TP both directions
   all coherent, zero server errors.
 

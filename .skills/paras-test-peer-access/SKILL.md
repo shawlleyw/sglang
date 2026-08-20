@@ -56,11 +56,35 @@ After transfer, the expected value at any destination position is computed by kn
 
 **Replication (R>1)**: When `num_kv_heads < tp_size`, R contiguous ranks share the same head. Each subgroup member sends a disjoint 1/R token slice. The verification traces which intra_rank within the subgroup sent each token position and checks against that member's pattern.
 
+### Asymmetric DP×TP (dp_size > 1)
+
+Two harnesses cover the `EP ↔ DP×TP` case (`ep_size = dp_size · tp_size`), where
+MoE weights reshard across the logical EP group while the KV cache redistributes
+only within each TP subgroup. On one node the dptp kernels perform the weight
+reshard directly. Across nodes, node-local peer access writes each node's final
+expert interval and a strided DP all-gather replicates those intervals:
+
+| Harness | Runs | Ground truth |
+|---------|------|--------------|
+| [`test_weight_transfer_dptp.py`](file:///home/shaoyuw/sglang/test/srt/paras/test_weight_transfer_dptp.py) | 4 GPUs, `EP=4/DP2/TP2` | dptp forward vs independently gathered TP shards; DP-replica bitwise consistency (ranks with the same tp rank hold identical TP data); `EP→DP×TP→EP` round-trip recovers the original EP weights. |
+| [`test_kv_roundtrip_dptp.py`](file:///home/shaoyuw/sglang/test/srt/paras/test_kv_roundtrip_dptp.py) | 4 GPUs, two `TP2` subgroups | intra-subgroup `EP→TP→EP` KV round-trip is bitwise; cross-group isolation (data seeded by global rank so the two subgroups never leak into each other). |
+
+Run them directly (both self-check and exit non-zero on failure):
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 test/srt/paras/test_weight_transfer_dptp.py
+PARAS_TEST_LOGICAL_MULTINODE=1 CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 test/srt/paras/test_weight_transfer_dptp.py
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 test/srt/paras/test_kv_roundtrip_dptp.py
+```
+
+The node-local dptp kernels admit `(T, G) = (tp_size, dp_size)` in `{(8,1), (4,2), (2,4), (2,2)}`;
+`EP=4/DP2/TP2` uses `(2,2)` and `EP=8/DP2/TP4` uses `(4,2)`. The full live serving
+switch at `dp>1` is covered by [`paras-test-manual-switch`](file:///home/shaoyuw/sglang/.skills/paras-test-manual-switch/SKILL.md).
+
 ### What is NOT tested (out of scope)
 
 - Performance benchmarks (latency measurement) — planned, not yet implemented
 - FP8 KV cache
-- dp_size > 1
 - Automatic switching policy
 - FlashInfer attention backend integration (tested via E2E only)
 
@@ -72,6 +96,8 @@ test/srt/paras/
 ├── test_kv_cache_transfer.py                  # 5 GPU tests (R=1 only)
 ├── test_kv_cache_transfer_replication.py      # 5 GPU tests (R=2 only)
 ├── test_weight_transfer.py                    # 6 GPU tests
+├── test_weight_transfer_dptp.py               # 3 GPU tests (EP=4/DP2/TP2)
+├── test_kv_roundtrip_dptp.py                  # 2 GPU tests (EP=4/DP2/TP2)
 ├── test_memory.py                             # 2 GPU tests
 └── test_roundtrip.py                          # 4 GPU tests
 ```

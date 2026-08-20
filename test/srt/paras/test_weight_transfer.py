@@ -85,13 +85,10 @@ def setup_paras_state(rank, world_size):
     ps._TP = tp_coord
 
     # ParaS-specific parallel state
+    pps._PARAS_EP = tp_coord
     pps._PARAS_TP = tp_coord
-    pps._PARAS_DP = _SimpleGroupCoordinator(
-        None, 1, f"cuda:{rank}", rank_in_group=0
-    )
-    pps._PARAS_SELF = _SimpleGroupCoordinator(
-        None, 1, f"cuda:{rank}", rank_in_group=0
-    )
+    pps._PARAS_DP = _SimpleGroupCoordinator(None, 1, f"cuda:{rank}", rank_in_group=0)
+    pps._PARAS_SELF = _SimpleGroupCoordinator(None, 1, f"cuda:{rank}", rank_in_group=0)
 
     pps._PARAS_TP_SIZE = world_size
     pps._PARAS_TP_RANK = rank
@@ -99,6 +96,8 @@ def setup_paras_state(rank, world_size):
     pps._PARAS_DP_RANK = 0
     pps._PARAS_EP_SIZE = world_size
     pps._PARAS_EP_RANK = rank
+    pps._PARAS_EP_GROUP_IS_NODE_LOCAL = True
+    pps._PARAS_TP_GROUP_IS_NODE_LOCAL = True
 
     return tp_group
 
@@ -109,54 +108,58 @@ def setup_paras_state(rank, world_size):
 
 
 def build_manager(rank, world_size):
-    """Create ParaSMemoryManager with N+1 slots + staging buffers."""
+    """Create ParaSMemoryManager via the overlapped plan_qwen_moe_layout API.
+
+    The removed N+1 slot layout has been replaced by the deferred overlapped
+    pass inside materialize(): plan_qwen_moe_layout stashes per-layer sizes,
+    materialize() creates the ep_experts / tp_experts primaries plus the
+    experts.{w13,w2}_weight aliases, and create_paras_moe_aliases is now a
+    validation shim that asserts the primaries exist.
+
+    moe_tp_size=1 keeps each EP expert's full intermediate dimension. The NCCL
+    method reserves one pre-permute buffer per weight; peer_access needs
+    no staging.
+    """
     from sglang.srt.paras.paras_memory_manager import (
         ParaSMemoryManager,
         create_paras_moe_aliases,
+        plan_qwen_moe_layout,
         set_global_paras_memory_manager,
     )
 
     ep_size = world_size
+    tp_size = world_size  # DP=1: TP covers the entire world
     num_local = NUM_EXPERTS // ep_size
+
+    # Attention constants for Qwen3-30B-A3B parity. The test never exercises
+    # attention weights, but plan_qwen_moe_layout still reserves qkv_proj /
+    # o_proj slots, so these must yield valid shapes.
+    NUM_HEADS = 32
+    NUM_KV_HEADS = 4
+    HEAD_DIM = 128
 
     mgr = ParaSMemoryManager(device=f"cuda:{rank}")
 
-    # N+1 generic physical slots (non-triton shape: E_local, 2*I, H / E_local, H, I)
-    for slot in range(NUM_LAYERS + 1):
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w13",
-            (num_local, 2 * INTERMEDIATE, HIDDEN),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w2",
-            (num_local, HIDDEN, INTERMEDIATE),
-            torch.bfloat16,
-        )
-
-    # 'experts' aliases → slot i+1 (for weight loading / EP access)
-    for i in range(NUM_LAYERS):
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w13"
-        ]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w2"
-        ]
-
-    # Staging buffers for NCCL all-to-all and overlap paths
-    staging_experts = num_local
-    w13_staging_shape = (staging_experts, 2 * INTERMEDIATE, HIDDEN)
-    w2_staging_shape = (staging_experts, HIDDEN, INTERMEDIATE)
-    for sfx in ("", "_1", "_2"):
-        mgr.reserve(
-            f"staging.w13_pre_permute{sfx}", w13_staging_shape, torch.bfloat16
-        )
-        mgr.reserve(
-            f"staging.w2_pre_permute{sfx}", w2_staging_shape, torch.bfloat16
-        )
+    plan_qwen_moe_layout(
+        mgr,
+        num_layers=NUM_LAYERS,
+        num_experts=NUM_EXPERTS,
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+        num_heads=NUM_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        ep_size=ep_size,
+        tp_size=tp_size,
+        dp_size=1,
+        moe_tp_size=1,
+        quant_name=None,
+        intra_node_weight_transfer_method="nccl",
+        prefix="model",
+    )
 
     mgr.materialize()
-    create_paras_moe_aliases(mgr, NUM_LAYERS)
+    create_paras_moe_aliases(mgr, NUM_LAYERS, prefix="model")
     set_global_paras_memory_manager(mgr)
     return mgr, num_local
 
@@ -187,12 +190,8 @@ def snapshot_weights(mgr):
     snap = {}
     for layer_id in range(NUM_LAYERS):
         snap[layer_id] = (
-            mgr.get_view(
-                f"model.layers.{layer_id}.mlp.experts.w13_weight"
-            ).clone(),
-            mgr.get_view(
-                f"model.layers.{layer_id}.mlp.experts.w2_weight"
-            ).clone(),
+            mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w13_weight").clone(),
+            mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w2_weight").clone(),
         )
     return snap
 
@@ -219,7 +218,7 @@ class _MockExperts:
         self.w2_weight = torch.nn.Parameter(w2_view, requires_grad=False)
 
 
-def _make_mixin(layer_id, num_local, mgr, set_gathered=True):
+def _make_mixin(layer_id, num_local, mgr):
     from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 
     m = object.__new__(ParaSMoeBlockMixin)
@@ -234,37 +233,58 @@ def _make_mixin(layer_id, num_local, mgr, set_gathered=True):
     w2 = mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w2_weight")
     m.ep_experts = _MockExperts(w13, w2)
 
-    if set_gathered:
-        m.w13_ep_gathered = w13.view(num_local, 2 * INTERMEDIATE, HIDDEN)
-        m.w2_ep_gathered = w2.view(num_local, HIDDEN, INTERMEDIATE)
     return m
 
 
-class _MockLayer:
-    """Wraps a ParaSMoeBlockMixin to satisfy the overlap path's layer interface."""
+class _ModelLayerAdapter:
+    """Expose weight transfers while making mode activation a no-op."""
 
-    def __init__(self, mixin):
-        self.mlp = mixin
+    def __init__(self, mlp):
+        self.mlp = mlp
 
-    def paras_configure_tp_attn(self, tp_size, tp_rank):
-        pass
+    def paras_reshard_ep_to_tp_intra_node_nccl(self, dp_rank, dp_size):
+        self.mlp.paras_reshard_ep_to_tp_intra_node_nccl(dp_rank, dp_size)
 
-    def paras_configure_tp_mlp_all_gather(
-        self, stream, handles, async_op=False, staging_suffix=""
+    def paras_reshard_ep_to_tp_intra_node_peer_access(
+        self, dst_base_ptrs, dp_rank, dp_size, stream
     ):
-        return self.mlp.paras_configure_tp_all_gather(
-            stream, handles, async_op, staging_suffix
+        self.mlp.paras_reshard_ep_to_tp_intra_node_peer_access(
+            dst_base_ptrs, dp_rank, dp_size, stream
         )
 
-    def paras_configure_tp_mlp_all_to_all(
-        self, stream, handles, staging_suffix=""
+    def paras_reshard_tp_to_ep_intra_node_nccl(self, dp_rank, dp_size):
+        self.mlp.paras_reshard_tp_to_ep_intra_node_nccl(dp_rank, dp_size)
+
+    def paras_reshard_tp_to_ep_intra_node_peer_access(
+        self, dst_base_ptrs, dp_rank, dp_size, stream
     ):
-        return self.mlp.paras_configure_tp_all_to_all(
-            stream, handles, staging_suffix
+        self.mlp.paras_reshard_tp_to_ep_intra_node_peer_access(
+            dst_base_ptrs, dp_rank, dp_size, stream
         )
 
-    def paras_configure_tp(self, tp_size, tp_rank):
+    def paras_configure_tp_attn(self, paras_tp_size, paras_tp_rank):
         pass
+
+    def paras_configure_tp(self, paras_tp_size, paras_tp_rank):
+        pass
+
+    def paras_configure_ep_attn(self):
+        pass
+
+    def paras_configure_ep(self):
+        pass
+
+
+def _make_model(mgr, num_local, peer_ctx=None):
+    from sglang.srt.paras.layers.paras_model import ParaSModelMixin
+
+    model = object.__new__(ParaSModelMixin)
+    model.layers = [
+        _ModelLayerAdapter(_make_mixin(layer_id, num_local, mgr))
+        for layer_id in range(NUM_LAYERS)
+    ]
+    model._peer_access_ctx = peer_ctx
+    return model
 
 
 def _read_tp_results(mgr, tp_inter):
@@ -283,116 +303,43 @@ def _read_tp_results(mgr, tp_inter):
     return results
 
 
-def run_naive_path(mgr, num_local):
-    from sglang.srt.paras.paras_parallel_state import get_paras_tp_size
-
-    tp_size = get_paras_tp_size()
-    tp_inter = INTERMEDIATE // tp_size
-    for layer_id in range(NUM_LAYERS):
-        mixin = _make_mixin(layer_id, num_local, mgr)
-        mixin.paras_configure_tp_all_to_all()
-    return _read_tp_results(mgr, tp_inter)
-
-
-def run_overlap_path(mgr, num_local):
-    from sglang.srt.paras.paras_parallel_state import get_paras_tp_size
-
-    tp_size = get_paras_tp_size()
-    tp_inter = INTERMEDIATE // tp_size
-
-    layers = [
-        _MockLayer(_make_mixin(i, num_local, mgr, set_gathered=False))
-        for i in range(NUM_LAYERS)
-    ]
-
-    stream_1 = torch.cuda.Stream()
-    stream_2 = torch.cuda.Stream()
-    staging_1 = "_1"
-    staging_2 = "_2"
-
-    layers[0].paras_configure_tp_attn(tp_size, 0)
-    last_layer_handles = layers[0].paras_configure_tp_mlp_all_gather(
-        stream_1, [], async_op=True, staging_suffix=staging_1
+def run_nccl_path(mgr, num_local):
+    from sglang.srt.paras.paras_parallel_state import (
+        get_paras_tp_rank,
+        get_paras_tp_size,
     )
-    nlayers = len(layers)
-    for i, layer in enumerate(layers):
-        not_last_layer = i < nlayers - 1
-        if not_last_layer:
-            next_layer = layers[i + 1]
-            next_layer.paras_configure_tp_attn(tp_size, 0)
-            new_handles = next_layer.paras_configure_tp_mlp_all_gather(
-                stream_2,
-                last_layer_handles,
-                async_op=True,
-                staging_suffix=staging_2,
-            )
 
-        layer.paras_configure_tp_mlp_all_to_all(
-            stream_1, last_layer_handles, staging_1
-        )
-        layer.paras_configure_tp(tp_size, 0)
-
-        if not_last_layer:
-            last_layer_handles = new_handles
-            stream_1, stream_2 = stream_2, stream_1
-            staging_1, staging_2 = staging_2, staging_1
-
-    torch.cuda.synchronize()
+    tp_size = get_paras_tp_size()
+    tp_inter = INTERMEDIATE // tp_size
+    model = _make_model(mgr, num_local)
+    model.paras_configure_tp(tp_size, get_paras_tp_rank(), intra_node_method="nccl")
     return _read_tp_results(mgr, tp_inter)
 
 
 def run_peer_access_path(mgr, num_local, peer_ctx):
     from sglang.srt.paras.paras_parallel_state import (
-        get_paras_tp_group,
+        get_paras_tp_rank,
         get_paras_tp_size,
     )
 
     tp_size = get_paras_tp_size()
     tp_inter = INTERMEDIATE // tp_size
-
-    paras_tp_group = get_paras_tp_group().device_group
-    dst_base_ptrs = torch.tensor(
-        peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+    model = _make_model(mgr, num_local, peer_ctx)
+    model.paras_configure_tp(
+        tp_size, get_paras_tp_rank(), intra_node_method="peer_access"
     )
-    barrier_tensor = torch.zeros(1, device="cuda")
-    dist.barrier(group=paras_tp_group)
-
-    for layer_id in range(NUM_LAYERS):
-        mixin = _make_mixin(layer_id, num_local, mgr)
-        mixin.paras_configure_tp_fused_peer_access_kernel(
-            peer_ctx, dst_base_ptrs, None
-        )
-        dist.all_reduce(
-            barrier_tensor, op=dist.ReduceOp.SUM, group=paras_tp_group
-        )
-
     return _read_tp_results(mgr, tp_inter)
 
 
 def run_peer_access_reverse_path(mgr, num_local, peer_ctx):
-    from sglang.srt.paras.paras_parallel_state import (
-        get_paras_tp_group,
-        get_paras_tp_size,
-    )
+    model = _make_model(mgr, num_local, peer_ctx)
+    model.paras_configure_ep(intra_node_method="peer_access")
+    return _read_ep_results(mgr)
 
-    tp_size = get_paras_tp_size()
 
-    paras_tp_group = get_paras_tp_group().device_group
-    dst_base_ptrs = torch.tensor(
-        peer_ctx.peer_addresses, dtype=torch.int64, device="cuda"
-    )
-    barrier_tensor = torch.zeros(1, device="cuda")
-    dist.barrier(group=paras_tp_group)
-
-    for layer_id in reversed(range(NUM_LAYERS)):
-        mixin = _make_mixin(layer_id, num_local, mgr)
-        mixin.paras_configure_ep_fused_peer_access_kernel(
-            peer_ctx, dst_base_ptrs, None
-        )
-        dist.all_reduce(
-            barrier_tensor, op=dist.ReduceOp.SUM, group=paras_tp_group
-        )
-
+def run_nccl_reverse_path(mgr, num_local):
+    model = _make_model(mgr, num_local)
+    model.paras_configure_ep(intra_node_method="nccl")
     return _read_ep_results(mgr)
 
 
@@ -400,12 +347,8 @@ def _read_ep_results(mgr):
     results = {}
     for layer_id in range(NUM_LAYERS):
         results[layer_id] = (
-            mgr.get_view(
-                f"model.layers.{layer_id}.mlp.experts.w13_weight"
-            ).clone(),
-            mgr.get_view(
-                f"model.layers.{layer_id}.mlp.experts.w2_weight"
-            ).clone(),
+            mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w13_weight").clone(),
+            mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w2_weight").clone(),
         )
     return results
 
@@ -481,9 +424,9 @@ def setup_peer_ctx(mgr, rank, world_size, tp_group):
                 remote_handle,
                 1,  # cudaIpcMemLazyEnablePeerAccess
             )
-            assert ret == 0, (
-                f"cudaIpcOpenMemHandle for rank {r} failed (cuda error {ret})"
-            )
+            assert (
+                ret == 0
+            ), f"cudaIpcOpenMemHandle for rank {r} failed (cuda error {ret})"
             peer_addresses.append(remote_ptr.value)
 
     return PeerAccessContext(
@@ -497,67 +440,6 @@ def setup_peer_ctx(mgr, rank, world_size, tp_group):
 # ---------------------------------------------------------------------------
 # Test classes
 # ---------------------------------------------------------------------------
-
-
-class TestEPtoTPWeightTransfer:
-    """EP→TP: peer_access vs NCCL comparison (from test_paras_peer_access.py)."""
-
-    def __init__(self, rank, world_size, mgr, num_local, snap, peer_ctx):
-        self.rank = rank
-        self.world_size = world_size
-        self.mgr = mgr
-        self.num_local = num_local
-        self.snap = snap
-        self.peer_ctx = peer_ctx
-        self._naive_results = None
-        self._pa_results = None
-
-    def _ensure_results(self):
-        """Run NCCL naive and peer_access paths, cache results."""
-        if self._naive_results is not None:
-            return
-        restore_weights(self.mgr, self.snap)
-        self._naive_results = run_naive_path(self.mgr, self.num_local)
-        restore_weights(self.mgr, self.snap)
-        self._pa_results = run_peer_access_path(
-            self.mgr, self.num_local, self.peer_ctx
-        )
-
-    def test_w13_peer_access_vs_nccl(self):
-        """w13 weights must be bitwise identical between peer_access and NCCL."""
-        self._ensure_results()
-        for layer_id in range(NUM_LAYERS):
-            ref = self._naive_results[layer_id][0].reshape(-1)
-            test = self._pa_results[layer_id][0].reshape(-1)
-            if not torch.equal(ref, test):
-                diff = (ref != test).sum().item()
-                raise AssertionError(
-                    f"[Rank {self.rank}] w13 mismatch layer={layer_id}: "
-                    f"{diff}/{ref.numel()} elements differ"
-                )
-        if self.rank == 0:
-            print(
-                "  [OK] w13 peer_access vs NCCL: bitwise match all layers",
-                flush=True,
-            )
-
-    def test_w2_peer_access_vs_nccl(self):
-        """w2 weights must be bitwise identical between peer_access and NCCL."""
-        self._ensure_results()
-        for layer_id in range(NUM_LAYERS):
-            ref = self._naive_results[layer_id][1].reshape(-1)
-            test = self._pa_results[layer_id][1].reshape(-1)
-            if not torch.equal(ref, test):
-                diff = (ref != test).sum().item()
-                raise AssertionError(
-                    f"[Rank {self.rank}] w2 mismatch layer={layer_id}: "
-                    f"{diff}/{ref.numel()} elements differ"
-                )
-        if self.rank == 0:
-            print(
-                "  [OK] w2 peer_access vs NCCL: bitwise match all layers",
-                flush=True,
-            )
 
 
 class TestTPtoEPWeightRestore:
@@ -593,22 +475,16 @@ class TestTPtoEPWeightRestore:
 
         # Switch to TP
         m.paras_configure_tp(self.world_size, self.rank)
-        assert (
-            m.experts is tp_exp
-        ), "After configure_tp, experts should be tp_experts"
+        assert m.experts is tp_exp, "After configure_tp, experts should be tp_experts"
         assert m.parallelism_config == "tp"
 
         # Switch back to EP
         m.paras_configure_ep()
-        assert (
-            m.experts is ep_exp
-        ), "After configure_ep, experts should be ep_experts"
+        assert m.experts is ep_exp, "After configure_ep, experts should be ep_experts"
         assert m.parallelism_config == "ep"
 
         if self.rank == 0:
-            print(
-                "  [OK] MoE pointer swap: ep→tp→ep verified", flush=True
-            )
+            print("  [OK] MoE pointer swap: ep→tp→ep verified", flush=True)
 
 
 class TestWeightRoundTrip:
@@ -626,23 +502,15 @@ class TestWeightRoundTrip:
         # Restore clean EP weights
         restore_weights(self.mgr, self.snap)
 
-        # EP→TP via NCCL naive all-to-all
-        run_naive_path(self.mgr, self.num_local)
+        # EP→TP via NCCL all-to-all (reverse order, handled inside)
+        run_nccl_path(self.mgr, self.num_local)
 
-        # TP→EP via NCCL naive reverse — MUST be in reversed layer order
-        # to respect N+1 slot aliasing (EP slot[i+1] = TP slot[i+1])
-        for layer_id in reversed(range(NUM_LAYERS)):
-            mixin = _make_mixin(layer_id, self.num_local, self.mgr)
-            mixin.paras_configure_ep_mlp_naive()
+        run_nccl_reverse_path(self.mgr, self.num_local)
 
         # Compare restored EP weights to original snapshot
         for layer_id in range(NUM_LAYERS):
-            w13 = self.mgr.get_view(
-                f"model.layers.{layer_id}.mlp.experts.w13_weight"
-            )
-            w2 = self.mgr.get_view(
-                f"model.layers.{layer_id}.mlp.experts.w2_weight"
-            )
+            w13 = self.mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w13_weight")
+            w2 = self.mgr.get_view(f"model.layers.{layer_id}.mlp.experts.w2_weight")
             w13_orig = self.snap[layer_id][0]
             w2_orig = self.snap[layer_id][1]
 
@@ -667,7 +535,7 @@ class TestWeightRoundTrip:
 
 
 class TestEPtoTPGroundTruth:
-    """EP→TP: verify NCCL and peer_access results against independently computed ground truth."""
+    """Verify NCCL and peer_access EP→TP against independent ground truth."""
 
     def __init__(self, rank, world_size, mgr, num_local, snap, tp_group, peer_ctx):
         self.rank = rank
@@ -700,33 +568,48 @@ class TestEPtoTPGroundTruth:
             full_w2 = torch.cat(gathered_w2, dim=0)
 
             gate_shard = full_w13[:, r * tp_inter : (r + 1) * tp_inter, :]
-            up_shard = full_w13[:, INTERMEDIATE + r * tp_inter : INTERMEDIATE + (r + 1) * tp_inter, :]
+            up_shard = full_w13[
+                :, INTERMEDIATE + r * tp_inter : INTERMEDIATE + (r + 1) * tp_inter, :
+            ]
             self._expected_w13[layer_id] = torch.cat([gate_shard, up_shard], dim=1)
-            self._expected_w2[layer_id] = full_w2[:, :, r * tp_inter : (r + 1) * tp_inter]
+            self._expected_w2[layer_id] = full_w2[
+                :, :, r * tp_inter : (r + 1) * tp_inter
+            ]
 
     def _verify_against_ground_truth(self, actual, method_name):
         self._build_ground_truth()
         for layer_id in range(NUM_LAYERS):
             aw13, aw2 = actual[layer_id]
             if not torch.equal(aw13, self._expected_w13[layer_id]):
-                diff = (aw13.reshape(-1) != self._expected_w13[layer_id].reshape(-1)).sum().item()
+                diff = (
+                    (aw13.reshape(-1) != self._expected_w13[layer_id].reshape(-1))
+                    .sum()
+                    .item()
+                )
                 raise AssertionError(
                     f"[Rank {self.rank}] {method_name} w13 mismatch layer={layer_id}: "
                     f"{diff}/{aw13.numel()} elements differ"
                 )
             if not torch.equal(aw2, self._expected_w2[layer_id]):
-                diff = (aw2.reshape(-1) != self._expected_w2[layer_id].reshape(-1)).sum().item()
+                diff = (
+                    (aw2.reshape(-1) != self._expected_w2[layer_id].reshape(-1))
+                    .sum()
+                    .item()
+                )
                 raise AssertionError(
                     f"[Rank {self.rank}] {method_name} w2 mismatch layer={layer_id}: "
                     f"{diff}/{aw2.numel()} elements differ"
                 )
         if self.rank == 0:
-            print(f"  [OK] EP→TP {method_name}: bitwise match ground truth all layers", flush=True)
+            print(
+                f"  [OK] EP→TP {method_name}: bitwise match ground truth all layers",
+                flush=True,
+            )
 
     def test_nccl_vs_ground_truth(self):
         restore_weights(self.mgr, self.snap)
-        actual = run_naive_path(self.mgr, self.num_local)
-        self._verify_against_ground_truth(actual, "NCCL naive")
+        actual = run_nccl_path(self.mgr, self.num_local)
+        self._verify_against_ground_truth(actual, "NCCL")
 
     def test_peer_access_vs_ground_truth(self):
         restore_weights(self.mgr, self.snap)
@@ -735,7 +618,7 @@ class TestEPtoTPGroundTruth:
 
 
 class TestTPtoEPGroundTruth:
-    """TP→EP: verify NCCL reverse and peer_access reverse both recover original EP weights."""
+    """Verify NCCL and peer_access TP→EP recover the original EP weights."""
 
     def __init__(self, rank, world_size, mgr, num_local, snap, peer_ctx):
         self.rank = rank
@@ -747,7 +630,7 @@ class TestTPtoEPGroundTruth:
 
     def _run_ep_to_tp(self):
         restore_weights(self.mgr, self.snap)
-        run_naive_path(self.mgr, self.num_local)
+        run_nccl_path(self.mgr, self.num_local)
 
     def _verify_ep_matches_original(self, method_name):
         actual = _read_ep_results(self.mgr)
@@ -768,14 +651,15 @@ class TestTPtoEPGroundTruth:
                     f"{diff}/{aw2.numel()} elements differ"
                 )
         if self.rank == 0:
-            print(f"  [OK] TP→EP {method_name}: bitwise match original EP all layers", flush=True)
+            print(
+                f"  [OK] TP→EP {method_name}: bitwise match original EP all layers",
+                flush=True,
+            )
 
     def test_nccl_reverse_vs_original(self):
         self._run_ep_to_tp()
-        for layer_id in reversed(range(NUM_LAYERS)):
-            mixin = _make_mixin(layer_id, self.num_local, self.mgr)
-            mixin.paras_configure_ep_mlp_naive()
-        self._verify_ep_matches_original("NCCL naive reverse")
+        run_nccl_reverse_path(self.mgr, self.num_local)
+        self._verify_ep_matches_original("NCCL reverse")
 
     def test_peer_access_reverse_vs_original(self):
         self._run_ep_to_tp()
@@ -821,7 +705,10 @@ def main():
         gt_tp_ep = TestTPtoEPGroundTruth(
             rank, world_size, mgr, num_local, snap, peer_ctx
         )
-        for name in ("test_nccl_reverse_vs_original", "test_peer_access_reverse_vs_original"):
+        for name in (
+            "test_nccl_reverse_vs_original",
+            "test_peer_access_reverse_vs_original",
+        ):
             try:
                 getattr(gt_tp_ep, name)()
                 passed += 1

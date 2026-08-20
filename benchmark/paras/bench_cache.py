@@ -4,9 +4,7 @@ Compares three transport methods per direction:
     peer_access  - production CUDA peer-access kernel
                    (peer_access_kv_scatter / peer_access_kv_transfer).
     nccl         - production NCCL all_to_all_single per layer.
-    nccl_overlap - same NCCL pattern, pipelined across 2 streams so a layer's
-                   all_to_all overlaps with the next layer's prep (mirrors the
-                   `paras_configure_tp_overlap` weight path).
+    nccl_overlap - benchmark-only two-stream NCCL baseline.
 
 Volume control:
     `--cache-size-gb` is the per-GPU EP cache capacity.

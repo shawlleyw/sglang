@@ -31,8 +31,13 @@ from sglang.srt.paras.paras_memory_manager import (
     get_global_paras_memory_manager,
     plan_qwen_moe_layout,
 )
-from sglang.srt.paras.paras_parallel_state import get_paras_dp_size, get_paras_tp_group, get_paras_tp_size
+from sglang.srt.paras.paras_parallel_state import (
+    get_paras_dp_size,
+    get_paras_tp_group,
+    get_paras_tp_size,
+)
 from sglang.srt.paras.utils import paras_func
+from sglang.srt.paras.weight_transfer import resolve_intra_node_weight_transfer_method
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
@@ -152,7 +157,10 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             qn = quant_config.get_name()
             if qn == "fp8":
                 quant_name = "fp8"
-                if hasattr(quant_config, "weight_block_size") and quant_config.weight_block_size:
+                if (
+                    hasattr(quant_config, "weight_block_size")
+                    and quant_config.weight_block_size
+                ):
                     fp8_block_size = quant_config.weight_block_size[0]
 
         head_dim = getattr(
@@ -162,8 +170,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         moe_tp_size = get_moe_tensor_parallel_world_size()
         dp_size = get_paras_dp_size()
 
-        import os
-        configure_method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
+        intra_node_method = resolve_intra_node_weight_transfer_method()
 
         plan_qwen_moe_layout(
             manager,
@@ -181,7 +188,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             quant_name=quant_name,
             fp8_block_size=fp8_block_size,
             num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
-            configure_method=configure_method,
+            intra_node_weight_transfer_method=intra_node_method,
             prefix="model",
         )
 
@@ -208,22 +215,30 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
 
-        # Pre-initialize NVLink peer access during model init to avoid overhead at switch time.
-        # cudaIpcOpenMemHandle() is slow on first call (~6s for NVLink connection setup).
+        # Pre-initialize the TP-local CUDA IPC mapping. Every weight-transfer
+        # path reshards only within this TP group; DP replication uses NCCL.
+        # cudaIpcOpenMemHandle() is slow on first use, so initialize it here.
         try:
             from sglang.srt.paras.peer_access import init_peer_access
+
             self._fused_peer_access_ctx = init_peer_access(
-                manager, get_paras_tp_group().device_group, get_paras_tp_size()
+                manager,
+                get_paras_tp_group().device_group,
+                get_paras_tp_size(),
             )
             logger.info("ParaS fused peer access pre-initialized.")
         except Exception as e:
-            logger.warning(f"ParaS fused peer access pre-init failed (will retry at switch): {e}")
+            logger.warning(
+                "ParaS fused peer access pre-init failed (will retry at switch): %s",
+                e,
+            )
             self._fused_peer_access_ctx = None
 
         self.model = Qwen3MoeModelParaS(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        # Inject pre-initialized peer access context so the switch doesn't pay 6s init cost
+        # Inject the pre-initialized node-local mapping so the switch does not
+        # pay the IPC setup cost on its first request.
         if self._fused_peer_access_ctx is not None:
             self.model._peer_access_ctx = self._fused_peer_access_ctx
 
@@ -357,9 +372,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
-        import os
-        method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
-        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank, method=method)
+        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
     @paras_func
     def paras_configure_ep(self):

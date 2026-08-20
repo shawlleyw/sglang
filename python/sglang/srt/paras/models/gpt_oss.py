@@ -19,11 +19,11 @@ Everything else is loaded through the normal PyTorch parameter path
 and stays untouched across switches.  Concretely for GPT-OSS:
 
   Managed by the UMM:
-    * paras.moe_slot.{i}.w13 / w2  (N+1 slot layout, EP<->TP transport)
+    * mlp.{ep,tp}_experts.w13 / w2  (overlapped unified layout, EP<->TP transport)
     * self_attn.qkv_proj.weight / tp_weight
     * self_attn.o_proj.weight
     * FP8 weight scales (when quant_name == "fp8")
-    * Staging buffers (when configure_method != "peer_access")
+    * Staging buffers for the NCCL weight-transfer fallback
 
   Replicated across all ranks, not in the UMM:
     * input_layernorm.weight, post_attention_layernorm.weight
@@ -63,6 +63,7 @@ from sglang.srt.paras.paras_parallel_state import (
     get_paras_tp_size,
 )
 from sglang.srt.paras.utils import paras_func
+from sglang.srt.paras.weight_transfer import resolve_intra_node_weight_transfer_method
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
@@ -305,7 +306,7 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
         moe_tp_size = get_moe_tensor_parallel_world_size()
         dp_size = get_paras_dp_size()
 
-        configure_method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
+        intra_node_method = resolve_intra_node_weight_transfer_method()
 
         plan_gpt_oss_moe_layout(
             manager,
@@ -323,7 +324,7 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
             quant_name=quant_name,
             fp8_block_size=fp8_block_size,
             num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
-            configure_method=configure_method,
+            intra_node_weight_transfer_method=intra_node_method,
             prefix="model",
         )
 
@@ -433,8 +434,7 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
 
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
-        method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
-        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank, method=method)
+        self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
 
     @paras_func
     def paras_configure_ep(self):

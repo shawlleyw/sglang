@@ -61,7 +61,6 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.paras.paras_parallel_state import (
     initialize_paras_parallel,
-    get_paras_dp_group,
     get_paras_tp_group,
     paras_comm_configure_tp,
     paras_comm_configure_ep,
@@ -701,10 +700,8 @@ class ModelRunner:
 
         # Initialize ParaS parallel groups
         if self.server_args.enable_paras_moe:
-            self.paras_dp_group = get_paras_dp_group()
             self.paras_tp_group = get_paras_tp_group()
         else:
-            self.paras_dp_group = None
             self.paras_tp_group = None
 
         # Check memory for tensor parallelism

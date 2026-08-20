@@ -559,13 +559,15 @@ class ParaSReqScatterManager:
                 source_full_to_swa_mapping=self.source_full_to_swa_mapping,
             )
 
-        # Per-layer dispatch in REVERSE order (preserves N+1 slot invariant).
+        # Per-layer dispatch in FORWARD order (0..N-1). In the overlapped layout
+        # writing EP cache layer i+1 overlaps TP cache layer i, so layer i must be
+        # read (scattered) before layer i+1's EP cache is written.
         num_layers = kv_cache.layer_num
         barrier_tensor = (
             torch.zeros(1, device="cuda") if method == "peer_access" else None
         )
 
-        for layer_id in range(num_layers - 1, -1, -1):
+        for layer_id in range(num_layers):
             if self.layer_specs is not None:
                 spec = self.layer_specs[layer_id]
             else:
