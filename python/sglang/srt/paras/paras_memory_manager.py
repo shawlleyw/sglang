@@ -1,20 +1,23 @@
 """
-ParaSMemoryManager: Static contiguous weight buffer for ParaS EP↔TP switching.
-V1 scope: Qwen sparse-MoE (no shared experts, no dense MLPs).
+ParaSMemoryManager: Static contiguous weight/KV buffer for ParaS EP↔TP switching.
+Scope: supported ParaS sparse-MoE layouts.
 Supported dtypes: BF16/FP16 (unquantized) and FP8.
 
 LIFECYCLE & DESIGN:
-  The manager pre-plans a single contiguous uint8 buffer that holds all weight tensors
-  needed for Expert Parallelism (EP) ↔ Tensor Parallelism (TP) switching. This design
-  avoids repeated allocations and fragmentation during dynamic reconfiguration.
+  The manager pre-plans one contiguous uint8 buffer containing the persistent
+  weights and KV views needed for Expert Parallelism (EP) ↔ Tensor Parallelism
+  (TP) switching. This avoids runtime allocation and fragmentation.
 
-  1. plan_qwen_moe_layout(manager, ...)  — reserves tensor slots (name, shape, dtype)
-  2. manager.materialize()                — computes aligned offsets, allocates one GPU buffer
-  3. manager.get_view("name")             — returns typed, shaped view for module to wrap as nn.Parameter
+  1. plan_*_moe_layout(manager, ...) — records weight and staging metadata
+  2. manager.plan_*_kv_capacity(...) — selects EP/TP cache capacities
+  3. manager.reserve_kv_cache(...)   — records the selected cache views
+  4. manager.materialize()           — assigns offsets and allocates one GPU buffer
+  5. manager.get_view("name")        — returns a typed view for model parameters
 
-MEMORY LAYOUT EXAMPLE (1 layer, BF16, 8 experts, ep_size=2, tp_size=4):
-  [EP_w13 | EP_w2 | TP_w13 | TP_w2 | QKV_full | O_proj | QKV_TP_buf | ...]
-   ^-- all in one contiguous torch.uint8 buffer, 256-byte aligned for GPU access
+MEMORY LAYOUT:
+  Ordinary weights and staging occupy an aligned prefix. Expert weights and KV
+  cache use a combined four-anchor run where inactive EP and TP storage overlaps.
+  Every entry is 256-byte aligned.
 
 WHY THIS APPROACH:
   - Single allocation: Avoids GPU memory fragmentation and repeated malloc/free overhead.
@@ -81,19 +84,29 @@ class LayoutEntry:
 
 @dataclass(frozen=True)
 class ParaSKVCapacityPlan:
-    """UMM-owned EP/TP KV cache capacity plan.
+    """Exact UMM-owned EP/TP weight and KV capacity plan.
 
-    SWA fields are zero / empty for pure-MHA plans. ``layer_specs`` is set
-    only by the SWA planner for downstream :meth:`reserve_kv_cache`.
+    ``manager_budget_bytes`` is the hard UMM limit after non-UMM static memory.
+    ``planned_umm_bytes`` is the exact aligned footprint selected below that
+    limit. The EP/TP weight and KV fields expose how each mode consumes the
+    shared allocation. SWA fields are zero / empty for pure-MHA plans;
+    ``layer_specs`` is set only by the SWA planner for downstream
+    :meth:`reserve_kv_cache`.
     """
 
     available_gpu_memory_bytes: int
     total_gpu_memory_bytes: int
     dynamic_reserve_bytes: int
     umm_budget_bytes: int
-    weights_only_bytes: int
     non_umm_static_bytes: int
-    kv_budget_bytes: int
+    manager_budget_bytes: int
+
+    fixed_umm_bytes: int
+    ep_expert_weight_bytes: int
+    tp_expert_weight_bytes: int
+    ep_kv_bytes: int
+    tp_kv_bytes: int
+    planned_umm_bytes: int
 
     kv_dtype: torch.dtype
 
@@ -110,6 +123,23 @@ class ParaSKVCapacityPlan:
     tp_max_tokens_swa: int = 0
 
     layer_specs: Optional[List["LayerCacheSpec"]] = None
+
+
+@dataclass(frozen=True)
+class _ParaSRunGeometry:
+    """Aligned byte geometry for the combined expert-weight/KV run."""
+
+    we: Tuple[int, ...]
+    wt: Tuple[int, ...]
+    ce: Tuple[int, ...]
+    ct: Tuple[int, ...]
+    sum_we: int
+    sum_wt: int
+    sum_ce: int
+    sum_ct: int
+    anchor: int
+    pad: int
+    run_bytes: int
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +307,7 @@ class ParaSMemoryManager:
         self._paras_kv_pending: Optional[Dict] = None
         self._paras_moe_pending: Optional[Dict] = None
         self._deferred_weight_bytes: int = 0
+        self._planned_umm_bytes_limit: Optional[int] = None
         
 
     # ----- reservation ----------------------------------------------------
@@ -461,7 +492,7 @@ class ParaSMemoryManager:
         lm_head_bytes = 0 if tie_word_embeddings else embed_bytes
         return embed_bytes + lm_head_bytes
 
-    def _compute_kv_budget_bytes(
+    def _compute_umm_budget_bytes(
         self, config=None
     ) -> Tuple[int, int, int, int, int, int, float]:
         from sglang.srt.utils.common import get_available_gpu_memory
@@ -488,17 +519,14 @@ class ParaSMemoryManager:
         non_umm_static_bytes = (
             self._compute_non_umm_static_bytes(config) if config is not None else 0
         )
-        kv_budget_bytes = max(
-            0,
-            umm_budget_bytes - self.weights_only_bytes - non_umm_static_bytes,
-        )
+        manager_budget_bytes = max(0, umm_budget_bytes - non_umm_static_bytes)
 
         return (
             avail_now_bytes,
             total_gpu_bytes,
             dynamic_reserve_bytes,
             umm_budget_bytes,
-            kv_budget_bytes,
+            manager_budget_bytes,
             non_umm_static_bytes,
             avail_now_gib,
         )
@@ -514,10 +542,11 @@ class ParaSMemoryManager:
 
         Reads device / gpu_id / server_args / cpu_group / world_size from
         ``self`` (set at construction in model_runner). Calls
-        ``get_available_gpu_memory``, computes the UMM and KV byte budgets,
-        derives EP and TP per-token caps, populates ``self.ep_max_kv_tokens``
-        and ``self.tp_max_kv_tokens``, logs at INFO level, and returns the
-        plan including the resolved ``kv_dtype`` for downstream
+        ``get_available_gpu_memory``, computes the UMM byte limit, and derives
+        separate EP and TP token caps whose exact four-anchor footprint fits
+        that limit. Populates ``self.ep_max_kv_tokens`` and
+        ``self.tp_max_kv_tokens``, logs at INFO level, and returns the plan
+        including the resolved ``kv_dtype`` for downstream
         ``reserve_kv_cache``.
         """
         kv_dtype = self._resolve_kv_store_dtype()
@@ -532,24 +561,63 @@ class ParaSMemoryManager:
             total_gpu_bytes,
             dynamic_reserve_bytes,
             umm_budget_bytes,
-            kv_budget_bytes,
+            manager_budget_bytes,
             non_umm_static_bytes,
             avail_now_gib,
-        ) = self._compute_kv_budget_bytes(config)
+        ) = self._compute_umm_budget_bytes(config)
 
         num_layers = config.num_hidden_layers
         num_kv_heads = config.num_key_value_heads
+        page_size = getattr(self.server_args, "page_size", 1) or 1
 
         ep_kv_heads = num_kv_heads
         tp_kv_heads = max(1, num_kv_heads // tp_size)
-        # (num_layers + 1) reserves one layer's K+V for the four-anchor cache
-        # tail overhead (the max(ct) anchor in _place_paras_run). Without it the
-        # materialized run exceeds kv_budget by ~one layer.
-        ep_cell_bytes = ep_kv_heads * head_dim * (num_layers + 1) * 2 * elem_size
-        tp_cell_bytes = tp_kv_heads * head_dim * (num_layers + 1) * 2 * elem_size
-        ep_max_tokens = max(1, int(kv_budget_bytes // ep_cell_bytes))
-        tp_max_tokens = max(1, int(kv_budget_bytes // tp_cell_bytes))
+        ep_cell_bytes = ep_kv_heads * head_dim * num_layers * 2 * elem_size
+        tp_cell_bytes = tp_kv_heads * head_dim * num_layers * 2 * elem_size
 
+        def _build_cache(ep_budget_bytes: int, tp_budget_bytes: int):
+            def _tokens_for_budget(budget_bytes: int, cell_bytes: int) -> int:
+                page_bytes = page_size * cell_bytes
+                return max(1, (budget_bytes - page_bytes) // cell_bytes)
+
+            ep_max_tokens = _tokens_for_budget(ep_budget_bytes, ep_cell_bytes)
+            tp_max_tokens = _tokens_for_budget(tp_budget_bytes, tp_cell_bytes)
+            tp_max_tokens = self._cap_tp_tokens_to_ep_layer(
+                ep_tokens=ep_max_tokens,
+                tp_tokens=tp_max_tokens,
+                ep_kv_heads=ep_kv_heads,
+                tp_kv_heads=tp_kv_heads,
+                head_dim=head_dim,
+                elem_size=elem_size,
+                page_size=page_size,
+            )
+            ep_k_bytes = (
+                (ep_max_tokens + page_size)
+                * ep_kv_heads
+                * head_dim
+                * elem_size
+            )
+            tp_k_bytes = (
+                (tp_max_tokens + page_size)
+                * tp_kv_heads
+                * head_dim
+                * elem_size
+            )
+            return {
+                "ep_max_tokens": ep_max_tokens,
+                "tp_max_tokens": tp_max_tokens,
+                "layer_ep_bytes": [ep_k_bytes] * num_layers,
+                "layer_tp_bytes": [tp_k_bytes] * num_layers,
+            }
+
+        cache_plan, geometry, fixed_umm_bytes, planned_umm_bytes = (
+            self._plan_balanced_kv_footprint(
+                manager_budget_bytes,
+                _build_cache,
+            )
+        )
+        ep_max_tokens = cache_plan["ep_max_tokens"]
+        tp_max_tokens = cache_plan["tp_max_tokens"]
         self.ep_max_kv_tokens = ep_max_tokens
         self.tp_max_kv_tokens = tp_max_tokens
 
@@ -558,9 +626,14 @@ class ParaSMemoryManager:
             f"total={total_gpu_bytes / (1 << 30):.3f}GiB  "
             f"dynamic_reserve={dynamic_reserve_bytes / (1 << 30):.3f}GiB  "
             f"umm_budget={umm_budget_bytes / (1 << 30):.3f}GiB  "
-            f"weights_only={self.weights_only_bytes / (1 << 30):.3f}GiB  "
             f"non_umm_static={non_umm_static_bytes / (1 << 30):.3f}GiB  "
-            f"kv_budget={kv_budget_bytes / (1 << 30):.3f}GiB  "
+            f"manager_budget={manager_budget_bytes / (1 << 30):.3f}GiB  "
+            f"planned_umm={planned_umm_bytes / (1 << 30):.3f}GiB  "
+            f"fixed_umm={fixed_umm_bytes / (1 << 30):.3f}GiB  "
+            f"ep_weights={geometry.sum_we / (1 << 30):.3f}GiB  "
+            f"tp_weights={geometry.sum_wt / (1 << 30):.3f}GiB  "
+            f"ep_kv={geometry.sum_ce / (1 << 30):.3f}GiB  "
+            f"tp_kv={geometry.sum_ct / (1 << 30):.3f}GiB  "
             f"ep_max_tokens={ep_max_tokens}  "
             f"tp_max_tokens={tp_max_tokens}  "
             f"ep_kv_heads={ep_kv_heads}  "
@@ -572,9 +645,14 @@ class ParaSMemoryManager:
             total_gpu_memory_bytes=total_gpu_bytes,
             dynamic_reserve_bytes=dynamic_reserve_bytes,
             umm_budget_bytes=umm_budget_bytes,
-            weights_only_bytes=self.weights_only_bytes,
             non_umm_static_bytes=non_umm_static_bytes,
-            kv_budget_bytes=kv_budget_bytes,
+            manager_budget_bytes=manager_budget_bytes,
+            fixed_umm_bytes=fixed_umm_bytes,
+            ep_expert_weight_bytes=geometry.sum_we,
+            tp_expert_weight_bytes=geometry.sum_wt,
+            ep_kv_bytes=geometry.sum_ce,
+            tp_kv_bytes=geometry.sum_ct,
+            planned_umm_bytes=planned_umm_bytes,
             kv_dtype=kv_dtype,
             ep_max_tokens=ep_max_tokens,
             tp_max_tokens=tp_max_tokens,
@@ -616,43 +694,115 @@ class ParaSMemoryManager:
             total_gpu_bytes,
             dynamic_reserve_bytes,
             umm_budget_bytes,
-            kv_budget_bytes,
+            manager_budget_bytes,
             non_umm_static_bytes,
             avail_now_gib,
-        ) = self._compute_kv_budget_bytes(config)
+        ) = self._compute_umm_budget_bytes(config)
 
         num_layers = config.num_hidden_layers
         num_kv_heads = config.num_key_value_heads
-
+        page_size = getattr(self.server_args, "page_size", 1) or 1
         layer_types = getattr(config, "layer_types", None) or (
             ["full_attention"] * num_layers
         )
-        n_full = sum(1 for t in layer_types if t == "full_attention")
-        n_swa = sum(1 for t in layer_types if t == "sliding_attention")
+        if len(layer_types) != num_layers:
+            raise ValueError(
+                "config.layer_types must contain one entry per hidden layer"
+            )
+        n_full = sum(
+            1 for layer_type in layer_types if layer_type == "full_attention"
+        )
+        n_swa = sum(
+            1 for layer_type in layer_types if layer_type == "sliding_attention"
+        )
 
         ep_kv_heads = num_kv_heads
         tp_kv_heads = max(1, num_kv_heads // tp_size)
-        cell_bytes = num_kv_heads * head_dim * 2 * elem_size
+        ep_layer_cell_bytes = ep_kv_heads * head_dim * 2 * elem_size
+        tp_layer_cell_bytes = tp_kv_heads * head_dim * 2 * elem_size
+        ep_cell_bytes = ep_layer_cell_bytes * num_layers
+        tp_cell_bytes = tp_layer_cell_bytes * num_layers
+        swa_ratio = getattr(self.server_args, "swa_full_tokens_ratio", 0.5)
 
-        def _solve_tokens(kv_budget: int) -> Tuple[int, int]:
-            tt = max(1, int(kv_budget // cell_bytes))
+        def _solve_tokens(
+            budget_bytes: int, layer_cell_bytes: int
+        ) -> Tuple[int, int]:
+            page_bytes = page_size * layer_cell_bytes * num_layers
+            total_layer_tokens = max(
+                1, (budget_bytes - page_bytes) // layer_cell_bytes
+            )
+            full_tokens, swa_tokens = plan_hybrid_kv_budget(
+                total_layer_tokens,
+                n_full,
+                n_swa,
+                swa_ratio,
+            )
+            if n_full > 0:
+                full_tokens = max(1, full_tokens)
             if n_swa > 0:
-                swa_ratio = getattr(self.server_args, "swa_full_tokens_ratio", 0.5)
-                return plan_hybrid_kv_budget(tt, n_full, n_swa, swa_ratio)
-            return max(1, tt // num_layers), 0
+                swa_tokens = max(1, swa_tokens)
+            return full_tokens, swa_tokens
 
-        # Two-pass: pass 1 estimates full_max_tokens, pass 2 subtracts the
-        # four-anchor cache tail overhead (~one max-layer of K+V bytes) and
-        # re-solves. Single iteration converges because the overhead << kv_budget.
-        full_max_tokens_pass1, _ = _solve_tokens(kv_budget_bytes)
-        overlap_gap_bytes = full_max_tokens_pass1 * cell_bytes
-        kv_budget_bytes = max(0, kv_budget_bytes - overlap_gap_bytes)
-        full_max_tokens, swa_max_tokens = _solve_tokens(kv_budget_bytes)
+        def _build_cache(ep_budget_bytes: int, tp_budget_bytes: int):
+            ep_full, ep_swa = _solve_tokens(ep_budget_bytes, ep_layer_cell_bytes)
+            tp_full, tp_swa = _solve_tokens(tp_budget_bytes, tp_layer_cell_bytes)
+            if n_full > 0:
+                tp_full = self._cap_tp_tokens_to_ep_layer(
+                    ep_tokens=ep_full,
+                    tp_tokens=tp_full,
+                    ep_kv_heads=ep_kv_heads,
+                    tp_kv_heads=tp_kv_heads,
+                    head_dim=head_dim,
+                    elem_size=elem_size,
+                    page_size=page_size,
+                )
+            if n_swa > 0:
+                tp_swa = self._cap_tp_tokens_to_ep_layer(
+                    ep_tokens=ep_swa,
+                    tp_tokens=tp_swa,
+                    ep_kv_heads=ep_kv_heads,
+                    tp_kv_heads=tp_kv_heads,
+                    head_dim=head_dim,
+                    elem_size=elem_size,
+                    page_size=page_size,
+                )
+            layer_ep_bytes = []
+            layer_tp_bytes = []
+            for layer_type in layer_types:
+                is_swa = layer_type == "sliding_attention"
+                ep_tokens = ep_swa if is_swa else ep_full
+                tp_tokens = tp_swa if is_swa else tp_full
+                layer_ep_bytes.append(
+                    (ep_tokens + page_size)
+                    * ep_kv_heads
+                    * head_dim
+                    * elem_size
+                )
+                layer_tp_bytes.append(
+                    (tp_tokens + page_size)
+                    * tp_kv_heads
+                    * head_dim
+                    * elem_size
+                )
+            return {
+                "ep_max_tokens": ep_full,
+                "tp_max_tokens": tp_full,
+                "ep_max_tokens_swa": ep_swa,
+                "tp_max_tokens_swa": tp_swa,
+                "layer_ep_bytes": layer_ep_bytes,
+                "layer_tp_bytes": layer_tp_bytes,
+            }
 
-        ep_max_tokens = full_max_tokens
-        tp_max_tokens = full_max_tokens * tp_size
-        ep_max_tokens_swa = swa_max_tokens
-        tp_max_tokens_swa = swa_max_tokens * tp_size
+        cache_plan, geometry, fixed_umm_bytes, planned_umm_bytes = (
+            self._plan_balanced_kv_footprint(
+                manager_budget_bytes,
+                _build_cache,
+            )
+        )
+        ep_max_tokens = cache_plan["ep_max_tokens"]
+        tp_max_tokens = cache_plan["tp_max_tokens"]
+        ep_max_tokens_swa = cache_plan["ep_max_tokens_swa"]
+        tp_max_tokens_swa = cache_plan["tp_max_tokens_swa"]
 
         layer_specs = classify_layers_from_config(
             config,
@@ -668,19 +818,23 @@ class ParaSMemoryManager:
         self.ep_max_kv_tokens_swa = ep_max_tokens_swa
         self.tp_max_kv_tokens_swa = tp_max_tokens_swa
 
-        ep_cell_bytes = ep_kv_heads * head_dim * num_layers * 2 * elem_size
-        tp_cell_bytes = tp_kv_heads * head_dim * num_layers * 2 * elem_size
-
         logger.info(
             f"ParaS SWA KV budget: avail_now={avail_now_gib:.3f}GiB  "
             f"total={total_gpu_bytes / (1 << 30):.3f}GiB  "
             f"dynamic_reserve={dynamic_reserve_bytes / (1 << 30):.3f}GiB  "
             f"umm_budget={umm_budget_bytes / (1 << 30):.3f}GiB  "
-            f"weights_only={self.weights_only_bytes / (1 << 30):.3f}GiB  "
             f"non_umm_static={non_umm_static_bytes / (1 << 30):.3f}GiB  "
-            f"overlap_gap={overlap_gap_bytes / (1 << 30):.3f}GiB  "
-            f"kv_budget={kv_budget_bytes / (1 << 30):.3f}GiB  "
-            f"full_max_tokens={full_max_tokens}  swa_max_tokens={swa_max_tokens}  "
+            f"manager_budget={manager_budget_bytes / (1 << 30):.3f}GiB  "
+            f"planned_umm={planned_umm_bytes / (1 << 30):.3f}GiB  "
+            f"fixed_umm={fixed_umm_bytes / (1 << 30):.3f}GiB  "
+            f"ep_weights={geometry.sum_we / (1 << 30):.3f}GiB  "
+            f"tp_weights={geometry.sum_wt / (1 << 30):.3f}GiB  "
+            f"ep_kv={geometry.sum_ce / (1 << 30):.3f}GiB  "
+            f"tp_kv={geometry.sum_ct / (1 << 30):.3f}GiB  "
+            f"ep_full_tokens={ep_max_tokens}  "
+            f"tp_full_tokens={tp_max_tokens}  "
+            f"ep_swa_tokens={ep_max_tokens_swa}  "
+            f"tp_swa_tokens={tp_max_tokens_swa}  "
             f"layers={num_layers} (full={n_full} swa={n_swa})"
         )
 
@@ -689,9 +843,14 @@ class ParaSMemoryManager:
             total_gpu_memory_bytes=total_gpu_bytes,
             dynamic_reserve_bytes=dynamic_reserve_bytes,
             umm_budget_bytes=umm_budget_bytes,
-            weights_only_bytes=self.weights_only_bytes,
             non_umm_static_bytes=non_umm_static_bytes,
-            kv_budget_bytes=kv_budget_bytes,
+            manager_budget_bytes=manager_budget_bytes,
+            fixed_umm_bytes=fixed_umm_bytes,
+            ep_expert_weight_bytes=geometry.sum_we,
+            tp_expert_weight_bytes=geometry.sum_wt,
+            ep_kv_bytes=geometry.sum_ce,
+            tp_kv_bytes=geometry.sum_ct,
+            planned_umm_bytes=planned_umm_bytes,
             kv_dtype=kv_dtype,
             ep_max_tokens=ep_max_tokens,
             tp_max_tokens=tp_max_tokens,
@@ -776,6 +935,187 @@ class ParaSMemoryManager:
     def has_kv_cache_reserved(self) -> bool:
         return self._kv_reserved
 
+    # ----- exact footprint planning --------------------------------------
+
+    def _ordinary_layout_bytes(self) -> int:
+        """Return the aligned prefix occupied outside the four-anchor run."""
+        offset = 0
+        for name in self._reservation_order:
+            entry = self._entries[name]
+            offset = self._align_up(offset, self.ALIGNMENT) + entry.size_bytes
+        return self._align_up(offset, self.ALIGNMENT)
+
+    def _compute_paras_run_geometry(
+        self,
+        moe: Optional[Dict],
+        kv: Optional[Dict],
+    ) -> _ParaSRunGeometry:
+        """Compute the exact aligned four-anchor footprint without allocating."""
+        meta = moe if moe is not None else kv
+        assert meta is not None, "ParaS run geometry requires MoE or KV metadata"
+        num_layers = meta["num_layers"]
+        if moe is not None and kv is not None:
+            assert kv["num_layers"] == num_layers, (
+                moe["num_layers"],
+                kv["num_layers"],
+            )
+
+        def au(value: int) -> int:
+            return self._align_up(value, self.ALIGNMENT)
+
+        if moe is not None:
+            we_slab = au(moe["ep_w13_bytes"]) + au(moe["ep_w2_bytes"])
+            wt_slab = au(moe["tp_w13_bytes"]) + au(moe["tp_w2_bytes"])
+            we = (we_slab,) * num_layers
+            wt = (wt_slab,) * num_layers
+        else:
+            we = (0,) * num_layers
+            wt = (0,) * num_layers
+
+        if kv is not None:
+            assert len(kv["layer_ep_bytes"]) == num_layers
+            assert len(kv["layer_tp_bytes"]) == num_layers
+            ce = tuple(au(value) * 2 for value in kv["layer_ep_bytes"])
+            ct = tuple(au(value) * 2 for value in kv["layer_tp_bytes"])
+        else:
+            ce = (0,) * num_layers
+            ct = (0,) * num_layers
+
+        sum_we = sum(we)
+        sum_wt = sum(wt)
+        sum_ce = sum(ce)
+        sum_ct = sum(ct)
+
+        assert all(ct[i] <= ce[i] for i in range(num_layers)), (
+            "four-anchor cache requires ct[i] <= ce[i] (per-layer TP cache "
+            f"must not exceed EP cache); ce={ce} ct={ct}"
+        )
+
+        anchor = 0
+        suffix = 0
+        for i in range(num_layers - 1, -1, -1):
+            anchor = max(anchor, ct[i] + suffix)
+            suffix += ct[i] - ce[i]
+        anchor = au(anchor)
+
+        tp_head_bytes = we[0] if we else 0
+        pad = au(
+            max(
+                0,
+                tp_head_bytes
+                + sum_wt
+                - sum_we
+                - sum_ce
+                + sum_ct
+                - anchor,
+            )
+        )
+        run_bytes = sum_we + pad + sum_ce + anchor
+        assert run_bytes == max(
+            sum_we + sum_ce + anchor,
+            tp_head_bytes + sum_wt + sum_ct,
+        )
+
+        return _ParaSRunGeometry(
+            we=we,
+            wt=wt,
+            ce=ce,
+            ct=ct,
+            sum_we=sum_we,
+            sum_wt=sum_wt,
+            sum_ce=sum_ce,
+            sum_ct=sum_ct,
+            anchor=anchor,
+            pad=pad,
+            run_bytes=run_bytes,
+        )
+
+    def _cap_tp_tokens_to_ep_layer(
+        self,
+        *,
+        ep_tokens: int,
+        tp_tokens: int,
+        ep_kv_heads: int,
+        tp_kv_heads: int,
+        head_dim: int,
+        elem_size: int,
+        page_size: int,
+    ) -> int:
+        """Enforce the four-anchor ct <= ce invariant after alignment."""
+
+        def _aligned_k_bytes(tokens: int, heads: int) -> int:
+            raw_bytes = (
+                (tokens + page_size) * heads * head_dim * elem_size
+            )
+            return self._align_up(raw_bytes, self.ALIGNMENT)
+
+        ep_bytes = _aligned_k_bytes(ep_tokens, ep_kv_heads)
+        while (
+            tp_tokens > 1
+            and _aligned_k_bytes(tp_tokens, tp_kv_heads) > ep_bytes
+        ):
+            tp_tokens -= 1
+
+        assert _aligned_k_bytes(tp_tokens, tp_kv_heads) <= ep_bytes, (
+            "one TP KV token plus page slots exceeds the EP layer capacity: "
+            f"{ep_tokens=} {tp_tokens=} {ep_kv_heads=} {tp_kv_heads=}"
+        )
+        return tp_tokens
+
+    def _plan_balanced_kv_footprint(self, manager_budget_bytes: int, build_cache):
+        """Maximize a shared EP/TP base footprint under one exact byte limit.
+
+        For a candidate base footprint B, EP receives B - sum(we) KV bytes
+        while TP receives B - sum(wt). This charges the larger TP expert
+        layout against TP cache capacity instead of incorrectly giving both
+        modes the same cache-byte budget. The exact four-anchor geometry then
+        accounts for its one-layer head/tail overhead and alignment.
+        """
+        fixed_umm_bytes = self._ordinary_layout_bytes()
+        run_budget_bytes = manager_budget_bytes - fixed_umm_bytes
+        if run_budget_bytes <= 0:
+            raise RuntimeError(
+                "ParaS UMM budget is exhausted by fixed weights and staging: "
+                f"{manager_budget_bytes=} {fixed_umm_bytes=}"
+            )
+
+        weight_geometry = self._compute_paras_run_geometry(
+            self._paras_moe_pending,
+            None,
+        )
+        low = 0
+        high = run_budget_bytes
+        best = None
+        while low <= high:
+            base_bytes = (low + high) // 2
+            ep_cache_budget = max(0, base_bytes - weight_geometry.sum_we)
+            tp_cache_budget = max(0, base_bytes - weight_geometry.sum_wt)
+            cache_plan = build_cache(ep_cache_budget, tp_cache_budget)
+            kv = {
+                "num_layers": len(cache_plan["layer_ep_bytes"]),
+                "layer_ep_bytes": cache_plan["layer_ep_bytes"],
+                "layer_tp_bytes": cache_plan["layer_tp_bytes"],
+            }
+            geometry = self._compute_paras_run_geometry(
+                self._paras_moe_pending,
+                kv,
+            )
+            planned_umm_bytes = fixed_umm_bytes + geometry.run_bytes
+            if planned_umm_bytes <= manager_budget_bytes:
+                best = (cache_plan, geometry, fixed_umm_bytes, planned_umm_bytes)
+                low = base_bytes + 1
+            else:
+                high = base_bytes - 1
+
+        if best is None:
+            raise RuntimeError(
+                "ParaS UMM budget cannot fit expert weights and one KV token "
+                f"per layer: {manager_budget_bytes=}"
+            )
+
+        self._planned_umm_bytes_limit = manager_budget_bytes
+        return best
+
     # ----- materialization ------------------------------------------------
 
     def materialize(self) -> int:
@@ -811,6 +1151,14 @@ class ParaSMemoryManager:
             offset = self._place_paras_run(offset, moe_pending, kv_pending)
 
         self._total_bytes = self._align_up(offset, self.ALIGNMENT)
+        if (
+            self._planned_umm_bytes_limit is not None
+            and self._total_bytes > self._planned_umm_bytes_limit
+        ):
+            raise RuntimeError(
+                "ParaS materialized UMM exceeds its planned static budget: "
+                f"total={self._total_bytes} limit={self._planned_umm_bytes_limit}"
+            )
         self._buffer = torch.empty(
             self._total_bytes, dtype=torch.uint8, device=self.device
         )
@@ -861,9 +1209,9 @@ class ParaSMemoryManager:
         footprint plus one layer. The tail anchor
         ``max_i(ct[i] + sum_{k>i}(ct[k] - ce[k]))`` keeps every layer's EP and TP
         cache disjoint for any layer order. This method requires ``ct[i] <= ce[i]``
-        (asserted below): the address math stays safe without it, but the kv
-        budget reserves only one ``max(ct)`` tail layer, which a ``ct > ce`` layer
-        would overflow. Under that precondition the anchor reduces to ``max(ct)``.
+        (asserted by the shared geometry helper). Under that precondition the
+        anchor reduces to ``max(ct)``; capacity planning charges the exact
+        resulting run, including this tail and all alignment, to the UMM limit.
         Weight sub-slabs are ``[w13|w2]`` and cache sub-slabs ``[k|v]``, laid
         identically in both modes so the offset-agnostic transfer kernels stay valid.
 
@@ -882,54 +1230,22 @@ class ParaSMemoryManager:
         def au(x: int) -> int:
             return self._align_up(x, A)
 
-        if moe is not None:
-            we_slab = au(moe["ep_w13_bytes"]) + au(moe["ep_w2_bytes"])
-            wt_slab = au(moe["tp_w13_bytes"]) + au(moe["tp_w2_bytes"])
-            we = [we_slab] * num_layers
-            wt = [wt_slab] * num_layers
-        else:
-            we = [0] * num_layers
-            wt = [0] * num_layers
-
-        if kv is not None:
-            ce = [au(b) * 2 for b in kv["layer_ep_bytes"]]
-            ct = [au(b) * 2 for b in kv["layer_tp_bytes"]]
-        else:
-            ce = [0] * num_layers
-            ct = [0] * num_layers
-
-        sum_we, sum_wt, sum_ce, sum_ct = sum(we), sum(wt), sum(ce), sum(ct)
-
-        # The kv budget (reserve_kv_cache) reserves exactly one tail layer
-        # (num_layers + 1 cells) for the cache tail, sized as max(ct). The general
-        # anchor below equals max(ct) only when ct[i] <= ce[i]; a ct[i] > ce[i]
-        # layer makes the suffix positive and the anchor exceed max(ct), so the
-        # materialized run would overflow the reserved kv budget. Enforce the
-        # precondition here. Real configs always satisfy it (num_kv_heads divides
-        # tp_size or GQA-replicates, page_size >= 1, so ct == ce for uniform
-        # attention and ct <= ce for hybrid).
-        assert all(ct[i] <= ce[i] for i in range(num_layers)), (
-            "four-anchor cache requires ct[i] <= ce[i] (per-layer TP cache must "
-            "not exceed EP cache); the (num_layers+1) kv budget reserves only one "
-            f"max(ct) tail layer, which a ct>ce layer would overflow. ce={ce} ct={ct}"
-        )
-
-        # Cache tail anchor: gap between EP and TP cache bases that keeps every
-        # layer's EP and TP cache disjoint for any layer order. Under the
-        # asserted ct[i] <= ce[i] the suffix is non-positive and this reduces to
-        # max(ct); the general form is kept so the address math stays correct if
-        # the precondition is ever relaxed.
-        anchor, suffix = 0, 0
-        for i in range(num_layers - 1, -1, -1):
-            anchor = max(anchor, ct[i] + suffix)
-            suffix += ct[i] - ce[i]
-        anchor = au(anchor)
+        geometry = self._compute_paras_run_geometry(moe, kv)
+        we = geometry.we
+        wt = geometry.wt
+        ce = geometry.ce
+        ct = geometry.ct
+        sum_we = geometry.sum_we
+        sum_wt = geometry.sum_wt
+        sum_ce = geometry.sum_ce
+        sum_ct = geometry.sum_ct
+        anchor = geometry.anchor
 
         w_end = P + sum_we
         tp_w_end = P + we[0] + sum_wt
-        PAD = au(max(0, tp_w_end - w_end - sum_ce + sum_ct - anchor))
+        PAD = geometry.pad
         EP_end = w_end + PAD + sum_ce
-        tc_end = EP_end + anchor
+        tc_end = P + geometry.run_bytes
         assert EP_end % A == 0 and tc_end % A == 0, (EP_end, tc_end)
 
         if moe is not None:
@@ -1147,17 +1463,6 @@ class ParaSMemoryManager:
     @property
     def buffer(self) -> Optional[torch.Tensor]:
         return self._buffer
-
-    @property
-    def weights_only_bytes(self) -> int:
-        """Total weight bytes NOT including KV cache entries (for KV sizing).
-
-        Includes deferred expert weights, which are placed by the four-anchor
-        pass at materialize time and so never enter ``_reservation_order``.
-        """
-        return sum(
-            self._entries[n].size_bytes for n in self._reservation_order
-        ) + getattr(self, "_deferred_weight_bytes", 0)
 
     # ----- dunder ---------------------------------------------------------
 

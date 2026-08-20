@@ -7,12 +7,14 @@ Validates, against the real offsets produced by ``plan_qwen_moe_layout`` +
     then cache-forward), so a cross-GPU transfer never clobbers unread source
     bytes on the same GPU;
   * the buffer is smaller than the naive weights+cache sum (overlap present);
-  * the KV budget accounting is conservative (weights_only < buffer);
+  * EP and TP cache capacities jointly respect the exact UMM byte limit;
   * no ``paras.moe_slot.*`` entries remain (slot design dropped);
   * standalone KV reservation still produces a valid cache-only layout.
 
 No GPU required.
 """
+
+from types import SimpleNamespace
 
 import torch
 
@@ -179,9 +181,9 @@ def test_buffer_smaller_than_naive_sum():
     assert total < naive, "combined run must overlap weights and cache"
 
 
-def test_budget_conservative():
+def test_deferred_expert_weights_are_materialized():
     mgr, total, _ = _build()
-    assert mgr.weights_only_bytes < total
+    assert mgr._deferred_weight_bytes < total
     assert mgr._deferred_weight_bytes > 0
 
 
@@ -233,3 +235,138 @@ def test_anchor_reduces_to_max_ct_for_real_configs():
 
     _assert_no_clobber(mgr, N, [("c", i) for i in range(N - 1, -1, -1)], "ep", "tp")
     _assert_no_clobber(mgr, N, [("c", i) for i in range(N)], "tp", "ep")
+
+
+def _build_budgeted_capacity_plan(*, ep_size, tp_size, hybrid=False, num_kv_heads=4):
+    budget_bytes = 4 << 20
+    server_args = SimpleNamespace(
+        kv_cache_dtype="auto",
+        page_size=1,
+        mem_fraction_static=0.6,
+        swa_full_tokens_ratio=0.25,
+    )
+    config = SimpleNamespace(
+        num_hidden_layers=4,
+        num_key_value_heads=num_kv_heads,
+        num_attention_heads=8,
+        hidden_size=64,
+        vocab_size=0,
+        tie_word_embeddings=True,
+    )
+    if hybrid:
+        config.layer_types = [
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ]
+        config.sliding_window = 128
+
+    manager = ParaSMemoryManager(device="cpu", server_args=server_args)
+    plan_qwen_moe_layout(
+        manager,
+        num_layers=config.num_hidden_layers,
+        num_experts=8,
+        hidden_size=config.hidden_size,
+        intermediate_size=32,
+        num_heads=config.num_attention_heads,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=8,
+        ep_size=ep_size,
+        tp_size=tp_size,
+        dp_size=ep_size // tp_size,
+        moe_tp_size=tp_size,
+    )
+    manager._compute_umm_budget_bytes = lambda config: (
+        budget_bytes,
+        budget_bytes,
+        0,
+        budget_bytes,
+        budget_bytes,
+        0,
+        budget_bytes / (1 << 30),
+    )
+
+    if hybrid:
+        plan = manager.plan_hybrid_swa_kv_capacity(
+            config=config,
+            tp_size=tp_size,
+            head_dim=8,
+        )
+    else:
+        plan = manager.plan_mha_kv_capacity(
+            config=config,
+            tp_size=tp_size,
+            head_dim=8,
+        )
+
+    manager.reserve_kv_cache(
+        num_layers=config.num_hidden_layers,
+        ep_max_tokens=plan.ep_max_tokens,
+        tp_max_tokens=plan.tp_max_tokens,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=8,
+        kv_dtype=plan.kv_dtype,
+        tp_size=tp_size,
+        page_size=server_args.page_size,
+        layer_specs=plan.layer_specs,
+    )
+    total_bytes = manager.materialize()
+    return manager, plan, total_bytes
+
+
+def test_mha_capacity_charges_larger_tp_weights_against_tp_cache():
+    manager, plan, total_bytes = _build_budgeted_capacity_plan(
+        ep_size=4,
+        tp_size=2,
+    )
+
+    weight_growth = plan.tp_expert_weight_bytes - plan.ep_expert_weight_bytes
+    assert plan.tp_expert_weight_bytes == 2 * plan.ep_expert_weight_bytes
+    assert plan.ep_kv_bytes - plan.tp_kv_bytes >= weight_growth
+    assert plan.tp_max_tokens < 2 * plan.ep_max_tokens
+    assert total_bytes == plan.planned_umm_bytes
+    assert total_bytes <= plan.manager_budget_bytes
+    assert manager._planned_umm_bytes_limit == plan.manager_budget_bytes
+
+
+def test_mha_capacity_charges_tp_weights_with_replicated_kv_heads():
+    _, plan, total_bytes = _build_budgeted_capacity_plan(
+        ep_size=4,
+        tp_size=2,
+        num_kv_heads=1,
+    )
+
+    weight_growth = plan.tp_expert_weight_bytes - plan.ep_expert_weight_bytes
+    assert plan.ep_kv_heads == plan.tp_kv_heads == 1
+    assert plan.ep_kv_bytes - plan.tp_kv_bytes >= weight_growth
+    assert plan.tp_max_tokens < plan.ep_max_tokens
+    assert total_bytes == plan.planned_umm_bytes
+    assert total_bytes <= plan.manager_budget_bytes
+
+
+def test_mha_capacity_preserves_equal_cache_bytes_when_weights_match():
+    _, plan, total_bytes = _build_budgeted_capacity_plan(
+        ep_size=2,
+        tp_size=2,
+    )
+
+    assert plan.tp_expert_weight_bytes == plan.ep_expert_weight_bytes
+    assert plan.tp_kv_bytes == plan.ep_kv_bytes
+    assert total_bytes == plan.planned_umm_bytes
+    assert total_bytes <= plan.manager_budget_bytes
+
+
+def test_hybrid_capacity_charges_larger_tp_weights_against_tp_cache():
+    _, plan, total_bytes = _build_budgeted_capacity_plan(
+        ep_size=4,
+        tp_size=2,
+        hybrid=True,
+    )
+
+    weight_growth = plan.tp_expert_weight_bytes - plan.ep_expert_weight_bytes
+    assert plan.ep_kv_bytes - plan.tp_kv_bytes >= weight_growth
+    assert plan.tp_max_tokens < 2 * plan.ep_max_tokens
+    assert plan.tp_max_tokens_swa < 2 * plan.ep_max_tokens_swa
+    assert total_bytes == plan.planned_umm_bytes
+    assert total_bytes <= plan.manager_budget_bytes

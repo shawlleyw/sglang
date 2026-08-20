@@ -61,8 +61,9 @@ The foundation of fast switching. Allocates ALL persistent GPU memory — expert
 **Key insight**: EP and TP are never live simultaneously. The manager can
 therefore overlap their persistent regions and reinterpret one allocation
 without allocating during a switch. When `dp_size > 1`, TP expert weights are
-larger per GPU while the TP cache is smaller; the combined layout balances the
-two differences.
+larger per GPU. Capacity planning charges that growth directly against TP KV
+cache capacity, then verifies the exact four-anchor footprint against the
+static-memory limit.
 
 ### Four-Anchor Design
 

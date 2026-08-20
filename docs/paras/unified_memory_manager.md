@@ -54,6 +54,23 @@ The main view APIs are:
 - `get_kv_views(num_layers, mode)` for the EP or TP K/V views.
 - `is_managed(tensor)` to check whether a tensor belongs to the backing buffer.
 
+## Capacity Planning
+
+The capacity planner first subtracts the dynamic reserve and non-UMM static
+weights from currently available GPU memory. It then binary-searches a common
+per-mode base footprint `B`:
+
+```text
+EP cache budget = B - sum(EP expert weights)
+TP cache budget = B - sum(TP expert weights)
+```
+
+For `dp_size > 1`, TP expert weights are larger, so TP cache capacity is
+reduced by that growth. The search evaluates the exact aligned four-anchor
+geometry rather than an additive weights-plus-cache estimate. The returned
+plan reports both mode-specific weight and cache bytes, and `materialize`
+refuses to allocate if the resulting UMM exceeds the planned limit.
+
 ## Four-Anchor Layout
 
 The former N+1 equal-slot layout only represented `ep_size == tp_size`. The
@@ -82,9 +99,9 @@ TP entries retain stable addresses even though the regions overlap across
 modes.
 
 Production currently requires `ct[i] <= ce[i]` for every layer. Under this
-condition the cache tail anchor reduces to `max(ct)`, matching the capacity
-budget reserved by `reserve_kv_cache`. `materialize` enforces the condition
-before assigning the combined run.
+condition the cache tail anchor reduces to `max(ct)`. Capacity planning and
+materialization share the same geometry calculation, including this anchor and
+all alignment, so the planned and allocated byte counts cannot diverge.
 
 The complete offset derivation and safety proof are in
 [`unified_memory_ep_tp.md`](unified_memory_ep_tp.md).
@@ -144,6 +161,10 @@ layer using its `LayerCacheSpec`.
 The request allocator, free lists, and eviction behavior do not change. During
 a switch the cache pool rebinds from `kv.ep` views to `kv.tp` views, or back,
 after the corresponding cache data movement finishes.
+
+Before EP -> TP movement begins, the gather precheck compares the in-flight
+global token count with this planned TP token capacity. A switch is rejected
+without mutating the pools when the reduced TP cache cannot hold the workload.
 
 KV cache and requests redistribute within each TP subgroup. Expert-weight
 replication across DP groups is independent of KV movement.

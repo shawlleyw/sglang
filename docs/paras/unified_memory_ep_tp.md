@@ -136,7 +136,7 @@ The change surface is in [`paras_memory_manager.py`](../../python/sglang/srt/par
 | `create_paras_moe_aliases` | Replace slot aliasing with direct EP/TP entries at the four-anchor offsets; keep `experts → ep_experts`. |
 | `alias` | Add a sibling that registers an entry at an explicit offset (keep the mirror path). |
 | `materialize` | Place all four blocks per `compute_layout`, then assert the non-clobber condition. |
-| `_compute_kv_budget_bytes` | Use per-mode elastic budgets so the EP and TP footprints match `B`. |
+| `_compute_umm_budget_bytes` / `_plan_balanced_kv_footprint` | Derive the static UMM limit, then select separate EP and TP KV capacities whose exact combined layout fits it. |
 | `reserve_kv_cache` / `_create_kv_layout` | Fold the cache block into the combined run. |
 
 ## Multiple TP Instances (`dp_size > 1`)
