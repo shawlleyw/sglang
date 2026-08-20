@@ -16,7 +16,7 @@ LIFECYCLE & DESIGN:
 
 MEMORY LAYOUT:
   Ordinary weights and staging occupy an aligned prefix. Expert weights and KV
-  cache use a combined four-anchor run where inactive EP and TP storage overlaps.
+  cache use a combined layout where inactive EP and TP storage overlaps.
   Every entry is 256-byte aligned.
 
 WHY THIS APPROACH:
@@ -57,6 +57,7 @@ logger = logging.getLogger(__name__)
 # LayoutEntry
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class LayoutEntry:
     """Metadata for one reserved tensor inside the contiguous buffer."""
@@ -83,10 +84,10 @@ class LayoutEntry:
 
 
 @dataclass(frozen=True)
-class ParaSKVCapacityPlan:
+class ParaSUMMCapacityPlan:
     """Exact UMM-owned EP/TP weight and KV capacity plan.
 
-    ``manager_budget_bytes`` is the hard UMM limit after non-UMM static memory.
+    ``umm_budget_bytes`` is the hard UMM limit after non-UMM static memory.
     ``planned_umm_bytes`` is the exact aligned footprint selected below that
     limit. The EP/TP weight and KV fields expose how each mode consumes the
     shared allocation. SWA fields are zero / empty for pure-MHA plans;
@@ -97,13 +98,13 @@ class ParaSKVCapacityPlan:
     available_gpu_memory_bytes: int
     total_gpu_memory_bytes: int
     dynamic_reserve_bytes: int
-    umm_budget_bytes: int
+    static_headroom_bytes: int
     non_umm_static_bytes: int
-    manager_budget_bytes: int
+    umm_budget_bytes: int
 
     fixed_umm_bytes: int
-    ep_expert_weight_bytes: int
-    tp_expert_weight_bytes: int
+    ep_expert_bytes: int
+    tp_expert_bytes: int
     ep_kv_bytes: int
     tp_kv_bytes: int
     planned_umm_bytes: int
@@ -126,20 +127,20 @@ class ParaSKVCapacityPlan:
 
 
 @dataclass(frozen=True)
-class _ParaSRunGeometry:
-    """Aligned byte geometry for the combined expert-weight/KV run."""
+class _OverlappedLayoutGeometry:
+    """Aligned byte geometry for the overlapped expert-weight/KV layout."""
 
-    we: Tuple[int, ...]
-    wt: Tuple[int, ...]
-    ce: Tuple[int, ...]
-    ct: Tuple[int, ...]
-    sum_we: int
-    sum_wt: int
-    sum_ce: int
-    sum_ct: int
-    anchor: int
-    pad: int
-    run_bytes: int
+    ep_layer_expert_bytes: Tuple[int, ...]
+    tp_layer_expert_bytes: Tuple[int, ...]
+    ep_layer_kv_bytes: Tuple[int, ...]
+    tp_layer_kv_bytes: Tuple[int, ...]
+    ep_expert_bytes: int
+    tp_expert_bytes: int
+    ep_kv_bytes: int
+    tp_kv_bytes: int
+    tp_kv_tail_bytes: int
+    ep_kv_pad_bytes: int
+    total_bytes: int
 
 
 # ---------------------------------------------------------------------------
@@ -307,8 +308,7 @@ class ParaSMemoryManager:
         self._paras_kv_pending: Optional[Dict] = None
         self._paras_moe_pending: Optional[Dict] = None
         self._deferred_weight_bytes: int = 0
-        self._planned_umm_bytes_limit: Optional[int] = None
-        
+        self._umm_budget_bytes: Optional[int] = None
 
     # ----- reservation ----------------------------------------------------
 
@@ -459,9 +459,8 @@ class ParaSMemoryManager:
                 self.ep_max_kv_tokens_swa = max(s.tokens_cap_ep for s in swa_specs)
                 self.tp_max_kv_tokens_swa = max(s.tokens_cap_tp for s in swa_specs)
 
-        # Placed by the deferred four-anchor pass at materialize time, which
-        # asserts the ct[i] <= ce[i] precondition its (num_layers+1) kv budget
-        # relies on (real configs always satisfy it).
+        # Deferred placement validates that every TP KV layer fits within its
+        # EP counterpart, as required by the overlapped layout.
         self._paras_kv_pending = {
             "num_layers": num_layers,
             "prefix": prefix,
@@ -515,19 +514,19 @@ class ParaSMemoryManager:
         mem_fraction = self.server_args.mem_fraction_static
         assert mem_fraction is not None, "server_args.mem_fraction_static is required"
         dynamic_reserve_bytes = int(total_gpu_bytes * (1.0 - mem_fraction))
-        umm_budget_bytes = max(0, avail_now_bytes - dynamic_reserve_bytes)
+        static_headroom_bytes = max(0, avail_now_bytes - dynamic_reserve_bytes)
         non_umm_static_bytes = (
             self._compute_non_umm_static_bytes(config) if config is not None else 0
         )
-        manager_budget_bytes = max(0, umm_budget_bytes - non_umm_static_bytes)
+        umm_budget_bytes = max(0, static_headroom_bytes - non_umm_static_bytes)
 
         return (
             avail_now_bytes,
             total_gpu_bytes,
             dynamic_reserve_bytes,
-            umm_budget_bytes,
-            manager_budget_bytes,
+            static_headroom_bytes,
             non_umm_static_bytes,
+            umm_budget_bytes,
             avail_now_gib,
         )
 
@@ -537,13 +536,13 @@ class ParaSMemoryManager:
         config,
         tp_size: int,
         head_dim: int,
-    ) -> ParaSKVCapacityPlan:
+    ) -> ParaSUMMCapacityPlan:
         """End-to-end MHA KV capacity planner.
 
         Reads device / gpu_id / server_args / cpu_group / world_size from
         ``self`` (set at construction in model_runner). Calls
         ``get_available_gpu_memory``, computes the UMM byte limit, and derives
-        separate EP and TP token caps whose exact four-anchor footprint fits
+        separate EP and TP token caps whose exact overlapped-layout footprint fits
         that limit. Populates ``self.ep_max_kv_tokens`` and
         ``self.tp_max_kv_tokens``, logs at INFO level, and returns the plan
         including the resolved ``kv_dtype`` for downstream
@@ -560,9 +559,9 @@ class ParaSMemoryManager:
             avail_now_bytes,
             total_gpu_bytes,
             dynamic_reserve_bytes,
-            umm_budget_bytes,
-            manager_budget_bytes,
+            static_headroom_bytes,
             non_umm_static_bytes,
+            umm_budget_bytes,
             avail_now_gib,
         ) = self._compute_umm_budget_bytes(config)
 
@@ -575,7 +574,7 @@ class ParaSMemoryManager:
         ep_cell_bytes = ep_kv_heads * head_dim * num_layers * 2 * elem_size
         tp_cell_bytes = tp_kv_heads * head_dim * num_layers * 2 * elem_size
 
-        def _build_cache(ep_budget_bytes: int, tp_budget_bytes: int):
+        def _build_kv_plan(ep_budget_bytes: int, tp_budget_bytes: int):
             def _tokens_for_budget(budget_bytes: int, cell_bytes: int) -> int:
                 page_bytes = page_size * cell_bytes
                 return max(1, (budget_bytes - page_bytes) // cell_bytes)
@@ -592,16 +591,10 @@ class ParaSMemoryManager:
                 page_size=page_size,
             )
             ep_k_bytes = (
-                (ep_max_tokens + page_size)
-                * ep_kv_heads
-                * head_dim
-                * elem_size
+                (ep_max_tokens + page_size) * ep_kv_heads * head_dim * elem_size
             )
             tp_k_bytes = (
-                (tp_max_tokens + page_size)
-                * tp_kv_heads
-                * head_dim
-                * elem_size
+                (tp_max_tokens + page_size) * tp_kv_heads * head_dim * elem_size
             )
             return {
                 "ep_max_tokens": ep_max_tokens,
@@ -610,14 +603,14 @@ class ParaSMemoryManager:
                 "layer_tp_bytes": [tp_k_bytes] * num_layers,
             }
 
-        cache_plan, geometry, fixed_umm_bytes, planned_umm_bytes = (
+        kv_plan, layout_geometry, fixed_umm_bytes, planned_umm_bytes = (
             self._plan_balanced_kv_footprint(
-                manager_budget_bytes,
-                _build_cache,
+                umm_budget_bytes,
+                _build_kv_plan,
             )
         )
-        ep_max_tokens = cache_plan["ep_max_tokens"]
-        tp_max_tokens = cache_plan["tp_max_tokens"]
+        ep_max_tokens = kv_plan["ep_max_tokens"]
+        tp_max_tokens = kv_plan["tp_max_tokens"]
         self.ep_max_kv_tokens = ep_max_tokens
         self.tp_max_kv_tokens = tp_max_tokens
 
@@ -625,33 +618,33 @@ class ParaSMemoryManager:
             f"ParaS KV budget: avail_now={avail_now_gib:.3f}GiB  "
             f"total={total_gpu_bytes / (1 << 30):.3f}GiB  "
             f"dynamic_reserve={dynamic_reserve_bytes / (1 << 30):.3f}GiB  "
-            f"umm_budget={umm_budget_bytes / (1 << 30):.3f}GiB  "
+            f"static_headroom={static_headroom_bytes / (1 << 30):.3f}GiB  "
             f"non_umm_static={non_umm_static_bytes / (1 << 30):.3f}GiB  "
-            f"manager_budget={manager_budget_bytes / (1 << 30):.3f}GiB  "
+            f"umm_budget={umm_budget_bytes / (1 << 30):.3f}GiB  "
             f"planned_umm={planned_umm_bytes / (1 << 30):.3f}GiB  "
             f"fixed_umm={fixed_umm_bytes / (1 << 30):.3f}GiB  "
-            f"ep_weights={geometry.sum_we / (1 << 30):.3f}GiB  "
-            f"tp_weights={geometry.sum_wt / (1 << 30):.3f}GiB  "
-            f"ep_kv={geometry.sum_ce / (1 << 30):.3f}GiB  "
-            f"tp_kv={geometry.sum_ct / (1 << 30):.3f}GiB  "
+            f"ep_weights={layout_geometry.ep_expert_bytes / (1 << 30):.3f}GiB  "
+            f"tp_weights={layout_geometry.tp_expert_bytes / (1 << 30):.3f}GiB  "
+            f"ep_kv={layout_geometry.ep_kv_bytes / (1 << 30):.3f}GiB  "
+            f"tp_kv={layout_geometry.tp_kv_bytes / (1 << 30):.3f}GiB  "
             f"ep_max_tokens={ep_max_tokens}  "
             f"tp_max_tokens={tp_max_tokens}  "
             f"ep_kv_heads={ep_kv_heads}  "
             f"tp_kv_heads={tp_kv_heads}"
         )
 
-        return ParaSKVCapacityPlan(
+        return ParaSUMMCapacityPlan(
             available_gpu_memory_bytes=avail_now_bytes,
             total_gpu_memory_bytes=total_gpu_bytes,
             dynamic_reserve_bytes=dynamic_reserve_bytes,
-            umm_budget_bytes=umm_budget_bytes,
+            static_headroom_bytes=static_headroom_bytes,
             non_umm_static_bytes=non_umm_static_bytes,
-            manager_budget_bytes=manager_budget_bytes,
+            umm_budget_bytes=umm_budget_bytes,
             fixed_umm_bytes=fixed_umm_bytes,
-            ep_expert_weight_bytes=geometry.sum_we,
-            tp_expert_weight_bytes=geometry.sum_wt,
-            ep_kv_bytes=geometry.sum_ce,
-            tp_kv_bytes=geometry.sum_ct,
+            ep_expert_bytes=layout_geometry.ep_expert_bytes,
+            tp_expert_bytes=layout_geometry.tp_expert_bytes,
+            ep_kv_bytes=layout_geometry.ep_kv_bytes,
+            tp_kv_bytes=layout_geometry.tp_kv_bytes,
             planned_umm_bytes=planned_umm_bytes,
             kv_dtype=kv_dtype,
             ep_max_tokens=ep_max_tokens,
@@ -669,7 +662,7 @@ class ParaSMemoryManager:
         config,
         tp_size: int,
         head_dim: int,
-    ) -> ParaSKVCapacityPlan:
+    ) -> ParaSUMMCapacityPlan:
         """End-to-end SWA-aware KV capacity planner for hybrid full / SWA models.
 
         Same prelude as :meth:`plan_mha_kv_capacity` (reads device, gpu_id,
@@ -693,9 +686,9 @@ class ParaSMemoryManager:
             avail_now_bytes,
             total_gpu_bytes,
             dynamic_reserve_bytes,
-            umm_budget_bytes,
-            manager_budget_bytes,
+            static_headroom_bytes,
             non_umm_static_bytes,
+            umm_budget_bytes,
             avail_now_gib,
         ) = self._compute_umm_budget_bytes(config)
 
@@ -709,9 +702,7 @@ class ParaSMemoryManager:
             raise ValueError(
                 "config.layer_types must contain one entry per hidden layer"
             )
-        n_full = sum(
-            1 for layer_type in layer_types if layer_type == "full_attention"
-        )
+        n_full = sum(1 for layer_type in layer_types if layer_type == "full_attention")
         n_swa = sum(
             1 for layer_type in layer_types if layer_type == "sliding_attention"
         )
@@ -724,13 +715,9 @@ class ParaSMemoryManager:
         tp_cell_bytes = tp_layer_cell_bytes * num_layers
         swa_ratio = getattr(self.server_args, "swa_full_tokens_ratio", 0.5)
 
-        def _solve_tokens(
-            budget_bytes: int, layer_cell_bytes: int
-        ) -> Tuple[int, int]:
+        def _solve_tokens(budget_bytes: int, layer_cell_bytes: int) -> Tuple[int, int]:
             page_bytes = page_size * layer_cell_bytes * num_layers
-            total_layer_tokens = max(
-                1, (budget_bytes - page_bytes) // layer_cell_bytes
-            )
+            total_layer_tokens = max(1, (budget_bytes - page_bytes) // layer_cell_bytes)
             full_tokens, swa_tokens = plan_hybrid_kv_budget(
                 total_layer_tokens,
                 n_full,
@@ -743,7 +730,7 @@ class ParaSMemoryManager:
                 swa_tokens = max(1, swa_tokens)
             return full_tokens, swa_tokens
 
-        def _build_cache(ep_budget_bytes: int, tp_budget_bytes: int):
+        def _build_kv_plan(ep_budget_bytes: int, tp_budget_bytes: int):
             ep_full, ep_swa = _solve_tokens(ep_budget_bytes, ep_layer_cell_bytes)
             tp_full, tp_swa = _solve_tokens(tp_budget_bytes, tp_layer_cell_bytes)
             if n_full > 0:
@@ -773,16 +760,10 @@ class ParaSMemoryManager:
                 ep_tokens = ep_swa if is_swa else ep_full
                 tp_tokens = tp_swa if is_swa else tp_full
                 layer_ep_bytes.append(
-                    (ep_tokens + page_size)
-                    * ep_kv_heads
-                    * head_dim
-                    * elem_size
+                    (ep_tokens + page_size) * ep_kv_heads * head_dim * elem_size
                 )
                 layer_tp_bytes.append(
-                    (tp_tokens + page_size)
-                    * tp_kv_heads
-                    * head_dim
-                    * elem_size
+                    (tp_tokens + page_size) * tp_kv_heads * head_dim * elem_size
                 )
             return {
                 "ep_max_tokens": ep_full,
@@ -793,16 +774,16 @@ class ParaSMemoryManager:
                 "layer_tp_bytes": layer_tp_bytes,
             }
 
-        cache_plan, geometry, fixed_umm_bytes, planned_umm_bytes = (
+        kv_plan, layout_geometry, fixed_umm_bytes, planned_umm_bytes = (
             self._plan_balanced_kv_footprint(
-                manager_budget_bytes,
-                _build_cache,
+                umm_budget_bytes,
+                _build_kv_plan,
             )
         )
-        ep_max_tokens = cache_plan["ep_max_tokens"]
-        tp_max_tokens = cache_plan["tp_max_tokens"]
-        ep_max_tokens_swa = cache_plan["ep_max_tokens_swa"]
-        tp_max_tokens_swa = cache_plan["tp_max_tokens_swa"]
+        ep_max_tokens = kv_plan["ep_max_tokens"]
+        tp_max_tokens = kv_plan["tp_max_tokens"]
+        ep_max_tokens_swa = kv_plan["ep_max_tokens_swa"]
+        tp_max_tokens_swa = kv_plan["tp_max_tokens_swa"]
 
         layer_specs = classify_layers_from_config(
             config,
@@ -822,15 +803,15 @@ class ParaSMemoryManager:
             f"ParaS SWA KV budget: avail_now={avail_now_gib:.3f}GiB  "
             f"total={total_gpu_bytes / (1 << 30):.3f}GiB  "
             f"dynamic_reserve={dynamic_reserve_bytes / (1 << 30):.3f}GiB  "
-            f"umm_budget={umm_budget_bytes / (1 << 30):.3f}GiB  "
+            f"static_headroom={static_headroom_bytes / (1 << 30):.3f}GiB  "
             f"non_umm_static={non_umm_static_bytes / (1 << 30):.3f}GiB  "
-            f"manager_budget={manager_budget_bytes / (1 << 30):.3f}GiB  "
+            f"umm_budget={umm_budget_bytes / (1 << 30):.3f}GiB  "
             f"planned_umm={planned_umm_bytes / (1 << 30):.3f}GiB  "
             f"fixed_umm={fixed_umm_bytes / (1 << 30):.3f}GiB  "
-            f"ep_weights={geometry.sum_we / (1 << 30):.3f}GiB  "
-            f"tp_weights={geometry.sum_wt / (1 << 30):.3f}GiB  "
-            f"ep_kv={geometry.sum_ce / (1 << 30):.3f}GiB  "
-            f"tp_kv={geometry.sum_ct / (1 << 30):.3f}GiB  "
+            f"ep_weights={layout_geometry.ep_expert_bytes / (1 << 30):.3f}GiB  "
+            f"tp_weights={layout_geometry.tp_expert_bytes / (1 << 30):.3f}GiB  "
+            f"ep_kv={layout_geometry.ep_kv_bytes / (1 << 30):.3f}GiB  "
+            f"tp_kv={layout_geometry.tp_kv_bytes / (1 << 30):.3f}GiB  "
             f"ep_full_tokens={ep_max_tokens}  "
             f"tp_full_tokens={tp_max_tokens}  "
             f"ep_swa_tokens={ep_max_tokens_swa}  "
@@ -838,18 +819,18 @@ class ParaSMemoryManager:
             f"layers={num_layers} (full={n_full} swa={n_swa})"
         )
 
-        return ParaSKVCapacityPlan(
+        return ParaSUMMCapacityPlan(
             available_gpu_memory_bytes=avail_now_bytes,
             total_gpu_memory_bytes=total_gpu_bytes,
             dynamic_reserve_bytes=dynamic_reserve_bytes,
-            umm_budget_bytes=umm_budget_bytes,
+            static_headroom_bytes=static_headroom_bytes,
             non_umm_static_bytes=non_umm_static_bytes,
-            manager_budget_bytes=manager_budget_bytes,
+            umm_budget_bytes=umm_budget_bytes,
             fixed_umm_bytes=fixed_umm_bytes,
-            ep_expert_weight_bytes=geometry.sum_we,
-            tp_expert_weight_bytes=geometry.sum_wt,
-            ep_kv_bytes=geometry.sum_ce,
-            tp_kv_bytes=geometry.sum_ct,
+            ep_expert_bytes=layout_geometry.ep_expert_bytes,
+            tp_expert_bytes=layout_geometry.tp_expert_bytes,
+            ep_kv_bytes=layout_geometry.ep_kv_bytes,
+            tp_kv_bytes=layout_geometry.tp_kv_bytes,
             planned_umm_bytes=planned_umm_bytes,
             kv_dtype=kv_dtype,
             ep_max_tokens=ep_max_tokens,
@@ -938,21 +919,23 @@ class ParaSMemoryManager:
     # ----- exact footprint planning --------------------------------------
 
     def _ordinary_layout_bytes(self) -> int:
-        """Return the aligned prefix occupied outside the four-anchor run."""
+        """Return the aligned prefix occupied outside the overlapped layout."""
         offset = 0
         for name in self._reservation_order:
             entry = self._entries[name]
             offset = self._align_up(offset, self.ALIGNMENT) + entry.size_bytes
         return self._align_up(offset, self.ALIGNMENT)
 
-    def _compute_paras_run_geometry(
+    def _compute_overlapped_layout_geometry(
         self,
         moe: Optional[Dict],
         kv: Optional[Dict],
-    ) -> _ParaSRunGeometry:
-        """Compute the exact aligned four-anchor footprint without allocating."""
+    ) -> _OverlappedLayoutGeometry:
+        """Compute the exact aligned footprint without allocating."""
         meta = moe if moe is not None else kv
-        assert meta is not None, "ParaS run geometry requires MoE or KV metadata"
+        assert (
+            meta is not None
+        ), "overlapped layout geometry requires MoE or KV metadata"
         num_layers = meta["num_layers"]
         if moe is not None and kv is not None:
             assert kv["num_layers"] == num_layers, (
@@ -964,70 +947,73 @@ class ParaSMemoryManager:
             return self._align_up(value, self.ALIGNMENT)
 
         if moe is not None:
-            we_slab = au(moe["ep_w13_bytes"]) + au(moe["ep_w2_bytes"])
-            wt_slab = au(moe["tp_w13_bytes"]) + au(moe["tp_w2_bytes"])
-            we = (we_slab,) * num_layers
-            wt = (wt_slab,) * num_layers
+            ep_expert_slab_bytes = au(moe["ep_w13_bytes"]) + au(moe["ep_w2_bytes"])
+            tp_expert_slab_bytes = au(moe["tp_w13_bytes"]) + au(moe["tp_w2_bytes"])
+            ep_layer_expert_bytes = (ep_expert_slab_bytes,) * num_layers
+            tp_layer_expert_bytes = (tp_expert_slab_bytes,) * num_layers
         else:
-            we = (0,) * num_layers
-            wt = (0,) * num_layers
+            ep_layer_expert_bytes = (0,) * num_layers
+            tp_layer_expert_bytes = (0,) * num_layers
 
         if kv is not None:
             assert len(kv["layer_ep_bytes"]) == num_layers
             assert len(kv["layer_tp_bytes"]) == num_layers
-            ce = tuple(au(value) * 2 for value in kv["layer_ep_bytes"])
-            ct = tuple(au(value) * 2 for value in kv["layer_tp_bytes"])
+            ep_layer_kv_bytes = tuple(au(value) * 2 for value in kv["layer_ep_bytes"])
+            tp_layer_kv_bytes = tuple(au(value) * 2 for value in kv["layer_tp_bytes"])
         else:
-            ce = (0,) * num_layers
-            ct = (0,) * num_layers
+            ep_layer_kv_bytes = (0,) * num_layers
+            tp_layer_kv_bytes = (0,) * num_layers
 
-        sum_we = sum(we)
-        sum_wt = sum(wt)
-        sum_ce = sum(ce)
-        sum_ct = sum(ct)
+        ep_expert_bytes = sum(ep_layer_expert_bytes)
+        tp_expert_bytes = sum(tp_layer_expert_bytes)
+        ep_kv_bytes = sum(ep_layer_kv_bytes)
+        tp_kv_bytes = sum(tp_layer_kv_bytes)
 
-        assert all(ct[i] <= ce[i] for i in range(num_layers)), (
-            "four-anchor cache requires ct[i] <= ce[i] (per-layer TP cache "
-            f"must not exceed EP cache); ce={ce} ct={ct}"
+        assert all(
+            tp_layer_kv_bytes[i] <= ep_layer_kv_bytes[i] for i in range(num_layers)
+        ), (
+            "overlapped layout requires every TP KV layer to fit within its "
+            "EP KV layer; "
+            f"{ep_layer_kv_bytes=} {tp_layer_kv_bytes=}"
         )
 
-        anchor = 0
+        tp_kv_tail_bytes = 0
         suffix = 0
         for i in range(num_layers - 1, -1, -1):
-            anchor = max(anchor, ct[i] + suffix)
-            suffix += ct[i] - ce[i]
-        anchor = au(anchor)
+            tp_kv_tail_bytes = max(tp_kv_tail_bytes, tp_layer_kv_bytes[i] + suffix)
+            suffix += tp_layer_kv_bytes[i] - ep_layer_kv_bytes[i]
+        tp_kv_tail_bytes = au(tp_kv_tail_bytes)
 
-        tp_head_bytes = we[0] if we else 0
-        pad = au(
+        tp_head_bytes = ep_layer_expert_bytes[0] if ep_layer_expert_bytes else 0
+        ep_kv_pad_bytes = au(
             max(
                 0,
                 tp_head_bytes
-                + sum_wt
-                - sum_we
-                - sum_ce
-                + sum_ct
-                - anchor,
+                + tp_expert_bytes
+                - ep_expert_bytes
+                - ep_kv_bytes
+                + tp_kv_bytes
+                - tp_kv_tail_bytes,
             )
         )
-        run_bytes = sum_we + pad + sum_ce + anchor
-        assert run_bytes == max(
-            sum_we + sum_ce + anchor,
-            tp_head_bytes + sum_wt + sum_ct,
+        total_bytes = ep_expert_bytes + ep_kv_pad_bytes + ep_kv_bytes + tp_kv_tail_bytes
+        assert total_bytes == max(
+            ep_expert_bytes + ep_kv_bytes + tp_kv_tail_bytes,
+            tp_head_bytes + tp_expert_bytes + tp_kv_bytes,
         )
 
-        return _ParaSRunGeometry(
-            we=we,
-            wt=wt,
-            ce=ce,
-            ct=ct,
-            sum_we=sum_we,
-            sum_wt=sum_wt,
-            sum_ce=sum_ce,
-            sum_ct=sum_ct,
-            anchor=anchor,
-            pad=pad,
-            run_bytes=run_bytes,
+        return _OverlappedLayoutGeometry(
+            ep_layer_expert_bytes=ep_layer_expert_bytes,
+            tp_layer_expert_bytes=tp_layer_expert_bytes,
+            ep_layer_kv_bytes=ep_layer_kv_bytes,
+            tp_layer_kv_bytes=tp_layer_kv_bytes,
+            ep_expert_bytes=ep_expert_bytes,
+            tp_expert_bytes=tp_expert_bytes,
+            ep_kv_bytes=ep_kv_bytes,
+            tp_kv_bytes=tp_kv_bytes,
+            tp_kv_tail_bytes=tp_kv_tail_bytes,
+            ep_kv_pad_bytes=ep_kv_pad_bytes,
+            total_bytes=total_bytes,
         )
 
     def _cap_tp_tokens_to_ep_layer(
@@ -1041,19 +1027,14 @@ class ParaSMemoryManager:
         elem_size: int,
         page_size: int,
     ) -> int:
-        """Enforce the four-anchor ct <= ce invariant after alignment."""
+        """Ensure each aligned TP KV layer fits within its EP counterpart."""
 
         def _aligned_k_bytes(tokens: int, heads: int) -> int:
-            raw_bytes = (
-                (tokens + page_size) * heads * head_dim * elem_size
-            )
+            raw_bytes = (tokens + page_size) * heads * head_dim * elem_size
             return self._align_up(raw_bytes, self.ALIGNMENT)
 
         ep_bytes = _aligned_k_bytes(ep_tokens, ep_kv_heads)
-        while (
-            tp_tokens > 1
-            and _aligned_k_bytes(tp_tokens, tp_kv_heads) > ep_bytes
-        ):
+        while tp_tokens > 1 and _aligned_k_bytes(tp_tokens, tp_kv_heads) > ep_bytes:
             tp_tokens -= 1
 
         assert _aligned_k_bytes(tp_tokens, tp_kv_heads) <= ep_bytes, (
@@ -1062,59 +1043,68 @@ class ParaSMemoryManager:
         )
         return tp_tokens
 
-    def _plan_balanced_kv_footprint(self, manager_budget_bytes: int, build_cache):
+    def _plan_balanced_kv_footprint(self, umm_budget_bytes: int, build_kv_plan):
         """Maximize a shared EP/TP base footprint under one exact byte limit.
 
-        For a candidate base footprint B, EP receives B - sum(we) KV bytes
-        while TP receives B - sum(wt). This charges the larger TP expert
-        layout against TP cache capacity instead of incorrectly giving both
-        modes the same cache-byte budget. The exact four-anchor geometry then
-        accounts for its one-layer head/tail overhead and alignment.
+        For a candidate mode footprint, subtract that mode's expert bytes to
+        obtain its KV budget. This charges the larger TP expert layout against
+        TP KV capacity instead of incorrectly giving both modes the same KV
+        budget. The exact overlapped geometry accounts for tail bytes,
+        padding, and alignment.
         """
         fixed_umm_bytes = self._ordinary_layout_bytes()
-        run_budget_bytes = manager_budget_bytes - fixed_umm_bytes
-        if run_budget_bytes <= 0:
+        overlapped_layout_budget_bytes = umm_budget_bytes - fixed_umm_bytes
+        if overlapped_layout_budget_bytes <= 0:
             raise RuntimeError(
                 "ParaS UMM budget is exhausted by fixed weights and staging: "
-                f"{manager_budget_bytes=} {fixed_umm_bytes=}"
+                f"{umm_budget_bytes=} {fixed_umm_bytes=}"
             )
 
-        weight_geometry = self._compute_paras_run_geometry(
+        expert_geometry = self._compute_overlapped_layout_geometry(
             self._paras_moe_pending,
             None,
         )
-        low = 0
-        high = run_budget_bytes
-        best = None
-        while low <= high:
-            base_bytes = (low + high) // 2
-            ep_cache_budget = max(0, base_bytes - weight_geometry.sum_we)
-            tp_cache_budget = max(0, base_bytes - weight_geometry.sum_wt)
-            cache_plan = build_cache(ep_cache_budget, tp_cache_budget)
-            kv = {
-                "num_layers": len(cache_plan["layer_ep_bytes"]),
-                "layer_ep_bytes": cache_plan["layer_ep_bytes"],
-                "layer_tp_bytes": cache_plan["layer_tp_bytes"],
-            }
-            geometry = self._compute_paras_run_geometry(
-                self._paras_moe_pending,
-                kv,
+        min_mode_target_bytes = 0
+        max_mode_target_bytes = overlapped_layout_budget_bytes
+        best_plan = None
+        while min_mode_target_bytes <= max_mode_target_bytes:
+            mode_target_bytes = (min_mode_target_bytes + max_mode_target_bytes) // 2
+            ep_kv_budget_bytes = max(
+                0, mode_target_bytes - expert_geometry.ep_expert_bytes
             )
-            planned_umm_bytes = fixed_umm_bytes + geometry.run_bytes
-            if planned_umm_bytes <= manager_budget_bytes:
-                best = (cache_plan, geometry, fixed_umm_bytes, planned_umm_bytes)
-                low = base_bytes + 1
+            tp_kv_budget_bytes = max(
+                0, mode_target_bytes - expert_geometry.tp_expert_bytes
+            )
+            kv_plan = build_kv_plan(ep_kv_budget_bytes, tp_kv_budget_bytes)
+            kv_geometry_input = {
+                "num_layers": len(kv_plan["layer_ep_bytes"]),
+                "layer_ep_bytes": kv_plan["layer_ep_bytes"],
+                "layer_tp_bytes": kv_plan["layer_tp_bytes"],
+            }
+            layout_geometry = self._compute_overlapped_layout_geometry(
+                self._paras_moe_pending,
+                kv_geometry_input,
+            )
+            planned_umm_bytes = fixed_umm_bytes + layout_geometry.total_bytes
+            if planned_umm_bytes <= umm_budget_bytes:
+                best_plan = (
+                    kv_plan,
+                    layout_geometry,
+                    fixed_umm_bytes,
+                    planned_umm_bytes,
+                )
+                min_mode_target_bytes = mode_target_bytes + 1
             else:
-                high = base_bytes - 1
+                max_mode_target_bytes = mode_target_bytes - 1
 
-        if best is None:
+        if best_plan is None:
             raise RuntimeError(
                 "ParaS UMM budget cannot fit expert weights and one KV token "
-                f"per layer: {manager_budget_bytes=}"
+                f"per layer: {umm_budget_bytes=}"
             )
 
-        self._planned_umm_bytes_limit = manager_budget_bytes
-        return best
+        self._umm_budget_bytes = umm_budget_bytes
+        return best_plan
 
     # ----- materialization ------------------------------------------------
 
@@ -1148,16 +1138,16 @@ class ParaSMemoryManager:
         moe_pending = getattr(self, "_paras_moe_pending", None)
         kv_pending = getattr(self, "_paras_kv_pending", None)
         if moe_pending is not None or kv_pending is not None:
-            offset = self._place_paras_run(offset, moe_pending, kv_pending)
+            offset = self._place_overlapped_layout(offset, moe_pending, kv_pending)
 
         self._total_bytes = self._align_up(offset, self.ALIGNMENT)
         if (
-            self._planned_umm_bytes_limit is not None
-            and self._total_bytes > self._planned_umm_bytes_limit
+            self._umm_budget_bytes is not None
+            and self._total_bytes > self._umm_budget_bytes
         ):
             raise RuntimeError(
                 "ParaS materialized UMM exceeds its planned static budget: "
-                f"total={self._total_bytes} limit={self._planned_umm_bytes_limit}"
+                f"total={self._total_bytes} limit={self._umm_budget_bytes}"
             )
         self._buffer = torch.empty(
             self._total_bytes, dtype=torch.uint8, device=self.device
@@ -1169,7 +1159,7 @@ class ParaSMemoryManager:
         self._materialized = True
         return self._total_bytes
 
-    # ----- unified four-anchor layout (called from materialize) -----------
+    # ----- unified overlapped layout (called from materialize) -----------
 
     def _register_entry(
         self,
@@ -1195,104 +1185,140 @@ class ParaSMemoryManager:
         self._entries[name] = entry
         return entry
 
-    def _place_paras_run(
+    def _place_overlapped_layout(
         self,
         offset: int,
         moe: Optional[Dict],
         kv: Optional[Dict],
     ) -> int:
-        """Place expert weights and KV cache in one four-anchor run.
+        """Place expert weights and KV in one overlapped layout.
 
         Orientation EP-low / TP-high. Per mode, address order is
-        ``weights | pad | cache``; the big TP weights overlap the big EP cache
-        (EP and TP are never live together), so the buffer is ~one per-mode
-        footprint plus one layer. The tail anchor
-        ``max_i(ct[i] + sum_{k>i}(ct[k] - ce[k]))`` keeps every layer's EP and TP
-        cache disjoint for any layer order. This method requires ``ct[i] <= ce[i]``
-        (asserted by the shared geometry helper). Under that precondition the
-        anchor reduces to ``max(ct)``; capacity planning charges the exact
-        resulting run, including this tail and all alignment, to the UMM limit.
-        Weight sub-slabs are ``[w13|w2]`` and cache sub-slabs ``[k|v]``, laid
-        identically in both modes so the offset-agnostic transfer kernels stay valid.
+        ``weights | padding | KV``; the large TP weights overlap the EP KV
+        region because EP and TP are never live together. ``tp_kv_tail_bytes``
+        keeps each layer's EP and TP KV regions disjoint. The shared geometry
+        helper enforces that every TP KV layer fits within its EP counterpart;
+        under that condition the tail is the largest TP KV layer. Capacity
+        planning charges the exact resulting layout to the UMM budget.
+        Weight sub-slabs are ``[w13|w2]`` and KV sub-slabs ``[k|v]``, laid
+        identically in both modes so the offset-agnostic transfer kernels stay
+        valid.
 
-        Returns the byte offset past the end of the run.
+        Returns the byte offset past the end of the layout.
         """
-        A = self.ALIGNMENT
-        P = self._align_up(offset, A)
+        alignment = self.ALIGNMENT
+        layout_start = self._align_up(offset, alignment)
 
         meta = moe if moe is not None else kv
-        assert meta is not None, "_place_paras_run requires moe or kv pending"
+        assert meta is not None, "_place_overlapped_layout requires moe or kv pending"
         num_layers = meta["num_layers"]
         prefix = meta["prefix"]
         if num_layers == 0:
-            return P
+            return layout_start
 
         def au(x: int) -> int:
-            return self._align_up(x, A)
+            return self._align_up(x, alignment)
 
-        geometry = self._compute_paras_run_geometry(moe, kv)
-        we = geometry.we
-        wt = geometry.wt
-        ce = geometry.ce
-        ct = geometry.ct
-        sum_we = geometry.sum_we
-        sum_wt = geometry.sum_wt
-        sum_ce = geometry.sum_ce
-        sum_ct = geometry.sum_ct
-        anchor = geometry.anchor
-
-        w_end = P + sum_we
-        tp_w_end = P + we[0] + sum_wt
-        PAD = geometry.pad
-        EP_end = w_end + PAD + sum_ce
-        tc_end = P + geometry.run_bytes
-        assert EP_end % A == 0 and tc_end % A == 0, (EP_end, tc_end)
+        layout_geometry = self._compute_overlapped_layout_geometry(moe, kv)
+        ep_layer_expert_bytes = layout_geometry.ep_layer_expert_bytes
+        tp_layer_expert_bytes = layout_geometry.tp_layer_expert_bytes
+        ep_layer_kv_bytes = layout_geometry.ep_layer_kv_bytes
+        tp_layer_kv_bytes = layout_geometry.tp_layer_kv_bytes
+        ep_expert_bytes = layout_geometry.ep_expert_bytes
+        tp_expert_bytes = layout_geometry.tp_expert_bytes
+        ep_kv_bytes = layout_geometry.ep_kv_bytes
+        tp_kv_bytes = layout_geometry.tp_kv_bytes
+        ep_expert_end = layout_start + ep_expert_bytes
+        tp_expert_end = layout_start + ep_layer_expert_bytes[0] + tp_expert_bytes
+        ep_kv_pad_bytes = layout_geometry.ep_kv_pad_bytes
+        ep_layout_end = ep_expert_end + ep_kv_pad_bytes + ep_kv_bytes
+        layout_end = layout_start + layout_geometry.total_bytes
+        assert ep_layout_end % alignment == 0 and layout_end % alignment == 0, (
+            ep_layout_end,
+            layout_end,
+        )
 
         if moe is not None:
             dtype = moe["dtype"]
-            off = P
+            off = layout_start
             for i in range(num_layers):
                 lp = f"{prefix}.layers.{i}.mlp.ep_experts"
-                self._register_entry(f"{lp}.w13_weight", moe["ep_w13_shape"], dtype, moe["ep_w13_bytes"], off)
-                self._register_entry(f"{lp}.w2_weight", moe["ep_w2_shape"], dtype, moe["ep_w2_bytes"], off + au(moe["ep_w13_bytes"]))
-                off += we[i]
-            assert off == w_end, (off, w_end)
+                self._register_entry(
+                    f"{lp}.w13_weight",
+                    moe["ep_w13_shape"],
+                    dtype,
+                    moe["ep_w13_bytes"],
+                    off,
+                )
+                self._register_entry(
+                    f"{lp}.w2_weight",
+                    moe["ep_w2_shape"],
+                    dtype,
+                    moe["ep_w2_bytes"],
+                    off + au(moe["ep_w13_bytes"]),
+                )
+                off += ep_layer_expert_bytes[i]
+            assert off == ep_expert_end, (off, ep_expert_end)
 
-            off = P + we[0]
+            off = layout_start + ep_layer_expert_bytes[0]
             for i in range(num_layers):
                 lp = f"{prefix}.layers.{i}.mlp.tp_experts"
-                self._register_entry(f"{lp}.w13_weight", moe["tp_w13_shape"], dtype, moe["tp_w13_bytes"], off)
-                self._register_entry(f"{lp}.w2_weight", moe["tp_w2_shape"], dtype, moe["tp_w2_bytes"], off + au(moe["tp_w13_bytes"]))
-                off += wt[i]
-            assert off == tp_w_end, (off, tp_w_end)
+                self._register_entry(
+                    f"{lp}.w13_weight",
+                    moe["tp_w13_shape"],
+                    dtype,
+                    moe["tp_w13_bytes"],
+                    off,
+                )
+                self._register_entry(
+                    f"{lp}.w2_weight",
+                    moe["tp_w2_shape"],
+                    dtype,
+                    moe["tp_w2_bytes"],
+                    off + au(moe["tp_w13_bytes"]),
+                )
+                off += tp_layer_expert_bytes[i]
+            assert off == tp_expert_end, (off, tp_expert_end)
 
             for i in range(num_layers):
-                self._entries[f"{prefix}.layers.{i}.mlp.experts.w13_weight"] = self._entries[f"{prefix}.layers.{i}.mlp.ep_experts.w13_weight"]
-                self._entries[f"{prefix}.layers.{i}.mlp.experts.w2_weight"] = self._entries[f"{prefix}.layers.{i}.mlp.ep_experts.w2_weight"]
+                self._entries[f"{prefix}.layers.{i}.mlp.experts.w13_weight"] = (
+                    self._entries[f"{prefix}.layers.{i}.mlp.ep_experts.w13_weight"]
+                )
+                self._entries[f"{prefix}.layers.{i}.mlp.experts.w2_weight"] = (
+                    self._entries[f"{prefix}.layers.{i}.mlp.ep_experts.w2_weight"]
+                )
 
         if kv is not None:
             kv_dtype = kv["kv_dtype"]
-            off = w_end + PAD
+            off = ep_expert_end + ep_kv_pad_bytes
             for i in range(num_layers):
                 kb = kv["layer_ep_bytes"][i]
                 shp = kv["layer_ep_shapes"][i]
-                k = self._register_entry(f"{prefix}.layers.{i}.kv.ep.k", shp, kv_dtype, kb, off)
-                v = self._register_entry(f"{prefix}.layers.{i}.kv.ep.v", shp, kv_dtype, kb, off + au(kb))
+                k = self._register_entry(
+                    f"{prefix}.layers.{i}.kv.ep.k", shp, kv_dtype, kb, off
+                )
+                v = self._register_entry(
+                    f"{prefix}.layers.{i}.kv.ep.v", shp, kv_dtype, kb, off + au(kb)
+                )
                 self._entries[f"{prefix}.layers.{i}.kv.k"] = k
                 self._entries[f"{prefix}.layers.{i}.kv.v"] = v
-                off += ce[i]
-            assert off == EP_end, (off, EP_end)
+                off += ep_layer_kv_bytes[i]
+            assert off == ep_layout_end, (off, ep_layout_end)
 
-            off = tc_end - sum_ct
+            off = layout_end - tp_kv_bytes
             for i in range(num_layers):
                 kb = kv["layer_tp_bytes"][i]
                 shp = kv["layer_tp_shapes"][i]
-                self._register_entry(f"{prefix}.layers.{i}.kv.tp.k", shp, kv_dtype, kb, off)
-                self._register_entry(f"{prefix}.layers.{i}.kv.tp.v", shp, kv_dtype, kb, off + au(kb))
-                off += ct[i]
-            assert off == tc_end, (off, tc_end)
+                self._register_entry(
+                    f"{prefix}.layers.{i}.kv.tp.k", shp, kv_dtype, kb, off
+                )
+                self._register_entry(
+                    f"{prefix}.layers.{i}.kv.tp.v", shp, kv_dtype, kb, off + au(kb)
+                )
+                off += tp_layer_kv_bytes[i]
+            assert off == layout_end, (off, layout_end)
 
-        return tc_end
+        return layout_end
 
     # ----- view access ----------------------------------------------------
 
@@ -1305,7 +1331,7 @@ class ParaSMemoryManager:
           2. .view(dtype): Reinterpret those bytes as the target dtype (BF16, FP8, etc.).
              This is a zero-copy operation—no data is moved, just reinterpreted.
           3. .reshape(shape): Reshape the flat 1-D tensor to the original shape.
-          
+
           This chain allows a single uint8 buffer to serve tensors of different dtypes
           without duplication or type conversion overhead.
         """
@@ -1601,7 +1627,7 @@ def plan_qwen_moe_layout(
     # intermediate (paras_moe_block EP gathered view). TP holds ALL num_experts
     # with the intermediate sharded by tp_size (the get_view_as TP view). Bytes
     # are equal at G=1 and TP is G=ep_size/tp_size times larger for G>1; the
-    # four-anchor layout sizes EP and TP independently.
+    # overlapped layout sizes EP and TP independently.
     ep_w13_shape = (ep_local_experts, 2 * intermediate_size, hidden_size)
     ep_w2_shape = (ep_local_experts, hidden_size, intermediate_size)
     tp_w13_shape = (num_experts, 2 * tp_inter, hidden_size)
@@ -1613,7 +1639,7 @@ def plan_qwen_moe_layout(
             n *= d
         return n * elem_size
 
-    # Expert weights are placed by the deferred four-anchor pass at materialize
+    # Expert weights are placed by the deferred overlapped-layout pass at materialize
     # time (like KV cache), not reserved in _reservation_order. Biases stay
     # replicated per rank (paras_moe_block: self._full_w{13,2}_bias).
     manager._paras_moe_pending = {
@@ -1631,9 +1657,9 @@ def plan_qwen_moe_layout(
         "tp_w2_bytes": _shape_bytes(tp_w2_shape),
     }
     # Only EP weights consume dedicated budget: TP weights overlap the EP cache
-    # in the four-anchor run (never live together), so they add no footprint
+    # in the overlapped-layout run (never live together), so they add no footprint
     # beyond the balanced per-mode budget. This matches the old slot subtraction
-    # (~Σwe), so KV token capacity does not regress at G=1.
+    # (~Σep_layer_expert_bytes), so KV token capacity does not regress at G=1.
     manager._deferred_weight_bytes = num_layers * (
         _shape_bytes(ep_w13_shape) + _shape_bytes(ep_w2_shape)
     )
@@ -1688,6 +1714,7 @@ def plan_qwen_moe_layout(
 # GPT-OSS MoE layout planning
 # ---------------------------------------------------------------------------
 
+
 def plan_gpt_oss_moe_layout(
     manager: ParaSMemoryManager,
     *,
@@ -1713,7 +1740,7 @@ def plan_gpt_oss_moe_layout(
     """Reserve all weight tensors for a GPT-OSS sparse-MoE model.
 
     GPT-OSS shares the Qwen3-MoE layout exactly for the tensors ParaS
-    manages: w13/w2 expert weights (four-anchor EP<->TP layout), QKV/O
+    manages: w13/w2 expert weights (overlapped EP<->TP layout), QKV/O
     attention projections, FP8 weight scales, and the pre-permute buffers
     used by the NCCL fallback. Both
     models are pure sparse MoE with no shared experts and identical
@@ -1758,6 +1785,7 @@ def plan_gpt_oss_moe_layout(
 # MoE alias creation (call after materialize)
 # ---------------------------------------------------------------------------
 
+
 def create_paras_moe_aliases(
     manager: ParaSMemoryManager,
     num_layers: int,
@@ -1765,7 +1793,7 @@ def create_paras_moe_aliases(
 ) -> None:
     """Call-order compatibility shim (kept so model files need no change).
 
-    ep_experts/tp_experts entries are now primaries created by the four-anchor
+    ep_experts/tp_experts entries are now primaries created by the overlapped-layout
     pass inside materialize(); this validates they exist rather than aliasing
     the removed N+1 slots.
     """

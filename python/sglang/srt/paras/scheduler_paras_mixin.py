@@ -814,7 +814,7 @@ class SchedulerParasMixin:
             with TimeReporter("reorchestrate_cache"):
                 paras_scatter_manager.reorchestrate_cache()
 
-        # Four-anchor TP->EP: transfer weights BEFORE scattering cache. Writing
+        # Overlapped TP->EP: transfer weights BEFORE scattering cache. Writing
         # EP cache overlaps TP weights in the unified buffer, so TP weights must
         # be read (consumed by the weight transfer) before EP cache is written.
         with TimeReporter("transfer_weights"):

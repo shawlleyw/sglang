@@ -62,10 +62,10 @@ The foundation of fast switching. Allocates ALL persistent GPU memory — expert
 therefore overlap their persistent regions and reinterpret one allocation
 without allocating during a switch. When `dp_size > 1`, TP expert weights are
 larger per GPU. Capacity planning charges that growth directly against TP KV
-cache capacity, then verifies the exact four-anchor footprint against the
+cache capacity, then verifies the exact overlapped layout footprint against the
 static-memory limit.
 
-### Four-Anchor Design
+### Overlapped Layout Design
 
 The manager places EP weights, TP weights, EP cache, and TP cache as four
 contiguous blocks with direct per-layer offsets. TP weights can overlap EP
@@ -255,8 +255,8 @@ Unlimited round-trips are supported without explicit state caching:
 
 | Component | Why it works |
 |-----------|-------------|
-| **Weight views** | `ep_experts` and `tp_experts` have permanent four-anchor entries. Each direction reconstructs its target views from the source. |
-| **KV views** | `kv.ep` and `kv.tp` have permanent four-anchor entries and are rebound after data movement. |
+| **Weight views** | `ep_experts` and `tp_experts` have permanent overlapped layout entries. Each direction reconstructs its target views from the source. |
+| **KV views** | `kv.ep` and `kv.tp` have permanent overlapped layout entries and are rebound after data movement. |
 | **Communication groups** | Created at init (PARAS_TP, PARAS_DP, PARAS_EP), never destroyed. |
 | **Dual LayerCommunicator** | EP and TP communicator objects co-exist. The switch swaps which one is active. |
 | **QKV weights** | Full (EP) and sharded (TP) weight views are permanent. |
@@ -289,7 +289,8 @@ Unlimited round-trips are supported without explicit state caching:
 |-------|-------|-----------------|
 | Layer cache spec + KV budget (CPU) | 14 | Formula parity and heterogeneous layer-spec invariants |
 | Unified memory manager heterogeneous layout (CPU) | 5 | Union-layout bookkeeping |
-| Unified memory manager four-anchor layout (CPU) | 13 | Materialized offsets, aliases, overlap, and switch safety |
+| Unified memory manager overlapped layout (CPU) | 13 | Materialized offsets, aliases, overlap, and switch safety |
+| Unified memory manager capacity (GPU) | 2 topologies | Exact planning and CUDA materialization for EP4/TP4 and EP4/DP2/TP2 |
 | Weight transfer EP4 <-> TP4 (GPU) | 6 | NCCL and peer_access ground truth and round trip |
 | Weight transfer EP4 <-> DP2/TP2 (GPU) | 12 | Both local transports and w13 layouts, DP replication, and manager-backed round trip |
 | SWA allocator (CPU) | 8 | Allocator invariants |
@@ -305,7 +306,7 @@ Unlimited round-trips are supported without explicit state caching:
 
 | Document | Contents |
 |----------|----------|
-| `unified_memory_manager.md` | Contiguous allocation, four-anchor layout, views, and KV integration |
+| `unified_memory_manager.md` | Contiguous allocation, overlapped layout, views, and KV integration |
 | `nvlink_peer_access_weight_transfer.md` | w13/w2 CUDA kernels (EP→TP + TP→EP reverse), data flow, performance comparison |
 | `nvlink_peer_access_kv_cache_transfer.md` | Fused K+V kernel (EP→TP + TP→EP scatter), head replication, NCCL fallback |
 | `nvlink_peer_access_guielines.md` | NVLink store optimization guidelines (grid config, vectorization, alignment) |

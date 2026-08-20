@@ -294,7 +294,7 @@ def test_ep_tp_ep_weight_roundtrip_and_cuda_graph():
         barrier_tensor = torch.zeros(1, device="cuda")
         dist.barrier(group=paras_tp_group)
 
-        # EP->TP reverse: TP weight i overlaps EP weight i+1 (four-anchor).
+        # EP->TP reverse: TP weight i overlaps EP weight i+1 (overlapped).
         for layer_id in reversed(range(NUM_LAYERS)):
             mixin = _make_mixin(layer_id, num_local, mgr)
             mixin.paras_reshard_ep_to_tp_intra_node_peer_access(dst_base_ptrs, 0, 1, None)
@@ -326,7 +326,7 @@ def test_ep_tp_ep_weight_roundtrip_and_cuda_graph():
         # --- TP→EP reverse weight transfer (peer access) ---
         dist.barrier(group=paras_tp_group)
         barrier_tensor.zero_()
-        # TP->EP forward: EP weight i+1 overlaps TP weight i (four-anchor).
+        # TP->EP forward: EP weight i+1 overlaps TP weight i (overlapped).
         for layer_id in range(NUM_LAYERS):
             mixin = _make_mixin(layer_id, num_local, mgr)
             mixin.paras_reshard_tp_to_ep_intra_node_peer_access(dst_base_ptrs, 0, 1, None)
@@ -364,7 +364,7 @@ def test_ep_tp_ep_weight_roundtrip_and_cuda_graph():
 def build_manager_with_bias(rank, world_size):
     # all_to_all / naive path variant: plan_gpt_oss_moe_layout with
     # intra_node_weight_transfer_method="nccl" reserves staging.{w13,w2}_pre_permute for
-    # NCCL transport. Biases are no longer part of the four-anchor MoE layout;
+    # NCCL transport. Biases are no longer part of the overlapped MoE layout;
     # the explicit reserves below preserve the test's mock-experts pattern
     # (see _MockExpertsWithBias / fill_biases) via regular reserve() entries.
     from sglang.srt.paras.paras_memory_manager import (
@@ -487,7 +487,7 @@ def _run_bias_roundtrip(interleaved_w13: bool):
         ep_weight_snap = snapshot_weights(mgr)
         ep_bias_snap = snapshot_biases(mgr)
 
-        # EP->TP reverse: TP weight i overlaps EP weight i+1 (four-anchor).
+        # EP->TP reverse: TP weight i overlaps EP weight i+1 (overlapped).
         for layer_id in reversed(range(NUM_LAYERS)):
             mixin = _make_mixin_with_bias(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
@@ -505,7 +505,7 @@ def _run_bias_roundtrip(interleaved_w13: bool):
             )
             assert tp_b13.abs().sum() > 0, f"Layer {layer_id} TP bias unexpectedly zero"
 
-        # TP->EP forward: EP weight i+1 overlaps TP weight i (four-anchor).
+        # TP->EP forward: EP weight i+1 overlaps TP weight i (overlapped).
         for layer_id in range(NUM_LAYERS):
             mixin = _make_mixin_with_bias(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
@@ -629,7 +629,7 @@ def _run_layout_semantics_test(interleaved_w13: bool):
         _fill_tagged_w13(mgr, rank, interleaved_w13, world_size)
         fill_biases(mgr, rank)
 
-        # EP->TP reverse: TP weight i overlaps EP weight i+1 (four-anchor).
+        # EP->TP reverse: TP weight i overlaps EP weight i+1 (overlapped).
         for layer_id in reversed(range(NUM_LAYERS)):
             mixin = _make_mixin_with_bias(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
@@ -689,7 +689,7 @@ def _run_peer_access_layout_semantics_test(interleaved_w13: bool):
         barrier_tensor = torch.zeros(1, device="cuda")
         dist.barrier(group=paras_tp_group)
 
-        # EP->TP reverse: TP weight i overlaps EP weight i+1 (four-anchor).
+        # EP->TP reverse: TP weight i overlaps EP weight i+1 (overlapped).
         for layer_id in reversed(range(NUM_LAYERS)):
             mixin = _make_mixin(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13
@@ -703,7 +703,7 @@ def _run_peer_access_layout_semantics_test(interleaved_w13: bool):
 
         dist.barrier(group=paras_tp_group)
         barrier_tensor.zero_()
-        # TP->EP forward: EP weight i+1 overlaps TP weight i (four-anchor).
+        # TP->EP forward: EP weight i+1 overlaps TP weight i (overlapped).
         for layer_id in range(NUM_LAYERS):
             mixin = _make_mixin(
                 layer_id, num_local, mgr, interleaved_w13=interleaved_w13

@@ -429,7 +429,7 @@ def peer_access_kv_scatter(
     is sent to exactly one EP rank determined by token_to_rank[t].
 
     Layers are processed in FORWARD order (0 to N-1) with a dist.all_reduce
-    barrier after each layer. In the four-anchor layout, writing EP cache
+    barrier after each layer. In the overlapped layout, writing EP cache
     layer i+1 overlaps TP cache layer i, so layer i must be read before layer
     i+1's EP is written.
 

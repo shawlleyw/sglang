@@ -559,7 +559,7 @@ class ParaSReqScatterManager:
                 source_full_to_swa_mapping=self.source_full_to_swa_mapping,
             )
 
-        # Per-layer dispatch in FORWARD order (0..N-1). In the four-anchor layout
+        # Per-layer dispatch in FORWARD order (0..N-1). In the overlapped layout
         # writing EP cache layer i+1 overlaps TP cache layer i, so layer i must be
         # read (scattered) before layer i+1's EP cache is written.
         num_layers = kv_cache.layer_num

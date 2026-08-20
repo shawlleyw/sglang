@@ -7,8 +7,9 @@ Tests cover:
   2. Heterogeneous reservation: 2 full + 4 SWA layers produce correct per-layer shapes
   3. Alias resolution: get_view() returns correct shapes per layer
   4. Alias-name stability: alias names remain consistent across layers
-  5. Offset geometry: four-anchor layout (EP cache low, TP cache high anchored at
-     EP_end + max(ct)), per-layer [k|v] slabs, clobber-safe under switch orders
+  5. Offset geometry: overlapped layout (EP cache low, TP cache high),
+     per-layer [k|v] slabs, clobber-safe under switch orders, and exact
+     tp_kv_tail_bytes accounting
 
 Usage:
   conda run -n sgl_paras python -m pytest test/srt/paras/test_umm_heterogeneous.py -v
@@ -33,8 +34,8 @@ def _overlap(a, b):
     return a[0] < b[0] + b[1] and b[0] < a[0] + a[1]
 
 
-def _assert_four_anchor_cache(mgr, num_layers, prefix="model"):
-    """Assert the four-anchor KV invariants over real offsets.
+def _assert_overlapped_kv_layout(mgr, num_layers, prefix="model"):
+    """Assert the overlapped KV invariants over real offsets.
 
     EP cache low / TP cache high; per-layer [k|v] slabs adjacent; and the
     layout is clobber-safe under the production switch orders (EP->TP cache
@@ -48,7 +49,9 @@ def _assert_four_anchor_cache(mgr, num_layers, prefix="model"):
     # Global orientation: the TP cache region base sits above the EP cache base.
     # Per-layer ranges can still overlap across modes; the clobber checks below
     # validate the production transfer orders.
-    assert rng("tp", 0, "k")[0] > rng("ep", 0, "k")[0], "TP cache base must sit above EP"
+    assert (
+        rng("tp", 0, "k")[0] > rng("ep", 0, "k")[0]
+    ), "TP cache base must sit above EP"
     for i in range(num_layers):
         ek, ev = rng("ep", i, "k"), rng("ep", i, "v")
         tk, tv = rng("tp", i, "k"), rng("tp", i, "v")
@@ -91,9 +94,8 @@ class TestBackwardCompatUniformShapes:
         mgr = ParaSMemoryManager(device="cpu")
 
         num_layers = 6
-        # Realistic relationship: TP shards num_kv_heads by tp_size (heads divide
-        # cleanly) and holds tp_size x more tokens, so ct <= ce as the real
-        # planner produces.
+        # TP shards num_kv_heads by tp_size and holds tp_size x more tokens, so
+        # each TP KV layer fits its EP counterpart, as the planner requires.
         tp_size = 4
         ep_max_tokens = 1024
         tp_max_tokens = ep_max_tokens * tp_size
@@ -127,18 +129,18 @@ class TestBackwardCompatUniformShapes:
             tp_k = mgr.get_view(f"model.layers.{i}.kv.tp.k")
             tp_v = mgr.get_view(f"model.layers.{i}.kv.tp.v")
 
-            assert ep_k.shape == expected_ep_shape, (
-                f"Layer {i} EP K shape: expected {expected_ep_shape}, got {ep_k.shape}"
-            )
+            assert (
+                ep_k.shape == expected_ep_shape
+            ), f"Layer {i} EP K shape: expected {expected_ep_shape}, got {ep_k.shape}"
             assert ep_v.shape == expected_ep_shape
             assert tp_k.shape == expected_tp_shape
             assert tp_v.shape == expected_tp_shape
 
-            assert ep_k.data_ptr() != tp_k.data_ptr(), (
-                f"Layer {i}: EP and TP K should have different offsets"
-            )
+            assert (
+                ep_k.data_ptr() != tp_k.data_ptr()
+            ), f"Layer {i}: EP and TP K should have different offsets"
 
-        _assert_four_anchor_cache(mgr, num_layers)
+        _assert_overlapped_kv_layout(mgr, num_layers)
 
 
 # =========================================================================
@@ -157,28 +159,58 @@ class TestHeterogeneousReservation:
 
         layer_specs = [
             LayerCacheSpec(
-                layer_id=0, kind="full", tokens_cap_ep=1024, tokens_cap_tp=4096,
-                num_kv_heads=8, head_dim=128, sliding_window_size=None,
+                layer_id=0,
+                kind="full",
+                tokens_cap_ep=1024,
+                tokens_cap_tp=4096,
+                num_kv_heads=8,
+                head_dim=128,
+                sliding_window_size=None,
             ),
             LayerCacheSpec(
-                layer_id=1, kind="full", tokens_cap_ep=1024, tokens_cap_tp=4096,
-                num_kv_heads=8, head_dim=128, sliding_window_size=None,
+                layer_id=1,
+                kind="full",
+                tokens_cap_ep=1024,
+                tokens_cap_tp=4096,
+                num_kv_heads=8,
+                head_dim=128,
+                sliding_window_size=None,
             ),
             LayerCacheSpec(
-                layer_id=2, kind="swa", tokens_cap_ep=256, tokens_cap_tp=1024,
-                num_kv_heads=8, head_dim=128, sliding_window_size=2048,
+                layer_id=2,
+                kind="swa",
+                tokens_cap_ep=256,
+                tokens_cap_tp=1024,
+                num_kv_heads=8,
+                head_dim=128,
+                sliding_window_size=2048,
             ),
             LayerCacheSpec(
-                layer_id=3, kind="swa", tokens_cap_ep=256, tokens_cap_tp=1024,
-                num_kv_heads=8, head_dim=128, sliding_window_size=2048,
+                layer_id=3,
+                kind="swa",
+                tokens_cap_ep=256,
+                tokens_cap_tp=1024,
+                num_kv_heads=8,
+                head_dim=128,
+                sliding_window_size=2048,
             ),
             LayerCacheSpec(
-                layer_id=4, kind="swa", tokens_cap_ep=256, tokens_cap_tp=1024,
-                num_kv_heads=8, head_dim=128, sliding_window_size=2048,
+                layer_id=4,
+                kind="swa",
+                tokens_cap_ep=256,
+                tokens_cap_tp=1024,
+                num_kv_heads=8,
+                head_dim=128,
+                sliding_window_size=2048,
             ),
             LayerCacheSpec(
-                layer_id=5, kind="swa", tokens_cap_ep=256, tokens_cap_tp=1024,
-                num_kv_heads=8, head_dim=128, sliding_window_size=2048,
+                layer_id=5,
+                kind="swa",
+                tokens_cap_ep=256,
+                tokens_cap_tp=1024,
+                num_kv_heads=8,
+                head_dim=128,
+                sliding_window_size=2048,
             ),
         ]
 
@@ -212,11 +244,11 @@ class TestHeterogeneousReservation:
 
         for i, exp_shape in expected_shapes.items():
             ep_k = mgr.get_view(f"model.layers.{i}.kv.ep.k")
-            assert ep_k.shape == exp_shape, (
-                f"Layer {i} EP K shape: expected {exp_shape}, got {ep_k.shape}"
-            )
+            assert (
+                ep_k.shape == exp_shape
+            ), f"Layer {i} EP K shape: expected {exp_shape}, got {ep_k.shape}"
 
-        _assert_four_anchor_cache(mgr, num_layers)
+        _assert_overlapped_kv_layout(mgr, num_layers)
 
 
 # =========================================================================
@@ -433,32 +465,41 @@ class TestOffsetGeometry:
                 for idx in range(len(intervals) - 1):
                     _, end_a, name_a = intervals[idx]
                     start_b, _, name_b = intervals[idx + 1]
-                    assert end_a <= start_b, (
-                        f"{mode} overlap: {name_a}→{end_a} vs {name_b}→{start_b}"
-                    )
+                    assert (
+                        end_a <= start_b
+                    ), f"{mode} overlap: {name_a}→{end_a} vs {name_b}→{start_b}"
 
         # EP cache low, TP cache high, per-layer [k|v] slabs, clobber-safe.
-        _assert_four_anchor_cache(mgr, num_layers)
+        _assert_overlapped_kv_layout(mgr, num_layers)
 
-        # TP cache tail anchored at EP_end + ANCHOR, where the general anchor
-        # max_i(ct_i + Σ_{k>i}(ct_k - ce_k)) tolerates ct_i > ce_i.
+        # Validate the general tail formula used by the layout geometry.
+        # Production inputs make this equal to max(tp_layer_kv_bytes).
         def _slab(mode, i):
-            return _align_up(mgr._entries[f"model.layers.{i}.kv.{mode}.k"].size_bytes) + \
-                _align_up(mgr._entries[f"model.layers.{i}.kv.{mode}.v"].size_bytes)
+            return _align_up(
+                mgr._entries[f"model.layers.{i}.kv.{mode}.k"].size_bytes
+            ) + _align_up(mgr._entries[f"model.layers.{i}.kv.{mode}.v"].size_bytes)
 
-        ct = [_slab("tp", i) for i in range(num_layers)]
-        ce = [_slab("ep", i) for i in range(num_layers)]
-        anchor, suffix = 0, 0
+        tp_layer_kv_bytes = [_slab("tp", i) for i in range(num_layers)]
+        ep_layer_kv_bytes = [_slab("ep", i) for i in range(num_layers)]
+        tp_kv_tail_bytes, suffix = 0, 0
         for i in range(num_layers - 1, -1, -1):
-            anchor = max(anchor, ct[i] + suffix)
-            suffix += ct[i] - ce[i]
-        anchor = _align_up(anchor)
+            tp_kv_tail_bytes = max(tp_kv_tail_bytes, tp_layer_kv_bytes[i] + suffix)
+            suffix += tp_layer_kv_bytes[i] - ep_layer_kv_bytes[i]
+        tp_kv_tail_bytes = _align_up(tp_kv_tail_bytes)
 
-        ep_end = max(e.offset_bytes + e.size_bytes for n, e in mgr._entries.items() if ".kv.ep." in n)
-        tc_end = max(e.offset_bytes + e.size_bytes for n, e in mgr._entries.items() if ".kv.tp." in n)
-        assert tc_end == _align_up(ep_end) + anchor, (
-            f"TP tail anchor mismatch: tc_end={tc_end}, ep_end={ep_end}, anchor={anchor}"
+        ep_end = max(
+            e.offset_bytes + e.size_bytes
+            for n, e in mgr._entries.items()
+            if ".kv.ep." in n
         )
+        tc_end = max(
+            e.offset_bytes + e.size_bytes
+            for n, e in mgr._entries.items()
+            if ".kv.tp." in n
+        )
+        assert (
+            tc_end == _align_up(ep_end) + tp_kv_tail_bytes
+        ), f"TP KV tail mismatch: {tc_end=} {ep_end=} {tp_kv_tail_bytes=}"
 
 
 if __name__ == "__main__":

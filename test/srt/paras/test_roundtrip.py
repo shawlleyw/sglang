@@ -298,11 +298,11 @@ def _snapshot_local_kv(kv_pool, req_to_token_pool, reqs):
 # ---------------------------------------------------------------------------
 
 def _build_weight_manager(rank, world_size):
-    """Create ParaSMemoryManager with MoE weight slots via the four-anchor API.
+    """Create ParaSMemoryManager with MoE weight slots via the overlapped API.
 
     `plan_qwen_moe_layout` stashes per-layer sizes; the ep_experts/tp_experts
     primaries and the `model.layers.{i}.mlp.experts.{w13,w2}_weight` aliases
-    are created by the deferred four-anchor pass inside materialize().
+    are created by the deferred overlapped pass inside materialize().
     """
     from sglang.srt.paras.paras_memory_manager import (
         ParaSMemoryManager,
@@ -397,7 +397,7 @@ def _run_ep_to_tp_weights(mgr, num_local, world_size):
 
     tp_inter = INTERMEDIATE // world_size
     # Reverse layer order: TP weight layer i overlaps EP weight layer i+1 in the
-    # four-anchor buffer, so i+1 must be read before i's TP weights are written.
+    # overlapped buffer, so i+1 must be read before i's TP weights are written.
     for layer_id in range(NUM_LAYERS - 1, -1, -1):
         m = object.__new__(ParaSMoeBlockMixin)
         m._paras_layer_id = layer_id
@@ -419,7 +419,7 @@ def _run_tp_to_ep_weights(mgr, num_local, world_size):
     from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 
     # Forward layer order: EP weight layer i+1 overlaps TP weight layer i in the
-    # four-anchor buffer, so i must be read before i+1's EP weights are written.
+    # overlapped buffer, so i must be read before i+1's EP weights are written.
     for layer_id in range(NUM_LAYERS):
         m = object.__new__(ParaSMoeBlockMixin)
         m._paras_layer_id = layer_id
@@ -756,7 +756,7 @@ class TestFullRoundTrip:
         kv_ok = ok_tensor.item() == 1
 
         # ---- Phase 4: TP→EP weight restore + verify ----
-        # In the four-anchor layout TP weights overlap EP weights, so EP->TP
+        # In the overlapped layout TP weights overlap EP weights, so EP->TP
         # overwrites EP in place. A TP->EP transfer reconstructs EP; only then
         # should the weights match the original.
         _run_tp_to_ep_weights(weight_mgr, num_local, world_size)

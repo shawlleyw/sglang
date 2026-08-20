@@ -27,7 +27,7 @@ Model construction has two phases.
    reserves attention entries, and optionally reserves NCCL staging.
 2. `reserve_kv_cache` records per-layer EP and TP cache sizes.
 3. `materialize` assigns offsets for ordinary reservations, places the combined
-   expert/KV four-anchor run, and allocates the backing buffer.
+   expert/KV overlapped-layout run, and allocates the backing buffer.
 4. `create_paras_moe_aliases` validates the materialized expert entries and
    preserves `experts.* -> ep_experts.*` names used by weight loading.
 
@@ -66,12 +66,12 @@ TP cache budget = B - sum(TP expert weights)
 ```
 
 For `dp_size > 1`, TP expert weights are larger, so TP cache capacity is
-reduced by that growth. The search evaluates the exact aligned four-anchor
+reduced by that growth. The search evaluates the exact aligned overlapped-layout
 geometry rather than an additive weights-plus-cache estimate. The returned
 plan reports both mode-specific weight and cache bytes, and `materialize`
 refuses to allocate if the resulting UMM exceeds the planned limit.
 
-## Four-Anchor Layout
+## Overlapped Layout
 
 The former N+1 equal-slot layout only represented `ep_size == tp_size`. The
 current layout also supports a wide EP group switching to `G` replicas of a
@@ -79,29 +79,29 @@ current layout also supports a wide EP group switching to `G` replicas of a
 
 For layer `i`, define the aligned per-GPU byte sizes:
 
-- `we[i]`: EP expert weights.
-- `wt[i]`: TP expert weights.
-- `ce[i]`: EP KV cache.
-- `ct[i]`: TP KV cache.
+- `ep_layer_expert_bytes[i]`: EP expert weights.
+- `tp_layer_expert_bytes[i]`: TP expert weights.
+- `ep_layer_kv_bytes[i]`: EP KV cache.
+- `tp_layer_kv_bytes[i]`: TP KV cache.
 
 The manager places four contiguous blocks in one run:
 
 ```text
 EP weights: forward from P
-EP cache:   forward after EP weights and PAD
-TP weights: forward from P + we[0]
-TP cache:   forward, with its tail anchored after the EP footprint
+EP cache:   forward after EP weights and ep_kv_pad_bytes
+TP weights: forward from P + ep_layer_expert_bytes[0]
+TP cache:   forward, with its tail placed after the EP footprint
 ```
 
 The two modes are never live simultaneously. TP weights can therefore overlap
-EP cache storage, which is necessary when `wt[i] = G * we[i]`. Separate EP and
-TP entries retain stable addresses even though the regions overlap across
-modes.
+EP KV storage, which is necessary when
+`tp_layer_expert_bytes[i] = G * ep_layer_expert_bytes[i]`. Separate EP and TP
+entries retain stable addresses even though the regions overlap across modes.
 
-Production currently requires `ct[i] <= ce[i]` for every layer. Under this
-condition the cache tail anchor reduces to `max(ct)`. Capacity planning and
-materialization share the same geometry calculation, including this anchor and
-all alignment, so the planned and allocated byte counts cannot diverge.
+Production requires every TP KV layer to fit within its EP counterpart. Under
+this condition, `tp_kv_tail_bytes` is the largest TP KV layer. Capacity
+planning and materialization share the same geometry calculation, including
+these tail bytes and all alignment, so their byte counts cannot diverge.
 
 The complete offset derivation and safety proof are in
 [`unified_memory_ep_tp.md`](unified_memory_ep_tp.md).
@@ -145,12 +145,16 @@ for the topology matrix and synchronization details.
 The memory manager is covered at both layout and transfer levels:
 
 - `test_paras_layout_unit.py` plans, materializes, and checks the real
-  four-anchor offsets, aliases, overlap, alignment, and switch-order safety.
+  overlapped-layout offsets, aliases, overlap, alignment, and switch-order safety.
+- `test_memory_manager_capacity_gpu.py` runs the production capacity solver and
+  real CUDA materialization for EP4/TP4 and EP4/DP2/TP2 under an exact byte limit.
 - `test_weight_transfer_method.py` materializes NCCL staging with
   `ep_size=4`, `tp_size=2`, and `dp_size=2`.
 - `test_weight_transfer.py` and `test_weight_transfer_tp_instances.py`
   perform GPU transfers through materialized manager EP/TP views and verify
   bitwise forward and round-trip results.
+- `test_kv_cache_transfer.py` and `test_kv_roundtrip_tp_instances.py` verify
+  NCCL and peer-access cache movement in both topologies.
 
 ## KV Cache Integration
 
@@ -189,7 +193,7 @@ The CPU reference implementation and fuzz checks live in
 
 | File | Responsibility |
 |------|----------------|
-| `paras_memory_manager.py` | Reservations, capacity planning, four-anchor placement, and typed views |
+| `paras_memory_manager.py` | Reservations, capacity planning, overlapped-layout placement, and typed views |
 | `layers/paras_model.py` | Method selection, topology selection, ordering, and synchronization |
 | `layers/paras_moe_block.py` | Expert-weight views and transfer primitives |
 | `gather_manager.py` / `scatter_manager.py` | EP/TP request and KV-cache movement |

@@ -136,15 +136,15 @@ ParaS preserves baseline's outer static-memory contract, then solves the two
 mode footprints together before allocating the UMM:
 
 ```python
-avail_now_bytes       = get_available_gpu_memory(...)  # via cudaMemGetInfo
-dynamic_reserve_bytes = total_gpu_bytes * (1 - mem_fraction_static)
-umm_budget_bytes      = avail_now_bytes - dynamic_reserve_bytes
-manager_budget_bytes  = umm_budget_bytes - non_umm_static_bytes
+avail_now_bytes        = get_available_gpu_memory(...)  # via cudaMemGetInfo
+dynamic_reserve_bytes  = total_gpu_bytes * (1 - mem_fraction_static)
+static_headroom_bytes  = avail_now_bytes - dynamic_reserve_bytes
+umm_budget_bytes       = static_headroom_bytes - non_umm_static_bytes
 
-ep_cache_budget = B - sum(ep_expert_weight_bytes)
-tp_cache_budget = B - sum(tp_expert_weight_bytes)
-planned_umm_bytes = fixed_umm_bytes + exact_four_anchor_bytes(...)
-assert planned_umm_bytes <= manager_budget_bytes
+ep_kv_budget_bytes     = B - sum(ep_expert_bytes)
+tp_kv_budget_bytes     = B - sum(tp_expert_bytes)
+planned_umm_bytes      = fixed_umm_bytes + exact_overlapped_layout_bytes(...)
+assert planned_umm_bytes <= umm_budget_bytes
 ```
 
 The planner binary-searches the largest common base footprint `B`. This
@@ -156,7 +156,7 @@ both modes retain equal cache bytes; TP still exposes more tokens because each
 token has fewer local KV heads.
 
 The exact geometry helper accounts for the fixed UMM prefix, all 256-byte
-alignment, and the four-anchor head/tail overhead. `materialize` uses the
+alignment, and the overlapped layout head/tail overhead. `materialize` uses the
 same helper and rejects any result above the planned byte limit before calling
 `torch.empty`.
 
@@ -169,7 +169,7 @@ The actual order in `Qwen3MoeForCausalLMParaS.__init__` is:
 | 1 | `manager = ParaSMemoryManager()` | none (empty planner) |
 | 2 | `plan_qwen_moe_layout(...)` | none; records ordinary and deferred expert metadata |
 | 3 | `get_available_gpu_memory(distributed=True, empty_cache=True)` | none (read-only) |
-| 4 | Solve exact EP and TP cache capacities under `manager_budget_bytes` | none (arithmetic) |
+| 4 | Solve exact EP and TP cache capacities under `umm_budget_bytes` | none (arithmetic) |
 | 5 | `manager.reserve_kv_cache(...)` | none; records the selected per-layer views |
 | 6 | **`manager.materialize()`** | **the only GPU allocation.** Allocates the exact combined footprint once |
 
@@ -187,7 +187,7 @@ of them share one physical allocation.
 
 The original outer-budget correction dropped `driver_used` from 57.77 GB to
 56.30 GB (−1.46 GB per GPU) and reduced the KV pool from 347,857 to
-332,225 tokens. Those measurements predate the four-anchor layout. The current
+332,225 tokens. Those measurements predate the overlapped layout. The current
 planner additionally reduces TP capacity when multiple TP instances make TP
 expert weights larger than EP expert weights.
 

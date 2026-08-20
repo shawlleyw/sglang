@@ -19,7 +19,7 @@ Everything else is loaded through the normal PyTorch parameter path
 and stays untouched across switches.  Concretely for GPT-OSS:
 
   Managed by the UMM:
-    * mlp.{ep,tp}_experts.w13 / w2  (four-anchor unified layout, EP<->TP transport)
+    * mlp.{ep,tp}_experts.w13 / w2  (overlapped unified layout, EP<->TP transport)
     * self_attn.qkv_proj.weight / tp_weight
     * self_attn.o_proj.weight
     * FP8 weight scales (when quant_name == "fp8")

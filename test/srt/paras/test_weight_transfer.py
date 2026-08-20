@@ -108,9 +108,9 @@ def setup_paras_state(rank, world_size):
 
 
 def build_manager(rank, world_size):
-    """Create ParaSMemoryManager via the four-anchor plan_qwen_moe_layout API.
+    """Create ParaSMemoryManager via the overlapped plan_qwen_moe_layout API.
 
-    The removed N+1 slot layout has been replaced by the deferred four-anchor
+    The removed N+1 slot layout has been replaced by the deferred overlapped
     pass inside materialize(): plan_qwen_moe_layout stashes per-layer sizes,
     materialize() creates the ep_experts / tp_experts primaries plus the
     experts.{w13,w2}_weight aliases, and create_paras_moe_aliases is now a

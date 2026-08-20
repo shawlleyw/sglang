@@ -3,14 +3,22 @@
 **Status:** Implemented in
 [`paras_memory_manager.py`](../../python/sglang/srt/paras/paras_memory_manager.py)
 and the switch orchestration. The CPU layout tests validate materialized
-four-anchor offsets. `test_weight_transfer.py` validates both intra-node
+overlapped-layout offsets. `test_weight_transfer.py` validates both intra-node
 transports for EP4 <-> TP4, and `test_weight_transfer_tp_instances.py`
 validates both transports plus the DP all-gather for EP4 <-> two TP2
-instances.
+instances. `test_memory_manager_capacity_gpu.py` additionally drives the
+capacity solver and real CUDA allocation for both topologies.
 
-**Scope:** This document describes the layout that replaced the `N+1` identical MoE weight slots. It supports `ep_size ≥ tp_size` with uniform or hybrid (sliding-window + full) attention cache, subject to the production capacity invariant `ct[i] ≤ ce[i]` described below.
+**Scope:** This document describes the layout that replaced the `N+1` identical MoE weight slots. It supports `ep_size ≥ tp_size` with uniform or hybrid (sliding-window + full) attention cache, subject to the production capacity invariant `tp_layer_kv_bytes[i] ≤ ep_layer_kv_bytes[i]` described below.
 
-**Two refinements landed during implementation.** (1) The address formula retains the general cache tail anchor `ANCHOR = max_i(ct_i + Σ_{k>i}(ct_k − ce_k))`, but the production KV budget reserves one `max(ct)` tail layer and therefore enforces `ct[i] ≤ ce[i]`; under that invariant the formula reduces to `max(ct)`. (2) The per-layer shapes match the ParaS forward exactly: EP holds `num_experts/ep_size` experts with the **full** intermediate; TP holds **all** `num_experts` with the intermediate sharded by `tp_size` (equal bytes at `G=1`, TP `G`× larger for `G>1`). The switch loop orders are flipped from the old slot design: EP→TP runs cache-then-weights in **reverse** layer order; TP→EP runs weights-then-cache in **forward** order.
+**Two refinements landed during implementation.** First, the general TP KV
+tail is
+`TP_KV_TAIL = max_i(tp_layer_kv_bytes[i] + Σ_{k>i}(tp_layer_kv_bytes[k] - ep_layer_kv_bytes[k]))`.
+Production enforces `tp_layer_kv_bytes[i] <= ep_layer_kv_bytes[i]`, so this
+reduces to the largest TP KV layer. Second, EP holds
+`num_experts/ep_size` complete experts, while TP holds all experts with the
+intermediate dimension sharded by `tp_size`. EP -> TP transfers KV and then
+weights in reverse layer order; TP -> EP uses forward layer order.
 
 ## Overview
 
@@ -24,34 +32,39 @@ Two properties frame the design. EP and TP are never live at the same time, so a
 
 ## Per-Layer Sizes and the One Invariant
 
-For `N` layers, write per-layer, per-GPU byte sizes `we[i]`, `wt[i]` (weights) and `ce[i]`, `ct[i]` (cache). `ep_size ≥ tp_size` gives two structural facts:
+For `N` layers, write per-layer, per-GPU byte sizes `ep_layer_expert_bytes[i]`, `tp_layer_expert_bytes[i]` (weights) and `ep_layer_kv_bytes[i]`, `tp_layer_kv_bytes[i]` (cache). `ep_size ≥ tp_size` gives two structural facts:
 
-- **weights:** `we[i] ≤ wt[i]` (`wt[i] = G · we[i]`),
-- **cache:** `ce[i] ≥ ct[i]` (EP holds the larger cache per layer).
+- **weights:** `ep_layer_expert_bytes[i] ≤ tp_layer_expert_bytes[i]` (`tp_layer_expert_bytes[i] = G · ep_layer_expert_bytes[i]`),
+- **cache:** `ep_layer_kv_bytes[i] ≥ tp_layer_kv_bytes[i]` (EP holds the larger cache per layer).
 
-Correctness rests on the **single invariant `ce[i] ≥ ct[i]`**, and `compute_layout` asserts it, so a violation (only possible if `tp_size > ep_size`) fails at build time rather than corrupting memory. Nothing else is assumed: no uniformity across layers, no ordering, no particular `G`.
+Correctness rests on the **single invariant `ep_layer_kv_bytes[i] ≥ tp_layer_kv_bytes[i]`**, and `compute_layout` asserts it, so a violation (only possible if `tp_size > ep_size`) fails at build time rather than corrupting memory. Nothing else is assumed: no uniformity across layers, no ordering, no particular `G`.
 
-## The Layout: Four Anchors
+## The Overlapped Layout
 
-Let `P` be the base offset, `Σx` a total, and all regions 256-byte aligned. Read per mode, each is `weights | pad | cache` in address order.
+Let `P` be the base offset, `Σx` a total, and all regions 256-byte aligned. Read per mode, each is `weights | ep_kv_pad_bytes | cache` in address order.
 
 ```
-EP weights:  EW[i].start = P + cumsum(we)[i]                         # forward from P
-EP cache:    EC[i].start = P + Σwe + PAD + cumsum(ce)[i]             # forward, after the seam
+EP weights:  EW[i].start = P + cumsum(ep_layer_expert_bytes)[i]                         # forward from P
+EP cache:    EC[i].start = P + Σep_layer_expert_bytes + ep_kv_pad_bytes + cumsum(ep_layer_kv_bytes)[i]             # forward, after the seam
              EP_end      = EC[N-1].end
-TP weights:  TW[i].start = (P + we[0]) + cumsum(wt)[i]               # first layer at the head
-TP cache:    tc_end      = EP_end + max(ct)                          # anchor: last layer ends here
-             TC[i].start = (tc_end - Σct) + cumsum(ct)[i]            # forward, same as the others
+TP weights:  TW[i].start = (P + ep_layer_expert_bytes[0]) + cumsum(tp_layer_expert_bytes)[i]               # first layer at the head
+TP cache:    tc_end      = EP_end + max(tp_layer_kv_bytes)                          # tp_kv_tail_bytes: last layer ends here
+             TC[i].start = (tc_end - Σtp_layer_kv_bytes) + cumsum(tp_layer_kv_bytes)[i]            # forward, same as the others
 
-PAD = max(0, tp_w_end - (P+Σwe) - Σce + Σct - max(ct))               # tp_w_end = P + we[0] + Σwt
+ep_kv_pad_bytes = max(0, tp_w_end - (P+Σep_layer_expert_bytes) - Σep_layer_kv_bytes + Σtp_layer_kv_bytes - max(tp_layer_kv_bytes))               # tp_w_end = P + ep_layer_expert_bytes[0] + Σtp_layer_expert_bytes
 ```
 
-`EP` is packed tight as `[weights | PAD | cache]`. The head offset `we[0]` keeps TP weight layer 0 off EP weight layer 0. The large TP weights then extend forward into the EP-cache region — that overlap is what keeps the buffer near `B`. The TP cache is anchored so its **last layer ends at `EP_end + max(ct)`** and is laid forward from `tc_end − Σct`, identical in form to the other three blocks. `PAD` is the seam that keeps the forward TP weights off the TP cache.
+EP is packed as `[weights | ep_kv_pad_bytes | KV]`. The
+`ep_layer_expert_bytes[0]` offset keeps TP expert layer 0 separate from EP
+expert layer 0. Larger TP expert weights then extend into EP KV storage. TP KV
+is placed forward from `tc_end - Σtp_layer_kv_bytes`, with its final layer
+ending at `EP_end + tp_kv_tail_bytes`. The padding keeps TP expert weights
+separate from TP KV.
 
 ```
-P ── EW0 EW1 … EW(N-1) │ PAD │ EC0 EC1 … EC(N-1) ──────── EP_end ─── +max(ct)
-     ␣we0␣ TW0 TW1 … TW(N-1) ……(over EP cache)…… TC0 TC1 … TC(N-1) ── tc_end
-       head: EP-only (we0)                                    tail: TP-only (max ct)
+P ── EW0 EW1 … EW(N-1) │ ep_kv_pad_bytes │ EC0 EC1 … EC(N-1) ──────── EP_end ─── +max(tp_layer_kv_bytes)
+     <EW0> TW0 TW1 … TW(N-1) ……(over EP KV)…… TC0 TC1 … TC(N-1) ── tc_end
+       head: EP layer 0                                 tail: largest TP KV layer
 ```
 
 ## Reference Code
@@ -59,54 +72,58 @@ P ── EW0 EW1 … EW(N-1) │ PAD │ EC0 EC1 … EC(N-1) ──────�
 The exact address math ([`paras_layout.py`](../../benchmark/paras/paras_layout.py)):
 
 ```python
-def compute_layout(we, wt, ce, ct, align=ALIGN, P=0):
-    N = len(we)
-    we = [_au(x) for x in we]; wt = [_au(x) for x in wt]
-    ce = [_au(x) for x in ce]; ct = [_au(x) for x in ct]
-    sum_we, sum_wt, sum_ce, sum_ct = sum(we), sum(wt), sum(ce), sum(ct)
+def compute_layout(ep_layer_expert_bytes, tp_layer_expert_bytes, ep_layer_kv_bytes, tp_layer_kv_bytes, align=ALIGN, P=0):
+    N = len(ep_layer_expert_bytes)
+    ep_layer_expert_bytes = [_au(x) for x in ep_layer_expert_bytes]; tp_layer_expert_bytes = [_au(x) for x in tp_layer_expert_bytes]
+    ep_layer_kv_bytes = [_au(x) for x in ep_layer_kv_bytes]; tp_layer_kv_bytes = [_au(x) for x in tp_layer_kv_bytes]
+    ep_expert_bytes, tp_expert_bytes, ep_kv_bytes, tp_kv_bytes = sum(ep_layer_expert_bytes), sum(tp_layer_expert_bytes), sum(ep_layer_kv_bytes), sum(tp_layer_kv_bytes)
 
-    # The address formula is general; production currently enforces ct <= ce
-    # because reserve_kv_cache budgets only a max(ct) tail layer.
-    assert all(ct[i] <= ce[i] for i in range(N))
-    anchor, suffix = 0, 0
+    # The address formula is general; production currently enforces tp_layer_kv_bytes <= ep_layer_kv_bytes
+    # because reserve_kv_cache budgets only a max(tp_layer_kv_bytes) tail layer.
+    assert all(tp_layer_kv_bytes[i] <= ep_layer_kv_bytes[i] for i in range(N))
+    tp_kv_tail_bytes, suffix = 0, 0
     for i in range(N - 1, -1, -1):
-        anchor = max(anchor, ct[i] + suffix)
-        suffix += ct[i] - ce[i]
+        tp_kv_tail_bytes = max(tp_kv_tail_bytes, tp_layer_kv_bytes[i] + suffix)
+        suffix += tp_layer_kv_bytes[i] - ep_layer_kv_bytes[i]
 
-    w_end    = P + sum_we
-    tp_w_end = P + we[0] + sum_wt
-    PAD      = _au(max(0, tp_w_end - w_end - sum_ce + sum_ct - anchor))
-    EP_end   = w_end + PAD + sum_ce
-    tc_end   = EP_end + anchor
+    w_end    = P + ep_expert_bytes
+    tp_w_end = P + ep_layer_expert_bytes[0] + tp_expert_bytes
+    ep_kv_pad_bytes      = _au(max(0, tp_w_end - w_end - ep_kv_bytes + tp_kv_bytes - tp_kv_tail_bytes))
+    EP_end   = w_end + ep_kv_pad_bytes + ep_kv_bytes
+    tc_end   = EP_end + tp_kv_tail_bytes
 
     addr = {}
     off = P
-    for i in range(N): addr[("ep", i, "w")] = (off, we[i]); off += we[i]
-    off = P + we[0]
-    for i in range(N): addr[("tp", i, "w")] = (off, wt[i]); off += wt[i]
-    off = w_end + PAD
-    for i in range(N): addr[("ep", i, "c")] = (off, ce[i]); off += ce[i]
-    off = tc_end - sum_ct
-    for i in range(N): addr[("tp", i, "c")] = (off, ct[i]); off += ct[i]
+    for i in range(N): addr[("ep", i, "w")] = (off, ep_layer_expert_bytes[i]); off += ep_layer_expert_bytes[i]
+    off = P + ep_layer_expert_bytes[0]
+    for i in range(N): addr[("tp", i, "w")] = (off, tp_layer_expert_bytes[i]); off += tp_layer_expert_bytes[i]
+    off = w_end + ep_kv_pad_bytes
+    for i in range(N): addr[("ep", i, "c")] = (off, ep_layer_kv_bytes[i]); off += ep_layer_kv_bytes[i]
+    off = tc_end - tp_kv_bytes
+    for i in range(N): addr[("tp", i, "c")] = (off, tp_layer_kv_bytes[i]); off += tp_layer_kv_bytes[i]
 
-    return {"addr": addr, "PAD": PAD, "EP_end": EP_end, "buffer_bytes": tc_end - P, ...}
+    return {"addr": addr, "ep_kv_pad_bytes": ep_kv_pad_bytes, "EP_end": EP_end, "buffer_bytes": tc_end - P, ...}
 ```
 
-`check_safe` in the same file re-validates, at materialization, per-mode contiguity, the exact anchors, and the non-clobber condition for both switch directions (EP→TP transfers cache `N-1..0` then weights `N-1..0`; TP→EP the reverse).
+`check_safe` in the same file re-validates, at materialization, per-mode contiguity, the exact region endpoints, and the non-clobber condition for both switch directions (EP→TP transfers cache `N-1..0` then weights `N-1..0`; TP→EP the reverse).
 
 ## Why It Is Safe
 
-The only cross-mode hazard is a layer's EP cache overlapping its TP cache. With EP cache forward from `A = P+Σwe+PAD` and TP cache anchored at `tc_end = EP_end + max(ct)`, "EP cache before TP cache at layer `i`" reduces to
+The only cross-mode hazard is a layer's EP cache overlapping its TP cache. With EP cache forward from `A = P+Σep_layer_expert_bytes+ep_kv_pad_bytes` and TP cache placed at `tc_end = EP_end + max(tp_layer_kv_bytes)`, "EP cache before TP cache at layer `i`" reduces to
 
 ```
-ct[i] - Σ_{k>i}(ce[k] - ct[k])  ≤  max(ct)
+tp_layer_kv_bytes[i] - Σ_{k>i}(ep_layer_kv_bytes[k] - tp_layer_kv_bytes[k])  ≤  max(tp_layer_kv_bytes)
 ```
 
-The left side is `≤ ct[i] ≤ max(ct)` **purely because `ce[k] ≥ ct[k]`**. This holds for every layer, in any order, for any per-layer sizes — which is exactly why hybrid SWA + full attention needs no reordering and introduces no bug. The `max(ct)` anchor (biggest single TP-cache layer) is the whole trick. Weights overlap safely because the transfer moves all cache before any weights, freeing the EP-cache region before TP weights land on it.
+The left side is at most `tp_layer_kv_bytes[i]`, which is at most the
+largest TP KV layer because every EP KV layer is at least as large as its TP
+counterpart. This holds for uniform and hybrid SWA layouts. Expert weights
+overlap safely because the transfer moves all KV first, freeing the EP KV
+region before TP expert weights are written.
 
 ## Memory Overhead
 
-Let `SE = we[0]` (one EP-weight layer) and `MC = max(ct)` (biggest TP-cache layer). With the elastic budget making the EP and TP footprints equal (`B`), the buffer is
+Let `SE = ep_layer_expert_bytes[0]` (one EP-weight layer) and `MC = max(tp_layer_kv_bytes)` (biggest TP-cache layer). With the elastic budget making the EP and TP footprints equal (`B`), the buffer is
 
 ```
 buffer = B + max(SE, MC)
@@ -114,8 +131,8 @@ buffer = B + max(SE, MC)
 
 — the shared budget plus **one layer**. The slack lands in exactly one seam (a seesaw), never both:
 
-- `MC ≥ SE` → `PAD = 0`, the extra layer is the TP-cache tail overhang `MC`;
-- `SE > MC` → `PAD = SE − MC`, the extra layer is the EP-weight head slab `SE`.
+- `MC ≥ SE` → `ep_kv_pad_bytes = 0`, the extra layer is the TP-cache tail overhang `MC`;
+- `SE > MC` → `ep_kv_pad_bytes = SE − MC`, the extra layer is the EP-weight head slab `SE`.
 
 Rounding (token flooring + 256-byte alignment) adds a token-scale term far below one layer. Prototype confirmation:
 
@@ -123,17 +140,17 @@ Rounding (token flooring + 256-byte alignment) adds a token-scale term far below
 |---|---|---|---|
 | qwen3-30B N48 G2 | 60000 MB | 650 MB | 650 |
 | qwen3-235B N94 G2 | 126900 MB | 550 MB | 550 |
-| adversarial `SE>CT` | 880 MB | 100 MB | 100 (PAD=80) |
-| hybrid SWA+full | — | 30 MB | 30 (`= max ct`, every pattern) |
+| adversarial `SE>CT` | 880 MB | 100 MB | 100 (ep_kv_pad_bytes=80) |
+| hybrid SWA+full | — | 30 MB | 30 (`= max tp_layer_kv_bytes`, every pattern) |
 
 ## Integration
 
-The change surface is in [`paras_memory_manager.py`](../../python/sglang/srt/paras/paras_memory_manager.py). Consumers key off entry names (`experts`, `ep_experts`, `tp_experts`) and `.offset_bytes`, so the contract to preserve is the names, not the offsets. The four-anchor places **EP low / TP high**, the mirror of the former slot layout, so transfer offsets are assigned accordingly.
+The change surface is in [`paras_memory_manager.py`](../../python/sglang/srt/paras/paras_memory_manager.py). Consumers key off entry names (`experts`, `ep_experts`, `tp_experts`) and `.offset_bytes`, so the contract to preserve is the names, not the offsets. The overlapped-layout places **EP low / TP high**, the mirror of the former slot layout, so transfer offsets are assigned accordingly.
 
 | Function | Change |
 |----------|--------|
 | `plan_qwen_moe_layout` / `plan_gpt_oss_moe_layout` | Stop reserving `N+1` identical `paras.moe_slot.{i}` pairs; record per-layer sizes for deferred placement. |
-| `create_paras_moe_aliases` | Replace slot aliasing with direct EP/TP entries at the four-anchor offsets; keep `experts → ep_experts`. |
+| `create_paras_moe_aliases` | Replace slot aliasing with direct EP/TP entries at the overlapped-layout offsets; keep `experts → ep_experts`. |
 | `alias` | Add a sibling that registers an entry at an explicit offset (keep the mirror path). |
 | `materialize` | Place all four blocks per `compute_layout`, then assert the non-clobber condition. |
 | `_compute_umm_budget_bytes` / `_plan_balanced_kv_footprint` | Derive the static UMM limit, then select separate EP and TP KV capacities whose exact combined layout fits it. |
@@ -202,7 +219,7 @@ four EP shards without inter-node communication.
 
 | Document | Contents |
 |----------|----------|
-| [`unified_memory_manager.md`](unified_memory_manager.md) | Current allocator lifecycle, four-anchor placement, views, and invariants. |
+| [`unified_memory_manager.md`](unified_memory_manager.md) | Current allocator lifecycle, overlapped-layout placement, views, and invariants. |
 | [`parallelism_switch.md`](parallelism_switch.md) | Runtime EP↔TP switch control flow, race-safety invariants, and verified performance. |
 | [`nvlink_peer_access_weight_transfer.md`](nvlink_peer_access_weight_transfer.md) | NVLink weight-transfer kernel design, synchronization, and tuning. |
 | [`nvlink_peer_access_kv_cache_transfer.md`](nvlink_peer_access_kv_cache_transfer.md) | KV-cache transfer kernels and NCCL fallback. |

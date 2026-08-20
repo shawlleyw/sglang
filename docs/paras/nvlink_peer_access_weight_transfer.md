@@ -32,7 +32,7 @@ node. A DP group connects ranks with the same `tp_rank` across TP instances.
 CUDA IPC and the NCCL all-to-all are therefore scoped to the local TP group.
 The DP group is used only for EP -> TP replication.
 
-The four-anchor memory layout registers stable EP and TP views for every layer.
+The overlapped memory layout registers stable EP and TP views for every layer.
 EP -> TP processes layers in reverse order; TP -> EP processes them in forward
 order. See [`unified_memory_ep_tp.md`](unified_memory_ep_tp.md) for the
 address proof.
@@ -135,6 +135,6 @@ cross-instance replication belongs to the DP all-gather.
 | `paras/weight_transfer.py` | Intra-node method enum and environment resolution |
 | `paras/peer_access.py` | CUDA IPC initialization and semantic kernel wrappers |
 | `paras/csrc/peer_access_transfer.cu` | Baseline v2 forward/reverse kernels |
-| `paras/paras_memory_manager.py` | Four-anchor EP/TP views and optional NCCL staging |
+| `paras/paras_memory_manager.py` | Overlapped EP/TP views and optional NCCL staging |
 | `test/srt/paras/test_weight_transfer.py` | EP4 <-> TP4, NCCL and peer_access |
 | `test/srt/paras/test_weight_transfer_tp_instances.py` | EP4 <-> two TP2 instances, both local transports and w13 layouts plus DP all-gather |

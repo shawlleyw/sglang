@@ -1,4 +1,4 @@
-"""CPU unit tests for the ParaS four-anchor unified layout.
+"""CPU unit tests for the ParaS overlapped-layout unified layout.
 
 Validates, against the real offsets produced by ``plan_qwen_moe_layout`` +
 ``reserve_kv_cache`` + ``materialize``, that:
@@ -138,7 +138,7 @@ def test_ep_tp_expert_shapes_match_forward():
 
 def test_g_greater_than_1_layout_shapes_and_safety():
     # G = ep_size / tp_size = 2 (dp_size=2): TP weights are G x EP weights, and
-    # the four-anchor layout stays clobber-safe in both switch directions.
+    # the overlapped layout stays clobber-safe in both switch directions.
     NE, H, I, EP, TP = 64, 2048, 1536, 4, 2
     mgr, _, N = _build(num_experts=NE, hidden=H, inter=I, ep=EP, tp=TP)
     ep_e = mgr._entries["model.layers.0.mlp.ep_experts.w13_weight"]
@@ -147,7 +147,9 @@ def test_g_greater_than_1_layout_shapes_and_safety():
     assert tuple(tp_e.shape) == (NE, 2 * (I // TP), H), tuple(tp_e.shape)
     assert tp_e.size_bytes == (EP // TP) * ep_e.size_bytes  # TP = G x EP
 
-    order_ep = [("c", i) for i in range(N - 1, -1, -1)] + [("w", i) for i in range(N - 1, -1, -1)]
+    order_ep = [("c", i) for i in range(N - 1, -1, -1)] + [
+        ("w", i) for i in range(N - 1, -1, -1)
+    ]
     _assert_no_clobber(mgr, N, order_ep, "ep", "tp")
     order_tp = [("w", i) for i in range(N)] + [("c", i) for i in range(N)]
     _assert_no_clobber(mgr, N, order_tp, "tp", "ep")
@@ -190,8 +192,15 @@ def test_deferred_expert_weights_are_materialized():
 def test_standalone_kv_degeneration():
     mgr = ParaSMemoryManager(device="cpu")
     mgr.reserve_kv_cache(
-        num_layers=4, ep_max_tokens=1024, tp_max_tokens=4096, num_kv_heads=8,
-        head_dim=128, kv_dtype=torch.bfloat16, tp_size=4, page_size=1, prefix="model",
+        num_layers=4,
+        ep_max_tokens=1024,
+        tp_max_tokens=4096,
+        num_kv_heads=8,
+        head_dim=128,
+        kv_dtype=torch.bfloat16,
+        tp_size=4,
+        page_size=1,
+        prefix="model",
     )
     mgr.materialize()
     for i in range(4):
@@ -203,14 +212,21 @@ def test_standalone_kv_degeneration():
         assert ep_v[0] >= ep[0] + ep[1]
 
 
-def test_anchor_reduces_to_max_ct_for_real_configs():
+def test_tp_kv_tail_matches_largest_tp_layer():
     # Real configs (num_kv_heads divisible by tp_size, page >= 1) always yield
-    # ct <= ce, so the general tail anchor collapses to max(ct).
+    # tp_layer_kv_bytes <= ep_layer_kv_bytes, so the TP KV tail equals the largest TP layer.
     mgr = ParaSMemoryManager(device="cpu")
     N = 4
     mgr.reserve_kv_cache(
-        num_layers=N, ep_max_tokens=1024, tp_max_tokens=4096, num_kv_heads=8,
-        head_dim=128, kv_dtype=torch.bfloat16, tp_size=4, page_size=1, prefix="model",
+        num_layers=N,
+        ep_max_tokens=1024,
+        tp_max_tokens=4096,
+        num_kv_heads=8,
+        head_dim=128,
+        kv_dtype=torch.bfloat16,
+        tp_size=4,
+        page_size=1,
+        prefix="model",
     )
     mgr.materialize()
 
@@ -222,16 +238,22 @@ def test_anchor_reduces_to_max_ct_for_real_configs():
         v = mgr._entries[f"model.layers.{i}.kv.{mode}.v"].size_bytes
         return au(k) + au(v)
 
-    ct = [slab("tp", i) for i in range(N)]
-    ce = [slab("ep", i) for i in range(N)]
-    assert all(ct[i] <= ce[i] for i in range(N)), (ct, ce)
+    tp_layer_kv_bytes = [slab("tp", i) for i in range(N)]
+    ep_layer_kv_bytes = [slab("ep", i) for i in range(N)]
+    assert all(tp_layer_kv_bytes[i] <= ep_layer_kv_bytes[i] for i in range(N)), (
+        tp_layer_kv_bytes,
+        ep_layer_kv_bytes,
+    )
 
-    # General anchor collapses to max(ct) when ct <= ce.
-    anchor, suffix = 0, 0
+    # TP KV tail equals the largest TP layer when every TP layer fits its EP counterpart.
+    tp_kv_tail_bytes, suffix = 0, 0
     for i in range(N - 1, -1, -1):
-        anchor = max(anchor, ct[i] + suffix)
-        suffix += ct[i] - ce[i]
-    assert anchor == max(ct), (anchor, max(ct))
+        tp_kv_tail_bytes = max(tp_kv_tail_bytes, tp_layer_kv_bytes[i] + suffix)
+        suffix += tp_layer_kv_bytes[i] - ep_layer_kv_bytes[i]
+    assert tp_kv_tail_bytes == max(tp_layer_kv_bytes), (
+        tp_kv_tail_bytes,
+        max(tp_layer_kv_bytes),
+    )
 
     _assert_no_clobber(mgr, N, [("c", i) for i in range(N - 1, -1, -1)], "ep", "tp")
     _assert_no_clobber(mgr, N, [("c", i) for i in range(N)], "tp", "ep")
@@ -282,8 +304,8 @@ def _build_budgeted_capacity_plan(*, ep_size, tp_size, hybrid=False, num_kv_head
         budget_bytes,
         0,
         budget_bytes,
-        budget_bytes,
         0,
+        budget_bytes,
         budget_bytes / (1 << 30),
     )
 
@@ -321,13 +343,13 @@ def test_mha_capacity_charges_larger_tp_weights_against_tp_cache():
         tp_size=2,
     )
 
-    weight_growth = plan.tp_expert_weight_bytes - plan.ep_expert_weight_bytes
-    assert plan.tp_expert_weight_bytes == 2 * plan.ep_expert_weight_bytes
+    weight_growth = plan.tp_expert_bytes - plan.ep_expert_bytes
+    assert plan.tp_expert_bytes == 2 * plan.ep_expert_bytes
     assert plan.ep_kv_bytes - plan.tp_kv_bytes >= weight_growth
     assert plan.tp_max_tokens < 2 * plan.ep_max_tokens
     assert total_bytes == plan.planned_umm_bytes
-    assert total_bytes <= plan.manager_budget_bytes
-    assert manager._planned_umm_bytes_limit == plan.manager_budget_bytes
+    assert total_bytes <= plan.umm_budget_bytes
+    assert manager._umm_budget_bytes == plan.umm_budget_bytes
 
 
 def test_mha_capacity_charges_tp_weights_with_replicated_kv_heads():
@@ -337,12 +359,12 @@ def test_mha_capacity_charges_tp_weights_with_replicated_kv_heads():
         num_kv_heads=1,
     )
 
-    weight_growth = plan.tp_expert_weight_bytes - plan.ep_expert_weight_bytes
+    weight_growth = plan.tp_expert_bytes - plan.ep_expert_bytes
     assert plan.ep_kv_heads == plan.tp_kv_heads == 1
     assert plan.ep_kv_bytes - plan.tp_kv_bytes >= weight_growth
     assert plan.tp_max_tokens < plan.ep_max_tokens
     assert total_bytes == plan.planned_umm_bytes
-    assert total_bytes <= plan.manager_budget_bytes
+    assert total_bytes <= plan.umm_budget_bytes
 
 
 def test_mha_capacity_preserves_equal_cache_bytes_when_weights_match():
@@ -351,10 +373,10 @@ def test_mha_capacity_preserves_equal_cache_bytes_when_weights_match():
         tp_size=2,
     )
 
-    assert plan.tp_expert_weight_bytes == plan.ep_expert_weight_bytes
+    assert plan.tp_expert_bytes == plan.ep_expert_bytes
     assert plan.tp_kv_bytes == plan.ep_kv_bytes
     assert total_bytes == plan.planned_umm_bytes
-    assert total_bytes <= plan.manager_budget_bytes
+    assert total_bytes <= plan.umm_budget_bytes
 
 
 def test_hybrid_capacity_charges_larger_tp_weights_against_tp_cache():
@@ -364,9 +386,9 @@ def test_hybrid_capacity_charges_larger_tp_weights_against_tp_cache():
         hybrid=True,
     )
 
-    weight_growth = plan.tp_expert_weight_bytes - plan.ep_expert_weight_bytes
+    weight_growth = plan.tp_expert_bytes - plan.ep_expert_bytes
     assert plan.ep_kv_bytes - plan.tp_kv_bytes >= weight_growth
     assert plan.tp_max_tokens < 2 * plan.ep_max_tokens
     assert plan.tp_max_tokens_swa < 2 * plan.ep_max_tokens_swa
     assert total_bytes == plan.planned_umm_bytes
-    assert total_bytes <= plan.manager_budget_bytes
+    assert total_bytes <= plan.umm_budget_bytes

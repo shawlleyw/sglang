@@ -138,7 +138,7 @@ class ParaSModelMixin:
         inter_node_stream = torch.cuda.Stream()
         gather_handles = []
 
-        # Reverse layer order preserves the four-anchor source/destination
+        # Reverse layer order preserves the overlapped source/destination
         # hazard. The DP all-gather consumes layer i while the local reshard
         # prepares layer i-1, overlapping inter-node and intra-node traffic.
         for layer in reversed(self.layers):
