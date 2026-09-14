@@ -565,10 +565,22 @@ def fused_experts_impl(
         min(M * topk, E + 1) * (max_block_m - 1) if down_moe_use_tma else 0
     )
     total_tokens = M * topk + max_padded_tokens
-    cache = torch.empty(
-        total_tokens * max(N, w2.shape[1]),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
+    from sglang.srt.paras.paras_memory_manager import get_paras_moe_workspace
+
+    workspace = get_paras_moe_workspace(
+        w1,
+        [(total_tokens * max(N, w2.shape[1]),), (total_tokens, N // 2)],
+        hidden_states.dtype,
+        hidden_states.device,
+    )
+    cache = (
+        workspace[0]
+        if workspace is not None
+        else torch.empty(
+            total_tokens * max(N, w2.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
     )
     intermediate_cache3 = cache[: M * topk * w2.shape[1]].view(
         (M, topk, w2.shape[1]),
@@ -621,10 +633,14 @@ def fused_experts_impl(
         intermediate_cache1 = cache[: total_tokens * N].view(
             (total_tokens, N),
         )
-        intermediate_cache2 = torch.empty(
-            (total_tokens, N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+        intermediate_cache2 = (
+            workspace[1][:total_tokens]
+            if workspace is not None
+            else torch.empty(
+                (total_tokens, N // 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         )
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]

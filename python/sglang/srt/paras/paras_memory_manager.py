@@ -269,7 +269,8 @@ class ParaSMemoryManager:
         self.ep_max_running_requests: int = 0
         self.tp_max_running_requests: int = 0
         self._kv_reserved: bool = False
-        
+        self._unified_spec = None
+        self._unified_layout = None
 
     # ----- reservation ----------------------------------------------------
 
@@ -318,6 +319,183 @@ class ParaSMemoryManager:
         return entry
 
     # ----- KV cache reservation -------------------------------------------
+
+    @property
+    def unified_workspace_enabled(self) -> bool:
+        return self._unified_spec is not None
+
+    def plan_unified_qwen(
+        self,
+        *,
+        num_layers,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        ep_size,
+        tp_size,
+        top_k,
+        prefix,
+    ):
+        """Register both layouts without reserving duplicate physical weights."""
+        from sglang.srt.paras.unified_layout import align_up, triton_workspace_sizes
+        from sglang.srt.utils import get_int_env_var
+
+        if ep_size != tp_size or num_experts % ep_size or intermediate_size % tp_size:
+            raise ValueError(
+                "Unified Qwen workspace requires equal EP/TP groups and divisible experts"
+            )
+        if num_heads % tp_size or (
+            tp_size % num_kv_heads
+            if tp_size >= num_kv_heads
+            else num_kv_heads % tp_size
+        ):
+            raise ValueError("Attention heads do not divide the configured TP group")
+        capacity = get_int_env_var(
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+        )
+        workspaces = triton_workspace_sizes(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            tp_size=tp_size,
+            dispatch_capacity=capacity,
+        )
+        spec = dict(
+            num_layers=num_layers,
+            prefix=prefix,
+            weight_names={"ep": [], "tp": []},
+            workspace_bytes=workspaces,
+            tp_size=tp_size,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            hidden_size=hidden_size,
+        )
+        for mode in ("ep", "tp"):
+            experts = num_experts // ep_size if mode == "ep" else num_experts
+            inter = intermediate_size if mode == "ep" else intermediate_size // tp_size
+            q = (
+                num_heads * head_dim
+                if mode == "ep"
+                else num_heads // tp_size * head_dim
+            )
+            kv = (
+                num_kv_heads * head_dim
+                if mode == "ep"
+                else max(1, num_kv_heads // tp_size) * head_dim
+            )
+            for i in range(num_layers):
+                lp = f"{prefix}.layers.{i}"
+                suffix = "weight" if mode == "ep" else "tp_weight"
+                entries = [
+                    (
+                        f"{lp}.mlp.{mode}_experts.w13_weight",
+                        (experts, 2 * inter, hidden_size),
+                    ),
+                    (
+                        f"{lp}.mlp.{mode}_experts.w2_weight",
+                        (experts, hidden_size, inter),
+                    ),
+                    (f"{lp}.self_attn.qkv_proj.{suffix}", (q + 2 * kv, hidden_size)),
+                    (f"{lp}.self_attn.o_proj.{suffix}", (hidden_size, q)),
+                ]
+                names = []
+                for name, shape in entries:
+                    self.reserve(name, shape, torch.bfloat16)
+                    self._reservation_order.remove(name)
+                    names.append(name)
+                spec["weight_names"][mode].append(names)
+                if mode == "ep":
+                    for weight in ("w13", "w2"):
+                        self._entries[f"{lp}.mlp.experts.{weight}_weight"] = (
+                            self._entries[f"{lp}.mlp.ep_experts.{weight}_weight"]
+                        )
+            spec[f"{mode}_weight_bytes"] = sum(
+                align_up(self._entries[n].size_bytes)
+                for n in spec["weight_names"][mode][0]
+            )
+        self._unified_spec = spec
+
+    def get_moe_workspace(self, mode, shapes, dtype, device):
+        """Typed, non-owning scratch views at the mode's fixed endpoint."""
+        if not self.unified_workspace_enabled:
+            return None
+        from sglang.srt.paras.unified_layout import align_up
+
+        if self._buffer is None or torch.device(device) != self._buffer.device:
+            raise RuntimeError("MoE workspace requested on a different device")
+        offset, capacity = self._unified_layout.workspace(mode)
+        cursor = 0
+        result = []
+        for shape in shapes:
+            size = math.prod(shape) * dtype.itemsize
+            cursor = align_up(cursor)
+            if cursor + size > capacity:
+                raise RuntimeError(
+                    f"ParaS {mode} workspace overflow: {cursor + size} > {capacity}"
+                )
+            result.append(
+                self._buffer[offset + cursor : offset + cursor + size]
+                .view(dtype)
+                .view(shape)
+            )
+            cursor += size
+        return result
+
+    def _materialize_unified(self):
+        layout, spec = self._unified_layout, self._unified_spec
+        if layout is None or not self._kv_reserved:
+            raise RuntimeError(
+                "Unified layout requires capacity planning and KV reservation"
+            )
+        if (layout.ep_tokens, layout.tp_tokens) != (
+            self.ep_max_kv_tokens,
+            self.tp_max_kv_tokens,
+        ):
+            raise ValueError("KV reservation differs from the unified capacity plan")
+        for mode in ("ep", "tp"):
+            for i, names in enumerate(spec["weight_names"][mode]):
+                offset = layout.weight_offset(mode, i)
+                for name in names:
+                    entry = self._entries[name]
+                    entry.offset_bytes = offset
+                    offset += self._align_up(entry.size_bytes, self.ALIGNMENT)
+                pending = self._paras_kv_pending
+                shape = pending[f"layer_{mode}_shapes"][i]
+                size = pending[f"layer_{mode}_bytes"][i]
+                dtype = pending["kv_dtype"]
+                for side, displacement in (("k", 0), ("v", size)):
+                    name = f"{spec['prefix']}.layers.{i}.kv.{mode}.{side}"
+                    entry = LayoutEntry(
+                        name,
+                        shape,
+                        dtype,
+                        math.prod(shape),
+                        dtype.itemsize,
+                        size,
+                        layout.cache_offset(mode, i) + displacement,
+                    )
+                    self._entries[name] = entry
+                    if mode == "ep":
+                        self._entries[f"{spec['prefix']}.layers.{i}.kv.{side}"] = entry
+        self._total_bytes = layout.budget
+        self._buffer = torch.empty(layout.budget, dtype=torch.uint8, device=self.device)
+        self._buffer_start = self._buffer.data_ptr()
+        self._buffer_end = self._buffer_start + layout.budget
+        self._workspace_weight_modes = {
+            (
+                self._buffer_start + self._entries[names[0]].offset_bytes,
+                self._entries[names[0]].shape,
+            ): mode
+            for mode in ("ep", "tp")
+            for names in spec["weight_names"][mode]
+        }
+        self._materialized = True
+        return layout.budget
 
     def reserve_kv_cache(
         self,
@@ -529,6 +707,47 @@ class ParaSMemoryManager:
 
         num_layers = config.num_hidden_layers
         num_kv_heads = config.num_key_value_heads
+
+        if self.unified_workspace_enabled:
+            from sglang.srt.paras.unified_layout import plan_unified_layout
+
+            spec = self._unified_spec
+            ep_row = num_kv_heads * head_dim * 2 * elem_size
+            tp_row = max(1, num_kv_heads // tp_size) * head_dim * 2 * elem_size
+            layout = plan_unified_layout(
+                num_layers=num_layers,
+                budget=umm_budget_bytes - non_umm_static_bytes,
+                ep_weight_bytes=spec["ep_weight_bytes"],
+                tp_weight_bytes=spec["tp_weight_bytes"],
+                ep_workspace_bytes=spec["workspace_bytes"][0],
+                tp_workspace_bytes=spec["workspace_bytes"][1],
+                ep_kv_row_bytes=ep_row,
+                tp_kv_row_bytes=tp_row,
+                page_size=self.server_args.page_size,
+            )
+            self._unified_layout = layout
+            self.ep_max_kv_tokens, self.tp_max_kv_tokens = (
+                layout.ep_tokens,
+                layout.tp_tokens,
+            )
+            logger.info("ParaS unified weights/KV/workspace: %s", layout)
+            return ParaSKVCapacityPlan(
+                available_gpu_memory_bytes=avail_now_bytes,
+                total_gpu_memory_bytes=total_gpu_bytes,
+                dynamic_reserve_bytes=dynamic_reserve_bytes,
+                umm_budget_bytes=layout.budget,
+                weights_only_bytes=self.weights_only_bytes,
+                non_umm_static_bytes=non_umm_static_bytes,
+                kv_budget_bytes=num_layers * layout.ep_cache_bytes,
+                kv_dtype=kv_dtype,
+                ep_max_tokens=layout.ep_tokens,
+                tp_max_tokens=layout.tp_tokens,
+                ep_cell_bytes=num_layers * ep_row,
+                tp_cell_bytes=num_layers * tp_row,
+                ep_kv_heads=num_kv_heads,
+                tp_kv_heads=max(1, num_kv_heads // tp_size),
+                full_layers=num_layers,
+            )
 
         ep_kv_heads = num_kv_heads
         tp_kv_heads = max(1, num_kv_heads // tp_size)
@@ -789,6 +1008,8 @@ class ParaSMemoryManager:
           falls within our managed buffer. This is used to distinguish managed vs. external
           tensors during parameter wrapping.
         """
+        if self.unified_workspace_enabled:
+            return self._materialize_unified()
         offset = 0
         for name in self._reservation_order:
             entry = self._entries[name]
@@ -1065,6 +1286,10 @@ class ParaSMemoryManager:
     @property
     def weights_only_bytes(self) -> int:
         """Total reserved bytes NOT including KV cache entries (for KV sizing)."""
+        if self.unified_workspace_enabled:
+            return (
+                self._unified_spec["num_layers"] * self._unified_spec["ep_weight_bytes"]
+            )
         return sum(
             self._entries[n].size_bytes
             for n in self._reservation_order
@@ -1105,9 +1330,28 @@ def get_global_paras_memory_manager() -> Optional[ParaSMemoryManager]:
     return _global_paras_memory_manager
 
 
+def get_paras_workspace_mode(weight):
+    mgr = get_global_paras_memory_manager()
+    if mgr is None or not mgr.unified_workspace_enabled or not mgr.materialized:
+        return None
+    # Opposite-mode views may start at the same address (EP layer 0 and
+    # TP layer 1, for example). Their expert dimensions distinguish them.
+    return mgr._workspace_weight_modes.get((weight.data_ptr(), tuple(weight.shape)))
+
+
+def get_paras_moe_workspace(weight, shapes, dtype, device):
+    mode = get_paras_workspace_mode(weight)
+    if mode is None:
+        return None
+    return get_global_paras_memory_manager().get_moe_workspace(
+        mode, shapes, dtype, device
+    )
+
+
 # ---------------------------------------------------------------------------
 # Qwen MoE layout planning
 # ---------------------------------------------------------------------------
+
 
 def plan_qwen_moe_layout(
     manager: ParaSMemoryManager,
@@ -1128,6 +1372,8 @@ def plan_qwen_moe_layout(
     num_fused_shared_experts: int = 0,
     configure_method: str = "peer_access",
     prefix: str = "model",
+    unified_workspace: bool = False,
+    top_k: int = 8,
 ) -> None:
     """
     Reserve all weight tensors for a Qwen sparse-MoE model.
@@ -1149,6 +1395,31 @@ def plan_qwen_moe_layout(
       modifying the original full weight and enables efficient in-place operations.
     """
     _validate_v1_scope(num_fused_shared_experts, quant_name)
+
+    if unified_workspace:
+        if (
+            quant_name
+            or moe_tp_size != 1
+            or dp_size != 1
+            or configure_method != "peer_access"
+        ):
+            raise ValueError(
+                "Unified attention/workspace currently requires BF16, equal EP/TP, and peer_access"
+            )
+        manager.plan_unified_qwen(
+            num_layers=num_layers,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            ep_size=ep_size,
+            tp_size=tp_size,
+            top_k=top_k,
+            prefix=prefix,
+        )
+        return
 
     is_fp8 = quant_name == "fp8"
     weight_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
@@ -1315,6 +1586,8 @@ def create_paras_moe_aliases(
     ep_experts layer i → slot i+1 (same physical buffer as EP weights)
     tp_experts layer i → slot i   (one slot before EP, for fused transfer)
     """
+    if manager.unified_workspace_enabled:
+        return
     for i in range(num_layers):
         manager.alias(f"{prefix}.layers.{i}.mlp.ep_experts.w13_weight", f"paras.moe_slot.{i+1}.w13")
         manager.alias(f"{prefix}.layers.{i}.mlp.ep_experts.w2_weight", f"paras.moe_slot.{i+1}.w2")

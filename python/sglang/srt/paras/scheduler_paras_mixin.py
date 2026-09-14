@@ -287,11 +287,11 @@ class SchedulerParasMixin:
     """
     This class implements the parallel configuration logic for Scheduler.
     """
-    
+
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: MHATokenToKVPool
     token_to_kv_pool_allocator: TokenToKVPoolAllocator
-    
+
     def init_paras_config(self):
         # Always initialize so non-ParaS schedulers can no-op the event-loop hook
         # with a single `if self._paras_auto_policy is not None:` check.
@@ -578,18 +578,18 @@ class SchedulerParasMixin:
             f"ParaS auto-switch policy fired: {self.paras_parallelism_config} -> {target}"
         )
         return ParaSAutoSwitchReq(target=req_type)
-    
+
     def paras_get_req_seqlens(self, reqs: List[Req]):
         seqlens = []
         for req in reqs:
             seqlens.append(req.seqlen)
         return seqlens
-    
+
     def paras_get_local_reqs(self):
         # Merge the last batch into the running batch, now every request is in the decode status
         self.merge_last_batch()
         return self.running_batch.reqs
-    
+
     @paras_func
     def paras_configure_tp(self):
         if self.paras_parallelism_config == "TP":
@@ -619,7 +619,7 @@ class SchedulerParasMixin:
         self.server_args.dp_size = 1
         self.server_args.ep_size = 1
         moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.NONE
-        
+
         self.paras_start_profile("/tmp/paras_configure_profile")
         self.tree_cache.reset()
         local_reqs = self.paras_get_local_reqs()
@@ -643,9 +643,9 @@ class SchedulerParasMixin:
                 None,
             ),
         )
-        
+
         start_time = time.time()
-        
+
         with TimeReporter("gather_global_reqs"):
             paras_gather_manager.gather_global_reqs()
 
@@ -680,10 +680,18 @@ class SchedulerParasMixin:
 
         with TimeReporter("reorchestrate_cache"):
             paras_gather_manager.reorchestrate_cache()
-        
+
+        # TP KV overlaps EP weights in the unified workspace layout. Move
+        # weights first, but keep EP attention/cache metadata until migration.
+        model = self.tp_worker.model_runner.model
+        mgr = getattr(model, "paras_memory_manager", None)
+        if mgr is not None and mgr.unified_workspace_enabled:
+            with TimeReporter("transfer_unified_weights"):
+                model.model.paras_transfer_unified_weights("tp", self.paras_tp_rank)
+
         with TimeReporter("gather_cache"):
             paras_gather_manager.gather_cache()
-        
+
         self.running_batch = paras_gather_manager.get_new_running_batch(
             self.tokenizer,
             self.tree_cache,
@@ -708,7 +716,7 @@ class SchedulerParasMixin:
 
         self.paras_stop_profile()
 
-        # drop-in replacement for scheduler tp configs 
+        # drop-in replacement for scheduler tp configs
         self.tp_size = self.paras_tp_size
         self.tp_rank = self.paras_tp_rank
         self.attn_tp_group = self.paras_tp_group
@@ -716,7 +724,7 @@ class SchedulerParasMixin:
         self.tp_group = self.paras_tp_group
         self.tp_cpu_group = self.paras_tp_cpu_group
 
-        # NOTE(shaoyuw): attn_dp_rank should be dealt with more carefully. 
+        # NOTE(shaoyuw): attn_dp_rank should be dealt with more carefully.
         #                But now it seems to be used only a few times.
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             self.paras_tp_rank,
@@ -921,7 +929,7 @@ class SchedulerParasMixin:
         else:
             raise ValueError(f"Unrecognized ParaSConfigureReqType: {recv_req.type}")
         return ParaSConfigureReqOutput()
-    
+
     def paras_start_profile(self, output_dir: str = "/tmp/paras_configure_profile"):
         import os
         # Off by default: stop() exports a multi-MB/rank trace that blocks the
@@ -941,7 +949,7 @@ class SchedulerParasMixin:
             with_stack=True,
         )
         self.profiler.start()
-        
+
     def paras_stop_profile(self):
         if self.profiler is None:
             return

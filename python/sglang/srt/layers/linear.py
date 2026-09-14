@@ -1286,15 +1286,18 @@ class QKVParallelLinear(ColumnParallelLinear):
                 requires_grad=False,
             )
         set_weight_attrs(self._paras_tp_weight, {"input_dim": 1, "output_dim": 0})
-        self._paras_tp_weight.data[:q_rows].copy_(
-            full_weight_tensor[tp_head_start * hs : tp_head_end * hs]
-        )
-        self._paras_tp_weight.data[q_rows : q_rows + kv_rows].copy_(
-            full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs]
-        )
-        self._paras_tp_weight.data[q_rows + kv_rows : q_rows + 2 * kv_rows].copy_(
-            full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs]
-        )
+        # In the overlapping layout TP addresses may contain another layer's
+        # live EP weights. Populate only during the ordered weight transfer.
+        if mgr is None or not mgr.unified_workspace_enabled:
+            self._paras_tp_weight.data[:q_rows].copy_(
+                full_weight_tensor[tp_head_start * hs : tp_head_end * hs]
+            )
+            self._paras_tp_weight.data[q_rows : q_rows + kv_rows].copy_(
+                full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs]
+            )
+            self._paras_tp_weight.data[q_rows + kv_rows : q_rows + 2 * kv_rows].copy_(
+                full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs]
+            )
 
         scale_attr_name = None
         if hasattr(self, "weight_scale_inv"):
@@ -1603,7 +1606,8 @@ class RowParallelLinear(LinearBase):
                 requires_grad=False,
             )
         set_weight_attrs(self._paras_tp_weight, {"input_dim": 1, "output_dim": 0})
-        self._paras_tp_weight.data.copy_(full_weight_tensor[:, row_start:row_end])
+        if mgr is None or not mgr.unified_workspace_enabled:
+            self._paras_tp_weight.data.copy_(full_weight_tensor[:, row_start:row_end])
 
         scale_attr_name = None
         if hasattr(self, "weight_scale_inv"):

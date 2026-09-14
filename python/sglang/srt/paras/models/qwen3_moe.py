@@ -183,6 +183,15 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
             configure_method=configure_method,
             prefix="model",
+            unified_workspace=(
+                quant_config is None
+                and configure_method == "peer_access"
+                and moe_tp_size == dp_size == 1
+                and get_moe_expert_parallel_world_size() == get_paras_tp_size()
+                and get_paras_tp_size() > 1
+                and get_global_server_args().moe_runner_backend in ("auto", "triton")
+            ),
+            top_k=config.num_experts_per_tok,
         )
 
         plan = manager.plan_mha_kv_capacity(

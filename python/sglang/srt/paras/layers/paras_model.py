@@ -40,6 +40,42 @@ class ParaSModelMixin:
       - self.layers — list/ModuleList of decoder layers supporting paras methods
     """
 
+    def paras_transfer_unified_weights(self, mode: str, rank: int):
+        """Transfer one complete layer at a time, without rebinding KV/backend state.
+
+        The scheduler calls the TP direction before migrating KV; graph
+        initialization calls it through the ordinary configure methods.
+        """
+        mgr = get_global_paras_memory_manager()
+        if getattr(self, "_unified_weights_mode", "ep") == mode:
+            return
+        from sglang.srt.paras.attention_transfer import transfer_attention
+
+        group = get_paras_tp_group().device_group
+        if getattr(self, "_peer_access_ctx", None) is None:
+            self._peer_access_ctx = init_peer_access(mgr, group, get_paras_tp_size())
+        if not hasattr(self, "_unified_peer_bases"):
+            self._unified_peer_bases = torch.tensor(
+                self._peer_access_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+            )
+            self._unified_fence = torch.zeros(1, device="cuda")
+        layers = self.layers if mode == "tp" else reversed(self.layers)
+        for layer in layers:
+            if mode == "tp":
+                layer.paras_configure_tp_mlp_fused_peer_access_kernel(
+                    self._peer_access_ctx, self._unified_peer_bases, None
+                )
+            else:
+                layer.paras_configure_ep_mlp_fused_peer_access_kernel(
+                    self._peer_access_ctx, self._unified_peer_bases, None
+                )
+            transfer_attention(
+                mgr, layer.mlp._paras_layer_id, mode, rank, self._unified_peer_bases
+            )
+            dist.all_reduce(self._unified_fence, group=group)
+        torch.cuda.synchronize()
+        self._unified_weights_mode = mode
+
     def paras_configure_tp_naive(self, paras_tp_size: int, paras_tp_rank: int):
         """Sequential (non-overlapped) EP→TP conversion for all layers."""
         for layer in self.layers:
@@ -77,6 +113,12 @@ class ParaSModelMixin:
 
     def paras_configure_tp_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
         mgr = get_global_paras_memory_manager()
+        if mgr.unified_workspace_enabled:
+            self.paras_transfer_unified_weights("tp", paras_tp_rank)
+            for layer in self.layers:
+                layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
+                layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
+            return
 
         if not hasattr(self, '_peer_access_ctx') or self._peer_access_ctx is None:
             tp_group_tmp = get_paras_tp_group().device_group
@@ -144,6 +186,14 @@ class ParaSModelMixin:
     def paras_configure_ep_peer_access(self):
         """TP→EP via peer access kernels (reverse layer order) + attn/communicator restore."""
         mgr = get_global_paras_memory_manager()
+        if mgr.unified_workspace_enabled:
+            from sglang.srt.paras.paras_parallel_state import get_paras_tp_rank
+
+            self.paras_transfer_unified_weights("ep", get_paras_tp_rank())
+            for layer in self.layers:
+                layer.paras_configure_ep_attn()
+                layer.paras_configure_ep()
+            return
 
         if not hasattr(self, '_peer_access_ctx') or self._peer_access_ctx is None:
             tp_group_tmp = get_paras_tp_group().device_group

@@ -1,0 +1,84 @@
+"""Numerical checks for TP scratch reuse and bounded EP prefill chunks."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("mode", ["ep", "tp"])
+def test_managed_triton_matches_original_allocations(monkeypatch, mode):
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+        fused_experts_impl,
+        moe_align_block_size,
+    )
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.triton import (
+        TritonMoeQuantInfo,
+        TritonRunnerCore,
+        TritonRunnerInput,
+    )
+    from sglang.srt.paras import paras_memory_manager as memory
+    from sglang.srt.paras import unified_layout
+    from sglang.srt import server_args
+
+    monkeypatch.setattr(
+        server_args,
+        "_global_server_args",
+        SimpleNamespace(enable_deterministic_inference=False),
+    )
+
+    torch.manual_seed(7)
+    m, e, h, inter = 79, 4, 64, 64
+    x = torch.randn((m, h), device="cuda", dtype=torch.bfloat16)
+    w1 = torch.randn((e, 2 * inter, h), device="cuda", dtype=torch.bfloat16) * 0.1
+    w2 = torch.randn((e, h, inter), device="cuda", dtype=torch.bfloat16) * 0.1
+    k = 1 if mode == "ep" else 2
+    ids = torch.randint(e, (m, k), device="cuda", dtype=torch.int64)
+    weights = torch.rand((m, k), device="cuda")
+    monkeypatch.setattr(memory, "_global_paras_memory_manager", None)
+    if mode == "ep":
+        config = dict(
+            BLOCK_SIZE_M=16,
+            BLOCK_SIZE_N=32,
+            BLOCK_SIZE_K=32,
+            GROUP_SIZE_M=1,
+            num_warps=4,
+            num_stages=2,
+        )
+        aligned = moe_align_block_size(ids, config["BLOCK_SIZE_M"], e)
+        runner = TritonRunnerCore(MoeRunnerConfig(no_combine=True, inplace=False))
+        inputs = TritonRunnerInput(x, weights, ids, *aligned)
+        quant = TritonMoeQuantInfo(w1, w2)
+
+        def run():
+            return runner.run(inputs, quant, {"config": config}).hidden_states
+
+    else:
+
+        def run():
+            return fused_experts_impl(x, w1, w2, weights, ids)
+
+    expected = run()
+
+    # Force three EP chunks, including a short final chunk; reserve only a
+    # single chunk's intermediates so an unbounded implementation must fail.
+    monkeypatch.setattr(unified_layout, "MOE_CHUNK_ROWS", 32)
+    rows = 32 if mode == "ep" else m * k
+    size = unified_layout.align_up(rows * 2 * inter * 2)
+    size += unified_layout.align_up(rows * inter * 2)
+    mgr = memory.ParaSMemoryManager(device="cuda")
+    mgr._unified_spec = {}
+    mgr._unified_layout = SimpleNamespace(workspace=lambda _: (256, size))
+    mgr._buffer = torch.full((size + 512,), 23, device="cuda", dtype=torch.uint8)
+    mgr._materialized = True
+    mgr._workspace_weight_modes = {(w1.data_ptr(), tuple(w1.shape)): mode}
+    monkeypatch.setattr(memory, "_global_paras_memory_manager", mgr)
+    actual = run()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # Returned outputs must survive reuse by subsequent layers.
+    mgr._buffer[256:-256].fill_(0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.all(mgr._buffer[:256] == 23)
+    assert torch.all(mgr._buffer[-256:] == 23)

@@ -1,5 +1,29 @@
 # ParaS Unified Memory Manager
 
+## Asymmetric attention and workspace layout
+
+Unquantized Qwen3 MoE with equal EP/TP groups, `peer_access`, and Triton MoE
+now uses the asymmetric layout described in
+[Attention layout switching and MoE workspace reuse](memory_reuse_design.md).
+The remaining sections describe the legacy layout retained by other configurations.
+
+```
+EP: [front: MoE scratch / transfer gap][EP weights][EP KV]
+TP: [TP weights][TP KV][tail: MoE scratch / transfer gap]
+```
+
+Weights include experts and QKV/O attention projections. Attention switches
+live; TP mode retains no full DP attention backup. Each endpoint holds
+mode-specific Triton intermediates, with larger TP token batches accounted
+for before KV capacity is chosen. One endpoint is shared across all layers.
+DeepEP transport buffers and outputs that outlive the runner remain external.
+
+For Qwen3-30B-A3B BF16 on four A100s at static fraction 0.7, the measured
+plan is 52.865405 GiB per GPU: EP has a 1.059124 GiB front, 15.187500 GiB
+weights and 36.618713 GiB KV; TP has 13.921875 GiB weights, 36.618759 GiB KV
+and a 2.324749 GiB tail. See the linked design for formulas and the 235B
+DEP8/TP8 calculation.
+
 ## Overview
 
 The ParaS Unified Memory Manager (`ParaSMemoryManager`) is a static, contiguous GPU memory allocator that owns **all** persistent memory for ParaS-enabled MoE models: expert weights, attention weights, staging buffers, and KV cache — in a single `torch.empty(..., dtype=torch.uint8)` allocation.
