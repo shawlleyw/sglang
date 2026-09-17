@@ -10,10 +10,11 @@ from sglang.srt.paras.workspace import (
     ModeWorkspaces,
     WorkspaceRequirement,
     attention_workspace_requirements,
+    triton_attention_split_config,
 )
 
 
-def requirements(backend, **overrides):
+def requirements(backend, *, resolved_context_len=None, num_heads=64, **overrides):
     args = dict(
         attention_backend=backend,
         enable_two_batch_overlap=False,
@@ -33,10 +34,16 @@ def requirements(backend, **overrides):
     args.update(overrides)
     config = SimpleNamespace(
         architectures=["Qwen3MoeForCausalLM"],
-        num_attention_heads=64,
+        num_attention_heads=num_heads,
         max_position_embeddings=32768,
     )
-    return attention_workspace_requirements(SimpleNamespace(**args), config, 8, 128)
+    return attention_workspace_requirements(
+        SimpleNamespace(**args),
+        config,
+        8,
+        128,
+        context_len=resolved_context_len or args["context_length"] or 32768,
+    )
 
 
 def test_flashinfer_configuration(monkeypatch):
@@ -61,6 +68,30 @@ def test_triton_preserves_existing_graph_capacity():
     )
     assert ep.size_bytes == 1032 << 20
     assert tp.size_bytes == 129 << 20
+
+
+def test_triton_uses_resolved_rope_context():
+    # The raw HF limit is 32768, but ModelConfig resolves 4x RoPE to 131072.
+    ep, tp = requirements(
+        "triton",
+        resolved_context_len=131072,
+        num_heads=32,
+        triton_attention_split_tile_size=4096,
+    )
+    assert ep.size_bytes == 1032 << 20
+    assert tp.size_bytes == 129 << 20
+
+
+def test_triton_deterministic_split_config(monkeypatch):
+    monkeypatch.setenv("SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", "4096")
+    args = SimpleNamespace(
+        enable_deterministic_inference=True,
+        triton_attention_num_kv_splits=8,
+        triton_attention_split_tile_size=None,
+    )
+    assert triton_attention_split_config(args, 131072) == (32, 4096)
+    with pytest.raises(ValueError, match="resolved context"):
+        triton_attention_split_config(args, None)
 
 
 @pytest.mark.parametrize(
@@ -116,7 +147,9 @@ def test_suballocation_alignment_and_validation():
 
 
 @pytest.mark.parametrize("backend_name", ["flashinfer", "triton"])
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Backend imports require CUDA")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Backend imports require CUDA"
+)
 def test_rebinding_does_not_overwrite_source_weights(monkeypatch, backend_name):
     from sglang.srt.paras.paras_memory_manager import ParaSMemoryManager
 

@@ -59,7 +59,26 @@ def triton_attention_workspace_size(tokens, heads, splits, head_dim):
     )
 
 
-def attention_workspace_requirements(server_args, config, tp_size, head_dim):
+def triton_attention_split_config(server_args, context_len):
+    """Return (maximum splits, tile size) using the resolved model context."""
+    from sglang.srt.utils import get_int_env_var
+
+    tile = server_args.triton_attention_split_tile_size
+    if server_args.enable_deterministic_inference:
+        tile = get_int_env_var("SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256)
+    splits = server_args.triton_attention_num_kv_splits
+    if tile is not None:
+        if context_len is None or context_len <= 0:
+            raise ValueError(
+                "Triton workspace sizing requires the resolved context length"
+            )
+        splits = (context_len + tile - 1) // tile
+    return splits, tile
+
+
+def attention_workspace_requirements(
+    server_args, config, tp_size, head_dim, *, context_len
+):
     """Resolve supported numerical scratch before constructing the backend.
 
     Preserve the existing graph runner's max(EP, TP) allocation capacity in both
@@ -67,7 +86,6 @@ def attention_workspace_requirements(server_args, config, tp_size, head_dim):
     independent workspace lifetimes. This does not change their allocation policy.
     """
     from sglang.srt.environ import envs
-    from sglang.srt.utils import get_int_env_var
 
     backend = server_args.attention_backend
     external = WorkspaceRequirement(backend, None)
@@ -89,13 +107,7 @@ def attention_workspace_requirements(server_args, config, tp_size, head_dim):
     if backend != "triton" or server_args.max_running_requests is None:
         return external, external
 
-    splits = server_args.triton_attention_num_kv_splits
-    tile = server_args.triton_attention_split_tile_size
-    if server_args.enable_deterministic_inference:
-        tile = get_int_env_var("SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256)
-    if tile is not None:
-        context = server_args.context_length or config.max_position_embeddings
-        splits = (context + tile - 1) // tile
+    splits, _ = triton_attention_split_config(server_args, context_len)
     graph_tokens = 0
     if not server_args.disable_cuda_graph:
         graph_tokens = max(

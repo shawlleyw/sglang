@@ -534,8 +534,12 @@ def fused_experts_impl(
     E, N, _ = w1.shape
     # We execute the fused_moe kernel in chunks to circumvent this issue:
     # https://github.com/vllm-project/vllm/issues/5938
-    CHUNK_SIZE = 64 * 1024
-    M = min(num_tokens, CHUNK_SIZE)
+    from sglang.srt.paras.unified_layout import (
+        MOE_CHUNK_ROWS,
+        validate_triton_workspace_blocks,
+    )
+
+    M = min(num_tokens, MOE_CHUNK_ROWS)
     config_dtype = get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
@@ -572,6 +576,11 @@ def fused_experts_impl(
         [(total_tokens * max(N, w2.shape[1]),), (total_tokens, N // 2)],
         hidden_states.dtype,
         hidden_states.device,
+        block_sizes=(
+            config["BLOCK_SIZE_M"],
+            down_config["BLOCK_SIZE_M"] if down_config is not None else None,
+            max_block_m,
+        ),
     )
     cache = (
         workspace[0]
@@ -600,10 +609,10 @@ def fused_experts_impl(
     else:
         out_hidden_states = torch.empty_like(hidden_states)
 
-    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
+    for chunk in range((num_tokens // MOE_CHUNK_ROWS) + 1):
         begin_chunk_idx, end_chunk_idx = (
-            chunk * CHUNK_SIZE,
-            min((chunk + 1) * CHUNK_SIZE, num_tokens),
+            chunk * MOE_CHUNK_ROWS,
+            min((chunk + 1) * MOE_CHUNK_ROWS, num_tokens),
         )
         curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
         tokens_in_chunk, _ = curr_hidden_states.shape
@@ -611,12 +620,17 @@ def fused_experts_impl(
         if tokens_in_chunk == 0:
             break
 
-        if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
+        if tokens_in_chunk < MOE_CHUNK_ROWS and chunk > 0:
             # Adjust the intermediate cache size and config for the last
             # chunk. Note that in most cases we only have one chunk
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
             config, (down_config, _) = get_config_func(tokens_in_chunk)
+            if workspace is not None:
+                validate_triton_workspace_blocks(
+                    config["BLOCK_SIZE_M"],
+                    down_config["BLOCK_SIZE_M"] if down_config is not None else None,
+                )
             down_moe_use_tma = (
                 _down_moe_use_tma()
                 and down_config is not None

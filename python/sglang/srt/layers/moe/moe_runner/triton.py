@@ -223,6 +223,7 @@ class TritonRunnerCore(MoeRunnerCore):
             [(M, topk_ids.shape[1], N), (M * topk_ids.shape[1], N // 2)],
             hidden_states.dtype,
             hidden_states.device,
+            block_sizes=(running_state["config"]["BLOCK_SIZE_M"],),
         )
         intermediate_cache1 = (
             workspace[0]

@@ -83,6 +83,10 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode):
     mgr._materialized = True
     mgr._workspace_weight_modes = {(w1.data_ptr(), tuple(w1.shape)): mode}
     monkeypatch.setattr(memory, "_global_paras_memory_manager", mgr)
+    with monkeypatch.context() as bounds:
+        bounds.setattr(unified_layout, "MOE_MAX_BLOCK_M", 1)
+        with pytest.raises(ValueError, match="selected configuration"):
+            run()
     actual = run()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     # Returned outputs must survive reuse by subsequent layers.

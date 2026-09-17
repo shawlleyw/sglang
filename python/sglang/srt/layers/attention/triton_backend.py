@@ -13,11 +13,11 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+from sglang.srt.paras.workspace import triton_attention_split_config
 from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
-    get_int_env_var,
     next_power_of_2,
 )
 
@@ -114,30 +114,18 @@ class TritonAttnBackend(AttentionBackend):
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
-        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        self.max_kv_splits, self.split_tile_size = triton_attention_split_config(
+            model_runner.server_args, self.max_context_len
+        )
 
         # Decide whether enable deterministic inference with batch-invariant operations
         self.enable_deterministic = (
             model_runner.server_args.enable_deterministic_inference
         )
 
-        # Configure deterministic inference settings
         if self.enable_deterministic:
-            # Use fixed split tile size for batch invariance
-            self.split_tile_size = get_int_env_var(
-                "SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256
-            )
             # Set static_kv_splits to False to use deterministic logic instead
             self.static_kv_splits = False
-        else:
-            self.split_tile_size = (
-                model_runner.server_args.triton_attention_split_tile_size
-            )
-
-        if self.split_tile_size is not None:
-            self.max_kv_splits = (
-                self.max_context_len + self.split_tile_size - 1
-            ) // self.split_tile_size
 
         # Check arguments
         assert not (

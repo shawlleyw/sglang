@@ -239,6 +239,7 @@ class ParaSMemoryManager:
         device: str = "cuda",
         gpu_id: Optional[int] = None,
         server_args: Optional["ServerArgs"] = None,
+        context_len: Optional[int] = None,
         cpu_group: Optional["ProcessGroup"] = None,
         world_size: int = 1,
     ) -> None:
@@ -250,6 +251,7 @@ class ParaSMemoryManager:
         else:
             self.gpu_id = 0
         self.server_args = server_args
+        self.context_len = context_len
         self.cpu_group = cpu_group
         self.world_size = world_size
 
@@ -758,7 +760,7 @@ class ParaSMemoryManager:
 
             spec = self._unified_spec
             attention = attention_workspace_requirements(
-                self.server_args, config, tp_size, head_dim
+                self.server_args, config, tp_size, head_dim, context_len=self.context_len
             )
             for mode, requirement in zip(("ep", "tp"), attention):
                 spec["workspaces"][mode] = ModeWorkspaces(
@@ -1398,10 +1400,13 @@ def get_paras_workspace_mode(weight):
     return mgr._workspace_weight_modes.get((weight.data_ptr(), tuple(weight.shape)))
 
 
-def get_paras_moe_workspace(weight, shapes, dtype, device):
+def get_paras_moe_workspace(weight, shapes, dtype, device, *, block_sizes=()):
     mode = get_paras_workspace_mode(weight)
     if mode is None:
         return None
+    from sglang.srt.paras.unified_layout import validate_triton_workspace_blocks
+
+    validate_triton_workspace_blocks(*block_sizes)
     return get_global_paras_memory_manager().get_moe_workspace(
         mode, shapes, dtype, device
     )

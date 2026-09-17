@@ -120,6 +120,16 @@ MOE_CHUNK_ROWS = 65536
 MOE_MAX_BLOCK_M = 256
 
 
+def validate_triton_workspace_blocks(*block_sizes):
+    """Reject tuning configurations that exceed the planned padding bound."""
+    for size in block_sizes:
+        if size is not None and not 0 < size <= MOE_MAX_BLOCK_M:
+            raise ValueError(
+                f"ParaS Triton workspace requires BLOCK_SIZE_M <= {MOE_MAX_BLOCK_M}, "
+                f"but the selected configuration uses {size}"
+            )
+
+
 def triton_workspace_sizes(
     *,
     hidden_size: int,

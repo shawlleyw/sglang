@@ -799,6 +799,7 @@ class ModelRunner:
                 device=self.device,
                 gpu_id=self.gpu_id,
                 server_args=self.server_args,
+                context_len=self.model_config.context_len,
                 cpu_group=paras_world.cpu_group if paras_world.world_size > 1 else None,
                 world_size=paras_world.world_size,
             )
