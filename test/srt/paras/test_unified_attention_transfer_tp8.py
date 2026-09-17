@@ -10,6 +10,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from sglang.srt.paras.mode import ParaSMode
+
 
 @pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) != 8, reason="Requires torchrun with 8 ranks"
@@ -27,13 +29,13 @@ def test_tp8_attention_ipc_uses_four_distinct_kv_shards():
         q, kv = heads * d, kv_heads * d
         qs, ks = q // t, d
         shapes = {
-            "ep": {"qkv_proj": (q + 2 * kv, h), "o_proj": (h, q)},
-            "tp": {"qkv_proj": (qs + 2 * ks, h), "o_proj": (h, qs)},
+            ParaSMode.EP: {"qkv_proj": (q + 2 * kv, h), "o_proj": (h, q)},
+            ParaSMode.TP: {"qkv_proj": (qs + 2 * ks, h), "o_proj": (h, qs)},
         }
         entries, cursor = {}, 256
         for mode, projections in shapes.items():
             for proj, shape in projections.items():
-                name = f"model.layers.0.self_attn.{proj}.{'weight' if mode == 'ep' else 'tp_weight'}"
+                name = f"model.layers.0.self_attn.{proj}.{'weight' if mode == ParaSMode.EP else 'tp_weight'}"
                 entries[name] = SimpleNamespace(offset_bytes=cursor, shape=shape)
                 cursor += 2 * shape[0] * shape[1]
         buffer = torch.empty(cursor, dtype=torch.uint8, device="cuda")
@@ -62,7 +64,7 @@ def test_tp8_attention_ipc_uses_four_distinct_kv_shards():
         generator = torch.Generator().manual_seed(1789)
         reference = {
             proj: torch.randn(shape, generator=generator, dtype=torch.bfloat16).cuda()
-            for proj, shape in shapes["ep"].items()
+            for proj, shape in shapes[ParaSMode.EP].items()
         }
         for proj, tensor in reference.items():
             view(f"model.layers.0.self_attn.{proj}.weight").copy_(tensor)
@@ -71,7 +73,7 @@ def test_tp8_attention_ipc_uses_four_distinct_kv_shards():
         )
         bases = torch.tensor(addresses, device="cuda", dtype=torch.int64)
 
-        transfer_attention(manager, 0, "tp", rank, bases)
+        transfer_attention(manager, 0, ParaSMode.TP, rank, bases)
         qkv = view("model.layers.0.self_attn.qkv_proj.tp_weight")
         torch.testing.assert_close(
             qkv[:qs], reference["qkv_proj"][rank * qs : (rank + 1) * qs], rtol=0, atol=0
@@ -102,7 +104,7 @@ def test_tp8_attention_ipc_uses_four_distinct_kv_shards():
             qkv[qs:].fill_(float("nan"))
         torch.cuda.synchronize()
         dist.barrier()
-        transfer_attention(manager, 0, "ep", rank, bases)
+        transfer_attention(manager, 0, ParaSMode.EP, rank, bases)
         for proj, expected in reference.items():
             torch.testing.assert_close(
                 view(f"model.layers.0.self_attn.{proj}.weight"),

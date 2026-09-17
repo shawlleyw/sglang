@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.paras import paras_memory_manager as memory
 from sglang.srt.paras import unified_layout
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.workspace import ModeWorkspaces, WorkspaceRequirement
 
 
@@ -30,7 +31,7 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(
         prefix="model",
     )
     spec = mgr._unified_spec
-    for mode in ("ep", "tp"):
+    for mode in (ParaSMode.EP, ParaSMode.TP):
         spec.for_mode(mode).workspaces = ModeWorkspaces(
             spec.for_mode(mode).workspaces.moe,
             WorkspaceRequirement("test", attention_bytes),
@@ -61,9 +62,9 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(
     tp_weight = mgr.get_view("model.layers.1.mlp.tp_experts.w13_weight")
     if attention_bytes < 400_000:
         assert ep_weight.data_ptr() == tp_weight.data_ptr()
-    assert memory.get_paras_workspace_mode(ep_weight) == "ep"
-    assert memory.get_paras_workspace_mode(tp_weight) == "tp"
-    for mode in ("ep", "tp"):
+    assert memory.get_paras_workspace_mode(ep_weight) == ParaSMode.EP
+    assert memory.get_paras_workspace_mode(tp_weight) == ParaSMode.TP
+    for mode in (ParaSMode.EP, ParaSMode.TP):
         mgr._buffer.fill_(23)
         shapes = [(3, 17), (7, 19)]
         scratch = mgr.get_moe_workspace(mode, shapes, torch.bfloat16, "cpu")

@@ -18,6 +18,8 @@ import sys
 import torch
 import torch.distributed as dist
 
+from sglang.srt.paras.mode import ParaSMode
+
 # Add sglang to path
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.join(_TEST_DIR, "..", "..", "..")
@@ -582,13 +584,13 @@ class TestTPtoEPWeightRestore:
             def __init__(self, tag):
                 self.tag = tag
 
-        ep_exp = _TaggedExperts("ep")
-        tp_exp = _TaggedExperts("tp")
+        ep_exp = _TaggedExperts(ParaSMode.EP)
+        tp_exp = _TaggedExperts(ParaSMode.TP)
 
         m.ep_experts = ep_exp
         m.tp_experts = tp_exp
         m.experts = ep_exp
-        m.parallelism_config = "ep"
+        m.parallelism_config = ParaSMode.EP
         m.tp_size = 1
 
         # Switch to TP
@@ -596,14 +598,14 @@ class TestTPtoEPWeightRestore:
         assert (
             m.experts is tp_exp
         ), "After configure_tp, experts should be tp_experts"
-        assert m.parallelism_config == "tp"
+        assert m.parallelism_config == ParaSMode.TP
 
         # Switch back to EP
         m.paras_configure_ep()
         assert (
             m.experts is ep_exp
         ), "After configure_ep, experts should be ep_experts"
-        assert m.parallelism_config == "ep"
+        assert m.parallelism_config == ParaSMode.EP
 
         if self.rank == 0:
             print(

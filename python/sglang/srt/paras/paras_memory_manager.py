@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.workspace import ModeWorkspaces, WorkspaceRequirement
 
 if TYPE_CHECKING:
@@ -114,10 +115,10 @@ class UnifiedLayoutSpec:
     ep: UnifiedModeSpec
     tp: UnifiedModeSpec
 
-    def for_mode(self, mode: str) -> UnifiedModeSpec:
-        if mode == "ep":
+    def for_mode(self, mode: ParaSMode) -> UnifiedModeSpec:
+        if mode == ParaSMode.EP:
             return self.ep
-        if mode == "tp":
+        if mode == ParaSMode.TP:
             return self.tp
         raise ValueError(mode)
 
@@ -436,30 +437,32 @@ class ParaSMemoryManager:
             head_dim=head_dim,
             hidden_size=hidden_size,
         )
-        for mode in ("ep", "tp"):
+        for mode in (ParaSMode.EP, ParaSMode.TP):
             mode_spec = spec.for_mode(mode)
-            experts = num_experts // ep_size if mode == "ep" else num_experts
-            inter = intermediate_size if mode == "ep" else intermediate_size // tp_size
+            experts = num_experts // ep_size if mode == ParaSMode.EP else num_experts
+            inter = (
+                intermediate_size if mode == ParaSMode.EP else intermediate_size // tp_size
+            )
             q = (
                 num_heads * head_dim
-                if mode == "ep"
+                if mode == ParaSMode.EP
                 else num_heads // tp_size * head_dim
             )
             kv = (
                 num_kv_heads * head_dim
-                if mode == "ep"
+                if mode == ParaSMode.EP
                 else max(1, num_kv_heads // tp_size) * head_dim
             )
             for i in range(num_layers):
                 lp = f"{prefix}.layers.{i}"
-                suffix = "weight" if mode == "ep" else "tp_weight"
+                suffix = "weight" if mode == ParaSMode.EP else "tp_weight"
                 entries = [
                     (
-                        f"{lp}.mlp.{mode}_experts.w13_weight",
+                        f"{lp}.mlp.{mode.value}_experts.w13_weight",
                         (experts, 2 * inter, hidden_size),
                     ),
                     (
-                        f"{lp}.mlp.{mode}_experts.w2_weight",
+                        f"{lp}.mlp.{mode.value}_experts.w2_weight",
                         (experts, hidden_size, inter),
                     ),
                     (f"{lp}.self_attn.qkv_proj.{suffix}", (q + 2 * kv, hidden_size)),
@@ -471,7 +474,7 @@ class ParaSMemoryManager:
                     self._reservation_order.remove(name)
                     names.append(name)
                 mode_spec.weight_names.append(names)
-                if mode == "ep":
+                if mode == ParaSMode.EP:
                     for weight in ("w13", "w2"):
                         self._entries[f"{lp}.mlp.experts.{weight}_weight"] = (
                             self._entries[f"{lp}.mlp.ep_experts.{weight}_weight"]
@@ -482,10 +485,10 @@ class ParaSMemoryManager:
             )
         self._unified_spec = spec
 
-    def get_moe_workspace(self, mode, shapes, dtype, device):
+    def get_moe_workspace(self, mode: ParaSMode, shapes, dtype, device):
         return self._get_workspace(mode, "moe", shapes, dtype, device)
 
-    def get_attention_workspace(self, backend, mode, shapes, dtype, device):
+    def get_attention_workspace(self, backend, mode: ParaSMode, shapes, dtype, device):
         """Return typed scratch views, or None when the backend owns its storage."""
         if not self.unified_workspace_enabled:
             return None
@@ -498,7 +501,9 @@ class ParaSMemoryManager:
             )
         return self._get_workspace(mode, "attention", shapes, dtype, device)
 
-    def get_attention_workspace_buffer(self, backend, mode) -> Optional[torch.Tensor]:
+    def get_attention_workspace_buffer(
+        self, backend, mode: ParaSMode
+    ) -> Optional[torch.Tensor]:
         """Return the backend's complete numerical workspace as one uint8 buffer.
 
         The manager owns its planned capacity; callers need neither tensor
@@ -514,7 +519,7 @@ class ParaSMemoryManager:
         )
         return workspace_buffer
 
-    def initialize_attention_workspace(self, mode):
+    def initialize_attention_workspace(self, mode: ParaSMode):
         """Call only after migration; the target region may hold source weights."""
         if not self.unified_workspace_enabled:
             return
@@ -525,7 +530,7 @@ class ParaSMemoryManager:
         if workspace_buffer is not None:
             workspace_buffer.zero_()
 
-    def _get_workspace(self, mode, kind, shapes, dtype, device):
+    def _get_workspace(self, mode: ParaSMode, kind, shapes, dtype, device):
         """Typed, non-owning scratch views at the mode's fixed endpoint."""
         if not self.unified_workspace_enabled:
             return None
@@ -548,7 +553,7 @@ class ParaSMemoryManager:
             cursor = align_up(cursor)
             if cursor + size > capacity:
                 raise RuntimeError(
-                    f"ParaS {mode} {kind} workspace overflow: {cursor + size} > {capacity}"
+                    f"ParaS {mode.value} {kind} workspace overflow: {cursor + size} > {capacity}"
                 )
             result.append(
                 self._buffer[offset + cursor : offset + cursor + size]
@@ -571,11 +576,15 @@ class ParaSMemoryManager:
         ):
             raise ValueError("KV reservation differs from the unified capacity plan")
         dtype = pending.kv_dtype
-        for mode in ("ep", "tp"):
+        for mode in (ParaSMode.EP, ParaSMode.TP):
             shapes = (
-                pending.layer_ep_shapes if mode == "ep" else pending.layer_tp_shapes
+                pending.layer_ep_shapes
+                if mode == ParaSMode.EP
+                else pending.layer_tp_shapes
             )
-            sizes = pending.layer_ep_bytes if mode == "ep" else pending.layer_tp_bytes
+            sizes = (
+                pending.layer_ep_bytes if mode == ParaSMode.EP else pending.layer_tp_bytes
+            )
             for i, names in enumerate(spec.for_mode(mode).weight_names):
                 offset = layout.weight_offset(mode, i)
                 for name in names:
@@ -584,7 +593,7 @@ class ParaSMemoryManager:
                     offset += self._align_up(entry.size_bytes, self.ALIGNMENT)
                 shape, size = shapes[i], sizes[i]
                 for side, displacement in (("k", 0), ("v", size)):
-                    name = f"{spec.prefix}.layers.{i}.kv.{mode}.{side}"
+                    name = f"{spec.prefix}.layers.{i}.kv.{mode.value}.{side}"
                     entry = LayoutEntry(
                         name,
                         shape,
@@ -595,7 +604,7 @@ class ParaSMemoryManager:
                         layout.cache_offset(mode, i) + displacement,
                     )
                     self._entries[name] = entry
-                    if mode == "ep":
+                    if mode == ParaSMode.EP:
                         self._entries[f"{spec.prefix}.layers.{i}.kv.{side}"] = entry
         self._total_bytes = layout.budget
         self._buffer = torch.empty(layout.budget, dtype=torch.uint8, device=self.device)
@@ -606,7 +615,7 @@ class ParaSMemoryManager:
                 self._buffer_start + self._entries[names[0]].offset_bytes,
                 self._entries[names[0]].shape,
             ): mode
-            for mode in ("ep", "tp")
+            for mode in (ParaSMode.EP, ParaSMode.TP)
             for names in spec.for_mode(mode).weight_names
         }
         self._materialized = True
@@ -831,7 +840,7 @@ class ParaSMemoryManager:
             attention = attention_workspace_requirements(
                 self.server_args, config, tp_size, head_dim, context_len=self.context_len
             )
-            for mode, requirement in zip(("ep", "tp"), attention):
+            for mode, requirement in zip((ParaSMode.EP, ParaSMode.TP), attention):
                 spec.for_mode(mode).workspaces = ModeWorkspaces(
                     spec.for_mode(mode).workspaces.moe, requirement
                 )
@@ -854,11 +863,11 @@ class ParaSMemoryManager:
                 layout.tp_tokens,
             )
             logger.info("ParaS unified weights/KV/workspace: %s", layout)
-            for mode in ("ep", "tp"):
+            for mode in (ParaSMode.EP, ParaSMode.TP):
                 requirements = spec.for_mode(mode).workspaces
                 logger.info(
                     "ParaS %s workspace: %s; unused padding=%d bytes",
-                    mode,
+                    mode.value,
                     requirements,
                     layout.workspace(mode)[1] - requirements.size_bytes,
                 )
@@ -1305,7 +1314,7 @@ class ParaSMemoryManager:
     def get_kv_views(
         self,
         num_layers: int,
-        mode: str,
+        mode: ParaSMode,
         tp_size: int = 1,
         page_size: int = 1,
         prefix: str = "model",
@@ -1329,10 +1338,10 @@ class ParaSMemoryManager:
             k_name = f"{lp}.kv.k"
             v_name = f"{lp}.kv.v"
 
-            if mode == "ep":
+            if mode == ParaSMode.EP:
                 k_bufs.append(self.get_view(k_name))
                 v_bufs.append(self.get_view(v_name))
-            elif mode == "tp":
+            elif mode == ParaSMode.TP:
                 # Prefer dedicated TP entries (contiguous-buffer design) when available.
                 tp_k_name = f"{lp}.kv.tp.k"
                 tp_v_name = f"{lp}.kv.tp.v"
@@ -1352,7 +1361,7 @@ class ParaSMemoryManager:
                     k_bufs.append(self.get_view_as(k_name, tp_shape))
                     v_bufs.append(self.get_view_as(v_name, tp_shape))
             else:
-                raise ValueError(f"mode must be 'ep' or 'tp', got '{mode}'")
+                raise ValueError(f"Expected a ParaSMode, got {mode!r}")
 
         return k_bufs, v_bufs
 
@@ -1468,7 +1477,7 @@ def get_global_paras_memory_manager() -> Optional[ParaSMemoryManager]:
     return _global_paras_memory_manager
 
 
-def get_paras_workspace_mode(weight):
+def get_paras_workspace_mode(weight) -> Optional[ParaSMode]:
     mgr = get_global_paras_memory_manager()
     if mgr is None or not mgr.unified_workspace_enabled or not mgr.materialized:
         return None

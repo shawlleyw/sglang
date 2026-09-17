@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.unified_layout import plan_unified_layout
 from sglang.srt.paras.workspace import (
     ModeWorkspaces,
@@ -188,7 +189,7 @@ def test_rebinding_does_not_overwrite_source_weights(monkeypatch, backend_name):
         backend.prefill_wrappers_paged = []
         backend.prefill_wrappers_verify = []
         backend.decode_wrappers = []
-        backend._paras_bind_workspace("tp")
+        backend._paras_bind_workspace(ParaSMode.TP)
         assert wrapper._int_workspace_buffer is plan
         assert wrapper._float_workspace_buffer.numel() == 4096
         assert (
@@ -199,7 +200,7 @@ def test_rebinding_does_not_overwrite_source_weights(monkeypatch, backend_name):
 
         backend = TritonAttnBackend.__new__(TritonAttnBackend)
         backend._paras_memory_manager = mgr
-        backend._paras_workspace_mode = "tp"
+        backend._paras_workspace_mode = ParaSMode.TP
         backend.num_head = backend.max_kv_splits = 2
         backend.v_head_dim = 8
         backend.device = "cpu"

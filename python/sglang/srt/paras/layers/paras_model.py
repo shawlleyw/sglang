@@ -26,6 +26,7 @@ import os
 import torch
 import torch.distributed as dist
 
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
 from sglang.srt.paras.peer_access import init_peer_access
@@ -40,14 +41,14 @@ class ParaSModelMixin:
       - self.layers — list/ModuleList of decoder layers supporting paras methods
     """
 
-    def paras_transfer_unified_weights(self, mode: str, rank: int):
+    def paras_transfer_unified_weights(self, mode: ParaSMode, rank: int):
         """Transfer one complete layer at a time, without rebinding KV/backend state.
 
         The scheduler calls the TP direction before migrating KV; graph
         initialization calls it through the ordinary configure methods.
         """
         mgr = get_global_paras_memory_manager()
-        if getattr(self, "_unified_weights_mode", "ep") == mode:
+        if getattr(self, "_unified_weights_mode", ParaSMode.EP) == mode:
             return
         from sglang.srt.paras.attention_transfer import transfer_attention
 
@@ -59,9 +60,9 @@ class ParaSModelMixin:
                 self._peer_access_ctx.peer_addresses, dtype=torch.int64, device="cuda"
             )
             self._unified_fence = torch.zeros(1, device="cuda")
-        layers = self.layers if mode == "tp" else reversed(self.layers)
+        layers = self.layers if mode == ParaSMode.TP else reversed(self.layers)
         for layer in layers:
-            if mode == "tp":
+            if mode == ParaSMode.TP:
                 layer.paras_configure_tp_mlp_fused_peer_access_kernel(
                     self._peer_access_ctx, self._unified_peer_bases, None
                 )
@@ -114,7 +115,7 @@ class ParaSModelMixin:
     def paras_configure_tp_peer_access(self, paras_tp_size: int, paras_tp_rank: int):
         mgr = get_global_paras_memory_manager()
         if mgr.unified_workspace_enabled:
-            self.paras_transfer_unified_weights("tp", paras_tp_rank)
+            self.paras_transfer_unified_weights(ParaSMode.TP, paras_tp_rank)
             for layer in self.layers:
                 layer.paras_configure_tp_attn(paras_tp_size, paras_tp_rank)
                 layer.paras_configure_tp(paras_tp_size, paras_tp_rank)
@@ -189,7 +190,7 @@ class ParaSModelMixin:
         if mgr.unified_workspace_enabled:
             from sglang.srt.paras.paras_parallel_state import get_paras_tp_rank
 
-            self.paras_transfer_unified_weights("ep", get_paras_tp_rank())
+            self.paras_transfer_unified_weights(ParaSMode.EP, get_paras_tp_rank())
             for layer in self.layers:
                 layer.paras_configure_ep_attn()
                 layer.paras_configure_ep()

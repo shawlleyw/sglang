@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip
 
 if TYPE_CHECKING:
@@ -118,7 +119,7 @@ class TritonRunnerCore(MoeRunnerCore):
         mode = get_paras_workspace_mode(quant_info.w13_weight)
         rows = runner_input.hidden_states.shape[0]
         if (
-            mode == "ep"
+            mode == ParaSMode.EP
             and running_state.get("masked_m") is None
             and rows > max_dispatched_rows_per_chunk
         ):

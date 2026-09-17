@@ -5,9 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.paras.mode import ParaSMode
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("mode", ["ep", "tp"])
+@pytest.mark.parametrize("mode", [ParaSMode.EP, ParaSMode.TP])
 def test_managed_triton_matches_original_allocations(monkeypatch, mode):
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
         fused_experts_impl,
@@ -35,11 +37,11 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode):
     x = torch.randn((m, h), device="cuda", dtype=torch.bfloat16)
     w1 = torch.randn((e, 2 * inter, h), device="cuda", dtype=torch.bfloat16) * 0.1
     w2 = torch.randn((e, h, inter), device="cuda", dtype=torch.bfloat16) * 0.1
-    k = 1 if mode == "ep" else 2
+    k = 1 if mode == ParaSMode.EP else 2
     ids = torch.randint(e, (m, k), device="cuda", dtype=torch.int64)
     weights = torch.rand((m, k), device="cuda")
     monkeypatch.setattr(memory, "_global_paras_memory_manager", None)
-    if mode == "ep":
+    if mode == ParaSMode.EP:
         config = dict(
             BLOCK_SIZE_M=16,
             BLOCK_SIZE_N=32,
@@ -66,7 +68,7 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode):
     # Force three EP chunks, including a short final chunk; reserve only a
     # single chunk's intermediates so an unbounded implementation must fail.
     monkeypatch.setattr(unified_layout, "triton_moe_chunk_size", 32)
-    rows = 32 if mode == "ep" else m * k
+    rows = 32 if mode == ParaSMode.EP else m * k
     size = unified_layout.align_up(rows * 2 * inter * 2)
     size += unified_layout.align_up(rows * inter * 2)
     mgr = memory.ParaSMemoryManager(device="cuda")

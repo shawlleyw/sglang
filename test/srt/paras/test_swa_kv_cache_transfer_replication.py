@@ -44,6 +44,8 @@ from test_kv_cache_transfer import (
     _SimpleGroupCoordinator,
 )
 
+from sglang.srt.paras.mode import ParaSMode
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -160,12 +162,12 @@ def setup_mgr_and_pool(rank, world_size):
     # Get EP views as external buffers for SWAKVPool
     full_ep_k, full_ep_v = mgr.get_kv_views(
         num_layers=len(FULL_LAYER_IDS),
-        mode="ep",
+        mode=ParaSMode.EP,
         layer_ids=FULL_LAYER_IDS,
     )
     swa_ep_k, swa_ep_v = mgr.get_kv_views(
         num_layers=len(SWA_LAYER_IDS),
-        mode="ep",
+        mode=ParaSMode.EP,
         layer_ids=SWA_LAYER_IDS,
     )
 

@@ -6,6 +6,8 @@ can be exhaustively checked before allocating GPU memory.
 
 from dataclasses import dataclass
 
+from sglang.srt.paras.mode import ParaSMode
+
 
 def align_up(n: int, alignment: int = 256) -> int:
     return (n + alignment - 1) // alignment * alignment
@@ -24,24 +26,24 @@ class UnifiedLayout:
     ep_tokens: int
     tp_tokens: int
 
-    def weight_offset(self, mode: str, layer: int) -> int:
-        if mode == "ep":
+    def weight_offset(self, mode: ParaSMode, layer: int) -> int:
+        if mode == ParaSMode.EP:
             return self.ep_front + layer * self.ep_weight_bytes
-        if mode == "tp":
+        if mode == ParaSMode.TP:
             return layer * self.tp_weight_bytes
         raise ValueError(mode)
 
-    def cache_offset(self, mode: str, layer: int) -> int:
-        if mode == "ep":
+    def cache_offset(self, mode: ParaSMode, layer: int) -> int:
+        if mode == ParaSMode.EP:
             return self.budget - (self.num_layers - layer) * self.ep_cache_bytes
-        if mode == "tp":
+        if mode == ParaSMode.TP:
             return self.num_layers * self.tp_weight_bytes + layer * self.tp_cache_bytes
         raise ValueError(mode)
 
-    def workspace(self, mode: str) -> tuple[int, int]:
-        if mode == "ep":
+    def workspace(self, mode: ParaSMode) -> tuple[int, int]:
+        if mode == ParaSMode.EP:
             return 0, self.ep_front
-        if mode == "tp":
+        if mode == ParaSMode.TP:
             return self.budget - self.tp_tail, self.tp_tail
         raise ValueError(mode)
 

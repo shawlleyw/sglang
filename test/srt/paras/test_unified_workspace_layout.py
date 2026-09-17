@@ -4,25 +4,26 @@ import random
 
 import pytest
 
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.unified_layout import plan_unified_layout, triton_workspace_sizes
 
 
 def assert_safe(layout):
     n = layout.num_layers
     entries = {}
-    for mode in ("ep", "tp"):
+    for mode in (ParaSMode.EP, ParaSMode.TP):
         ws, length = layout.workspace(mode)
         for i in range(n):
             for kind, offset, size in (
                 (
                     "w",
                     layout.weight_offset(mode, i),
-                    getattr(layout, f"{mode}_weight_bytes"),
+                    getattr(layout, f"{mode.value}_weight_bytes"),
                 ),
                 (
                     "c",
                     layout.cache_offset(mode, i),
-                    getattr(layout, f"{mode}_cache_bytes"),
+                    getattr(layout, f"{mode.value}_cache_bytes"),
                 ),
             ):
                 assert offset % 256 == 0
@@ -30,11 +31,11 @@ def assert_safe(layout):
                 assert offset + size <= ws or ws + length <= offset
                 entries[mode, kind, i] = (offset, offset + size)
         assert layout.weight_offset(mode, n - 1) + getattr(
-            layout, f"{mode}_weight_bytes"
+            layout, f"{mode.value}_weight_bytes"
         ) <= layout.cache_offset(mode, 0)
     for source, target, kinds, ids in (
-        ("ep", "tp", ("w", "c"), range(n)),
-        ("tp", "ep", ("c", "w"), reversed(range(n))),
+        (ParaSMode.EP, ParaSMode.TP, ("w", "c"), range(n)),
+        (ParaSMode.TP, ParaSMode.EP, ("c", "w"), reversed(range(n))),
     ):
         ids = list(ids)
         order = [(kind, i) for kind in kinds for i in ids]

@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 from sglang.srt.paras.workspace import flashinfer_workspace_size
 from sglang.srt.speculative.spec_info import SpecInput
@@ -187,7 +188,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.disable_cuda_graph_kv_split = True
 
-        self._paras_workspace_mode = "ep"
+        self._paras_workspace_mode = ParaSMode.EP
         self._paras_memory_manager = get_global_paras_memory_manager()
         managed_workspace = self._paras_workspace()
 
@@ -323,7 +324,7 @@ class FlashInferAttnBackend(AttentionBackend):
             "flashinfer", self._paras_workspace_mode
         )
 
-    def _paras_bind_workspace(self, mode):
+    def _paras_bind_workspace(self, mode: ParaSMode):
         self._paras_workspace_mode = mode
         workspace = self._paras_workspace()
         if workspace is None:
@@ -358,7 +359,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def paras_configure_tp(self, paras_tp_size: int, req_to_token: "torch.Tensor"):
         """Update cached state for TP mode after ParaS switch."""
-        self._paras_bind_workspace("tp")
+        self._paras_bind_workspace(ParaSMode.TP)
         num_qo_heads = self.total_num_attention_heads // paras_tp_size
         num_kv_heads = self._get_num_kv_heads(paras_tp_size)
         for updater_attr in ('indices_updater_decode', 'indices_updater_prefill'):
@@ -371,7 +372,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def paras_configure_ep(self, req_to_token: "torch.Tensor"):
         """Revert cached state for EP mode after ParaS switch."""
-        self._paras_bind_workspace("ep")
+        self._paras_bind_workspace(ParaSMode.EP)
         # EP mode uses DP attention: each rank has all heads, tp_size=1
         num_qo_heads = self.total_num_attention_heads
         num_kv_heads = self._get_num_kv_heads(1)

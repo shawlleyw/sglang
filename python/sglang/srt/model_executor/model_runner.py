@@ -59,6 +59,7 @@ from sglang.srt.distributed import (
     set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.paras_parallel_state import (
     initialize_paras_parallel,
     get_paras_dp_group,
@@ -1861,12 +1862,12 @@ class ModelRunner:
                     ):
                         _full_ep_k, _full_ep_v = _paras_mgr.get_kv_views(
                             num_layers=len(self.model_config.full_attention_layer_ids),
-                            mode="ep",
+                            mode=ParaSMode.EP,
                             layer_ids=self.model_config.full_attention_layer_ids,
                         )
                         _swa_ep_k, _swa_ep_v = _paras_mgr.get_kv_views(
                             num_layers=len(self.model_config.swa_attention_layer_ids),
-                            mode="ep",
+                            mode=ParaSMode.EP,
                             layer_ids=self.model_config.swa_attention_layer_ids,
                         )
 
@@ -1923,7 +1924,7 @@ class ModelRunner:
                 ):
                     _paras_external_k, _paras_external_v = _paras_mgr.get_kv_views(
                         num_layers=self.num_effective_layers,
-                        mode="ep",
+                        mode=ParaSMode.EP,
                         tp_size=1,  # EP mode: tp_size=1 for KV heads
                         page_size=self.page_size,
                         prefix="model",
@@ -2568,7 +2569,7 @@ class ModelRunner:
 
         from sglang.srt.paras.paras_cuda_graph import paras_swap_cuda_graphs
 
-        paras_swap_cuda_graphs(self, "tp")
+        paras_swap_cuda_graphs(self, ParaSMode.TP)
 
     @paras_func
     def paras_configure_ep(self):
@@ -2589,7 +2590,7 @@ class ModelRunner:
 
         from sglang.srt.paras.paras_cuda_graph import paras_swap_cuda_graphs
 
-        paras_swap_cuda_graphs(self, "ep")
+        paras_swap_cuda_graphs(self, ParaSMode.EP)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

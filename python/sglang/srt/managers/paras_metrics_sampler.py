@@ -26,6 +26,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from sglang.srt.paras.mode import ParaSMode
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,7 +51,7 @@ class ParasMetricsSampler:
         self._t0 = time.time()
         self._prev_decode_total = 0
         self._prev_prefill_total = 0
-        self._prev_mode: Optional[str] = None
+        self._prev_mode: Optional[ParaSMode] = None
         self._fh: Any = None
         self._writer: Any = None
 
@@ -105,14 +107,18 @@ class ParasMetricsSampler:
             # Static mode (no ParaS): enable_dp_attention <=> "EP" shape data plane.
             sa = getattr(scheduler, "server_args", None)
             if sa is not None and getattr(sa, "enable_dp_attention", False):
-                mode = "EP"
+                mode = ParaSMode.EP
             else:
-                mode = "TP"
+                mode = ParaSMode.TP
 
         # Source selection mirrors paras_auto_observe in scheduler_paras_mixin:
         # EP mode -> rank 0 holds only its DP slice, so sum the all-gather output;
         # TP mode -> unified data plane, rank 0's local view IS the global view.
-        if mode == "EP" and batch is not None and getattr(batch, "global_running_reqs", None):
+        if (
+            mode == ParaSMode.EP
+            and batch is not None
+            and getattr(batch, "global_running_reqs", None)
+        ):
             running = int(sum(batch.global_running_reqs))
             waiting = int(sum(batch.global_waiting_reqs))
             decode_total = int(sum(batch.global_total_decode_tokens))
@@ -143,7 +149,7 @@ class ParasMetricsSampler:
         row = [
             datetime.now(timezone.utc).isoformat(),
             f"{now - self._t0:.3f}",
-            mode,
+            mode.name,
             running,
             waiting,
             f"{decode_tps:.2f}",

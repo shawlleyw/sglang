@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 from sglang.srt.paras.workspace import triton_attention_split_config
 from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
@@ -108,7 +109,7 @@ class TritonAttnBackend(AttentionBackend):
             ]
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
-        self._paras_workspace_mode = "ep"
+        self._paras_workspace_mode = ParaSMode.EP
         self._paras_memory_manager = get_global_paras_memory_manager()
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         self.static_kv_splits = get_bool_env_var(
@@ -182,7 +183,7 @@ class TritonAttnBackend(AttentionBackend):
         Callers in the cuda-graph path then restore mode-appropriate
         buffer references via ``paras_load_cuda_graph_state``.
         """
-        self._paras_workspace_mode = "tp"
+        self._paras_workspace_mode = ParaSMode.TP
         self.num_head = self.total_num_attention_heads // paras_tp_size
         self.num_kv_head = self._get_num_kv_heads(paras_tp_size)
         self.req_to_token = req_to_token
@@ -193,7 +194,7 @@ class TritonAttnBackend(AttentionBackend):
 
         See ``paras_configure_tp`` for the buffer-allocation contract.
         """
-        self._paras_workspace_mode = "ep"
+        self._paras_workspace_mode = ParaSMode.EP
         self.num_head = self.total_num_attention_heads
         self.num_kv_head = self._get_num_kv_heads(1)
         self.req_to_token = req_to_token

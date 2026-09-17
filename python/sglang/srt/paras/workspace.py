@@ -6,6 +6,7 @@ metadata and outputs that escape an operator are not part of these regions.
 
 from dataclasses import dataclass
 
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.unified_layout import align_up
 
 
@@ -118,11 +119,14 @@ def attention_workspace_requirements(
         WorkspaceRequirement(
             backend,
             triton_attention_workspace_size(
-                max(graph_tokens, requests // tp_size if mode == "ep" else requests),
-                config.num_attention_heads // (tp_size if mode == "tp" else 1),
+                max(
+                    graph_tokens,
+                    requests // tp_size if mode == ParaSMode.EP else requests,
+                ),
+                config.num_attention_heads // (tp_size if mode == ParaSMode.TP else 1),
                 splits,
                 head_dim,
             ),
         )
-        for mode in ("ep", "tp")
+        for mode in (ParaSMode.EP, ParaSMode.TP)
     )

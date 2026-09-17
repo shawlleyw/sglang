@@ -3,6 +3,8 @@
 import triton
 import triton.language as tl
 
+from sglang.srt.paras.mode import ParaSMode
+
 
 @triton.jit
 def _restore_attention(
@@ -40,7 +42,7 @@ def _restore_attention(
     tl.store(output + x, value, valid)
 
 
-def transfer_attention(manager, layer_id, mode, rank, peer_bases):
+def transfer_attention(manager, layer_id, mode: ParaSMode, rank, peer_bases):
     """Caller fences all ranks after the complete layer, including MoE."""
     spec = manager._unified_spec
     lp = f"{spec.prefix}.layers.{layer_id}.self_attn"
@@ -51,7 +53,7 @@ def transfer_attention(manager, layer_id, mode, rank, peer_bases):
     for proj in ("qkv_proj", "o_proj"):
         ep_name, tp_name = f"{lp}.{proj}.weight", f"{lp}.{proj}.tp_weight"
         ep, tp = manager.get_view(ep_name), manager.get_view(tp_name)
-        if mode == "tp":
+        if mode == ParaSMode.TP:
             if proj == "qkv_proj":
                 tp[:qs].copy_(ep[rank * qs : (rank + 1) * qs])
                 tp[qs : qs + ks].copy_(ep[q + kv_rank * ks : q + (kv_rank + 1) * ks])
@@ -60,7 +62,7 @@ def transfer_attention(manager, layer_id, mode, rank, peer_bases):
                 )
             else:
                 tp.copy_(ep[:, rank * qs : (rank + 1) * qs])
-        elif mode == "ep":
+        elif mode == ParaSMode.EP:
             _restore_attention[(triton.cdiv(ep.numel(), 1024),)](
                 peer_bases,
                 ep,

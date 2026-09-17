@@ -21,6 +21,7 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info, get_
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, MHATokenToKVPool
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.server_args import get_global_server_args
 
 from sglang.srt.paras.utils import paras_func, paras_profile_func
@@ -76,21 +77,21 @@ class ParasAutoSwitchPolicy(abc.ABC):
             return
         self.window.append(value)
 
-    def pick_target(self, current_mode: str, now: float) -> Optional[str]:
+    def pick_target(self, current_mode: ParaSMode, now: float) -> Optional[ParaSMode]:
         if now < self.cooldown_until:
             return None
         if len(self.window) < self.window.maxlen:
             return None
         avg = sum(self.window) / len(self.window)
-        target: Optional[str] = None
-        if current_mode == "EP" and avg < self.threshold:
-            target = "TP"
-        elif current_mode == "TP" and avg > self.threshold:
-            target = "EP"
+        target: Optional[ParaSMode] = None
+        if current_mode == ParaSMode.EP and avg < self.threshold:
+            target = ParaSMode.TP
+        elif current_mode == ParaSMode.TP and avg > self.threshold:
+            target = ParaSMode.EP
         if target is not None:
             logger.info(
                 f"ParaS [{type(self).__name__}] policy fired: "
-                f"{current_mode} -> {target} at t={now:.3f} | "
+                f"{current_mode.name} -> {target.name} at t={now:.3f} | "
                 f"observations={list(self.window)} avg={avg:.2f} "
                 f"threshold={self.threshold} window_maxlen={self.window.maxlen} "
                 f"cooldown_sec={self.cooldown_sec}"
@@ -178,7 +179,7 @@ class HybridAutoSwitchPolicy(ParasAutoSwitchPolicy):
     def observation_for_batch(
         self, scheduler: Any, batch: Optional[ScheduleBatch]
     ) -> Optional[int]:
-        if scheduler.paras_parallelism_config == "EP":
+        if scheduler.paras_parallelism_config == ParaSMode.EP:
             if batch is None:
                 return None
             running_field = batch.global_running_reqs
@@ -205,25 +206,25 @@ class HybridAutoSwitchPolicy(ParasAutoSwitchPolicy):
         )
         return running + waiting + local_prefilling
 
-    def pick_target(self, current_mode: str, now: float) -> Optional[str]:
+    def pick_target(self, current_mode: ParaSMode, now: float) -> Optional[ParaSMode]:
         if now < self.cooldown_until:
             return None
         if not self.window:
             return None
 
-        target: Optional[str] = None
+        target: Optional[ParaSMode] = None
         trigger = ""
-        if current_mode == "TP":
+        if current_mode == ParaSMode.TP:
             latest = self.window[-1]
             if latest > self.threshold:
-                target = "EP"
+                target = ParaSMode.EP
                 trigger = f"latest={latest} > threshold={self.threshold}"
         else:
             if len(self.window) < self.window.maxlen:
                 return None
             avg = sum(self.window) / len(self.window)
             if avg < self.low_threshold:
-                target = "TP"
+                target = ParaSMode.TP
                 trigger = (
                     f"avg={avg:.2f} < low_threshold={self.low_threshold} "
                     f"(threshold={self.threshold} * low_ratio={self.low_ratio})"
@@ -232,7 +233,7 @@ class HybridAutoSwitchPolicy(ParasAutoSwitchPolicy):
         if target is not None:
             logger.info(
                 f"ParaS [HybridAutoSwitchPolicy] policy fired: "
-                f"{current_mode} -> {target} at t={now:.3f} | {trigger} | "
+                f"{current_mode.name} -> {target.name} at t={now:.3f} | {trigger} | "
                 f"window={list(self.window)} cooldown_sec={self.cooldown_sec}"
             )
             self.cooldown_until = now + self.cooldown_sec
@@ -261,7 +262,7 @@ class RolloutAutoSwitchPolicy(ParasAutoSwitchPolicy):
     def observation_for_batch(
         self, scheduler: Any, batch: Optional[ScheduleBatch]
     ) -> Optional[int]:
-        if scheduler.paras_parallelism_config == "EP":
+        if scheduler.paras_parallelism_config == ParaSMode.EP:
             if batch is None:
                 return None
             running_field = batch.global_running_reqs
@@ -343,7 +344,7 @@ class SchedulerParasMixin:
         self.ep_send_to_tokenizer = self.send_to_tokenizer
         self.ep_send_to_detokenizer = self.send_to_detokenizer
 
-        self.paras_parallelism_config = "EP"
+        self.paras_parallelism_config = ParaSMode.EP
 
         sa = self.server_args
         if sa.paras_auto_switch:
@@ -394,7 +395,7 @@ class SchedulerParasMixin:
 
         _paras_mgr = get_global_paras_memory_manager()
         if _paras_mgr is not None:
-            if self.paras_parallelism_config == "TP":
+            if self.paras_parallelism_config == ParaSMode.TP:
                 self.max_running_requests = _paras_mgr.get_tp_max_running_requests()
             else:
                 self.max_running_requests = _paras_mgr.get_ep_max_running_requests()
@@ -555,7 +556,7 @@ class SchedulerParasMixin:
 
         self.paras_stop_profile()
 
-        self.paras_parallelism_config = "EP"
+        self.paras_parallelism_config = ParaSMode.EP
         self.server_args.enable_dp_attention = True
         self.server_args.moe_a2a_backend = MoeA2ABackend.DEEPEP.value
         self.server_args.dp_size = self.paras_ep_size
@@ -571,11 +572,11 @@ class SchedulerParasMixin:
             return None
         req_type = (
             ParaSConfigureReqType.CONFIGURE_TP
-            if target == "TP"
+            if target == ParaSMode.TP
             else ParaSConfigureReqType.CONFIGURE_EP
         )
         logger.info(
-            f"ParaS auto-switch policy fired: {self.paras_parallelism_config} -> {target}"
+            f"ParaS auto-switch policy fired: {self.paras_parallelism_config.name} -> {target.name}"
         )
         return ParaSAutoSwitchReq(target=req_type)
 
@@ -592,7 +593,7 @@ class SchedulerParasMixin:
 
     @paras_func
     def paras_configure_tp(self):
-        if self.paras_parallelism_config == "TP":
+        if self.paras_parallelism_config == ParaSMode.TP:
             logger.warning("paras_configure_tp called but already in TP mode; skipping")
             return
         if not self.paras_check():
@@ -606,7 +607,7 @@ class SchedulerParasMixin:
             self._paras_auto_clear_window_on_switch()
 
         # switch from EP to DP x TP
-        self.paras_parallelism_config = "TP"
+        self.paras_parallelism_config = ParaSMode.TP
         self.server_args.enable_dp_attention = False
         # Store the string value (matching ServerArgs dataclass), not the Enum.
         # `require_attn_tp_gather` compares `server_args.moe_a2a_backend != "none"`
@@ -687,7 +688,7 @@ class SchedulerParasMixin:
         mgr = getattr(model, "paras_memory_manager", None)
         if mgr is not None and mgr.unified_workspace_enabled:
             with TimeReporter("transfer_unified_weights"):
-                model.model.paras_transfer_unified_weights("tp", self.paras_tp_rank)
+                model.model.paras_transfer_unified_weights(ParaSMode.TP, self.paras_tp_rank)
 
         with TimeReporter("gather_cache"):
             paras_gather_manager.gather_cache()
@@ -748,7 +749,7 @@ class SchedulerParasMixin:
     @paras_func
     def paras_configure_ep(self):
         # Entry guards
-        if self.paras_parallelism_config != "TP":
+        if self.paras_parallelism_config != ParaSMode.TP:
             logger.warning("paras_configure_ep called but not in TP mode")
             return
         if not self.paras_check():
@@ -859,7 +860,7 @@ class SchedulerParasMixin:
 
         # Phase 4: Update scheduler config and restore tokenizer
         # switch from TP to EP
-        self.paras_parallelism_config = "EP"
+        self.paras_parallelism_config = ParaSMode.EP
         self._paras_post_switch_iters_remaining = self._paras_post_switch_ramp_iters
         self.server_args.enable_dp_attention = True
         self.server_args.moe_a2a_backend = MoeA2ABackend.DEEPEP.value

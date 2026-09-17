@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.paras_parallel_state import (
     get_paras_dp_group,
     get_paras_dp_rank,
@@ -186,7 +187,7 @@ class ParaSMoeBlockMixin:
             self.tp_experts.register_parameter("w2_weight", w2_param)
 
         # Start in EP mode; will switch to TP after paras_configure_tp()
-        self.parallelism_config = "ep"
+        self.parallelism_config = ParaSMode.EP
 
     # ------------------------------------------------------------------
     # Weight redistribution helpers
@@ -732,14 +733,14 @@ class ParaSMoeBlockMixin:
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
         """Configure the block for TP mode."""
-        self.parallelism_config = "tp"
+        self.parallelism_config = ParaSMode.TP
         self.tp_size = paras_tp_size
         self.experts = self.tp_experts
 
     @paras_func
     def paras_configure_ep(self):
         """Configure the block back to EP mode."""
-        self.parallelism_config = "ep"
+        self.parallelism_config = ParaSMode.EP
         self.tp_size = 1
         self.experts = self.ep_experts
 
@@ -764,7 +765,7 @@ class ParaSMoeBlockMixin:
         - EP + normal backend  → forward_normal
         - TP                   → forward_normal
         """
-        if self.parallelism_config == "ep":
+        if self.parallelism_config == ParaSMode.EP:
             if get_moe_a2a_backend().is_deepep():
                 return self.forward_deepep(hidden_states, forward_batch)
             else:

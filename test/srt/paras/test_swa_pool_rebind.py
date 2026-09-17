@@ -25,6 +25,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from sglang.srt.paras.mode import ParaSMode
+
 # Add sglang to path
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.join(_TEST_DIR, "..", "..", "..")
@@ -98,7 +100,7 @@ class TestTPRebindBufferPointers:
 
         mgr.get_view_as = mock_get_view_as
 
-        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+        def mock_get_kv_views(num_layers, mode=ParaSMode.EP, tp_size=1, page_size=1, prefix="model", layer_ids=None):
             iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
             k_bufs, v_bufs = [], []
             for lid in iter_ids:
@@ -183,7 +185,7 @@ class TestTPRebindBufferPointers:
 
         mgr.get_view_as = mock_get_view_as
 
-        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+        def mock_get_kv_views(num_layers, mode=ParaSMode.EP, tp_size=1, page_size=1, prefix="model", layer_ids=None):
             iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
             k_bufs, v_bufs = [], []
             for lid in iter_ids:
@@ -273,7 +275,7 @@ class TestEPRebindBufferPointers:
 
         mgr.get_view_as = mock_get_view_as
 
-        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+        def mock_get_kv_views(num_layers, mode=ParaSMode.EP, tp_size=1, page_size=1, prefix="model", layer_ids=None):
             iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
             k_bufs, v_bufs = [], []
             for lid in iter_ids:
@@ -354,7 +356,7 @@ class TestEPRebindBufferPointers:
 
         mgr.get_view_as = mock_get_view_as
 
-        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+        def mock_get_kv_views(num_layers, mode=ParaSMode.EP, tp_size=1, page_size=1, prefix="model", layer_ids=None):
             iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
             k_bufs, v_bufs = [], []
             for lid in iter_ids:
@@ -445,9 +447,9 @@ class TestHeadCountUpdate:
 
         mgr.get_view_as = mock_get_view_as
 
-        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+        def mock_get_kv_views(num_layers, mode=ParaSMode.EP, tp_size=1, page_size=1, prefix="model", layer_ids=None):
             iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
-            heads = original_head_num // tp_size if mode == "tp" else original_head_num
+            heads = original_head_num // tp_size if mode == ParaSMode.TP else original_head_num
             k_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
             v_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
             return k_bufs, v_bufs
@@ -514,9 +516,9 @@ class TestHeadCountUpdate:
 
         mgr.get_view_as = mock_get_view_as
 
-        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+        def mock_get_kv_views(num_layers, mode=ParaSMode.EP, tp_size=1, page_size=1, prefix="model", layer_ids=None):
             iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
-            heads = original_head_num // tp_size if mode == "tp" else original_head_num
+            heads = original_head_num // tp_size if mode == ParaSMode.TP else original_head_num
             k_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
             v_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
             return k_bufs, v_bufs
@@ -589,9 +591,9 @@ class TestFullToSWAIndexMappingUntouched:
 
         mgr.get_view_as = mock_get_view_as
 
-        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+        def mock_get_kv_views(num_layers, mode=ParaSMode.EP, tp_size=1, page_size=1, prefix="model", layer_ids=None):
             iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
-            heads = head_num // tp_size if mode == "tp" else head_num
+            heads = head_num // tp_size if mode == ParaSMode.TP else head_num
             k_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
             v_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
             return k_bufs, v_bufs
@@ -652,9 +654,9 @@ class TestFullToSWAIndexMappingUntouched:
 
         mgr.get_view_as = mock_get_view_as
 
-        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+        def mock_get_kv_views(num_layers, mode=ParaSMode.EP, tp_size=1, page_size=1, prefix="model", layer_ids=None):
             iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
-            heads = head_num // tp_size if mode == "tp" else head_num
+            heads = head_num // tp_size if mode == ParaSMode.TP else head_num
             k_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
             v_bufs = [torch.zeros((512, heads, head_dim), dtype=torch.bfloat16) for _ in iter_ids]
             return k_bufs, v_bufs
@@ -753,11 +755,11 @@ class TestRoundTripEPTPEP:
 
         mgr.get_view_as = mock_get_view_as
 
-        def mock_get_kv_views(num_layers, mode="ep", tp_size=1, page_size=1, prefix="model", layer_ids=None):
+        def mock_get_kv_views(num_layers, mode=ParaSMode.EP, tp_size=1, page_size=1, prefix="model", layer_ids=None):
             iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
             k_bufs, v_bufs = [], []
             for lid in iter_ids:
-                if mode == "tp":
+                if mode == ParaSMode.TP:
                     k_bufs.append(tp_k_buffers[f"{prefix}.layers.{lid}.kv.tp.k"])
                     v_bufs.append(tp_v_buffers[f"{prefix}.layers.{lid}.kv.tp.v"])
                 else:

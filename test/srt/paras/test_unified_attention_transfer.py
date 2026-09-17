@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.paras.mode import ParaSMode
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("tp_size,kv_heads", [(4, 8), (8, 4)])
@@ -23,23 +25,23 @@ def test_attention_roundtrip_without_full_backup(tp_size, kv_heads):
     buffers, managers = [], []
     for _ in range(tp_size):
         offsets, views, cursor = {}, {}, 256
-        for mode, mode_shapes in (("ep", shapes), ("tp", tp_shapes)):
+        for mode, mode_shapes in ((ParaSMode.EP, shapes), (ParaSMode.TP, tp_shapes)):
             for p, shape in mode_shapes.items():
-                name = f"model.layers.0.self_attn.{p}.{'weight' if mode == 'ep' else 'tp_weight'}"
+                name = f"model.layers.0.self_attn.{p}.{'weight' if mode == ParaSMode.EP else 'tp_weight'}"
                 offsets[name] = SimpleNamespace(offset_bytes=cursor)
                 cursor += 2 * shape[0] * shape[1]
         buffer = torch.empty(cursor, device="cuda", dtype=torch.uint8)
         buffers.append(buffer)
-        for mode, mode_shapes in (("ep", shapes), ("tp", tp_shapes)):
+        for mode, mode_shapes in ((ParaSMode.EP, shapes), (ParaSMode.TP, tp_shapes)):
             for p, shape in mode_shapes.items():
-                name = f"model.layers.0.self_attn.{p}.{'weight' if mode == 'ep' else 'tp_weight'}"
+                name = f"model.layers.0.self_attn.{p}.{'weight' if mode == ParaSMode.EP else 'tp_weight'}"
                 offset = offsets[name].offset_bytes
                 views[name] = (
                     buffer[offset : offset + 2 * shape[0] * shape[1]]
                     .view(torch.bfloat16)
                     .view(shape)
                 )
-                if mode == "ep":
+                if mode == ParaSMode.EP:
                     views[name].copy_(reference[p])
         managers.append(
             SimpleNamespace(
@@ -59,12 +61,12 @@ def test_attention_roundtrip_without_full_backup(tp_size, kv_heads):
         [b.data_ptr() for b in buffers], device="cuda", dtype=torch.int64
     )
     for rank, manager in enumerate(managers):
-        transfer_attention(manager, 0, "tp", rank, bases)
+        transfer_attention(manager, 0, ParaSMode.TP, rank, bases)
     for manager in managers:
         for p in shapes:
             manager.get_view(f"model.layers.0.self_attn.{p}.weight").fill_(float("nan"))
     for rank, manager in enumerate(managers):
-        transfer_attention(manager, 0, "ep", rank, bases)
+        transfer_attention(manager, 0, ParaSMode.EP, rank, bases)
         for p in shapes:
             torch.testing.assert_close(
                 manager.get_view(f"model.layers.0.self_attn.{p}.weight"),
