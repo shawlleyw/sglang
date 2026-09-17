@@ -433,6 +433,7 @@ class ParaSMemoryManager:
         return self._get_workspace(mode, "moe", shapes, dtype, device)
 
     def get_attention_workspace(self, backend, mode, shapes, dtype, device):
+        """Return typed scratch views, or None when the backend owns its storage."""
         if not self.unified_workspace_enabled:
             return None
         requirement = self._unified_spec["workspaces"][mode].attention
@@ -444,19 +445,32 @@ class ParaSMemoryManager:
             )
         return self._get_workspace(mode, "attention", shapes, dtype, device)
 
+    def get_attention_workspace_buffer(self, backend, mode) -> Optional[torch.Tensor]:
+        """Return the backend's complete numerical workspace as one uint8 buffer.
+
+        The manager owns its planned capacity; callers need neither tensor
+        shapes nor knowledge of the multi-view workspace API.
+        """
+        if not self.unified_workspace_enabled:
+            return None
+        requirement = self._unified_spec["workspaces"][mode].attention
+        if requirement.size_bytes is None:
+            return None
+        (workspace_buffer,) = self.get_attention_workspace(
+            backend, mode, [(requirement.size_bytes,)], torch.uint8, self.device
+        )
+        return workspace_buffer
+
     def initialize_attention_workspace(self, mode):
         """Call only after migration; the target region may hold source weights."""
         if not self.unified_workspace_enabled:
             return
         requirement = self._unified_spec["workspaces"][mode].attention
-        if requirement.size_bytes is not None:
-            self.get_attention_workspace(
-                requirement.backend,
-                mode,
-                [(requirement.size_bytes,)],
-                torch.uint8,
-                self.device,
-            )[0].zero_()
+        workspace_buffer = self.get_attention_workspace_buffer(
+            requirement.backend, mode
+        )
+        if workspace_buffer is not None:
+            workspace_buffer.zero_()
 
     def _get_workspace(self, mode, kind, shapes, dtype, device):
         """Typed, non-owning scratch views at the mode's fixed endpoint."""

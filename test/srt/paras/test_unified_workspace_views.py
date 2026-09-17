@@ -78,6 +78,10 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(
         attention = mgr.get_attention_workspace(
             "test", mode, [(attention_bytes,)], torch.uint8, "cpu"
         )[0]
+        attention_buffer = mgr.get_attention_workspace_buffer("test", mode)
+        assert attention_buffer.dtype == torch.uint8
+        assert attention_buffer.shape == (attention_bytes,)
+        assert attention_buffer.data_ptr() == attention.data_ptr()
         attention.fill_(9)
         assert all(torch.all(view == 1) for view in scratch)
         assert torch.all(mgr._buffer[:offset] == 23)
@@ -89,6 +93,8 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(
             )
         with pytest.raises(RuntimeError, match="planned for"):
             mgr.get_attention_workspace("wrong", mode, [(1,)], torch.uint8, "cpu")
+        with pytest.raises(RuntimeError, match="planned for"):
+            mgr.get_attention_workspace_buffer("wrong", mode)
         mgr.initialize_attention_workspace(mode)
         assert torch.all(attention == 0)
         assert all(torch.all(view == 1) for view in scratch)

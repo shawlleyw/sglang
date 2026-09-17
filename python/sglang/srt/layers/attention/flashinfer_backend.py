@@ -319,14 +319,9 @@ class FlashInferAttnBackend(AttentionBackend):
         mgr = self._paras_memory_manager
         if mgr is None:
             return None
-        views = mgr.get_attention_workspace(
-            "flashinfer",
-            self._paras_workspace_mode,
-            [(envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),)],
-            torch.uint8,
-            mgr.device,
+        return mgr.get_attention_workspace_buffer(
+            "flashinfer", self._paras_workspace_mode
         )
-        return views[0] if views is not None else None
 
     def _paras_bind_workspace(self, mode):
         self._paras_workspace_mode = mode

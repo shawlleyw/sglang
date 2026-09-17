@@ -167,7 +167,8 @@ def test_rebinding_does_not_overwrite_source_weights(monkeypatch, backend_name):
     if backend_name == "flashinfer":
         from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
-        monkeypatch.setenv("SGLANG_FLASHINFER_WORKSPACE_SIZE", "4096")
+        # A managed buffer uses its planned capacity, not a later env value.
+        monkeypatch.setenv("SGLANG_FLASHINFER_WORKSPACE_SIZE", "8192")
         backend = FlashInferAttnBackend.__new__(FlashInferAttnBackend)
         backend._paras_memory_manager = mgr
         plan = object()
@@ -178,6 +179,7 @@ def test_rebinding_does_not_overwrite_source_weights(monkeypatch, backend_name):
         backend.decode_wrappers = []
         backend._paras_bind_workspace("tp")
         assert wrapper._int_workspace_buffer is plan
+        assert wrapper._float_workspace_buffer.numel() == 4096
         assert (
             wrapper._float_workspace_buffer.data_ptr() == mgr.buffer[12288:].data_ptr()
         )
