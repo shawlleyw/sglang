@@ -48,7 +48,7 @@ def test_tp8_attention_ipc_uses_four_distinct_kv_shards():
             )
 
         manager = SimpleNamespace(
-            _unified_spec=dict(
+            _unified_spec=SimpleNamespace(
                 prefix="model",
                 hidden_size=h,
                 num_heads=heads,

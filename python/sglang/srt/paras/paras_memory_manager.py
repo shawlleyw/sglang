@@ -36,10 +36,13 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.paras.workspace import ModeWorkspaces, WorkspaceRequirement
+
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
     from sglang.srt.paras.layers.utils import LayerCacheSpec
+    from sglang.srt.paras.unified_layout import UnifiedLayout
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -72,6 +75,51 @@ class LayoutEntry:
             "size_bytes": self.size_bytes,
             "offset_bytes": self.offset_bytes,
         }
+
+
+@dataclass(frozen=True)
+class KVCacheReservation:
+    """Per-layer K/V shapes and sizes retained until buffer materialization."""
+
+    num_layers: int
+    prefix: str
+    layer_ep_bytes: List[int]
+    layer_tp_bytes: List[int]
+    layer_ep_shapes: List[Tuple[int, ...]]
+    layer_tp_shapes: List[Tuple[int, ...]]
+    kv_dtype: torch.dtype
+
+
+@dataclass
+class UnifiedModeSpec:
+    """Weights and operator scratch for one mode of the unified buffer."""
+
+    workspaces: ModeWorkspaces
+    weight_names: List[List[str]] = field(default_factory=list)
+    # Aligned bytes per layer, populated when weights are registered.
+    weight_bytes: int = 0
+
+
+@dataclass
+class UnifiedLayoutSpec:
+    """Model dimensions and EP/TP requirements used to build UnifiedLayout."""
+
+    num_layers: int
+    prefix: str
+    tp_size: int
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    hidden_size: int
+    ep: UnifiedModeSpec
+    tp: UnifiedModeSpec
+
+    def for_mode(self, mode: str) -> UnifiedModeSpec:
+        if mode == "ep":
+            return self.ep
+        if mode == "tp":
+            return self.tp
+        raise ValueError(mode)
 
 
 @dataclass(frozen=True)
@@ -271,8 +319,9 @@ class ParaSMemoryManager:
         self.ep_max_running_requests: int = 0
         self.tp_max_running_requests: int = 0
         self._kv_reserved: bool = False
-        self._unified_spec = None
-        self._unified_layout = None
+        self._unified_spec: Optional[UnifiedLayoutSpec] = None
+        self._unified_layout: Optional["UnifiedLayout"] = None
+        self._paras_kv_pending: Optional[KVCacheReservation] = None
 
     # ----- reservation ----------------------------------------------------
 
@@ -343,7 +392,6 @@ class ParaSMemoryManager:
     ):
         """Register both layouts without reserving duplicate physical weights."""
         from sglang.srt.paras.unified_layout import align_up, triton_workspace_sizes
-        from sglang.srt.paras.workspace import ModeWorkspaces, WorkspaceRequirement
         from sglang.srt.utils import get_int_env_var
 
         if ep_size != tp_size or num_experts % ep_size or intermediate_size % tp_size:
@@ -359,7 +407,7 @@ class ParaSMemoryManager:
         capacity = get_int_env_var(
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
         )
-        workspaces = triton_workspace_sizes(
+        ep_workspace_bytes, tp_workspace_bytes = triton_workspace_sizes(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_experts=num_experts,
@@ -367,17 +415,21 @@ class ParaSMemoryManager:
             tp_size=tp_size,
             dispatch_capacity=capacity,
         )
-        spec = dict(
+        spec = UnifiedLayoutSpec(
             num_layers=num_layers,
             prefix=prefix,
-            weight_names={"ep": [], "tp": []},
-            workspaces={
-                mode: ModeWorkspaces(
-                    WorkspaceRequirement("triton", size),
+            ep=UnifiedModeSpec(
+                ModeWorkspaces(
+                    WorkspaceRequirement("triton", ep_workspace_bytes),
                     WorkspaceRequirement("unconfigured", None),
                 )
-                for mode, size in zip(("ep", "tp"), workspaces)
-            },
+            ),
+            tp=UnifiedModeSpec(
+                ModeWorkspaces(
+                    WorkspaceRequirement("triton", tp_workspace_bytes),
+                    WorkspaceRequirement("unconfigured", None),
+                )
+            ),
             tp_size=tp_size,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -385,6 +437,7 @@ class ParaSMemoryManager:
             hidden_size=hidden_size,
         )
         for mode in ("ep", "tp"):
+            mode_spec = spec.for_mode(mode)
             experts = num_experts // ep_size if mode == "ep" else num_experts
             inter = intermediate_size if mode == "ep" else intermediate_size // tp_size
             q = (
@@ -417,15 +470,15 @@ class ParaSMemoryManager:
                     self.reserve(name, shape, torch.bfloat16)
                     self._reservation_order.remove(name)
                     names.append(name)
-                spec["weight_names"][mode].append(names)
+                mode_spec.weight_names.append(names)
                 if mode == "ep":
                     for weight in ("w13", "w2"):
                         self._entries[f"{lp}.mlp.experts.{weight}_weight"] = (
                             self._entries[f"{lp}.mlp.ep_experts.{weight}_weight"]
                         )
-            spec[f"{mode}_weight_bytes"] = sum(
+            mode_spec.weight_bytes = sum(
                 align_up(self._entries[n].size_bytes)
-                for n in spec["weight_names"][mode][0]
+                for n in mode_spec.weight_names[0]
             )
         self._unified_spec = spec
 
@@ -436,7 +489,7 @@ class ParaSMemoryManager:
         """Return typed scratch views, or None when the backend owns its storage."""
         if not self.unified_workspace_enabled:
             return None
-        requirement = self._unified_spec["workspaces"][mode].attention
+        requirement = self._unified_spec.for_mode(mode).workspaces.attention
         if requirement.size_bytes is None:
             return None
         if requirement.backend != backend:
@@ -453,7 +506,7 @@ class ParaSMemoryManager:
         """
         if not self.unified_workspace_enabled:
             return None
-        requirement = self._unified_spec["workspaces"][mode].attention
+        requirement = self._unified_spec.for_mode(mode).workspaces.attention
         if requirement.size_bytes is None:
             return None
         (workspace_buffer,) = self.get_attention_workspace(
@@ -465,7 +518,7 @@ class ParaSMemoryManager:
         """Call only after migration; the target region may hold source weights."""
         if not self.unified_workspace_enabled:
             return
-        requirement = self._unified_spec["workspaces"][mode].attention
+        requirement = self._unified_spec.for_mode(mode).workspaces.attention
         workspace_buffer = self.get_attention_workspace_buffer(
             requirement.backend, mode
         )
@@ -484,7 +537,9 @@ class ParaSMemoryManager:
         if self._buffer is None or requested_device != self._buffer.device:
             raise RuntimeError(f"{kind} workspace requested on a different device")
         offset, _ = self._unified_layout.workspace(mode)
-        relative_offset, capacity = self._unified_spec["workspaces"][mode].region(kind)
+        relative_offset, capacity = self._unified_spec.for_mode(mode).workspaces.region(
+            kind
+        )
         offset += relative_offset
         cursor = 0
         result = []
@@ -505,7 +560,8 @@ class ParaSMemoryManager:
 
     def _materialize_unified(self):
         layout, spec = self._unified_layout, self._unified_spec
-        if layout is None or not self._kv_reserved:
+        pending = self._paras_kv_pending
+        if layout is None or not self._kv_reserved or pending is None:
             raise RuntimeError(
                 "Unified layout requires capacity planning and KV reservation"
             )
@@ -514,19 +570,21 @@ class ParaSMemoryManager:
             self.tp_max_kv_tokens,
         ):
             raise ValueError("KV reservation differs from the unified capacity plan")
+        dtype = pending.kv_dtype
         for mode in ("ep", "tp"):
-            for i, names in enumerate(spec["weight_names"][mode]):
+            shapes = (
+                pending.layer_ep_shapes if mode == "ep" else pending.layer_tp_shapes
+            )
+            sizes = pending.layer_ep_bytes if mode == "ep" else pending.layer_tp_bytes
+            for i, names in enumerate(spec.for_mode(mode).weight_names):
                 offset = layout.weight_offset(mode, i)
                 for name in names:
                     entry = self._entries[name]
                     entry.offset_bytes = offset
                     offset += self._align_up(entry.size_bytes, self.ALIGNMENT)
-                pending = self._paras_kv_pending
-                shape = pending[f"layer_{mode}_shapes"][i]
-                size = pending[f"layer_{mode}_bytes"][i]
-                dtype = pending["kv_dtype"]
+                shape, size = shapes[i], sizes[i]
                 for side, displacement in (("k", 0), ("v", size)):
-                    name = f"{spec['prefix']}.layers.{i}.kv.{mode}.{side}"
+                    name = f"{spec.prefix}.layers.{i}.kv.{mode}.{side}"
                     entry = LayoutEntry(
                         name,
                         shape,
@@ -538,7 +596,7 @@ class ParaSMemoryManager:
                     )
                     self._entries[name] = entry
                     if mode == "ep":
-                        self._entries[f"{spec['prefix']}.layers.{i}.kv.{side}"] = entry
+                        self._entries[f"{spec.prefix}.layers.{i}.kv.{side}"] = entry
         self._total_bytes = layout.budget
         self._buffer = torch.empty(layout.budget, dtype=torch.uint8, device=self.device)
         self._buffer_start = self._buffer.data_ptr()
@@ -549,7 +607,7 @@ class ParaSMemoryManager:
                 self._entries[names[0]].shape,
             ): mode
             for mode in ("ep", "tp")
-            for names in spec["weight_names"][mode]
+            for names in spec.for_mode(mode).weight_names
         }
         self._materialized = True
         return layout.budget
@@ -656,15 +714,15 @@ class ParaSMemoryManager:
                 self.tp_max_kv_tokens_swa = max(s.tokens_cap_tp for s in swa_specs)
 
         # Save metadata for _create_kv_layout (called from materialize).
-        self._paras_kv_pending = {
-            "num_layers": num_layers,
-            "prefix": prefix,
-            "layer_ep_bytes": layer_ep_bytes,
-            "layer_tp_bytes": layer_tp_bytes,
-            "layer_ep_shapes": layer_ep_shapes,
-            "layer_tp_shapes": layer_tp_shapes,
-            "kv_dtype": kv_dtype,
-        }
+        self._paras_kv_pending = KVCacheReservation(
+            num_layers=num_layers,
+            prefix=prefix,
+            layer_ep_bytes=layer_ep_bytes,
+            layer_tp_bytes=layer_tp_bytes,
+            layer_ep_shapes=layer_ep_shapes,
+            layer_tp_shapes=layer_tp_shapes,
+            kv_dtype=kv_dtype,
+        )
 
         self._kv_reserved = True
 
@@ -767,28 +825,25 @@ class ParaSMemoryManager:
 
         if self.unified_workspace_enabled:
             from sglang.srt.paras.unified_layout import plan_unified_layout
-            from sglang.srt.paras.workspace import (
-                ModeWorkspaces,
-                attention_workspace_requirements,
-            )
+            from sglang.srt.paras.workspace import attention_workspace_requirements
 
             spec = self._unified_spec
             attention = attention_workspace_requirements(
                 self.server_args, config, tp_size, head_dim, context_len=self.context_len
             )
             for mode, requirement in zip(("ep", "tp"), attention):
-                spec["workspaces"][mode] = ModeWorkspaces(
-                    spec["workspaces"][mode].moe, requirement
+                spec.for_mode(mode).workspaces = ModeWorkspaces(
+                    spec.for_mode(mode).workspaces.moe, requirement
                 )
             ep_row = num_kv_heads * head_dim * 2 * elem_size
             tp_row = max(1, num_kv_heads // tp_size) * head_dim * 2 * elem_size
             layout = plan_unified_layout(
                 num_layers=num_layers,
                 budget=umm_budget_bytes - non_umm_static_bytes,
-                ep_weight_bytes=spec["ep_weight_bytes"],
-                tp_weight_bytes=spec["tp_weight_bytes"],
-                ep_workspace_bytes=spec["workspaces"]["ep"].size_bytes,
-                tp_workspace_bytes=spec["workspaces"]["tp"].size_bytes,
+                ep_weight_bytes=spec.ep.weight_bytes,
+                tp_weight_bytes=spec.tp.weight_bytes,
+                ep_workspace_bytes=spec.ep.workspaces.size_bytes,
+                tp_workspace_bytes=spec.tp.workspaces.size_bytes,
                 ep_kv_row_bytes=ep_row,
                 tp_kv_row_bytes=tp_row,
                 page_size=self.server_args.page_size,
@@ -799,7 +854,8 @@ class ParaSMemoryManager:
                 layout.tp_tokens,
             )
             logger.info("ParaS unified weights/KV/workspace: %s", layout)
-            for mode, requirements in spec["workspaces"].items():
+            for mode in ("ep", "tp"):
+                requirements = spec.for_mode(mode).workspaces
                 logger.info(
                     "ParaS %s workspace: %s; unused padding=%d bytes",
                     mode,
@@ -1093,7 +1149,16 @@ class ParaSMemoryManager:
 
         pending = getattr(self, "_paras_kv_pending", None)
         if pending is not None:
-            offset = self._create_kv_layout(offset, **pending)
+            offset = self._create_kv_layout(
+                offset,
+                num_layers=pending.num_layers,
+                prefix=pending.prefix,
+                layer_ep_bytes=pending.layer_ep_bytes,
+                layer_tp_bytes=pending.layer_tp_bytes,
+                layer_ep_shapes=pending.layer_ep_shapes,
+                layer_tp_shapes=pending.layer_tp_shapes,
+                kv_dtype=pending.kv_dtype,
+            )
 
         self._total_bytes = self._align_up(offset, self.ALIGNMENT)
         self._buffer = torch.empty(
@@ -1362,9 +1427,7 @@ class ParaSMemoryManager:
     def weights_only_bytes(self) -> int:
         """Total reserved bytes NOT including KV cache entries (for KV sizing)."""
         if self.unified_workspace_enabled:
-            return (
-                self._unified_spec["num_layers"] * self._unified_spec["ep_weight_bytes"]
-            )
+            return self._unified_spec.num_layers * self._unified_spec.ep.weight_bytes
         return sum(
             self._entries[n].size_bytes
             for n in self._reservation_order

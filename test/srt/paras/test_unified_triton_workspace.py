@@ -70,14 +70,21 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode):
     size = unified_layout.align_up(rows * 2 * inter * 2)
     size += unified_layout.align_up(rows * inter * 2)
     mgr = memory.ParaSMemoryManager(device="cuda")
-    mgr._unified_spec = {
-        "workspaces": {
-            mode: ModeWorkspaces(
-                WorkspaceRequirement("triton", size),
-                WorkspaceRequirement("external", None),
-            )
-        }
-    }
+    workspaces = ModeWorkspaces(
+        WorkspaceRequirement("triton", size),
+        WorkspaceRequirement("external", None),
+    )
+    mgr._unified_spec = memory.UnifiedLayoutSpec(
+        num_layers=1,
+        prefix="model",
+        tp_size=1,
+        num_heads=1,
+        num_kv_heads=1,
+        head_dim=128,
+        hidden_size=h,
+        ep=memory.UnifiedModeSpec(workspaces),
+        tp=memory.UnifiedModeSpec(workspaces),
+    )
     mgr._unified_layout = SimpleNamespace(workspace=lambda _: (256, size))
     mgr._buffer = torch.full((size + 512,), 23, device="cuda", dtype=torch.uint8)
     mgr._materialized = True

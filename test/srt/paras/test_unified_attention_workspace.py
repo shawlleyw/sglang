@@ -151,19 +151,30 @@ def test_suballocation_alignment_and_validation():
     not torch.cuda.is_available(), reason="Backend imports require CUDA"
 )
 def test_rebinding_does_not_overwrite_source_weights(monkeypatch, backend_name):
-    from sglang.srt.paras.paras_memory_manager import ParaSMemoryManager
+    from sglang.srt.paras.paras_memory_manager import (
+        ParaSMemoryManager,
+        UnifiedLayoutSpec,
+        UnifiedModeSpec,
+    )
 
     mgr = ParaSMemoryManager(device="cpu")
     mgr._buffer = torch.full((16384,), 23, dtype=torch.uint8)
     mgr._unified_layout = SimpleNamespace(workspace=lambda mode: (8192, 8192))
-    mgr._unified_spec = {
-        "workspaces": {
-            "tp": ModeWorkspaces(
-                WorkspaceRequirement("triton", 4096),
-                WorkspaceRequirement(backend_name, 4096),
-            )
-        }
-    }
+    workspaces = ModeWorkspaces(
+        WorkspaceRequirement("triton", 4096),
+        WorkspaceRequirement(backend_name, 4096),
+    )
+    mgr._unified_spec = UnifiedLayoutSpec(
+        num_layers=1,
+        prefix="model",
+        tp_size=8,
+        num_heads=32,
+        num_kv_heads=4,
+        head_dim=128,
+        hidden_size=2048,
+        ep=UnifiedModeSpec(workspaces),
+        tp=UnifiedModeSpec(workspaces),
+    )
     if backend_name == "flashinfer":
         from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 

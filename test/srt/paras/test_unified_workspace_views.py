@@ -31,17 +31,17 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(
     )
     spec = mgr._unified_spec
     for mode in ("ep", "tp"):
-        spec["workspaces"][mode] = ModeWorkspaces(
-            spec["workspaces"][mode].moe,
+        spec.for_mode(mode).workspaces = ModeWorkspaces(
+            spec.for_mode(mode).workspaces.moe,
             WorkspaceRequirement("test", attention_bytes),
         )
     layout = unified_layout.plan_unified_layout(
         num_layers=4,
         budget=5 << 20,
-        ep_weight_bytes=spec["ep_weight_bytes"],
-        tp_weight_bytes=spec["tp_weight_bytes"],
-        ep_workspace_bytes=spec["workspaces"]["ep"].size_bytes,
-        tp_workspace_bytes=spec["workspaces"]["tp"].size_bytes,
+        ep_weight_bytes=spec.ep.weight_bytes,
+        tp_weight_bytes=spec.tp.weight_bytes,
+        ep_workspace_bytes=spec.ep.workspaces.size_bytes,
+        tp_workspace_bytes=spec.tp.workspaces.size_bytes,
         ep_kv_row_bytes=1024,
         tp_kv_row_bytes=512,
     )

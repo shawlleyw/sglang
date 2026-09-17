@@ -43,11 +43,11 @@ def _restore_attention(
 def transfer_attention(manager, layer_id, mode, rank, peer_bases):
     """Caller fences all ranks after the complete layer, including MoE."""
     spec = manager._unified_spec
-    lp = f"{spec['prefix']}.layers.{layer_id}.self_attn"
-    h, d, t = spec["hidden_size"], spec["head_dim"], spec["tp_size"]
-    q, kv = spec["num_heads"] * d, spec["num_kv_heads"] * d
+    lp = f"{spec.prefix}.layers.{layer_id}.self_attn"
+    h, d, t = spec.hidden_size, spec.head_dim, spec.tp_size
+    q, kv = spec.num_heads * d, spec.num_kv_heads * d
     qs, ks = q // t, max(d, kv // t)
-    kv_rank = rank // max(1, t // spec["num_kv_heads"])
+    kv_rank = rank // max(1, t // spec.num_kv_heads)
     for proj in ("qkv_proj", "o_proj"):
         ep_name, tp_name = f"{lp}.{proj}.weight", f"{lp}.{proj}.tp_weight"
         ep, tp = manager.get_view(ep_name), manager.get_view(tp_name)

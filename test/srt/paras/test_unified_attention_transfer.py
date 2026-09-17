@@ -43,7 +43,7 @@ def test_attention_roundtrip_without_full_backup(tp_size, kv_heads):
                     views[name].copy_(reference[p])
         managers.append(
             SimpleNamespace(
-                _unified_spec=dict(
+                _unified_spec=SimpleNamespace(
                     prefix="model",
                     hidden_size=h,
                     head_dim=d,
