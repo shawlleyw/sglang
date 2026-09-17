@@ -535,11 +535,11 @@ def fused_experts_impl(
     # We execute the fused_moe kernel in chunks to circumvent this issue:
     # https://github.com/vllm-project/vllm/issues/5938
     from sglang.srt.paras.unified_layout import (
-        MOE_CHUNK_ROWS,
+        triton_moe_chunk_size as max_input_tokens_per_chunk,
         validate_triton_workspace_blocks,
     )
 
-    M = min(num_tokens, MOE_CHUNK_ROWS)
+    M = min(num_tokens, max_input_tokens_per_chunk)
     config_dtype = get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
@@ -609,10 +609,10 @@ def fused_experts_impl(
     else:
         out_hidden_states = torch.empty_like(hidden_states)
 
-    for chunk in range((num_tokens // MOE_CHUNK_ROWS) + 1):
+    for chunk in range((num_tokens // max_input_tokens_per_chunk) + 1):
         begin_chunk_idx, end_chunk_idx = (
-            chunk * MOE_CHUNK_ROWS,
-            min((chunk + 1) * MOE_CHUNK_ROWS, num_tokens),
+            chunk * max_input_tokens_per_chunk,
+            min((chunk + 1) * max_input_tokens_per_chunk, num_tokens),
         )
         curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
         tokens_in_chunk, _ = curr_hidden_states.shape
@@ -620,7 +620,7 @@ def fused_experts_impl(
         if tokens_in_chunk == 0:
             break
 
-        if tokens_in_chunk < MOE_CHUNK_ROWS and chunk > 0:
+        if tokens_in_chunk < max_input_tokens_per_chunk and chunk > 0:
             # Adjust the intermediate cache size and config for the last
             # chunk. Note that in most cases we only have one chunk
             # so the cache size and config are already set correctly and

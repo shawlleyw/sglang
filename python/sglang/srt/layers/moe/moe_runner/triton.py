@@ -111,14 +111,16 @@ class TritonRunnerCore(MoeRunnerCore):
     ) -> TritonRunnerOutput:
 
         from sglang.srt.paras.paras_memory_manager import get_paras_workspace_mode
-        from sglang.srt.paras.unified_layout import MOE_CHUNK_ROWS
+        from sglang.srt.paras.unified_layout import (
+            triton_moe_chunk_size as max_dispatched_rows_per_chunk,
+        )
 
         mode = get_paras_workspace_mode(quant_info.w13_weight)
         rows = runner_input.hidden_states.shape[0]
         if (
             mode == "ep"
             and running_state.get("masked_m") is None
-            and rows > MOE_CHUNK_ROWS
+            and rows > max_dispatched_rows_per_chunk
         ):
             # Normal DeepEP dispatch expands tokens into expert rows. Bound
             # internal scratch independently of long requests/routing skew.
@@ -132,8 +134,8 @@ class TritonRunnerCore(MoeRunnerCore):
                 dtype=runner_input.hidden_states.dtype,
                 device=runner_input.hidden_states.device,
             )
-            for start in range(0, rows, MOE_CHUNK_ROWS):
-                end = min(start + MOE_CHUNK_ROWS, rows)
+            for start in range(0, rows, max_dispatched_rows_per_chunk):
+                end = min(start + max_dispatched_rows_per_chunk, rows)
                 ids = runner_input.topk_ids[start:end]
                 sorted_ids, experts, padded = moe_align_block_size(
                     ids,

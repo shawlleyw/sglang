@@ -65,7 +65,7 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode):
 
     # Force three EP chunks, including a short final chunk; reserve only a
     # single chunk's intermediates so an unbounded implementation must fail.
-    monkeypatch.setattr(unified_layout, "MOE_CHUNK_ROWS", 32)
+    monkeypatch.setattr(unified_layout, "triton_moe_chunk_size", 32)
     rows = 32 if mode == "ep" else m * k
     size = unified_layout.align_up(rows * 2 * inter * 2)
     size += unified_layout.align_up(rows * inter * 2)

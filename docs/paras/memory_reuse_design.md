@@ -54,9 +54,13 @@ views. Neither operator can consume the other's region or unused padding.
 | FlashInfer attention | Partial outputs and normalization statistics | Configured capacity: normally 384 MiB for Qwen3 MoE; 2 GiB in deterministic mode |
 | Triton attention | FP32 partial outputs and LSE | Separately aligned tensors with payload `tokens * local_query_heads * KV_splits * (head_dim + 1) * 4` bytes |
 
-MoE planning and runners share `MOE_CHUNK_ROWS`. Managed calls validate the
-selected `BLOCK_SIZE_M` against `MOE_MAX_BLOCK_M = 256`, including the TP
-final chunk and down-projection configuration. Kernel tuning beyond that
+MoE planning and runners share the `triton_moe_chunk_size` variable, keeping
+the existing `64 * 1024` limit. TP uses it as `max_input_tokens_per_chunk`; EP uses
+it as `max_dispatched_rows_per_chunk`, after routing expands tokens into
+token/expert assignments. It bounds one execution chunk, not the total batch.
+Managed calls validate the selected `BLOCK_SIZE_M` against
+`MOE_MAX_BLOCK_M = 256`, including the TP final chunk and down-projection
+configuration. Kernel tuning beyond that
 bound fails explicitly before using the workspace.
 
 Triton attention planning and execution share the split-count calculation

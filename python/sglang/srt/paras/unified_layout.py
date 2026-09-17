@@ -115,7 +115,9 @@ def plan_unified_layout(
     )
 
 
-MOE_CHUNK_ROWS = 65536
+# Existing Triton execution limit, shared by workspace planning and runners.
+# TP counts input tokens; EP counts dispatched rows (token/expert assignments).
+triton_moe_chunk_size: int = 64 * 1024
 # The Triton configurations supported by this workspace have BLOCK_SIZE_M <= 256.
 MOE_MAX_BLOCK_M = 256
 
@@ -141,14 +143,18 @@ def triton_workspace_sizes(
 ) -> tuple[int, int]:
     """BF16 internal scratch; dispatcher inputs and escaped outputs are separate.
 
-    EP contiguous work is tiled into MOE_CHUNK_ROWS expert rows. LL uses its
+    EP contiguous work is tiled into dispatched expert rows. LL uses its
     full padded receive shape. TP follows the fused runner's input-token chunks.
     """
-    ep_rows = max(MOE_CHUNK_ROWS, num_experts * dispatch_capacity)
+    max_dispatched_rows_per_chunk = triton_moe_chunk_size
+    ep_rows = max(max_dispatched_rows_per_chunk, num_experts * dispatch_capacity)
     ep = align_up(ep_rows * 2 * intermediate_size * 2)
     ep += align_up(ep_rows * intermediate_size * 2)
     tp_inter = intermediate_size // tp_size
-    tp_rows = MOE_CHUNK_ROWS * top_k + (num_experts + 1) * (MOE_MAX_BLOCK_M - 1)
+    max_input_tokens_per_chunk = triton_moe_chunk_size
+    tp_rows = max_input_tokens_per_chunk * top_k + (num_experts + 1) * (
+        MOE_MAX_BLOCK_M - 1
+    )
     tp = align_up(tp_rows * max(2 * tp_inter, hidden_size) * 2)
     tp += align_up(tp_rows * tp_inter * 2)
     return ep, tp
