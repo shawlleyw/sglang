@@ -37,8 +37,8 @@ Before attention workspace integration, for Qwen3-30B-A3B BF16 on four A100s
 at static fraction 0.7, the measured
 plan is 52.865405 GiB per GPU: EP has a 1.059124 GiB front, 15.187500 GiB
 weights and 36.618713 GiB KV; TP has 13.921875 GiB weights, 36.618759 GiB KV
-and a 2.324749 GiB tail. See the linked design for formulas and the 235B
-DEP8/TP8 calculation.
+and a 2.324749 GiB tail. The linked design describes the current contract
+and links to the historical 235B DEP8/TP8 calculations.
 
 ## Overview
 
