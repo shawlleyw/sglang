@@ -15,6 +15,10 @@ if TYPE_CHECKING:
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
+    def paras_initialize_workspace(self):
+        """Initialize managed scratch after all live weight/KV transfers finish."""
+        pass
+
     @abstractmethod
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""

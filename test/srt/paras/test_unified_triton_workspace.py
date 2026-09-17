@@ -21,6 +21,7 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode):
     )
     from sglang.srt.paras import paras_memory_manager as memory
     from sglang.srt.paras import unified_layout
+    from sglang.srt.paras.workspace import ModeWorkspaces, WorkspaceRequirement
     from sglang.srt import server_args
 
     monkeypatch.setattr(
@@ -69,7 +70,14 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode):
     size = unified_layout.align_up(rows * 2 * inter * 2)
     size += unified_layout.align_up(rows * inter * 2)
     mgr = memory.ParaSMemoryManager(device="cuda")
-    mgr._unified_spec = {}
+    mgr._unified_spec = {
+        "workspaces": {
+            mode: ModeWorkspaces(
+                WorkspaceRequirement("triton", size),
+                WorkspaceRequirement("external", None),
+            )
+        }
+    }
     mgr._unified_layout = SimpleNamespace(workspace=lambda _: (256, size))
     mgr._buffer = torch.full((size + 512,), 23, device="cuda", dtype=torch.uint8)
     mgr._materialized = True

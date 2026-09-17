@@ -341,6 +341,7 @@ class ParaSMemoryManager:
     ):
         """Register both layouts without reserving duplicate physical weights."""
         from sglang.srt.paras.unified_layout import align_up, triton_workspace_sizes
+        from sglang.srt.paras.workspace import ModeWorkspaces, WorkspaceRequirement
         from sglang.srt.utils import get_int_env_var
 
         if ep_size != tp_size or num_experts % ep_size or intermediate_size % tp_size:
@@ -368,7 +369,13 @@ class ParaSMemoryManager:
             num_layers=num_layers,
             prefix=prefix,
             weight_names={"ep": [], "tp": []},
-            workspace_bytes=workspaces,
+            workspaces={
+                mode: ModeWorkspaces(
+                    WorkspaceRequirement("triton", size),
+                    WorkspaceRequirement("unconfigured", None),
+                )
+                for mode, size in zip(("ep", "tp"), workspaces)
+            },
             tp_size=tp_size,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -421,14 +428,48 @@ class ParaSMemoryManager:
         self._unified_spec = spec
 
     def get_moe_workspace(self, mode, shapes, dtype, device):
+        return self._get_workspace(mode, "moe", shapes, dtype, device)
+
+    def get_attention_workspace(self, backend, mode, shapes, dtype, device):
+        if not self.unified_workspace_enabled:
+            return None
+        requirement = self._unified_spec["workspaces"][mode].attention
+        if requirement.size_bytes is None:
+            return None
+        if requirement.backend != backend:
+            raise RuntimeError(
+                f"Attention workspace planned for {requirement.backend}, got {backend}"
+            )
+        return self._get_workspace(mode, "attention", shapes, dtype, device)
+
+    def initialize_attention_workspace(self, mode):
+        """Call only after migration; the target region may hold source weights."""
+        if not self.unified_workspace_enabled:
+            return
+        requirement = self._unified_spec["workspaces"][mode].attention
+        if requirement.size_bytes is not None:
+            self.get_attention_workspace(
+                requirement.backend,
+                mode,
+                [(requirement.size_bytes,)],
+                torch.uint8,
+                self.device,
+            )[0].zero_()
+
+    def _get_workspace(self, mode, kind, shapes, dtype, device):
         """Typed, non-owning scratch views at the mode's fixed endpoint."""
         if not self.unified_workspace_enabled:
             return None
         from sglang.srt.paras.unified_layout import align_up
 
-        if self._buffer is None or torch.device(device) != self._buffer.device:
-            raise RuntimeError("MoE workspace requested on a different device")
-        offset, capacity = self._unified_layout.workspace(mode)
+        requested_device = torch.device(device)
+        if requested_device.type == "cuda" and requested_device.index is None:
+            requested_device = torch.device("cuda", torch.cuda.current_device())
+        if self._buffer is None or requested_device != self._buffer.device:
+            raise RuntimeError(f"{kind} workspace requested on a different device")
+        offset, _ = self._unified_layout.workspace(mode)
+        relative_offset, capacity = self._unified_spec["workspaces"][mode].region(kind)
+        offset += relative_offset
         cursor = 0
         result = []
         for shape in shapes:
@@ -436,7 +477,7 @@ class ParaSMemoryManager:
             cursor = align_up(cursor)
             if cursor + size > capacity:
                 raise RuntimeError(
-                    f"ParaS {mode} workspace overflow: {cursor + size} > {capacity}"
+                    f"ParaS {mode} {kind} workspace overflow: {cursor + size} > {capacity}"
                 )
             result.append(
                 self._buffer[offset + cursor : offset + cursor + size]
@@ -710,8 +751,19 @@ class ParaSMemoryManager:
 
         if self.unified_workspace_enabled:
             from sglang.srt.paras.unified_layout import plan_unified_layout
+            from sglang.srt.paras.workspace import (
+                ModeWorkspaces,
+                attention_workspace_requirements,
+            )
 
             spec = self._unified_spec
+            attention = attention_workspace_requirements(
+                self.server_args, config, tp_size, head_dim
+            )
+            for mode, requirement in zip(("ep", "tp"), attention):
+                spec["workspaces"][mode] = ModeWorkspaces(
+                    spec["workspaces"][mode].moe, requirement
+                )
             ep_row = num_kv_heads * head_dim * 2 * elem_size
             tp_row = max(1, num_kv_heads // tp_size) * head_dim * 2 * elem_size
             layout = plan_unified_layout(
@@ -719,8 +771,8 @@ class ParaSMemoryManager:
                 budget=umm_budget_bytes - non_umm_static_bytes,
                 ep_weight_bytes=spec["ep_weight_bytes"],
                 tp_weight_bytes=spec["tp_weight_bytes"],
-                ep_workspace_bytes=spec["workspace_bytes"][0],
-                tp_workspace_bytes=spec["workspace_bytes"][1],
+                ep_workspace_bytes=spec["workspaces"]["ep"].size_bytes,
+                tp_workspace_bytes=spec["workspaces"]["tp"].size_bytes,
                 ep_kv_row_bytes=ep_row,
                 tp_kv_row_bytes=tp_row,
                 page_size=self.server_args.page_size,
@@ -731,6 +783,13 @@ class ParaSMemoryManager:
                 layout.tp_tokens,
             )
             logger.info("ParaS unified weights/KV/workspace: %s", layout)
+            for mode, requirements in spec["workspaces"].items():
+                logger.info(
+                    "ParaS %s workspace: %s; unused padding=%d bytes",
+                    mode,
+                    requirements,
+                    layout.workspace(mode)[1] - requirements.size_bytes,
+                )
             return ParaSKVCapacityPlan(
                 available_gpu_memory_bytes=avail_now_bytes,
                 total_gpu_memory_bytes=total_gpu_bytes,

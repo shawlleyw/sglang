@@ -2563,6 +2563,7 @@ class ModelRunner:
             "Use ParaSModelMixin from sglang.srt.paras.paras_model."
         )
         self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
+        self.attn_backend.paras_initialize_workspace()
 
         from sglang.srt.paras.paras_cuda_graph import paras_swap_cuda_graphs
 
@@ -2583,6 +2584,7 @@ class ModelRunner:
             self.attn_backend.paras_configure_ep(self.req_to_token_pool.req_to_token)
 
         self.model.paras_configure_ep()
+        self.attn_backend.paras_initialize_workspace()
 
         from sglang.srt.paras.paras_cuda_graph import paras_swap_cuda_graphs
 

@@ -4,6 +4,62 @@ Status: implemented for unquantized Qwen3 MoE with equal EP/TP groups,
 `peer_access`, and Triton MoE in both modes. The DeepGEMM integration below
 remains a design proposal. All memory numbers are per GPU.
 
+## Combined attention and MoE workspace
+
+The implemented planner now treats the two numerical workspaces as separate
+subregions of a single endpoint requirement:
+
+```
+W_mode = align_up(MoE_bytes, 256) + align_up(attention_bytes, 256)
+EP_front >= max(one_TP_weight_layer, W_EP)
+TP_tail   = align_up(max(one_EP_KV_layer, W_TP), 256)
+padding   = endpoint_capacity - W_mode
+
+EP: [MoE][attention][padding][EP weights][EP KV]
+TP: [TP weights][TP KV][MoE][attention][padding]
+```
+
+The ordered-transfer planner also enforces TP KV bytes/layer >= EP KV
+bytes/layer; that can enlarge the EP front when TP scratch exceeds the
+weight savings. The TP gap is recomputed from the final EP KV capacity.
+The same algorithm handles workspace requirements smaller or larger than
+the transfer gap, including backend-specific asymmetric requirements.
+
+`paras/workspace.py` provides allocation-free requirements, with backend
+identity and a byte count (`None` means externally allocated). The manager
+validates backend identity and each subregion's capacity when returning
+views. It does not let either operator consume the other's space or padding.
+
+* FlashInfer uses its configured numerical capacity (384 MiB by default for
+  Qwen3 MoE; deterministic mode reserves 2 GiB). Its ordinary prefill/decode
+  wrappers share the current mode's view. Integer plans, pinned CPU staging,
+  and attention metadata remain external. Rebinding preserves those plans.
+* Triton uses FP32 partial outputs and LSE: separately aligned tensors with
+  `tokens * query_heads * KV_splits * (head_dim + 1) * 4` total payload bytes.
+  Eager decode and graph capture use managed views. The existing graph runner
+  allocates for max(EP graph capacity, TP graph capacity) in both modes;
+  integration preserves this policy. Thus Qwen235B with 2,048 graph tokens,
+  eight splits and head dimension 128 reserves **516 MiB EP / 64.5 MiB TP**,
+  rather than the 64.5/64.5 MiB possible with per-mode graph sizing.
+* FlashAttention and other backends without external scratch bindings remain
+  external. Composite prefill/decode backends, speculative workers, PDMux and
+  two-batch overlap also retain external attention allocation. Triton without
+  an explicit maximum running-request count retains external allocation.
+
+MoE remains the implemented BF16 Triton path with its existing 65,536-row
+chunk bounds and conservative block padding. The runtime-sized 8,192-token
+examples later in this document remain proposals. DeepGEMM is not integrated.
+Neither native backend allocation policy nor `mem_fraction_static` changes.
+Managed scratch is charged once inside the existing UMM budget; its replaced
+external allocation is omitted, while the configured dynamic reserve remains.
+
+During switching, scratch contents are disposable, but the target endpoint
+may contain live source weights. Reconfiguration therefore binds views
+without writing them; initialization occurs only after migration. CUDA graph
+capture and runtime switching follow the same ordering. Numerical attention
+and MoE scratch do **not** overlap during inference, preserving the baseline
+comparison. Historical measured layouts below precede this integration.
+
 ## Implemented Triton layout
 
 `unified_layout.py` plans one allocation; `paras_memory_manager.py` exposes

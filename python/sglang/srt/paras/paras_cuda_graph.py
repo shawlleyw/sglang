@@ -442,6 +442,7 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
             paras_tp_size, model_runner.req_to_token_pool.req_to_token
         )
     model_runner.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
+    model_runner.attn_backend.paras_initialize_workspace()
 
     # 3. Clear the live graph dicts before capturing TP. The EP graph
     #    objects are still referenced via ``runner._paras_saved["ep"]``
@@ -508,6 +509,7 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
             model_runner.req_to_token_pool.req_to_token
         )
     model_runner.model.paras_configure_ep()
+    model_runner.attn_backend.paras_initialize_workspace()
 
     # 8. Load EP graph state — restores EP's graphs/buffers and the EP
     #    graph memory pool as the global pool. Ready to serve in EP mode.

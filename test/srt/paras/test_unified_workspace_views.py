@@ -5,9 +5,13 @@ import torch
 
 from sglang.srt.paras import paras_memory_manager as memory
 from sglang.srt.paras import unified_layout
+from sglang.srt.paras.workspace import ModeWorkspaces, WorkspaceRequirement
 
 
-def test_workspace_ownership_when_mode_weight_addresses_coincide(monkeypatch):
+@pytest.mark.parametrize("attention_bytes", [0, 1024, 400_000])
+def test_workspace_ownership_when_mode_weight_addresses_coincide(
+    monkeypatch, attention_bytes
+):
     monkeypatch.setattr(
         unified_layout, "triton_workspace_sizes", lambda **_: (4096, 8192)
     )
@@ -26,13 +30,18 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(monkeypatch):
         prefix="model",
     )
     spec = mgr._unified_spec
+    for mode in ("ep", "tp"):
+        spec["workspaces"][mode] = ModeWorkspaces(
+            spec["workspaces"][mode].moe,
+            WorkspaceRequirement("test", attention_bytes),
+        )
     layout = unified_layout.plan_unified_layout(
         num_layers=4,
         budget=5 << 20,
         ep_weight_bytes=spec["ep_weight_bytes"],
         tp_weight_bytes=spec["tp_weight_bytes"],
-        ep_workspace_bytes=4096,
-        tp_workspace_bytes=8192,
+        ep_workspace_bytes=spec["workspaces"]["ep"].size_bytes,
+        tp_workspace_bytes=spec["workspaces"]["tp"].size_bytes,
         ep_kv_row_bytes=1024,
         tp_kv_row_bytes=512,
     )
@@ -50,7 +59,8 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(monkeypatch):
     monkeypatch.setattr(memory, "_global_paras_memory_manager", mgr)
     ep_weight = mgr.get_view("model.layers.0.mlp.ep_experts.w13_weight")
     tp_weight = mgr.get_view("model.layers.1.mlp.tp_experts.w13_weight")
-    assert ep_weight.data_ptr() == tp_weight.data_ptr()
+    if attention_bytes < 400_000:
+        assert ep_weight.data_ptr() == tp_weight.data_ptr()
     assert memory.get_paras_workspace_mode(ep_weight) == "ep"
     assert memory.get_paras_workspace_mode(tp_weight) == "tp"
     for mode in ("ep", "tp"):
@@ -65,3 +75,20 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(monkeypatch):
         assert torch.all(mgr._buffer[offset + size :] == 23)
         with pytest.raises(RuntimeError, match="overflow"):
             mgr.get_moe_workspace(mode, [(size,)], torch.bfloat16, "cpu")
+        attention = mgr.get_attention_workspace(
+            "test", mode, [(attention_bytes,)], torch.uint8, "cpu"
+        )[0]
+        attention.fill_(9)
+        assert all(torch.all(view == 1) for view in scratch)
+        assert torch.all(mgr._buffer[:offset] == 23)
+        assert torch.all(mgr._buffer[offset + size :] == 23)
+        # Accessors must not silently consume padding or another operator's region.
+        with pytest.raises(RuntimeError, match="overflow"):
+            mgr.get_attention_workspace(
+                "test", mode, [(attention_bytes + 256,)], torch.uint8, "cpu"
+            )
+        with pytest.raises(RuntimeError, match="planned for"):
+            mgr.get_attention_workspace("wrong", mode, [(1,)], torch.uint8, "cpu")
+        mgr.initialize_attention_workspace(mode)
+        assert torch.all(attention == 0)
+        assert all(torch.all(view == 1) for view in scratch)

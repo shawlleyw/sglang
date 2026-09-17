@@ -8,17 +8,33 @@ now uses the asymmetric layout described in
 The remaining sections describe the legacy layout retained by other configurations.
 
 ```
-EP: [front: MoE scratch / transfer gap][EP weights][EP KV]
-TP: [TP weights][TP KV][tail: MoE scratch / transfer gap]
+EP: [MoE scratch][attention scratch][padding][EP weights][EP KV]
+TP: [TP weights][TP KV][MoE scratch][attention scratch][padding]
 ```
 
 Weights include experts and QKV/O attention projections. Attention switches
 live; TP mode retains no full DP attention backup. Each endpoint holds
 mode-specific Triton intermediates, with larger TP token batches accounted
 for before KV capacity is chosen. One endpoint is shared across all layers.
-DeepEP transport buffers and outputs that outlive the runner remain external.
+The endpoint capacity is sized from the **sum** of separately aligned MoE
+and attention requirements, bounded below by the transfer gap. Attention
+and MoE never alias each other. `workspace.py` declares backend requirements
+before construction; the manager binds their views after allocation.
 
-For Qwen3-30B-A3B BF16 on four A100s at static fraction 0.7, the measured
+FlashInfer's numerical workspace and Triton's decode partial-output/LSE
+buffers are managed. FlashAttention scratch remains external because its
+binding does not accept caller-owned workspace. FlashInfer integer plans,
+KV indices, graph metadata, DeepEP transport buffers, and outputs that
+outlive the runner remain external. Startup logs distinguish an external
+requirement (`size_bytes=None`) from a backend requiring zero scratch.
+
+Backend reconfiguration only changes references. Initializing target scratch
+is delayed until weight/KV migration completes, since that address range can
+still contain source weights during a switch. CUDA graphs retain stable
+per-mode addresses.
+
+Before attention workspace integration, for Qwen3-30B-A3B BF16 on four A100s
+at static fraction 0.7, the measured
 plan is 52.865405 GiB per GPU: EP has a 1.059124 GiB front, 15.187500 GiB
 weights and 36.618713 GiB KV; TP has 13.921875 GiB weights, 36.618759 GiB KV
 and a 2.324749 GiB tail. See the linked design for formulas and the 235B
