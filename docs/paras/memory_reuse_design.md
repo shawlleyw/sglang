@@ -49,15 +49,16 @@ views. Neither operator can consume the other's region or unused padding.
 
 | Backend | Managed numerical scratch | Sizing |
 | --- | --- | --- |
-| Triton MoE, EP | Gate/up and activation intermediates | Up to 65,536 dispatched expert rows per chunk, or the larger padded masked-decode receive bound |
+| Triton MoE, EP | Gate/up and activation intermediates | Reserved capacity for 65,536 dispatched expert rows, or the larger padded masked-decode receive bound |
 | Triton MoE, TP | Gate/up and down share storage; activation is separate | Up to 65,536 input tokens per chunk, routed top-k rows, and conservative block padding |
 | FlashInfer attention | Partial outputs and normalization statistics | Configured capacity: normally 384 MiB for Qwen3 MoE; 2 GiB in deterministic mode |
 | Triton attention | FP32 partial outputs and LSE | Separately aligned tensors with payload `tokens * local_query_heads * KV_splits * (head_dim + 1) * 4` bytes |
 
-MoE planning and runners share the `triton_moe_chunk_size` variable, keeping
-the existing `64 * 1024` limit. TP uses it as `max_input_tokens_per_chunk`; EP uses
-it as `max_dispatched_rows_per_chunk`, after routing expands tokens into
-token/expert assignments. It bounds one execution chunk, not the total batch.
+TP retains SGLang's existing `triton_moe_chunk_size = 64 * 1024`
+input-token loop. EP reserves scratch for that many dispatched token/expert
+rows but preserves SGLang's original single-call execution. Calls that exceed
+the reserved scratch use the backend's original temporary allocations; those
+allocations are outside the unified buffer and consume dynamic memory.
 Managed calls validate the selected `BLOCK_SIZE_M` against
 `MOE_MAX_BLOCK_M = 256`, including the TP final chunk and down-projection
 configuration. Kernel tuning beyond that

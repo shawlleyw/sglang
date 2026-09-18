@@ -29,8 +29,9 @@ def workspace_views(buffer, shapes, dtype, device, *, label="workspace"):
 
 
 def moe_workspace_views(buffer, shapes, dtype, device, *, block_sizes=()):
-    """None retains the backend's original allocation policy."""
-    if buffer is None:
+    """Reuse reserved scratch when it fits; otherwise use the original allocation."""
+    size = sum(align_up(math.prod(shape) * dtype.itemsize) for shape in shapes)
+    if buffer is None or size > buffer.numel():
         return None
     validate_triton_workspace_blocks(*block_sizes)
     return workspace_views(buffer, shapes, dtype, device, label="ParaS MoE workspace")

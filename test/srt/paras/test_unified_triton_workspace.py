@@ -1,4 +1,4 @@
-"""Numerical checks for TP scratch reuse and bounded EP prefill chunks."""
+"""Workspace reuse preserves original MoE execution, including larger EP batches."""
 
 from types import SimpleNamespace
 
@@ -10,10 +10,17 @@ from sglang.srt.paras.mode import ParaSMode
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
-    "mode,inplace",
-    [(ParaSMode.EP, False), (ParaSMode.TP, False), (ParaSMode.TP, True)],
+    "mode,inplace,reserved_rows",
+    [
+        (ParaSMode.EP, False, None),
+        (ParaSMode.EP, False, 32),
+        (ParaSMode.TP, False, None),
+        (ParaSMode.TP, True, None),
+    ],
 )
-def test_managed_triton_matches_original_allocations(monkeypatch, mode, inplace):
+def test_managed_triton_matches_original_allocations(
+    monkeypatch, mode, inplace, reserved_rows
+):
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
         fused_experts,
         moe_align_block_size,
@@ -76,10 +83,10 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode, inplace)
 
     expected = run()
 
-    # Force three EP chunks, including a short final chunk; reserve only a
-    # single chunk's intermediates so an unbounded implementation must fail.
+    # TP keeps its original chunk loop; EP runs the whole batch even when
+    # the reserved scratch is smaller than that batch.
     monkeypatch.setattr(unified_layout, "triton_moe_chunk_size", 32)
-    rows = 32 if mode == ParaSMode.EP else m * k
+    rows = m * k if reserved_rows is None else reserved_rows
     size = unified_layout.align_up(rows * 2 * inter * 2)
     size += unified_layout.align_up(rows * inter * 2)
     mgr = memory.ParaSMemoryManager(device="cuda")
@@ -103,12 +110,15 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode, inplace)
     mgr._materialized = True
     # Binding works without a global manager or a weight-address registry.
     runner_config.paras_workspace = mgr.bind_moe_workspace(mode)
-    with monkeypatch.context() as bounds:
-        bounds.setattr(unified_layout, "MOE_MAX_BLOCK_M", 1)
-        with pytest.raises(ValueError, match="selected configuration"):
-            run()
+    if reserved_rows is None:
+        with monkeypatch.context() as bounds:
+            bounds.setattr(unified_layout, "MOE_MAX_BLOCK_M", 1)
+            with pytest.raises(ValueError, match="selected configuration"):
+                run()
     actual = run()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if reserved_rows is not None:
+        assert torch.all(mgr._buffer == 23)
     if mode == ParaSMode.TP:
         compiled = torch.compile(run, backend="eager", fullgraph=True)
         torch.testing.assert_close(compiled(), expected, rtol=0, atol=0)

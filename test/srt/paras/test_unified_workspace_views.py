@@ -79,8 +79,10 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(
         offset, size = layout.workspace(mode)
         assert torch.all(mgr._buffer[:offset] == 23)
         assert torch.all(mgr._buffer[offset + size :] == 23)
-        with pytest.raises(RuntimeError, match="overflow"):
+        assert (
             moe_workspace_views(binding.buffer, [(size,)], torch.bfloat16, "cpu")
+            is None
+        )
         attention = mgr.get_attention_workspace(
             "test", mode, [(attention_bytes,)], torch.uint8, "cpu"
         )[0]
