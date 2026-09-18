@@ -344,32 +344,15 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
         self.paras_memory_manager = manager
         self.paras_layer_specs = plan.layer_specs
 
-        # Skip peer access pre-init when using NCCL transfer (no benefit
-        # and seems to interact badly with NCCL on A100).  Set
-        # PARAS_DISABLE_PEER_ACCESS=0 to re-enable for peer_access path.
-        if os.environ.get("PARAS_DISABLE_PEER_ACCESS", "1") == "1":
-            self._fused_peer_access_ctx = None
-        else:
-            try:
-                from sglang.srt.paras.peer_access import init_peer_access
+        from sglang.srt.paras.peer_access import init_peer_access
 
-                self._fused_peer_access_ctx = init_peer_access(
-                    manager, get_paras_tp_group().device_group, get_paras_tp_size()
-                )
-                logger.info("ParaS fused peer access pre-initialized.")
-            except Exception as e:
-                logger.warning(
-                    "ParaS fused peer access pre-init failed (will retry at switch): %s", e
-                )
-                self._fused_peer_access_ctx = None
-
+        self._fused_peer_access_ctx = init_peer_access(
+            manager, get_paras_tp_group().device_group, get_paras_tp_size()
+        )
         self.model = GptOssModelParaS(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        # Inject pre-initialized peer access context so the switch
-        # doesn't pay 6s init cost
-        if self._fused_peer_access_ctx is not None:
-            self.model._peer_access_ctx = self._fused_peer_access_ctx
+        self.model.paras_init_peer_access(self._fused_peer_access_ctx)
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,

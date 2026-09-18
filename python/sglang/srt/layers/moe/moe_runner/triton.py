@@ -174,9 +174,9 @@ class TritonRunnerCore(MoeRunnerCore):
 
         from sglang.srt.paras.workspace import moe_workspace_views
 
-        binding = self.config.paras_workspace
+        moe_workspace = self.config.paras_workspace
         intermediate_workspace, activation_workspace = moe_workspace_views(
-            binding.buffer if binding is not None else None,
+            moe_workspace.buffer if moe_workspace is not None else None,
             (M, topk_ids.shape[1], N),
             (M * topk_ids.shape[1], N // 2),
             hidden_states.dtype,

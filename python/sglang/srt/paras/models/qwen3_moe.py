@@ -204,24 +204,15 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
 
-        # Pre-initialize NVLink peer access during model init to avoid overhead at switch time.
-        # cudaIpcOpenMemHandle() is slow on first call (~6s for NVLink connection setup).
-        try:
-            from sglang.srt.paras.peer_access import init_peer_access
-            self._fused_peer_access_ctx = init_peer_access(
-                manager, get_paras_tp_group().device_group, get_paras_tp_size()
-            )
-            logger.info("ParaS fused peer access pre-initialized.")
-        except Exception as e:
-            logger.warning(f"ParaS fused peer access pre-init failed (will retry at switch): {e}")
-            self._fused_peer_access_ctx = None
+        from sglang.srt.paras.peer_access import init_peer_access
 
+        self._fused_peer_access_ctx = init_peer_access(
+            manager, get_paras_tp_group().device_group, get_paras_tp_size()
+        )
         self.model = Qwen3MoeModelParaS(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        # Inject pre-initialized peer access context so the switch doesn't pay 6s init cost
-        if self._fused_peer_access_ctx is not None:
-            self.model._peer_access_ctx = self._fused_peer_access_ctx
+        self.model.paras_init_peer_access(self._fused_peer_access_ctx)
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,

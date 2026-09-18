@@ -214,8 +214,6 @@ def test_gpt_oss_hybrid_views_match_capacity_plan(monkeypatch, head_dim):
             assert key.shape[0] == cache.layer_tokens[i] + 1
             assert (
                 unified_layout.align_up(key.numel() * key.element_size()) * 2
-                == cache.layer_bytes[i]
+                <= cache.layer_bytes[i]
             )
-            assert value.data_ptr() == key.data_ptr() + unified_layout.align_up(
-                key.numel() * key.element_size()
-            )
+            assert value.data_ptr() == key.data_ptr() + cache.layer_bytes[i] // 2

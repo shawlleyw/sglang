@@ -27,13 +27,23 @@ The same bytes provide transfer headroom once inference is drained.
 Requirements smaller than the transfer gap leave padding; larger ones
 expand the endpoint before KV capacity is calculated.
 
-`unified_layout.py` also enforces TP KV bytes/layer >= EP KV bytes/layer.
-When TP workspace exceeds the weight savings, this can enlarge the EP
-front. The planner finds the smallest aligned front satisfying this
-constraint and recomputes the TP gap from the resulting EP KV capacity.
-GPT-OSS full-attention and sliding-window layers have separate page-aligned
-capacities using the existing `swa_full_tokens_ratio`. Cache offsets use
-per-layer byte counts, preserving the same forward/reverse transfer order.
+`unified_layout.py` calculates the endpoints directly. Let `D` be the total
+EP-to-TP weight saving, `A = budget - TP_weights`, and `r` the largest layer's
+share of the KV budget (1/N for uniform attention). Then:
+
+```
+EP_front = align_up(max(TP_weight_layer, W_EP, W_TP - D, ceil(A*r/(1+r)) - D))
+```
+
+The last term reserves room for one EP cache layer during migration:
+`EP_KV * (1+r) <= A`. After dividing the remaining EP budget into per-layer
+slots, TP's tail is the larger of the largest EP slot and TP scratch. The
+remaining bytes form TP's KV budget, which is at least EP's budget.
+
+Each layer has equal 256-byte-aligned K and V slots. Token capacities are
+rounded down to pages within these slots, preserving `swa_full_tokens_ratio`
+for GPT-OSS. Placement is independent of token rounding; TP slots are at least
+as large as their EP counterparts. Neither calculation needs a search.
 
 Weights include expert w13/w2 and attention QKV/O. TP retains no full DP
 attention backup. Per-mode views and offsets are fixed before graph capture.

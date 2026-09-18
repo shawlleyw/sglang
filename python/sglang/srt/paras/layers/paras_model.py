@@ -26,8 +26,7 @@ import torch.distributed as dist
 
 from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
-from sglang.srt.paras.paras_parallel_state import get_paras_tp_group, get_paras_tp_size
-from sglang.srt.paras.peer_access import init_peer_access
+from sglang.srt.paras.paras_parallel_state import get_paras_tp_group
 from sglang.srt.paras.utils import paras_func
 
 
@@ -39,6 +38,16 @@ class ParaSModelMixin:
       - self.layers — list/ModuleList of decoder layers supporting paras methods
     """
 
+    def paras_init_peer_access(self, peer_access_ctx):
+        """Initialize the transfer resources once, before any mode switches."""
+        assert peer_access_ctx is not None
+        self._peer_access_ctx = peer_access_ctx
+        self._unified_peer_bases = torch.tensor(
+            peer_access_ctx.peer_addresses, dtype=torch.int64, device="cuda"
+        )
+        self._unified_fence = torch.zeros(1, device="cuda")
+        self._unified_weights_mode = ParaSMode.EP
+
     def paras_transfer_unified_weights(self, mode: ParaSMode, rank: int):
         """Transfer one complete layer at a time, without rebinding KV/backend state.
 
@@ -46,18 +55,12 @@ class ParaSModelMixin:
         initialization calls it through the ordinary configure methods.
         """
         mgr = get_global_paras_memory_manager()
-        if getattr(self, "_unified_weights_mode", ParaSMode.EP) == mode:
+        assert self._peer_access_ctx is not None
+        if self._unified_weights_mode == mode:
             return
         from sglang.srt.paras.attention_transfer import transfer_attention
 
         group = get_paras_tp_group().device_group
-        if getattr(self, "_peer_access_ctx", None) is None:
-            self._peer_access_ctx = init_peer_access(mgr, group, get_paras_tp_size())
-        if not hasattr(self, "_unified_peer_bases"):
-            self._unified_peer_bases = torch.tensor(
-                self._peer_access_ctx.peer_addresses, dtype=torch.int64, device="cuda"
-            )
-            self._unified_fence = torch.zeros(1, device="cuda")
         layers = self.layers if mode == ParaSMode.TP else reversed(self.layers)
         for layer in layers:
             if mode == ParaSMode.TP:

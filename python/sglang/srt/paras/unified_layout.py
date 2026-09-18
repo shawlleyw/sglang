@@ -16,9 +16,39 @@ def align_up(n: int, alignment: int = 256) -> int:
 
 @dataclass(frozen=True)
 class CacheCapacity:
+    """Token capacities and reserved K+V slot bytes for each layer."""
+
     full_tokens: int
     layer_tokens: tuple[int, ...]
     layer_bytes: tuple[int, ...]
+
+    @classmethod
+    def from_budget(cls, budget, row_bytes, ratios, page_size):
+        """Divide bytes between layers, then fit page-aligned tokens inside them.
+
+        Each layer gets equally sized, 256-byte-aligned K and V slots. Keeping
+        slot placement separate from token rounding makes migration geometry
+        independent of the EP/TP head counts and page sizes.
+        """
+        ratio_sum = sum(ratios)
+        kv_pair_alignment = 2 * 256  # One aligned slot for K, one for V.
+        layer_bytes = tuple(
+            int(budget * ratio / ratio_sum) // kv_pair_alignment * kv_pair_alignment
+            for ratio in ratios
+        )
+        full_token_limits = (
+            (size // row_bytes - page_size) / ratio
+            for size, ratio in zip(layer_bytes, ratios)
+        )
+        full_tokens = int(min(full_token_limits)) // page_size * page_size
+        layer_tokens = tuple(
+            int(full_tokens * r) // page_size * page_size for r in ratios
+        )
+        if min(layer_tokens) < page_size:
+            raise ValueError(
+                "Unified memory budget cannot hold weights, workspace, and KV"
+            )
+        return cls(full_tokens, layer_tokens, layer_bytes)
 
     @property
     def total_bytes(self) -> int:
@@ -79,71 +109,34 @@ def plan_unified_layout(
         raise ValueError("EP-low-weight topology needs a different layout orientation")
     we, wt = align_up(ep_weight_bytes), align_up(tp_weight_bytes)
     budget = budget // 256 * 256
-    front = align_up(
-        max(wt, ep_workspace_bytes, tp_workspace_bytes - num_layers * (we - wt))
-    )
-
     ratios = layer_token_ratios or (1.0,) * num_layers
     assert len(ratios) == num_layers and min(ratios) > 0
+    weight_saving = num_layers * (we - wt)
+    tp_available = budget - num_layers * wt
 
-    def capacity_for_tokens(full_tokens, row_bytes):
-        tokens = tuple(
-            int(full_tokens * ratio) // page_size * page_size for ratio in ratios
+    # Let K be EP's total cache budget and r the largest layer's share.
+    # TP needs room for K plus its transfer gap r*K, so K <= tp_available/(1+r).
+    # EP's front also covers one weight layer, its scratch, and any TP scratch
+    # that exceeds the space freed by sharding attention weights.
+    largest_layer_share = max(ratios) / sum(ratios)
+    cache_transfer_gap = math.ceil(
+        tp_available * largest_layer_share / (1 + largest_layer_share)
+    )
+    front = align_up(
+        max(
+            wt,
+            ep_workspace_bytes,
+            tp_workspace_bytes - weight_saving,
+            cache_transfer_gap - weight_saving,
         )
-        sizes = tuple(2 * align_up((n + page_size) * row_bytes // 2) for n in tokens)
-        return CacheCapacity(full_tokens, tokens, sizes)
-
-    minimum_tokens = math.ceil(page_size / min(ratios) / page_size) * page_size
-
-    def cache_capacity(available, row_bytes):
-        # Preserve the configured full/SWA ratio, rounding each pool to pages.
-        lo = minimum_tokens // page_size
-        hi = max(lo, int(available / row_bytes / sum(ratios)) // page_size)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if capacity_for_tokens(mid * page_size, row_bytes).total_bytes <= available:
-                lo = mid
-            else:
-                hi = mid - 1
-        capacity = capacity_for_tokens(lo * page_size, row_bytes)
-        if capacity.total_bytes > available:
-            raise ValueError(
-                "Unified memory budget cannot hold weights, workspace, and KV"
-            )
-        return capacity
-
-    def capacities(front):
-        ep = cache_capacity(budget - front - num_layers * we, ep_kv_row_bytes)
-        tail = align_up(max(max(ep.layer_bytes), tp_workspace_bytes))
-        tp = cache_capacity(budget - tail - num_layers * wt, tp_kv_row_bytes)
-        return ep, tail, tp
-
-    def migration_fits(ep, tp):
-        return all(t >= e for e, t in zip(ep.layer_bytes, tp.layer_bytes))
-
-    # Ordered cache migration requires ct >= ce. A large TP workspace can
-    # consume more than the weight saving; reserve the difference at EP's
-    # front. For small layer counts the cache transfer gap can dominate too.
-    # Find the smallest aligned front satisfying both constraints.
-    lo = front // 256
-    hi = (
-        budget
-        - num_layers * we
-        - capacity_for_tokens(minimum_tokens, ep_kv_row_bytes).total_bytes
-    ) // 256
-    if hi < lo:
-        raise ValueError("Unified memory budget cannot hold weights, workspace, and KV")
-    while lo < hi:
-        mid = (lo + hi) // 2
-        ep, _, tp = capacities(mid * 256)
-        if migration_fits(ep, tp):
-            hi = mid
-        else:
-            lo = mid + 1
-    front = lo * 256
-    ep, tail, tp = capacities(front)
-    if not migration_fits(ep, tp):
-        raise ValueError("Unified memory budget cannot support ordered cache migration")
+    )
+    ep = CacheCapacity.from_budget(
+        budget - num_layers * we - front, ep_kv_row_bytes, ratios, page_size
+    )
+    tail = align_up(max(max(ep.layer_bytes), tp_workspace_bytes))
+    tp = CacheCapacity.from_budget(
+        tp_available - tail, tp_kv_row_bytes, ratios, page_size
+    )
     return UnifiedLayout(num_layers, budget, we, wt, front, tail, ep, tp)
 
 

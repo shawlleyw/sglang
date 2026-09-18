@@ -241,9 +241,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         from sglang.srt.paras.workspace import moe_workspace_views
 
-        binding = self.config.paras_workspace
+        moe_workspace = self.config.paras_workspace
         gateup_output, down_input = moe_workspace_views(
-            binding.buffer if binding is not None else None,
+            moe_workspace.buffer if moe_workspace is not None else None,
             (all_tokens, N),
             (all_tokens, N // 2),
             torch.bfloat16,
@@ -449,9 +449,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         from sglang.srt.paras.workspace import moe_workspace_views
 
-        binding = self.config.paras_workspace
+        moe_workspace = self.config.paras_workspace
         gateup_output, down_input = moe_workspace_views(
-            binding.buffer if binding is not None else None,
+            moe_workspace.buffer if moe_workspace is not None else None,
             (num_groups, m, n),
             (num_groups, m, n // 2),
             torch.bfloat16,

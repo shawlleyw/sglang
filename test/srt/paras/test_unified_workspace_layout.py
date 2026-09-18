@@ -63,8 +63,8 @@ def test_qwen235_asymmetric_workspaces():
     )
     assert layout.ep_front == 594 * mib
     assert layout.tp_tail == 1280 * mib
-    assert layout.ep_cache.total_bytes == 68784345088
-    assert layout.tp_cache.total_bytes == 79695925248
+    assert (layout.ep_cache.full_tokens + 1) * 2048 * 94 == 68784345088
+    assert (layout.tp_cache.full_tokens + 1) * 512 * 94 == 79695925248
     assert_safe(layout)
 
 

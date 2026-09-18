@@ -452,11 +452,9 @@ class ParaSMemoryManager:
                     offset += self._align_up(entry.size_bytes, self.ALIGNMENT)
                 shape, size = shapes[i], sizes[i]
                 cache = layout.ep_cache if mode == ParaSMode.EP else layout.tp_cache
-                aligned_size = self._align_up(size, self.ALIGNMENT)
-                assert (
-                    aligned_size * 2 == cache.layer_bytes[i]
-                ), "KV reservation differs from capacity plan"
-                for side, displacement in (("k", 0), ("v", aligned_size)):
+                kv_slot_bytes = cache.layer_bytes[i] // 2
+                assert size <= kv_slot_bytes, "KV reservation exceeds capacity plan"
+                for side, displacement in (("k", 0), ("v", kv_slot_bytes)):
                     name = f"{spec.prefix}.layers.{i}.kv.{mode.value}.{side}"
                     entry = LayoutEntry(
                         name,
