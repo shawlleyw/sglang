@@ -236,7 +236,7 @@ void launch_peer_access_fused_transfer_w2_v2(
 }
 
 // =============================================================================
-// TP→EP reverse kernels: write TP slot[i] data back to peer EP slot[i+1].
+// TP→EP reverse kernels: write each layer's TP weights to its peers' EP regions.
 // Used for: (a) correctness verification, (b) future dp_size>1 support.
 // Layer ordering: REVERSE (N-1→0) with per-layer barrier.
 // Same NVLink optimizations as v2 kernels: warp-level peer assignment,
@@ -244,10 +244,10 @@ void launch_peer_access_fused_transfer_w2_v2(
 // =============================================================================
 
 // TP→EP w13 kernel: reverse of EP→TP w13_v2.
-// Source: TP slot[i], layout (E_total, num_gates, I'H) — contiguous per (expert, gate).
-// Dest:   peer's EP slot[i+1], layout (E_local, num_gates, tp_size, I'H).
-// For peer r, reads experts [r*E_local, (r+1)*E_local) from local TP slot,
-// writes to peer r's EP slot at the tp_rank shard position.
+// Source: the layer's TP region, layout (E_total, num_gates, I'H) — contiguous per (expert, gate).
+// Dest:   the peer's EP region, layout (E_local, num_gates, tp_size, I'H).
+// For peer r, reads experts [r*E_local, (r+1)*E_local) from local TP region,
+// writes to peer r's EP region at the tp_rank shard position.
 __global__ void peer_access_fused_transfer_w13_ep(
     const char* __restrict__ local_buffer,
     char* const* __restrict__ peer_buffers,
@@ -360,10 +360,10 @@ void launch_peer_access_fused_transfer_w13_ep(
 }
 
 // TP→EP w2 kernel: reverse of EP→TP w2_v2.
-// Source: TP slot[i], layout (E_total, H, I') — contiguous rows of width I'.
-// Dest:   peer's EP slot[i+1], layout (E_local, H, I_full) — TP split on last dim.
-// For peer r, reads experts [r*E_local, (r+1)*E_local) from local TP slot,
-// writes tp_rank's column shard to peer r's EP slot.
+// Source: the layer's TP region, layout (E_total, H, I') — contiguous rows of width I'.
+// Dest:   the peer's EP region, layout (E_local, H, I_full) — TP split on last dim.
+// For peer r, reads experts [r*E_local, (r+1)*E_local) from local TP region,
+// writes tp_rank's column shard to peer r's EP region.
 __global__ void peer_access_fused_transfer_w2_ep(
     const char* __restrict__ local_buffer,
     char* const* __restrict__ peer_buffers,

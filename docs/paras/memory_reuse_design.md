@@ -37,12 +37,12 @@ EP_front = align_up(max(TP_weight_layer, W_EP, W_TP - D, ceil(A*r/(1+r)) - D))
 
 The last term reserves room for one EP cache layer during migration:
 `EP_KV * (1+r) <= A`. After dividing the remaining EP budget into per-layer
-slots, TP's tail is the larger of the largest EP slot and TP scratch. The
+regions, TP's tail is the larger of the largest EP region and TP scratch. The
 remaining bytes form TP's KV budget, which is at least EP's budget.
 
-Each layer has equal 256-byte-aligned K and V slots. Token capacities are
-rounded down to pages within these slots, preserving `swa_full_tokens_ratio`
-for GPT-OSS. Placement is independent of token rounding; TP slots are at least
+Each layer has equal 256-byte-aligned K and V regions. Token capacities are
+rounded down to pages within these regions, preserving `swa_full_tokens_ratio`
+for GPT-OSS. Placement is independent of token rounding; TP regions are at least
 as large as their EP counterparts. Neither calculation needs a search.
 
 Weights include expert w13/w2 and attention QKV/O. TP retains no full DP
@@ -51,6 +51,18 @@ Managed workspace is charged inside the UMM budget. Its replaced external
 allocation is omitted; the configured dynamic reserve remains unchanged.
 If a budget caps all static memory, external static allocations must first
 be subtracted from the amount available to the UMM.
+
+## Initialization
+
+1. `reserve_model_weights` declares per-mode weight shapes and MoE requirements.
+   Qwen and GPT-OSS share this declaration, with GPT-OSS specifying its biases.
+2. `plan_layout` resolves the budget and attention requirements, calculates the
+   unified layout, then derives every weight/KV view's shape and offset. It
+   returns one typed `UnifiedMemoryPlan`, including full/SWA layer capacities.
+3. `materialize(plan)` allocates the backing buffer and exposes the planned views.
+
+There is no second KV reservation pass or alternate slot allocator. Transfer
+headroom is part of the front/tail regions shown above.
 
 ## Backend requirements
 
@@ -62,20 +74,23 @@ views. Neither operator can consume the other's region or unused padding.
 
 | Backend | Managed numerical scratch | Sizing |
 | --- | --- | --- |
-| BF16 DeepGEMM / Triton MoE, EP | Gate/up and activation intermediates | Reserved capacity for 65,536 dispatched expert rows, or the larger padded masked-decode receive bound |
+| BF16 DeepGEMM / Triton MoE, EP | Gate/up and activation intermediates | DeepEP padded receive shape: `local_experts * EP_size * dispatch_tokens_per_rank` rows |
 | Triton MoE, TP | Gate/up and down share storage; activation is separate | Up to 65,536 input tokens per chunk, routed top-k rows, and conservative block padding |
 | FlashInfer attention | Partial outputs and normalization statistics | Configured capacity: normally 384 MiB for Qwen3 MoE; 2 GiB in deterministic mode |
 | Triton attention | FP32 partial outputs and LSE | Separately aligned tensors with payload `tokens * local_query_heads * KV_splits * (head_dim + 1) * 4` bytes |
 
 TP retains SGLang's existing `triton_moe_chunk_size = 64 * 1024`
-input-token loop. EP reserves scratch for that many dispatched token/expert
-rows but preserves SGLang's original single-call execution. Calls that exceed
-the reserved scratch use the backend's original temporary allocations; those
-allocations are outside the unified buffer and consume dynamic memory.
-Managed calls validate the selected `BLOCK_SIZE_M` against
-`MOE_MAX_BLOCK_M = 256`, including the TP final chunk and down-projection
-configuration. Kernel tuning beyond that
-bound fails explicitly before using the workspace.
+input-token loop. EP has no corresponding chunk limit. Its scratch follows
+DeepEP's configured low-latency receive shape, consumed directly by masked
+DeepGEMM and flattened by Triton EP. Normal dispatch uses the actual number
+of received expert rows. Calls larger than the reserved scratch retain the
+backend's original temporary allocations and allocation timing; those
+allocations consume dynamic memory outside the unified buffer. No 64K
+reservation floor is imposed on either EP backend.
+
+Only fused Triton TMA calls validate the padding bound `MOE_MAX_BLOCK_M = 256`,
+including the final chunk's configuration. Shared workspace views check byte
+capacity independently of kernel tuning.
 
 Triton attention planning and execution share the split-count calculation
 and use ModelRunner's resolved context length, including RoPE scaling and

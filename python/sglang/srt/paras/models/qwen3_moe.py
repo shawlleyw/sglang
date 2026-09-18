@@ -28,7 +28,7 @@ from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 
 from sglang.srt.paras.paras_memory_manager import (
     get_global_paras_memory_manager,
-    plan_qwen_moe_layout,
+    reserve_model_weights,
 )
 from sglang.srt.paras.paras_parallel_state import get_paras_dp_size, get_paras_tp_group, get_paras_tp_size
 from sglang.srt.paras.utils import paras_func
@@ -162,7 +162,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         import os
         configure_method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
 
-        plan_qwen_moe_layout(
+        reserve_model_weights(
             manager,
             num_layers=config.num_hidden_layers,
             num_experts=config.num_experts,
@@ -181,26 +181,8 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             top_k=config.num_experts_per_tok,
         )
 
-        plan = manager.plan_kv_capacity(
-            config=config,
-            tp_size=get_paras_tp_size(),
-            head_dim=head_dim,
-        )
-
-        manager.reserve_kv_cache(
-            num_layers=config.num_hidden_layers,
-            ep_max_tokens=plan.ep_max_tokens,
-            tp_max_tokens=plan.tp_max_tokens,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=head_dim,
-            tp_size=get_paras_tp_size(),
-            kv_dtype=plan.kv_dtype,
-            page_size=get_global_server_args().page_size,
-            layer_specs=plan.layer_specs,
-            prefix="model",
-        )
-
-        manager.materialize()
+        plan = manager.plan_layout(config)
+        manager.materialize(plan)
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
 

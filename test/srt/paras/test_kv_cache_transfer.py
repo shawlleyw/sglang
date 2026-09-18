@@ -223,7 +223,7 @@ def cleanup_global_manager():
 
 
 def setup_memory_manager(rank, world_size, num_kv_heads, tokens_per_rank):
-    """Create ParaSMemoryManager with N+1 KV slots.
+    """Create ParaSMemoryManager with planned EP/TP KV views.
 
     Returns (mgr, ep_max_tokens, tp_max_tokens).
     """
@@ -241,19 +241,21 @@ def setup_memory_manager(rank, world_size, num_kv_heads, tokens_per_rank):
         (total_tokens * heads_per_rank + num_kv_heads - 1) // num_kv_heads
     )
     ep_max_tokens = max(ep_max_tokens, min_ep_for_tp)
-    tp_max_tokens = (ep_max_tokens + PAGE_SIZE) * num_kv_heads // heads_per_rank
+    tp_max_tokens = (ep_max_tokens + PAGE_SIZE) * num_kv_heads // heads_per_rank - PAGE_SIZE
 
     mgr = ParaSMemoryManager(device=f"cuda:{rank}")
-    mgr.reserve_kv_cache(
+    from test.srt.paras.unified_memory_test_utils import materialize_test_cache
+
+    materialize_test_cache(mgr,
         num_layers=NUM_LAYERS,
         ep_max_tokens=ep_max_tokens,
         tp_max_tokens=tp_max_tokens,
         num_kv_heads=num_kv_heads,
         head_dim=HEAD_DIM,
         kv_dtype=DTYPE,
+        tp_size=world_size,
         page_size=PAGE_SIZE,
     )
-    mgr.materialize()
     set_global_paras_memory_manager(mgr)
     return mgr, ep_max_tokens, tp_max_tokens
 
@@ -584,7 +586,7 @@ def do_ep_to_tp_gather_peer_access(mgr, rank, world_size, num_kv_heads,
             )
 
         # Per-layer barrier: ensures all ranks finish writing before next
-        # layer reads (TP slot i is EP slot i+1 in the N+1 design).
+        # layer reads in the overlapping unified layout.
         dist.all_reduce(barrier_tensor, group=tp_group)
 
     torch.cuda.synchronize()
@@ -693,7 +695,7 @@ def do_tp_to_ep_scatter_peer_access(mgr, rank, world_size, num_kv_heads,
     elem_size = 2  # bfloat16
 
     # Launch kernel per layer in REVERSE order with per-layer barrier,
-    # matching the N+1 slot design (same pattern as scatter_manager).
+    # matching the unified layout transfer order in scatter_manager.
     import paras_peer_access_cuda as _pa_cuda
 
     barrier_tensor = torch.zeros(1, device="cuda")
@@ -1346,7 +1348,7 @@ class TestKVRoundTrip:
 
         # Step 2: TP→EP scatter
         # NOTE: Do NOT zero EP buffers here — they share physical memory
-        # with TP buffers via the N+1 slot design.  MHACacheTransfer
+        # with TP buffers in the unified layout. MHACacheTransfer
         # processes layers in reverse order to avoid corrupting TP source.
         token_partition, ep_dst = do_tp_to_ep_scatter(
             mgr, rank, world_size, num_kv_heads, tokens_per_rank,

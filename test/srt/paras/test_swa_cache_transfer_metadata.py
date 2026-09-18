@@ -230,6 +230,7 @@ def test_source_mapping_falls_back_to_live_mapping_when_snapshot_is_absent():
 
     backend = SWACacheTransfer.__new__(SWACacheTransfer)
     backend._full_to_swa_mapping = live_mapping
+    backend.source_full_to_swa_mapping = None
 
     result = backend._full_to_swa_source(torch.tensor([1, 4], dtype=torch.int32))
 

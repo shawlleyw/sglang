@@ -115,7 +115,7 @@ class PeerAccessContext:
 def init_peer_access(manager, tp_group, tp_size: int) -> PeerAccessContext:
     """Initialize peer access for ParaS weight transfers.
 
-    Call once after ``manager.materialize()`` and before the first EP→TP switch.
+    Call once after ``manager.materialize(plan)`` and before the first EP→TP switch.
 
     Args:
         manager: :class:`ParaSMemoryManager` (must be materialized).
@@ -412,8 +412,8 @@ def peer_access_kv_scatter(
     is sent to exactly one EP rank determined by token_to_rank[t].
 
     Layers are processed in REVERSE order (N-1 to 0) with a dist.all_reduce
-    barrier after each layer. This ensures that layer i's read from TP slot[i]
-    completes before layer (i-1)'s write to EP slot[i] (N+1 slot design).
+    barrier after each layer. This completes peer reads before a later
+    destination reuses their source bytes in the unified layout.
 
     Data flow per token t:
       Source:  local TP buffer at tp_token_positions[t], heads [0, heads_per_rank)

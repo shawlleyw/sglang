@@ -1,7 +1,7 @@
 """Shared schema and helpers for ParaS per-layer KV cache configuration.
 
 ``LayerCacheSpec`` is the per-layer descriptor consumed by both the planning
-side (``ParaSMemoryManager.reserve_kv_cache``, model __init__) and the
+side (``ParaSMemoryManager.plan_layout``, model __init__) and the
 transfer side (``cache_transfer.mha``/``swa``, scatter/gather managers). It
 lives here rather than under ``cache_transfer/`` because it is shared schema,
 not transfer logic.

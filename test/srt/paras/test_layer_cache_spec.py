@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit tests for LayerCacheSpec, classify_layers_from_config, and plan_hybrid_kv_budget.
+Unit tests for LayerCacheSpec and classify_layers_from_config.
 
 Tests cover:
   1. LayerCacheSpec frozen dataclass immutability
@@ -10,7 +10,6 @@ Tests cover:
   5. classify_layers_from_config without layer_types attribute
   6. G15 violation: mismatched num_kv_heads
   7. G7 violation: tp_size > num_kv_heads with SWA
-  8. Budget parity: plan_hybrid_kv_budget formula verification
 
 Usage:
   conda run -n sgl_paras python -m pytest test/srt/paras/test_layer_cache_spec.py -v
@@ -39,7 +38,7 @@ class TestLayerCacheSpecFrozen:
 
     def test_layer_cache_spec_is_frozen(self):
         """Mutation of LayerCacheSpec should raise FrozenInstanceError."""
-        from sglang.srt.paras.cache_transfer import LayerCacheSpec
+        from sglang.srt.paras.layers.utils import LayerCacheSpec
 
         spec = LayerCacheSpec(
             layer_id=0,
@@ -76,7 +75,7 @@ class TestClassifyLayersFromConfigMixed:
 
     def test_classify_mixed_full_and_swa(self):
         """Classify 6 layers: 2 full + 4 SWA."""
-        from sglang.srt.paras.cache_transfer import classify_layers_from_config
+        from sglang.srt.paras.layers.utils import classify_layers_from_config
 
         # Mock HF config with layer_types
         class MockConfig:
@@ -142,7 +141,7 @@ class TestClassifyLayersFromConfigAllFull:
 
     def test_classify_all_full_no_layer_types(self):
         """Classify 4 layers as all-full when layer_types is absent."""
-        from sglang.srt.paras.cache_transfer import classify_layers_from_config
+        from sglang.srt.paras.layers.utils import classify_layers_from_config
 
         class MockConfig:
             num_hidden_layers = 4
@@ -186,7 +185,7 @@ class TestClassifyLayersFromConfigAllSWA:
 
     def test_classify_all_swa(self):
         """Classify 3 layers as all-SWA."""
-        from sglang.srt.paras.cache_transfer import classify_layers_from_config
+        from sglang.srt.paras.layers.utils import classify_layers_from_config
 
         class MockConfig:
             num_hidden_layers = 3
@@ -230,7 +229,7 @@ class TestClassifyLayersFromConfigNoLayerTypes:
 
     def test_classify_layer_types_none(self):
         """Classify layers when layer_types is explicitly None."""
-        from sglang.srt.paras.cache_transfer import classify_layers_from_config
+        from sglang.srt.paras.layers.utils import classify_layers_from_config
 
         class MockConfig:
             num_hidden_layers = 2
@@ -267,7 +266,7 @@ class TestG15ViolationMismatchedHeads:
 
     def test_g15_violation_raises_value_error(self):
         """Mismatched num_kv_heads should raise ValueError with 'uniform' in message."""
-        from sglang.srt.paras.cache_transfer import validate_layer_specs, LayerCacheSpec
+        from sglang.srt.paras.layers.utils import validate_layer_specs, LayerCacheSpec
 
         # Create specs with mismatched num_kv_heads
         specs = [
@@ -308,7 +307,7 @@ class TestG7ViolationTPSizeExceedsHeads:
 
     def test_g7_violation_raises_value_error(self):
         """tp_size > num_kv_heads with SWA should raise ValueError with 'tp_size' in message."""
-        from sglang.srt.paras.cache_transfer import validate_layer_specs, LayerCacheSpec
+        from sglang.srt.paras.layers.utils import validate_layer_specs, LayerCacheSpec
 
         # Create specs with SWA and tp_size > num_kv_heads
         specs = [
@@ -340,7 +339,7 @@ class TestG7ViolationTPSizeExceedsHeads:
 
     def test_g7_violation_in_classify_layers(self):
         """classify_layers_from_config should also enforce G7."""
-        from sglang.srt.paras.cache_transfer import classify_layers_from_config
+        from sglang.srt.paras.layers.utils import classify_layers_from_config
 
         class MockConfig:
             num_hidden_layers = 2
@@ -365,126 +364,3 @@ class TestG7ViolationTPSizeExceedsHeads:
             )
 
         assert "tp_size" in str(exc_info.value).lower()
-
-
-# =========================================================================
-# TEST GROUP 8: Budget parity — plan_hybrid_kv_budget formula verification
-# =========================================================================
-
-
-class TestPlanHybridKVBudgetParity:
-    """Test plan_hybrid_kv_budget matches the formula from model_runner.py:1511-1515."""
-
-    def test_budget_parity_ac8(self):
-        """Verify budget formula: denominator = ratio * swa + full, full_max = int(total/denom), swa_max = int(full_max * ratio)."""
-        from sglang.srt.paras.paras_memory_manager import plan_hybrid_kv_budget
-
-        # Test case: total=10000, full_layers=10, swa_layers=20, ratio=0.25
-        total_tokens = 10000
-        full_layers_num = 10
-        swa_layers_num = 20
-        swa_full_tokens_ratio = 0.25
-
-        full_max, swa_max = plan_hybrid_kv_budget(
-            total_tokens, full_layers_num, swa_layers_num, swa_full_tokens_ratio
-        )
-
-        # Manual calculation per formula:
-        # denominator = 0.25 * 20 + 10 = 5 + 10 = 15
-        # full_max = int(10000 / 15) = int(666.666...) = 666
-        # swa_max = int(666 * 0.25) = int(166.5) = 166
-        expected_full_max = 666
-        expected_swa_max = 166
-
-        assert full_max == expected_full_max, (
-            f"Expected full_max={expected_full_max}, got {full_max}"
-        )
-        assert swa_max == expected_swa_max, (
-            f"Expected swa_max={expected_swa_max}, got {swa_max}"
-        )
-
-    def test_budget_all_full_layers(self):
-        """Test budget when there are no SWA layers (all-full case)."""
-        from sglang.srt.paras.paras_memory_manager import plan_hybrid_kv_budget
-
-        total_tokens = 10000
-        full_layers_num = 10
-        swa_layers_num = 0
-        swa_full_tokens_ratio = 1.0  # Ignored when swa_layers_num=0
-
-        full_max, swa_max = plan_hybrid_kv_budget(
-            total_tokens, full_layers_num, swa_layers_num, swa_full_tokens_ratio
-        )
-
-        # All-full shortcut: full_max = total / full_layers, swa_max = 0
-        assert full_max == 1000
-        assert swa_max == 0
-
-    def test_budget_all_swa_layers(self):
-        """Test budget when there are only SWA layers (all-SWA case)."""
-        from sglang.srt.paras.paras_memory_manager import plan_hybrid_kv_budget
-
-        total_tokens = 10000
-        full_layers_num = 0
-        swa_layers_num = 10
-        swa_full_tokens_ratio = 0.5
-
-        full_max, swa_max = plan_hybrid_kv_budget(
-            total_tokens, full_layers_num, swa_layers_num, swa_full_tokens_ratio
-        )
-
-        # denominator = 0.5 * 10 + 0 = 5
-        # full_max = int(10000 / 5) = 2000
-        # swa_max = int(2000 * 0.5) = 1000
-        assert full_max == 2000
-        assert swa_max == 1000
-
-    def test_budget_no_layers_raises(self):
-        """Test that plan_hybrid_kv_budget raises when no layers are present."""
-        from sglang.srt.paras.paras_memory_manager import plan_hybrid_kv_budget
-
-        with pytest.raises(ValueError) as exc_info:
-            plan_hybrid_kv_budget(10000, 0, 0, 1.0)
-
-        assert "no layers" in str(exc_info.value).lower()
-
-    def test_budget_invalid_ratio_raises(self):
-        """Test that plan_hybrid_kv_budget raises when ratio <= 0 with SWA layers."""
-        from sglang.srt.paras.paras_memory_manager import plan_hybrid_kv_budget
-
-        with pytest.raises(ValueError) as exc_info:
-            plan_hybrid_kv_budget(10000, 5, 5, 0.0)  # ratio=0 with SWA
-
-        assert "ratio" in str(exc_info.value).lower()
-
-    def test_budget_ratio_scaling(self):
-        """Test budget with different ratio values."""
-        from sglang.srt.paras.paras_memory_manager import plan_hybrid_kv_budget
-
-        total_tokens = 10000
-        full_layers_num = 5
-        swa_layers_num = 5
-
-        # Test ratio=0.5
-        full_max_half, swa_max_half = plan_hybrid_kv_budget(
-            total_tokens, full_layers_num, swa_layers_num, 0.5
-        )
-        # denominator = 0.5 * 5 + 5 = 7.5
-        # full_max = int(10000 / 7.5) = 1333
-        # swa_max = int(1333 * 0.5) = 666
-        assert full_max_half == 1333
-        assert swa_max_half == 666
-
-        # Test ratio=0.25
-        full_max_quarter, swa_max_quarter = plan_hybrid_kv_budget(
-            total_tokens, full_layers_num, swa_layers_num, 0.25
-        )
-        # denominator = 0.25 * 5 + 5 = 6.25
-        # full_max = int(10000 / 6.25) = 1600
-        # swa_max = int(1600 * 0.25) = 400
-        assert full_max_quarter == 1600
-        assert swa_max_quarter == 400
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

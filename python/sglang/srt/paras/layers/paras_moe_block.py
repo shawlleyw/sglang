@@ -524,10 +524,9 @@ class ParaSMoeBlockMixin:
     ):
         """Launch NVLink-optimized v2 peer access kernels for this layer. NO barriers — caller manages them.
 
-        The N+1 slot design guarantees no inter-layer aliasing:
-          - Layer i reads local slot[i+1], writes to peer slot[i]
-          - Layer i+1 reads local slot[i+2], writes to peer slot[i+1]
-          - Different slots → no race → barriers only needed at sweep start/end.
+        The unified plan separates each layer's source and destination.
+        The caller orders layers and synchronizes peer reads before reusing
+        their source memory for subsequent destinations.
 
         w13 layout dispatch:
           - Qwen3 (concat [g0..g_I, u0..u_I]): num_gates=2, chunk=I'*H per (e, k)
@@ -585,7 +584,7 @@ class ParaSMoeBlockMixin:
     def paras_configure_ep_mlp_naive(self):
         """Naive TP→EP reverse weight transfer via NCCL all_to_all (inverse of EP→TP).
 
-        Reads from TP slot[i], all_to_all, inverse permute, writes to EP slot[i+1].
+        Reads from the layer's TP region, all_to_all, inverse permute, writes to the layer's EP region.
         Currently only supports dp_size==1.
         """
         mgr = get_global_paras_memory_manager()

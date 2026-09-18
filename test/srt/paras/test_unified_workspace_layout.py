@@ -117,6 +117,17 @@ def test_qwen30_tp_workspace_exceeds_attention_saving():
         tp_size=4,
         dispatch_capacity=512,
     )
+    # EP capacity follows DeepEP's receive shape, independently of TP chunking.
+    small_ep, same_tp = bf16_moe_workspace_sizes(
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=128,
+        top_k=8,
+        tp_size=4,
+        dispatch_capacity=128,
+    )
+    assert small_ep == ep_ws // 4
+    assert same_tp == tp_ws
     layout = plan_unified_layout(
         num_layers=48,
         budget=56763796480,

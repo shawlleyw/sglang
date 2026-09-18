@@ -7,8 +7,7 @@ All ParaS-specific logic for GPT-OSS lives here.  The base model file
 GPT-OSS uses heterogeneous layers: each layer is either "full_attention"
 or "sliding_attention" (see config.layer_types).  This module mirrors the
 Qwen3-MoE ParaS pattern (sglang/srt/paras/models/qwen3_moe.py) while
-handling the per-layer attention geometry and MXFP4 weight loading that
-are unique to GPT-OSS.
+handling GPT-OSS per-layer attention geometry and bias views.
 
 Parameter management under ParaS
 --------------------------------
@@ -19,11 +18,8 @@ Everything else is loaded through the normal PyTorch parameter path
 and stays untouched across switches.  Concretely for GPT-OSS:
 
   Managed by the UMM:
-    * paras.moe_slot.{i}.w13 / w2  (N+1 slot layout, EP<->TP transport)
-    * self_attn.qkv_proj.weight / tp_weight
-    * self_attn.o_proj.weight
-    * FP8 weight scales (when quant_name == "fp8")
-    * Staging buffers (when configure_method != "peer_access")
+    * Per-mode expert and attention weight views
+    * KV cache and attention/MoE scratch
 
   Replicated across all ranks, not in the UMM:
     * input_layernorm.weight, post_attention_layernorm.weight
@@ -54,7 +50,7 @@ from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 from sglang.srt.paras.paras_memory_manager import (
     get_global_paras_memory_manager,
-    plan_gpt_oss_moe_layout,
+    reserve_model_weights,
 )
 from sglang.srt.paras.paras_parallel_state import (
     get_paras_dp_size,
@@ -301,7 +297,7 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
 
         configure_method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
 
-        plan_gpt_oss_moe_layout(
+        reserve_model_weights(
             manager,
             num_layers=config.num_hidden_layers,
             num_experts=config.num_experts,
@@ -318,28 +314,11 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
             configure_method=configure_method,
             prefix="model",
             top_k=config.num_experts_per_tok,
+            with_bias=True,
         )
 
-        plan = manager.plan_kv_capacity(
-            config=config,
-            tp_size=get_paras_tp_size(),
-            head_dim=head_dim,
-        )
-
-        manager.reserve_kv_cache(
-            num_layers=config.num_hidden_layers,
-            ep_max_tokens=plan.ep_max_tokens,
-            tp_max_tokens=plan.tp_max_tokens,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=head_dim,
-            tp_size=get_paras_tp_size(),
-            kv_dtype=plan.kv_dtype,
-            page_size=getattr(get_global_server_args(), "page_size", 1),
-            prefix="model",
-            layer_specs=plan.layer_specs,
-        )
-
-        manager.materialize()
+        plan = manager.plan_layout(config)
+        manager.materialize(plan)
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
         self.paras_layer_specs = plan.layer_specs

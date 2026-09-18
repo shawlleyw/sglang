@@ -8,13 +8,13 @@ sliding-window KV pools retain separate capacities within this layout.
 import json
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.paras.mode import ParaSMode
-from sglang.srt.paras.unified_layout import MEMORY_ALIGNMENT
+from sglang.srt.paras.unified_layout import MEMORY_ALIGNMENT, align_up
 from sglang.srt.paras.workspace import ModeWorkspaces, WorkspaceRequirement
 
 if TYPE_CHECKING:
@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # LayoutEntry
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class LayoutEntry:
@@ -55,19 +56,6 @@ class LayoutEntry:
             "size_bytes": self.size_bytes,
             "offset_bytes": self.offset_bytes,
         }
-
-
-@dataclass(frozen=True)
-class KVCacheReservation:
-    """Per-layer K/V shapes and sizes retained until buffer materialization."""
-
-    num_layers: int
-    prefix: str
-    layer_ep_bytes: List[int]
-    layer_tp_bytes: List[int]
-    layer_ep_shapes: List[Tuple[int, ...]]
-    layer_tp_shapes: List[Tuple[int, ...]]
-    kv_dtype: torch.dtype
 
 
 @dataclass
@@ -103,36 +91,13 @@ class UnifiedLayoutSpec:
 
 
 @dataclass(frozen=True)
-class ParaSKVCapacityPlan:
-    """UMM-owned EP/TP KV cache capacity plan.
+class UnifiedMemoryPlan:
+    """Completed layout, tensor views, and per-layer cache capacities."""
 
-    SWA fields are zero / empty for pure-MHA plans. ``layer_specs`` is set
-    only by the SWA planner for downstream :meth:`reserve_kv_cache`.
-    """
-
-    available_gpu_memory_bytes: int
-    total_gpu_memory_bytes: int
-    dynamic_reserve_bytes: int
-    umm_budget_bytes: int
-    weights_only_bytes: int
-    non_umm_static_bytes: int
-    kv_budget_bytes: int
-
+    layout: "UnifiedLayout"
+    entries: tuple[LayoutEntry, ...]
     kv_dtype: torch.dtype
-
-    ep_max_tokens: int
-    tp_max_tokens: int
-    ep_cell_bytes: int
-    tp_cell_bytes: int
-    ep_kv_heads: int
-    tp_kv_heads: int
-
-    full_layers: int = 0
-    swa_layers: int = 0
-    ep_max_tokens_swa: int = 0
-    tp_max_tokens_swa: int = 0
-
-    layer_specs: Optional[List["LayerCacheSpec"]] = None
+    layer_specs: List["LayerCacheSpec"]
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +115,7 @@ _SUPPORTED_DTYPES = {
 # ---------------------------------------------------------------------------
 # V1 scope validation
 # ---------------------------------------------------------------------------
+
 
 def _validate_v1_scope(
     num_fused_shared_experts: int,
@@ -195,69 +161,8 @@ def _validate_paras_swa_runtime_scope(server_args, model_config) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# Hybrid KV budget planner
-# ---------------------------------------------------------------------------
-
-def plan_hybrid_kv_budget(
-    total_tokens: int,
-    full_layers_num: int,
-    swa_layers_num: int,
-    swa_full_tokens_ratio: float,
-) -> Tuple[int, int]:
-    """Compute per-layer token budgets for a hybrid full/SWA attention model.
-
-    Mirrors the generic branch of ``set_num_token_hybrid`` in
-    ``model_runner.py`` (lines 1497-1516).  Pure arithmetic — no tensor
-    allocation.
-
-    The two unknowns satisfy:
-        swa_max * swa_layers + full_max * full_layers == total_tokens
-        swa_max == full_max * swa_full_tokens_ratio
-
-    Returns:
-        (full_max_total_num_tokens, swa_max_total_num_tokens)
-    """
-    if full_layers_num == 0 and swa_layers_num == 0:
-        raise ValueError("no layers")
-    if swa_layers_num > 0 and swa_full_tokens_ratio <= 0:
-        raise ValueError(
-            "swa_full_tokens_ratio must be > 0 when SWA layers present"
-        )
-
-    # All-MHA shortcut: no SWA layers at all.
-    if swa_layers_num == 0:
-        return (int(total_tokens / full_layers_num), 0)
-
-    denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
-    full_max = int(total_tokens / denominator)
-    swa_max = int(full_max * swa_full_tokens_ratio)
-
-    if swa_max < 1:
-        logging.warning(
-            "plan_hybrid_kv_budget: computed swa_max_total_num_tokens < 1 "
-            "(ratio=%.4f, full_max=%d). SWA layers will have near-zero budget.",
-            swa_full_tokens_ratio,
-            full_max,
-        )
-
-    return (full_max, swa_max)
-
-
-# ---------------------------------------------------------------------------
-# ParaSMemoryManager
-# ---------------------------------------------------------------------------
-
 class ParaSMemoryManager:
-    """
-    Pre-plans and materialises a single contiguous ``uint8`` buffer that
-    holds every weight tensor needed for ParaS EP↔TP switching.
-
-    Lifecycle:
-        1. ``reserve()`` — declare each tensor (name, shape, dtype).
-        2. ``materialize()`` — compute aligned offsets, allocate buffer.
-        3. ``get_view()`` — obtain typed, shaped views into the buffer.
-    """
+    """Declare model tensors, plan their layout, then allocate one shared buffer."""
 
     ALIGNMENT: int = MEMORY_ALIGNMENT
 
@@ -284,7 +189,6 @@ class ParaSMemoryManager:
         self.world_size = world_size
 
         self._entries: Dict[str, LayoutEntry] = {}
-        self._reservation_order: List[str] = []
         self._buffer: Optional[torch.Tensor] = None
         self._materialized: bool = False
         self._total_bytes: int = 0
@@ -298,10 +202,9 @@ class ParaSMemoryManager:
         self.tp_max_num_reqs: int = 0
         self.ep_max_running_requests: int = 0
         self.tp_max_running_requests: int = 0
-        self._kv_reserved: bool = False
         self._unified_spec: Optional[UnifiedLayoutSpec] = None
         self._unified_layout: Optional["UnifiedLayout"] = None
-        self._paras_kv_pending: Optional[KVCacheReservation] = None
+        self._plan: Optional[UnifiedMemoryPlan] = None
 
     # ----- reservation ----------------------------------------------------
 
@@ -311,30 +214,24 @@ class ParaSMemoryManager:
         shape: Tuple[int, ...],
         dtype: torch.dtype,
     ) -> LayoutEntry:
-        """
-        Register a tensor to be placed in the contiguous buffer.
-
-        WHY TRACK RESERVATION ORDER:
-          Offsets are assigned in the order tensors are reserved. This deterministic
-          ordering ensures reproducible memory layouts across runs, which is critical
-          for distributed training where all ranks must agree on the buffer structure.
-        """
+        """Declare a weight tensor; planning assigns its offset later."""
         if self._materialized:
-            raise RuntimeError(
-                "Cannot reserve after the buffer has been materialized."
-            )
+            raise RuntimeError("Cannot reserve after the buffer has been materialized.")
         if name in self._entries:
             raise ValueError(f"Duplicate reservation name: '{name}'")
         if dtype not in _SUPPORTED_DTYPES:
             raise ValueError(
-                f"Unsupported dtype {dtype}. "
-                f"Supported: {_SUPPORTED_DTYPES}"
+                f"Unsupported dtype {dtype}. " f"Supported: {_SUPPORTED_DTYPES}"
             )
 
         numel = 1
         for d in shape:
             numel *= d
-        elem_size = dtype.itemsize if hasattr(dtype, "itemsize") else torch.tensor([], dtype=dtype).element_size()
+        elem_size = (
+            dtype.itemsize
+            if hasattr(dtype, "itemsize")
+            else torch.tensor([], dtype=dtype).element_size()
+        )
         size_bytes = numel * elem_size
 
         entry = LayoutEntry(
@@ -346,10 +243,9 @@ class ParaSMemoryManager:
             size_bytes=size_bytes,
         )
         self._entries[name] = entry
-        self._reservation_order.append(name)  # Preserve order for deterministic offset assignment
         return entry
 
-    # ----- KV cache reservation -------------------------------------------
+    # ----- Backend workspace views ----------------------------------------
 
     def get_moe_workspace(self, mode: ParaSMode, shapes, dtype, device):
         return self._get_workspace(mode, "moe", shapes, dtype, device)
@@ -421,174 +317,40 @@ class ParaSMemoryManager:
             label=f"ParaS {mode.value} {kind} workspace",
         )
 
-    def _materialize_unified(self):
-        layout, spec = self._unified_layout, self._unified_spec
-        pending = self._paras_kv_pending
-        if layout is None or not self._kv_reserved or pending is None:
-            raise RuntimeError(
-                "Unified layout requires capacity planning and KV reservation"
-            )
-        if (layout.ep_cache.full_tokens, layout.tp_cache.full_tokens) != (
-            self.ep_max_kv_tokens,
-            self.tp_max_kv_tokens,
-        ):
-            raise ValueError("KV reservation differs from the unified capacity plan")
-        dtype = pending.kv_dtype
+    def _plan_tensor_entries(self, layout, kv_dtype, page_size):
+        """Assign weight offsets and derive KV views directly from the layout."""
+        spec = self._unified_spec
         for mode in (ParaSMode.EP, ParaSMode.TP):
-            shapes = (
-                pending.layer_ep_shapes
-                if mode == ParaSMode.EP
-                else pending.layer_tp_shapes
-            )
-            sizes = (
-                pending.layer_ep_bytes
-                if mode == ParaSMode.EP
-                else pending.layer_tp_bytes
-            )
+            cache = layout.ep_cache if mode == ParaSMode.EP else layout.tp_cache
+            heads = spec.num_kv_heads
+            if mode == ParaSMode.TP:
+                heads = max(1, heads // spec.tp_size)
             for i, names in enumerate(spec.for_mode(mode).weight_names):
                 offset = layout.weight_offset(mode, i)
                 for name in names:
                     entry = self._entries[name]
                     entry.offset_bytes = offset
-                    offset += self._align_up(entry.size_bytes, self.ALIGNMENT)
-                shape, size = shapes[i], sizes[i]
-                cache = layout.ep_cache if mode == ParaSMode.EP else layout.tp_cache
-                kv_slot_bytes = cache.layer_bytes[i] // 2
-                assert size <= kv_slot_bytes, "KV reservation exceeds capacity plan"
-                for side, displacement in (("k", 0), ("v", kv_slot_bytes)):
+                    offset += align_up(entry.size_bytes)
+                shape = (cache.layer_tokens[i] + page_size, heads, spec.head_dim)
+                numel = math.prod(shape)
+                size = numel * kv_dtype.itemsize
+                kv_region_bytes = cache.layer_bytes[i] // 2
+                assert size <= kv_region_bytes, "KV view exceeds planned capacity"
+                for side, displacement in (("k", 0), ("v", kv_region_bytes)):
                     name = f"{spec.prefix}.layers.{i}.kv.{mode.value}.{side}"
                     entry = LayoutEntry(
                         name,
                         shape,
-                        dtype,
-                        math.prod(shape),
-                        dtype.itemsize,
+                        kv_dtype,
+                        numel,
+                        kv_dtype.itemsize,
                         size,
                         layout.cache_offset(mode, i) + displacement,
                     )
                     self._entries[name] = entry
                     if mode == ParaSMode.EP:
                         self._entries[f"{spec.prefix}.layers.{i}.kv.{side}"] = entry
-        self._total_bytes = layout.budget
-        self._buffer = torch.empty(layout.budget, dtype=torch.uint8, device=self.device)
-        self._buffer_start = self._buffer.data_ptr()
-        self._buffer_end = self._buffer_start + layout.budget
-        self._materialized = True
-        return layout.budget
-
-    def reserve_kv_cache(
-        self,
-        *,
-        num_layers: int,
-        ep_max_tokens: int,
-        tp_max_tokens: int,
-        num_kv_heads: int,
-        head_dim: int,
-        kv_dtype: torch.dtype,
-        tp_size: int = 1,
-        page_size: int = 1,
-        prefix: str = "model",
-        layer_specs: Optional[list] = None,
-    ) -> None:
-        """
-        Reserve KV cache using a contiguous buffer with per-layer offsets.
-
-        Must be called AFTER plan_qwen_moe_layout() and BEFORE materialize().
-
-        Layout (per K and V separately):
-          - TP views are packed at the front of the region.
-          - EP views are packed after the smallest gap that keeps every
-            same-layer EP source disjoint from its TP destination.
-          - TP and EP entries have their own UMM-computed shapes, so GQA
-            replication and floor effects are represented explicitly instead
-            of inferred from the other mode's byte count.
-
-        Actual LayoutEntry objects are created during materialize() so that
-        offsets are computed relative to the end of the weight region.
-        """
-        if self._materialized:
-            raise RuntimeError("Cannot reserve KV cache after materialize().")
-        if self._kv_reserved:
-            raise RuntimeError("KV cache already reserved.")
-
-        self.ep_max_kv_tokens = ep_max_tokens
-        self.tp_max_kv_tokens = tp_max_tokens
-        self.ep_max_kv_tokens_swa = 0
-        self.tp_max_kv_tokens_swa = 0
-        self._layer_specs = layer_specs
-
-        elem_size = (
-            kv_dtype.itemsize
-            if hasattr(kv_dtype, "itemsize")
-            else torch.tensor([], dtype=kv_dtype).element_size()
-        )
-        tp_kv_heads = max(1, num_kv_heads // tp_size)
-
-        if layer_specs is None:
-            ep_per_layer_tokens = ep_max_tokens + page_size
-            tp_per_layer_tokens = tp_max_tokens + page_size
-            ep_per_layer_bytes = (
-                ep_per_layer_tokens * num_kv_heads * head_dim * elem_size
-            )
-            tp_per_layer_bytes = (
-                tp_per_layer_tokens * tp_kv_heads * head_dim * elem_size
-            )
-            layer_ep_shapes = [
-                (ep_per_layer_tokens, num_kv_heads, head_dim)
-            ] * num_layers
-            layer_tp_shapes = [
-                (tp_per_layer_tokens, tp_kv_heads, head_dim)
-            ] * num_layers
-            layer_ep_bytes = [ep_per_layer_bytes] * num_layers
-            layer_tp_bytes = [tp_per_layer_bytes] * num_layers
-        else:
-            layer_ep_shapes = [
-                (s.tokens_cap_ep + page_size, s.num_kv_heads, s.head_dim)
-                for s in layer_specs
-            ]
-            layer_tp_shapes = [
-                (
-                    s.tokens_cap_tp + page_size,
-                    max(1, s.num_kv_heads // tp_size),
-                    s.head_dim,
-                )
-                for s in layer_specs
-            ]
-            layer_ep_bytes = [
-                (s.tokens_cap_ep + page_size)
-                * s.num_kv_heads
-                * s.head_dim
-                * elem_size
-                for s in layer_specs
-            ]
-            layer_tp_bytes = [
-                (s.tokens_cap_tp + page_size)
-                * max(1, s.num_kv_heads // tp_size)
-                * s.head_dim
-                * elem_size
-                for s in layer_specs
-            ]
-            full_specs = [s for s in layer_specs if s.kind == "full"]
-            swa_specs = [s for s in layer_specs if s.kind == "swa"]
-            if full_specs:
-                self.ep_max_kv_tokens = max(s.tokens_cap_ep for s in full_specs)
-                self.tp_max_kv_tokens = max(s.tokens_cap_tp for s in full_specs)
-            if swa_specs:
-                self.ep_max_kv_tokens_swa = max(s.tokens_cap_ep for s in swa_specs)
-                self.tp_max_kv_tokens_swa = max(s.tokens_cap_tp for s in swa_specs)
-
-        # Save metadata for _create_kv_layout (called from materialize).
-        self._paras_kv_pending = KVCacheReservation(
-            num_layers=num_layers,
-            prefix=prefix,
-            layer_ep_bytes=layer_ep_bytes,
-            layer_tp_bytes=layer_tp_bytes,
-            layer_ep_shapes=layer_ep_shapes,
-            layer_tp_shapes=layer_tp_shapes,
-            kv_dtype=kv_dtype,
-        )
-
-        self._kv_reserved = True
+        return tuple(replace(entry, name=name) for name, entry in self._entries.items())
 
     def _resolve_kv_store_dtype(self) -> torch.dtype:
         s = self.server_args.kv_cache_dtype if self.server_args is not None else "auto"
@@ -608,82 +370,44 @@ class ParaSMemoryManager:
         lm_head_bytes = 0 if tie_word_embeddings else embed_bytes
         return embed_bytes + lm_head_bytes
 
-    def _compute_kv_budget_bytes(
-        self, config=None
-    ) -> Tuple[int, int, int, int, int, int, float]:
+    def _memory_budget(self, config) -> int:
+        """Available bytes after native dynamic and unmanaged static allocations."""
         from sglang.srt.utils.common import get_available_gpu_memory
 
-        assert self.server_args is not None, (
-            "ParaSMemoryManager: server_args required for budget planning. "
-            "Construct via ParaSMemoryManager(server_args=...) in model_runner."
+        total = torch.cuda.get_device_properties(self.gpu_id).total_memory
+        available = int(
+            get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=self.world_size > 1,
+                cpu_group=self.cpu_group,
+                empty_cache=True,
+            )
+            * (1 << 30)
+        )
+        dynamic_reserve = int(total * (1.0 - self.server_args.mem_fraction_static))
+        return max(
+            0, available - dynamic_reserve - self._compute_non_umm_static_bytes(config)
         )
 
-        total_gpu_bytes = torch.cuda.get_device_properties(self.gpu_id).total_memory
-        avail_now_gib = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=self.world_size > 1,
-            cpu_group=self.cpu_group,
-            empty_cache=True,
-        )
-        avail_now_bytes = int(avail_now_gib * (1 << 30))
+    def plan_layout(self, config, *, budget: Optional[int] = None) -> UnifiedMemoryPlan:
+        """Finish the weight, workspace, and KV plan before allocating storage.
 
-        mem_fraction = self.server_args.mem_fraction_static
-        assert mem_fraction is not None, "server_args.mem_fraction_static is required"
-        dynamic_reserve_bytes = int(total_gpu_bytes * (1.0 - mem_fraction))
-        umm_budget_bytes = max(0, avail_now_bytes - dynamic_reserve_bytes)
-        non_umm_static_bytes = (
-            self._compute_non_umm_static_bytes(config) if config is not None else 0
-        )
-        kv_budget_bytes = max(
-            0,
-            umm_budget_bytes - self.weights_only_bytes - non_umm_static_bytes,
-        )
-
-        return (
-            avail_now_bytes,
-            total_gpu_bytes,
-            dynamic_reserve_bytes,
-            umm_budget_bytes,
-            kv_budget_bytes,
-            non_umm_static_bytes,
-            avail_now_gib,
-        )
-
-    def plan_kv_capacity(
-        self,
-        *,
-        config,
-        tp_size: int,
-        head_dim: int,
-    ) -> ParaSKVCapacityPlan:
-        """Plan weights, backend scratch, and per-layer full/SWA KV capacities."""
+        An explicit byte budget also permits planning without a CUDA device.
+        """
         from sglang.srt.paras.layers.utils import classify_layers_from_config
 
+        spec = self._unified_spec
+        tp_size, head_dim = spec.tp_size, spec.head_dim
+        num_layers, num_kv_heads = spec.num_layers, spec.num_kv_heads
         kv_dtype = self._resolve_kv_store_dtype()
-        elem_size = (
-            kv_dtype.itemsize
-            if hasattr(kv_dtype, "itemsize")
-            else torch.tensor([], dtype=kv_dtype).element_size()
-        )
-
-        (
-            avail_now_bytes,
-            total_gpu_bytes,
-            dynamic_reserve_bytes,
-            umm_budget_bytes,
-            kv_budget_bytes,
-            non_umm_static_bytes,
-            avail_now_gib,
-        ) = self._compute_kv_budget_bytes(config)
-
-        num_layers = config.num_hidden_layers
-        num_kv_heads = config.num_key_value_heads
+        elem_size = kv_dtype.itemsize
+        if budget is None:
+            budget = self._memory_budget(config)
 
         from sglang.srt.paras.unified_layout import plan_unified_layout
         from sglang.srt.paras.workspace import attention_workspace_requirements
 
-        spec = self._unified_spec
         attention = attention_workspace_requirements(
             self.server_args, config, tp_size, head_dim, context_len=self.context_len
         )
@@ -702,7 +426,7 @@ class ParaSMemoryManager:
         )
         layout = plan_unified_layout(
             num_layers=num_layers,
-            budget=umm_budget_bytes - non_umm_static_bytes,
+            budget=budget,
             ep_weight_bytes=spec.ep.weight_bytes,
             tp_weight_bytes=spec.tp.weight_bytes,
             ep_workspace_bytes=spec.ep.workspaces.size_bytes,
@@ -712,28 +436,21 @@ class ParaSMemoryManager:
             page_size=self.server_args.page_size,
             layer_token_ratios=ratios,
         )
-        self._unified_layout = layout
-        self.ep_max_kv_tokens, self.tp_max_kv_tokens = (
-            layout.ep_cache.full_tokens,
-            layout.tp_cache.full_tokens,
-        )
         swa_layer = next(
             (i for i, kind in enumerate(layer_types) if kind == "sliding_attention"),
             None,
         )
-        self.ep_max_kv_tokens_swa = (
-            layout.ep_cache.layer_tokens[swa_layer] if swa_layer is not None else 0
-        )
-        self.tp_max_kv_tokens_swa = (
-            layout.tp_cache.layer_tokens[swa_layer] if swa_layer is not None else 0
-        )
         layer_specs = classify_layers_from_config(
             config,
             tp_size=tp_size,
-            ep_tokens_full=self.ep_max_kv_tokens,
-            tp_tokens_full=self.tp_max_kv_tokens,
-            ep_tokens_swa=self.ep_max_kv_tokens_swa,
-            tp_tokens_swa=self.tp_max_kv_tokens_swa,
+            ep_tokens_full=layout.ep_cache.full_tokens,
+            tp_tokens_full=layout.tp_cache.full_tokens,
+            ep_tokens_swa=(
+                layout.ep_cache.layer_tokens[swa_layer] if swa_layer is not None else 0
+            ),
+            tp_tokens_swa=(
+                layout.tp_cache.layer_tokens[swa_layer] if swa_layer is not None else 0
+            ),
         )
         logger.info("ParaS unified weights/KV/workspace: %s", layout)
         for mode in (ParaSMode.EP, ParaSMode.TP):
@@ -744,27 +461,15 @@ class ParaSMemoryManager:
                 requirements,
                 layout.workspace(mode)[1] - requirements.size_bytes,
             )
-        return ParaSKVCapacityPlan(
-            available_gpu_memory_bytes=avail_now_bytes,
-            total_gpu_memory_bytes=total_gpu_bytes,
-            dynamic_reserve_bytes=dynamic_reserve_bytes,
-            umm_budget_bytes=layout.budget,
-            weights_only_bytes=self.weights_only_bytes,
-            non_umm_static_bytes=non_umm_static_bytes,
-            kv_budget_bytes=layout.ep_cache.total_bytes,
+        self._plan = UnifiedMemoryPlan(
+            layout=layout,
+            entries=self._plan_tensor_entries(
+                layout, kv_dtype, self.server_args.page_size
+            ),
             kv_dtype=kv_dtype,
-            ep_max_tokens=layout.ep_cache.full_tokens,
-            tp_max_tokens=layout.tp_cache.full_tokens,
-            ep_cell_bytes=num_layers * ep_row,
-            tp_cell_bytes=num_layers * tp_row,
-            ep_kv_heads=num_kv_heads,
-            tp_kv_heads=max(1, num_kv_heads // tp_size),
-            full_layers=layer_types.count("full_attention"),
-            swa_layers=layer_types.count("sliding_attention"),
-            ep_max_tokens_swa=self.ep_max_kv_tokens_swa,
-            tp_max_tokens_swa=self.tp_max_kv_tokens_swa,
             layer_specs=layer_specs,
         )
+        return self._plan
 
     def plan_req_capacities(
         self,
@@ -834,144 +539,28 @@ class ParaSMemoryManager:
         raise ValueError(f"Unknown KV token capacity kind: {kind}")
 
     def has_kv_cache_reserved(self) -> bool:
-        return self._kv_reserved
+        return self._plan is not None
 
     # ----- materialization ------------------------------------------------
 
-    def materialize(self) -> int:
-        """
-        Assign aligned offsets in reservation order, then allocate the
-        backing ``uint8`` buffer on ``self.device``.
-
-        Returns the total buffer size in bytes.
-
-        WHY UINT8 BUFFER:
-          We store raw bytes (uint8) instead of a typed buffer because different tensors
-          have different dtypes (BF16, FP8, FP32). A uint8 buffer is dtype-agnostic and
-          allows get_view() to reinterpret the same bytes as different types via .view(dtype).
-
-        WHY 256-BYTE ALIGNMENT:
-          GPU memory coalescing works best when tensors start at 256-byte boundaries.
-          This alignment ensures efficient memory access patterns during kernel execution.
-
-        WHY STORE BUFFER_START/BUFFER_END:
-          These pointers enable is_managed() to quickly check if a tensor's data pointer
-          falls within our managed buffer. This is used to distinguish managed vs. external
-          tensors during parameter wrapping.
-        """
-        if self._unified_spec is not None:
-            return self._materialize_unified()
-        offset = 0
-        for name in self._reservation_order:
-            entry = self._entries[name]
-            entry.offset_bytes = self._align_up(offset, self.ALIGNMENT)
-            offset = entry.offset_bytes + entry.size_bytes
-
-        pending = getattr(self, "_paras_kv_pending", None)
-        if pending is not None:
-            offset = self._create_kv_layout(
-                offset,
-                num_layers=pending.num_layers,
-                prefix=pending.prefix,
-                layer_ep_bytes=pending.layer_ep_bytes,
-                layer_tp_bytes=pending.layer_tp_bytes,
-                layer_ep_shapes=pending.layer_ep_shapes,
-                layer_tp_shapes=pending.layer_tp_shapes,
-                kv_dtype=pending.kv_dtype,
-            )
-
-        self._total_bytes = self._align_up(offset, self.ALIGNMENT)
+    def materialize(self, plan: UnifiedMemoryPlan) -> int:
+        """Allocate the completed plan; all view offsets are already fixed."""
+        self._plan = plan
+        self._unified_layout = plan.layout
+        self._entries = {entry.name: entry for entry in plan.entries}
+        self.ep_max_kv_tokens = plan.layout.ep_cache.full_tokens
+        self.tp_max_kv_tokens = plan.layout.tp_cache.full_tokens
+        swa = next((s for s in plan.layer_specs if s.kind == "swa"), None)
+        self.ep_max_kv_tokens_swa = swa.tokens_cap_ep if swa is not None else 0
+        self.tp_max_kv_tokens_swa = swa.tokens_cap_tp if swa is not None else 0
+        self._total_bytes = plan.layout.budget
         self._buffer = torch.empty(
             self._total_bytes, dtype=torch.uint8, device=self.device
         )
-        buf = self._buffer
-        assert buf is not None
-        self._buffer_start = buf.data_ptr()
+        self._buffer_start = self._buffer.data_ptr()
         self._buffer_end = self._buffer_start + self._total_bytes
         self._materialized = True
         return self._total_bytes
-
-    # ----- KV layout creation (called from materialize) -------------------
-
-    def _create_kv_layout(
-        self,
-        offset: int,
-        *,
-        num_layers: int,
-        prefix: str,
-        layer_ep_bytes: List[int],
-        layer_tp_bytes: List[int],
-        layer_ep_shapes: List[Tuple[int, ...]],
-        layer_tp_shapes: List[Tuple[int, ...]],
-        kv_dtype: torch.dtype,
-    ) -> int:
-        """Create per-layer TP and EP LayoutEntry objects at computed offsets.
-
-        Returns the byte offset past the end of the V region.
-        """
-        if num_layers == 0:
-            return offset
-
-        elem_size = (
-            kv_dtype.itemsize
-            if hasattr(kv_dtype, "itemsize")
-            else torch.tensor([], dtype=kv_dtype).element_size()
-        )
-        tp_prefix = 0
-        ep_prefix = 0
-        overlap_gap = 0
-        for tp_bytes, ep_bytes in zip(layer_tp_bytes, layer_ep_bytes):
-            overlap_gap = max(overlap_gap, tp_prefix + tp_bytes - ep_prefix)
-            tp_prefix += tp_bytes
-            ep_prefix += ep_bytes
-
-        kv_region_bytes = max(sum(layer_tp_bytes), overlap_gap + sum(layer_ep_bytes))
-
-        k_region_start = self._align_up(offset, self.ALIGNMENT)
-        v_region_start = self._align_up(
-            k_region_start + kv_region_bytes, self.ALIGNMENT
-        )
-
-        for side, region_start in [("k", k_region_start), ("v", v_region_start)]:
-            tp_prefix = 0
-            ep_prefix = 0
-            for i in range(num_layers):
-                ep_shape = layer_ep_shapes[i]
-                tp_shape = layer_tp_shapes[i]
-                ep_bytes = layer_ep_bytes[i]
-                tp_bytes = layer_tp_bytes[i]
-                ep_numel = ep_shape[0] * ep_shape[1] * ep_shape[2]
-                tp_numel = tp_shape[0] * tp_shape[1] * tp_shape[2]
-
-                tp_offset = region_start + tp_prefix
-                ep_offset = region_start + overlap_gap + ep_prefix
-
-                ep_entry = LayoutEntry(
-                    name=f"{prefix}.layers.{i}.kv.ep.{side}",
-                    shape=ep_shape,
-                    dtype=kv_dtype,
-                    numel=ep_numel,
-                    element_size=elem_size,
-                    size_bytes=ep_bytes,
-                    offset_bytes=ep_offset,
-                )
-                self._entries[f"{prefix}.layers.{i}.kv.ep.{side}"] = ep_entry
-                self._entries[f"{prefix}.layers.{i}.kv.{side}"] = ep_entry
-
-                self._entries[f"{prefix}.layers.{i}.kv.tp.{side}"] = LayoutEntry(
-                    name=f"{prefix}.layers.{i}.kv.tp.{side}",
-                    shape=tp_shape,
-                    dtype=kv_dtype,
-                    numel=tp_numel,
-                    element_size=elem_size,
-                    size_bytes=tp_bytes,
-                    offset_bytes=tp_offset,
-                )
-
-                tp_prefix += tp_bytes
-                ep_prefix += ep_bytes
-
-        return v_region_start + kv_region_bytes
 
     # ----- view access ----------------------------------------------------
 
@@ -984,7 +573,7 @@ class ParaSMemoryManager:
           2. .view(dtype): Reinterpret those bytes as the target dtype (BF16, FP8, etc.).
              This is a zero-copy operation—no data is moved, just reinterpreted.
           3. .reshape(shape): Reshape the flat 1-D tensor to the original shape.
-          
+
           This chain allows a single uint8 buffer to serve tensors of different dtypes
           without duplication or type conversion overhead.
         """
@@ -1026,87 +615,17 @@ class ParaSMemoryManager:
         self,
         num_layers: int,
         mode: ParaSMode,
-        tp_size: int = 1,
-        page_size: int = 1,
         prefix: str = "model",
         layer_ids: Optional[List[int]] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """
-        Return k_buffers and v_buffers for the KV pool in the given mode.
-
-        EP mode: returns UMM-planned EP views.
-        TP mode: returns UMM-planned TP views when available, falling back to
-        reinterpreting EP bytes only for legacy layouts.
-
-        When *layer_ids* is provided, iterate over those specific layer
-        indices instead of ``range(num_layers)``.
-        """
-        k_bufs: List[torch.Tensor] = []
-        v_bufs: List[torch.Tensor] = []
-        iter_ids = layer_ids if layer_ids is not None else list(range(num_layers))
-        for layer_id in iter_ids:
-            lp = f"{prefix}.layers.{layer_id}"
-            k_name = f"{lp}.kv.k"
-            v_name = f"{lp}.kv.v"
-
-            if mode == ParaSMode.EP:
-                k_bufs.append(self.get_view(k_name))
-                v_bufs.append(self.get_view(v_name))
-            elif mode == ParaSMode.TP:
-                # Prefer dedicated TP entries (contiguous-buffer design) when available.
-                tp_k_name = f"{lp}.kv.tp.k"
-                tp_v_name = f"{lp}.kv.tp.v"
-                if tp_k_name in self._entries:
-                    k_bufs.append(self.get_view(tp_k_name))
-                    v_bufs.append(self.get_view(tp_v_name))
-                else:
-                    # Fallback: reinterpret EP bytes as TP shape.
-                    k_entry = self._entries[k_name]
-                    ep_heads = k_entry.shape[1]
-                    tp_heads = max(1, ep_heads // tp_size)
-                    tp_shape = (
-                        self.tp_max_kv_tokens + page_size,
-                        tp_heads,
-                        k_entry.shape[2],
-                    )
-                    k_bufs.append(self.get_view_as(k_name, tp_shape))
-                    v_bufs.append(self.get_view_as(v_name, tp_shape))
-            else:
-                raise ValueError(f"Expected a ParaSMode, got {mode!r}")
-
-        return k_bufs, v_bufs
-
-    # ----- aliasing -------------------------------------------------------
-
-    def alias(self, alias_name: str, target_name: str) -> LayoutEntry:
-        """
-        Create an alias entry that points to the same physical memory as *target*.
-
-        Aliases inherit the target's shape, dtype, offset, and size. They enable
-        multiple logical names (e.g., EP vs TP views) to map to the same physical
-        slot without duplicating buffer space.
-
-        Must be called after ``materialize()`` because offsets are only valid then.
-        """
-        if not self._materialized:
-            raise RuntimeError("alias() can only be called after materialize().")
-        if alias_name in self._entries:
-            raise ValueError(f"Alias name already exists: '{alias_name}'")
-        if target_name not in self._entries:
-            raise KeyError(f"Alias target not found: '{target_name}'")
-
-        target = self._entries[target_name]
-        entry = LayoutEntry(
-            name=alias_name,
-            shape=target.shape,
-            dtype=target.dtype,
-            numel=target.numel,
-            element_size=target.element_size,
-            size_bytes=target.size_bytes,
-            offset_bytes=target.offset_bytes,
-        )
-        self._entries[alias_name] = entry
-        return entry
+        """Return the planned per-layer K/V views for this mode."""
+        ids = layer_ids if layer_ids is not None else range(num_layers)
+        keys, values = [], []
+        for i in ids:
+            name = f"{prefix}.layers.{i}.kv.{mode.value}"
+            keys.append(self.get_view(f"{name}.k"))
+            values.append(self.get_view(f"{name}.v"))
+        return keys, values
 
     # ----- queries --------------------------------------------------------
 
@@ -1118,8 +637,8 @@ class ParaSMemoryManager:
         return self._buffer_start <= ptr < self._buffer_end
 
     def dump_layout(self) -> List[Dict]:
-        """All entries as JSON-serializable dicts, in reservation order."""
-        return [self._entries[n].to_dict() for n in self._reservation_order]
+        """Planned tensor views and their lookup aliases."""
+        return [entry.to_dict() for entry in self._entries.values()]
 
     def dump_layout_json(self) -> str:
         """Pretty-printed JSON of the full layout."""
@@ -1143,16 +662,6 @@ class ParaSMemoryManager:
     def buffer(self) -> Optional[torch.Tensor]:
         return self._buffer
 
-    @property
-    def weights_only_bytes(self) -> int:
-        """Total reserved bytes NOT including KV cache entries (for KV sizing)."""
-        if self._unified_spec is not None:
-            return self._unified_spec.num_layers * self._unified_spec.ep.weight_bytes
-        return sum(
-            self._entries[n].size_bytes
-            for n in self._reservation_order
-        )
-
     # ----- dunder ---------------------------------------------------------
 
     def __repr__(self) -> str:
@@ -1164,12 +673,6 @@ class ParaSMemoryManager:
             f"total={mib:.2f} MiB, "
             f"status={status})"
         )
-
-    # ----- helpers --------------------------------------------------------
-
-    @staticmethod
-    def _align_up(value: int, alignment: int) -> int:
-        return (value + alignment - 1) // alignment * alignment
 
 
 # ---------------------------------------------------------------------------
@@ -1193,7 +696,7 @@ def get_global_paras_memory_manager() -> Optional[ParaSMemoryManager]:
 # ---------------------------------------------------------------------------
 
 
-def plan_qwen_moe_layout(
+def reserve_model_weights(
     manager: ParaSMemoryManager,
     *,
     num_layers: int,
@@ -1214,7 +717,7 @@ def plan_qwen_moe_layout(
     top_k: int = 8,
     with_bias: bool = False,
 ) -> None:
-    """Reserve the shared BF16 EP/TP layout for Qwen and GPT-OSS."""
+    """Declare BF16 EP/TP weight tensors and native MoE workspace requirements."""
     assert quant_name is None, "ParaS unified layout requires unquantized BF16 weights"
     assert (
         configure_method == "peer_access"
@@ -1322,76 +825,3 @@ def plan_qwen_moe_layout(
             align_up(manager._entries[n].size_bytes) for n in mode_spec.weight_names[0]
         )
     manager._unified_spec = spec
-
-
-# ---------------------------------------------------------------------------
-# GPT-OSS MoE layout planning
-# ---------------------------------------------------------------------------
-
-
-def plan_gpt_oss_moe_layout(
-    manager: ParaSMemoryManager,
-    *,
-    num_layers: int,
-    num_experts: int,
-    hidden_size: int,
-    intermediate_size: int,
-    num_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    ep_size: int,
-    tp_size: int,
-    dp_size: int,
-    moe_tp_size: int,
-    quant_name: Optional[str] = None,
-    num_fused_shared_experts: int = 0,
-    configure_method: str = "peer_access",
-    prefix: str = "model",
-    top_k: int = 8,
-) -> None:
-    """GPT-OSS uses the same weight geometry, with separately owned biases."""
-    plan_qwen_moe_layout(
-        manager,
-        num_layers=num_layers,
-        num_experts=num_experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        ep_size=ep_size,
-        tp_size=tp_size,
-        dp_size=dp_size,
-        moe_tp_size=moe_tp_size,
-        quant_name=quant_name,
-        num_fused_shared_experts=num_fused_shared_experts,
-        configure_method=configure_method,
-        prefix=prefix,
-        top_k=top_k,
-        with_bias=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# MoE alias creation (call after materialize)
-# ---------------------------------------------------------------------------
-
-def create_paras_moe_aliases(
-    manager: ParaSMemoryManager,
-    num_layers: int,
-    prefix: str = "model",
-) -> None:
-    """
-    Create ep_experts and tp_experts aliases for the N+1 slot layout.
-    Call after materialize().
-
-    ep_experts layer i → slot i+1 (same physical buffer as EP weights)
-    tp_experts layer i → slot i   (one slot before EP, for fused transfer)
-    """
-    if manager._unified_spec is not None:
-        return
-    for i in range(num_layers):
-        manager.alias(f"{prefix}.layers.{i}.mlp.ep_experts.w13_weight", f"paras.moe_slot.{i+1}.w13")
-        manager.alias(f"{prefix}.layers.{i}.mlp.ep_experts.w2_weight", f"paras.moe_slot.{i+1}.w2")
-        manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w13_weight", f"paras.moe_slot.{i}.w13")
-        manager.alias(f"{prefix}.layers.{i}.mlp.tp_experts.w2_weight", f"paras.moe_slot.{i}.w2")

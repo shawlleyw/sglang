@@ -17,10 +17,15 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
-from sglang.srt.paras.cache_transfer import LayerCacheSpec
+from sglang.srt.paras.layers.utils import LayerCacheSpec
 from sglang.srt.paras.paras_memory_manager import ParaSMemoryManager
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.paras import paras_memory_manager as pmm
+
+@pytest.fixture(autouse=True)
+def isolated_memory_manager(monkeypatch):
+    monkeypatch.setattr(pmm, "_global_paras_memory_manager", None)
+
 
 FULL_LAYER_IDS = [0, 1]
 SWA_LAYER_IDS = [2, 3, 4, 5]
@@ -59,17 +64,19 @@ def make_layer_specs():
 
 def setup_mgr_and_pool(specs):
     mgr = ParaSMemoryManager(device=DEVICE)
-    mgr.reserve_kv_cache(
+    from test.srt.paras.unified_memory_test_utils import materialize_test_cache
+
+    materialize_test_cache(mgr,
         num_layers=NUM_LAYERS,
         ep_max_tokens=EP_TOKENS_FULL,
         tp_max_tokens=TP_TOKENS_FULL,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         kv_dtype=KV_DTYPE,
+        tp_size=TP_SIZE,
         page_size=PAGE_SIZE,
         layer_specs=specs,
     )
-    mgr.materialize()
     pmm._global_paras_memory_manager = mgr
 
     pool = SWAKVPool(
@@ -186,6 +193,7 @@ class TestSWAAllocatorSignature:
         )
         alloc = SWATokenToKVPoolAllocator(
             size=64, size_swa=32, dtype=torch.int64,
+            paras_max_size=128, paras_max_size_swa=64,
             device=DEVICE, kvcache=kvcache, need_sort=False,
         )
         alloc.paras_resize_and_clear(128, 64)
@@ -205,6 +213,7 @@ class TestSWAAllocatorSignature:
         )
         alloc = SWATokenToKVPoolAllocator(
             size=64, size_swa=32, dtype=torch.int64,
+            paras_max_size=128, paras_max_size_swa=64,
             device=DEVICE, kvcache=kvcache, need_sort=False,
         )
         req_pool = ReqToTokenPool(size=32, max_context_len=128, device=DEVICE, enable_memory_saver=False)
@@ -223,11 +232,11 @@ class TestSWAAllocatorSignature:
         mgr.global_seqlens_list = []
         mgr.global_num_tokens = []
         mgr.num_global_tokens = 0
-        mgr.reorchestrate_cache()
+        mgr.reorchestrate_cache(new_req_pool_size=32, new_cache_size=128, new_cache_size_swa=64)
         assert alloc._size_full == 128
         assert alloc._size_swa == 64
 
-    def test_scatter_manager_reorchestrate_with_swa_allocator(self):
+    def test_scatter_manager_reorchestrate_with_swa_allocator(self, monkeypatch):
         from unittest.mock import MagicMock
         from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
         from sglang.srt.mem_cache.memory_pool import SWAKVPool, ReqToTokenPool
@@ -248,6 +257,10 @@ class TestSWAAllocatorSignature:
         group.world_size = 2
 
         from sglang.srt.paras.scatter_manager import ParaSReqScatterManager
+        monkeypatch.setattr(
+            "sglang.srt.paras.scatter_manager.paras_tp_group_all_gather_reqs",
+            lambda *args: ([], []),
+        )
         mgr = ParaSReqScatterManager(
             global_reqs=[], scatter_group=group,
             req_to_token_pool=req_pool,
@@ -257,7 +270,7 @@ class TestSWAAllocatorSignature:
         mgr.local_reqs = []
         mgr.num_local_tokens = 0
         mgr.token_partition = [[], []]
-        mgr.reorchestrate_cache()
+        mgr.reorchestrate_cache(new_req_pool_size=64, new_ep_cache_size=64, new_ep_cache_size_swa=32)
         assert alloc._size_full == 64
         assert alloc._size_swa == 32
 
@@ -350,6 +363,7 @@ class TestPeerAccessPerDestCap:
         from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 
         stub = SWACacheTransfer.__new__(SWACacheTransfer)
+        stub.source_full_to_swa_mapping = None
         device = "cpu"
         stub.token_partition = token_partition
         stub.global_token_indices = global_token_indices
@@ -384,7 +398,7 @@ class TestPeerAccessPerDestCap:
 
     def test_per_destination_capping(self, monkeypatch):
         import sglang.srt.paras.cache_transfer.swa as swa_mod
-        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+        from sglang.srt.paras.layers.utils import LayerCacheSpec
 
         spec = LayerCacheSpec(
             layer_id=0, kind='swa', tokens_cap_ep=3,
@@ -429,7 +443,7 @@ class TestPeerAccessPerDestCap:
 
     def test_per_destination_capping_with_translation(self, monkeypatch):
         import sglang.srt.paras.cache_transfer.swa as swa_mod
-        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+        from sglang.srt.paras.layers.utils import LayerCacheSpec
 
         spec = LayerCacheSpec(
             layer_id=0, kind='swa', tokens_cap_ep=2,
@@ -484,6 +498,7 @@ class TestSWAFullToSwaDtype:
         from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
         # Bypass __init__ — we only need the mapping attribute for _full_to_swa.
         stub = SWACacheTransfer.__new__(SWACacheTransfer)
+        stub.source_full_to_swa_mapping = None
         # Non-trivial mapping so we can check translation correctness too.
         # Full index i maps to SWA index (i * 3) % 17.
         stub._full_to_swa_mapping = torch.tensor(
@@ -523,6 +538,7 @@ class TestSWAFullToSwaDtype:
         """If allocator didn't attach a mapping, pass through unchanged."""
         from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
         stub = SWACacheTransfer.__new__(SWACacheTransfer)
+        stub.source_full_to_swa_mapping = None
         stub._full_to_swa_mapping = None
         t = torch.tensor([1, 2, 3], dtype=torch.int32)
         out = stub._full_to_swa(t)
@@ -536,6 +552,7 @@ class TestSWAScatterRefactor:
                         global_token_indices=None):
         from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
         stub = SWACacheTransfer.__new__(SWACacheTransfer)
+        stub.source_full_to_swa_mapping = None
 
         device = "cpu"
         n_tokens = sum(len(p) for p in token_partition)
@@ -583,7 +600,7 @@ class TestSWAScatterRefactor:
 
     def test_nccl_scatter_caps_per_destination(self, monkeypatch):
         import sglang.srt.paras.cache_transfer.swa as swa_mod
-        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+        from sglang.srt.paras.layers.utils import LayerCacheSpec
 
         captured = {}
         def fake_scatter_nccl(
@@ -624,7 +641,7 @@ class TestSWAScatterRefactor:
 
     def test_nccl_scatter_translates_indices_to_swa_space(self, monkeypatch):
         import sglang.srt.paras.cache_transfer.swa as swa_mod
-        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+        from sglang.srt.paras.layers.utils import LayerCacheSpec
 
         captured = {}
         def fake_scatter_nccl(*args, **kwargs):
@@ -654,7 +671,7 @@ class TestSWAScatterRefactor:
 
     def test_peer_access_scatter_delegates_with_int32_indices(self, monkeypatch):
         import sglang.srt.paras.cache_transfer.swa as swa_mod
-        from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+        from sglang.srt.paras.layers.utils import LayerCacheSpec
 
         captured = {}
         def fake_scatter_peer_access(
@@ -715,6 +732,7 @@ class TestSWAReplicationWarning:
         from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 
         stub = SWACacheTransfer.__new__(SWACacheTransfer)
+        stub.source_full_to_swa_mapping = None
         stub.group_size = group_size
         stub.direction = direction
 

@@ -793,7 +793,7 @@ class ModelRunner:
         # so that create_weights() inside the model class can pull tensor views
         # from the manager via the global accessor. The manager owns its own
         # device/gpu_id/server_args/cpu_group state, which is the input that
-        # plan_kv_capacity will later read.
+        # plan_layout will later read.
         if self.server_args.enable_paras_moe:
             paras_world = get_world_group()
             paras_manager = ParaSMemoryManager(
@@ -1925,8 +1925,6 @@ class ModelRunner:
                     _paras_external_k, _paras_external_v = _paras_mgr.get_kv_views(
                         num_layers=self.num_effective_layers,
                         mode=ParaSMode.EP,
-                        tp_size=1,  # EP mode: tp_size=1 for KV heads
-                        page_size=self.page_size,
                         prefix="model",
                     )
 

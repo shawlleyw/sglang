@@ -20,7 +20,7 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(
 
     monkeypatch.setattr(moe_utils, "use_deep_gemm_bf16", lambda *args, **kwargs: False)
     mgr = memory.ParaSMemoryManager(device="cpu")
-    memory.plan_qwen_moe_layout(
+    memory.reserve_model_weights(
         mgr,
         dp_size=1,
         moe_tp_size=1,
@@ -52,17 +52,10 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(
         ep_kv_row_bytes=1024,
         tp_kv_row_bytes=512,
     )
-    mgr._unified_layout = layout
-    mgr.reserve_kv_cache(
-        num_layers=4,
-        ep_max_tokens=layout.ep_cache.full_tokens,
-        tp_max_tokens=layout.tp_cache.full_tokens,
-        num_kv_heads=2,
-        head_dim=128,
-        kv_dtype=torch.bfloat16,
-        tp_size=4,
+    plan = memory.UnifiedMemoryPlan(
+        layout, mgr._plan_tensor_entries(layout, torch.bfloat16, 1), torch.bfloat16, []
     )
-    mgr.materialize()
+    mgr.materialize(plan)
     ep_weight = mgr.get_view("model.layers.0.mlp.ep_experts.w13_weight")
     tp_weight = mgr.get_view("model.layers.1.mlp.tp_experts.w13_weight")
     if attention_bytes < 400_000:
@@ -122,7 +115,7 @@ def test_unsupported_model_scope_rejected_before_reservation(
 ):
     mgr = memory.ParaSMemoryManager(device="cpu")
     with pytest.raises(AssertionError, match="ParaS"):
-        memory.plan_qwen_moe_layout(
+        memory.reserve_model_weights(
             mgr,
             num_layers=4,
             num_experts=8,
@@ -163,7 +156,7 @@ def test_gpt_oss_hybrid_views_match_capacity_plan(monkeypatch, head_dim):
         decode_attention_backend=None,
     )
     mgr = memory.ParaSMemoryManager(device="cpu", server_args=args)
-    memory.plan_gpt_oss_moe_layout(
+    memory.reserve_model_weights(
         mgr,
         num_layers=4,
         num_experts=8,
@@ -171,6 +164,7 @@ def test_gpt_oss_hybrid_views_match_capacity_plan(monkeypatch, head_dim):
         intermediate_size=128,
         num_heads=8,
         num_kv_heads=4,
+        with_bias=True,
         head_dim=head_dim,
         ep_size=4,
         tp_size=4,
@@ -187,23 +181,8 @@ def test_gpt_oss_hybrid_views_match_capacity_plan(monkeypatch, head_dim):
         layer_types=["sliding_attention", "full_attention"] * 2,
     )
     budget = 16 << 20
-    monkeypatch.setattr(
-        mgr,
-        "_compute_kv_budget_bytes",
-        lambda _: (budget, budget, 0, budget, 0, 0, budget / (1 << 30)),
-    )
-    plan = mgr.plan_kv_capacity(config=config, tp_size=4, head_dim=head_dim)
-    mgr.reserve_kv_cache(
-        num_layers=4,
-        ep_max_tokens=plan.ep_max_tokens,
-        tp_max_tokens=plan.tp_max_tokens,
-        num_kv_heads=4,
-        head_dim=head_dim,
-        kv_dtype=plan.kv_dtype,
-        tp_size=4,
-        layer_specs=plan.layer_specs,
-    )
-    mgr.materialize()
+    plan = mgr.plan_layout(config, budget=budget)
+    mgr.materialize(plan)
     assert mgr.total_bytes == budget
     assert mgr.ep_max_kv_tokens_swa < mgr.ep_max_kv_tokens
     for mode in (ParaSMode.EP, ParaSMode.TP):
