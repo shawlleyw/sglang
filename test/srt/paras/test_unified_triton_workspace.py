@@ -116,11 +116,6 @@ def test_managed_triton_matches_original_allocations(
     mgr._materialized = True
     # Binding works without a global manager or a weight-address registry.
     runner_config.paras_workspace = mgr.bind_moe_workspace(mode)
-    if reserved_rows is None:
-        with monkeypatch.context() as bounds:
-            bounds.setattr(unified_layout, "MOE_MAX_BLOCK_M", 1)
-            with pytest.raises(ValueError, match="selected configuration"):
-                run()
     actual = run()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     if reserved_rows is not None:

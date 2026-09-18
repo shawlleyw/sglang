@@ -9,8 +9,10 @@ from dataclasses import dataclass
 
 from sglang.srt.paras.mode import ParaSMode
 
+MEMORY_ALIGNMENT = 256
 
-def align_up(n: int, alignment: int = 256) -> int:
+
+def align_up(n: int, alignment: int = MEMORY_ALIGNMENT) -> int:
     return (n + alignment - 1) // alignment * alignment
 
 
@@ -31,7 +33,7 @@ class CacheCapacity:
         independent of the EP/TP head counts and page sizes.
         """
         ratio_sum = sum(ratios)
-        kv_pair_alignment = 2 * 256  # One aligned slot for K, one for V.
+        kv_pair_alignment = 2 * MEMORY_ALIGNMENT  # One slot for K, one for V.
         layer_bytes = tuple(
             int(budget * ratio / ratio_sum) // kv_pair_alignment * kv_pair_alignment
             for ratio in ratios
@@ -108,7 +110,7 @@ def plan_unified_layout(
     if ep_weight_bytes < tp_weight_bytes:
         raise ValueError("EP-low-weight topology needs a different layout orientation")
     we, wt = align_up(ep_weight_bytes), align_up(tp_weight_bytes)
-    budget = budget // 256 * 256
+    budget = budget // MEMORY_ALIGNMENT * MEMORY_ALIGNMENT
     ratios = layer_token_ratios or (1.0,) * num_layers
     assert len(ratios) == num_layers and min(ratios) > 0
     weight_saving = num_layers * (we - wt)

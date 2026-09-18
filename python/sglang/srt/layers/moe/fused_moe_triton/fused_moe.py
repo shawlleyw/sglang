@@ -584,28 +584,28 @@ def fused_experts_impl(
         min(M * topk, E + 1) * (max_block_m - 1) if down_moe_use_tma else 0
     )
     total_tokens = M * topk + max_padded_tokens
-    from sglang.srt.paras.workspace import moe_workspace_views
+    from sglang.srt.paras.workspace import moe_workspace_views, workspace_or_empty
 
+    intermediate_shape = (total_tokens * max(N, w2.shape[1]),)
+    activation_shape = (total_tokens, N // 2)
     intermediate_workspace, activation_workspace = moe_workspace_views(
         workspace_buffer,
-        (total_tokens * max(N, w2.shape[1]),),
-        (total_tokens, N // 2),
+        intermediate_shape,
+        activation_shape,
         hidden_states.dtype,
         hidden_states.device,
-        block_sizes=(
-            config["BLOCK_SIZE_M"],
-            down_config["BLOCK_SIZE_M"] if down_config is not None else None,
-            max_block_m,
-        ),
     )
-    cache = (
-        intermediate_workspace
-        if intermediate_workspace is not None
-        else torch.empty(
-            total_tokens * max(N, w2.shape[1]),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+    if intermediate_workspace is not None and down_moe_use_tma:
+        validate_triton_workspace_blocks(
+            config["BLOCK_SIZE_M"],
+            down_config["BLOCK_SIZE_M"],
+            max_block_m,
         )
+    cache = workspace_or_empty(
+        intermediate_workspace,
+        intermediate_shape,
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
     )
     intermediate_cache3 = cache[: M * topk * w2.shape[1]].view(
         (M, topk, w2.shape[1]),
@@ -642,16 +642,15 @@ def fused_experts_impl(
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
             config, (down_config, _) = get_config_func(tokens_in_chunk)
-            if intermediate_workspace is not None:
-                validate_triton_workspace_blocks(
-                    config["BLOCK_SIZE_M"],
-                    down_config["BLOCK_SIZE_M"] if down_config is not None else None,
-                )
             down_moe_use_tma = (
                 _down_moe_use_tma()
                 and down_config is not None
                 and down_config.pop("USE_TMA", False)
             )
+            if intermediate_workspace is not None and down_moe_use_tma:
+                validate_triton_workspace_blocks(
+                    config["BLOCK_SIZE_M"], down_config["BLOCK_SIZE_M"]
+                )
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
 
         padded_tokens = (
@@ -663,14 +662,15 @@ def fused_experts_impl(
         intermediate_cache1 = cache[: total_tokens * N].view(
             (total_tokens, N),
         )
-        intermediate_cache2 = (
-            activation_workspace[:total_tokens]
-            if activation_workspace is not None
-            else torch.empty(
-                (total_tokens, N // 2),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
+        intermediate_cache2 = workspace_or_empty(
+            (
+                activation_workspace[:total_tokens]
+                if activation_workspace is not None
+                else None
+            ),
+            (total_tokens, N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]

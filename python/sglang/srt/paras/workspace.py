@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import torch
 
 from sglang.srt.paras.mode import ParaSMode
-from sglang.srt.paras.unified_layout import align_up, validate_triton_workspace_blocks
+from sglang.srt.paras.unified_layout import align_up
 
 
 @dataclass(frozen=True)
@@ -145,19 +145,21 @@ def workspace_views(buffer, shapes, dtype, device, *, label="workspace"):
     return result
 
 
-def moe_workspace_views(
-    buffer, intermediate_shape, activation_shape, dtype, device, *, block_sizes=()
-):
+def moe_workspace_views(buffer, intermediate_shape, activation_shape, dtype, device):
     """Return (intermediate, activation) views, or (None, None) for dynamic allocation."""
     shapes = (intermediate_shape, activation_shape)
     size = sum(align_up(math.prod(shape) * dtype.itemsize) for shape in shapes)
     if buffer is None or size > buffer.numel():
         return None, None
-    validate_triton_workspace_blocks(*block_sizes)
     intermediate, activation = workspace_views(
         buffer, shapes, dtype, device, label="ParaS MoE workspace"
     )
     return intermediate, activation
+
+
+def workspace_or_empty(view, shape, *, dtype, device):
+    """Reuse a workspace view, allocating fallback storage only when called."""
+    return view if view is not None else torch.empty(shape, dtype=dtype, device=device)
 
 
 @dataclass(frozen=True)

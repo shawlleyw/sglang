@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.paras.mode import ParaSMode
+from sglang.srt.paras.unified_layout import MEMORY_ALIGNMENT
 from sglang.srt.paras.workspace import ModeWorkspaces, WorkspaceRequirement
 
 if TYPE_CHECKING:
@@ -258,7 +259,7 @@ class ParaSMemoryManager:
         3. ``get_view()`` — obtain typed, shaped views into the buffer.
     """
 
-    ALIGNMENT: int = 256  # bytes — keeps GPU loads aligned
+    ALIGNMENT: int = MEMORY_ALIGNMENT
 
     def __init__(
         self,

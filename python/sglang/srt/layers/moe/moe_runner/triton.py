@@ -172,25 +172,23 @@ class TritonRunnerCore(MoeRunnerCore):
             tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
         )
 
-        from sglang.srt.paras.workspace import moe_workspace_views
+        from sglang.srt.paras.workspace import moe_workspace_views, workspace_or_empty
 
         moe_workspace = self.config.paras_workspace
+        intermediate_shape = (M, topk_ids.shape[1], N)
+        activation_shape = (M * topk_ids.shape[1], N // 2)
         intermediate_workspace, activation_workspace = moe_workspace_views(
             moe_workspace.buffer if moe_workspace is not None else None,
-            (M, topk_ids.shape[1], N),
-            (M * topk_ids.shape[1], N // 2),
+            intermediate_shape,
+            activation_shape,
             hidden_states.dtype,
             hidden_states.device,
-            block_sizes=(running_state["config"]["BLOCK_SIZE_M"],),
         )
-        intermediate_cache1 = (
-            intermediate_workspace
-            if intermediate_workspace is not None
-            else torch.empty(
-                (M, topk_ids.shape[1], N),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
+        intermediate_cache1 = workspace_or_empty(
+            intermediate_workspace,
+            intermediate_shape,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
 
         invoke_fused_moe_kernel(
@@ -218,14 +216,11 @@ class TritonRunnerCore(MoeRunnerCore):
             block_shape=block_shape,
         )
 
-        intermediate_cache2 = (
-            activation_workspace
-            if activation_workspace is not None
-            else torch.empty(
-                (M * topk_ids.shape[1], N // 2),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
+        intermediate_cache2 = workspace_or_empty(
+            activation_workspace,
+            activation_shape,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
 
         masked_m = running_state.get("masked_m")

@@ -343,9 +343,9 @@ class FlashInferAttnBackend(AttentionBackend):
             wrapper._float_workspace_buffer = workspace
 
     def paras_initialize_workspace(self):
-        workspace = self._paras_workspace()
-        if workspace is not None:
-            workspace.zero_()
+        mgr = self._paras_memory_manager
+        if mgr is not None:
+            mgr.initialize_attention_workspace(self._paras_workspace_mode)
 
     def paras_configure_helper(self):
         """Recompute derived state after head counts change."""
