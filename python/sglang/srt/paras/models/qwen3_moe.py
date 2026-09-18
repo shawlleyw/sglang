@@ -27,9 +27,8 @@ from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 
 from sglang.srt.paras.paras_memory_manager import (
-    create_paras_moe_aliases,
     get_global_paras_memory_manager,
-    plan_qwen_moe_layout,
+    reserve_model_weights,
 )
 from sglang.srt.paras.paras_parallel_state import get_paras_dp_size, get_paras_tp_group, get_paras_tp_size
 from sglang.srt.paras.utils import paras_func
@@ -146,14 +145,12 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             "created it before get_model() under enable_paras_moe."
         )
 
-        quant_name = None
-        fp8_block_size = None
-        if quant_config is not None:
-            qn = quant_config.get_name()
-            if qn == "fp8":
-                quant_name = "fp8"
-                if hasattr(quant_config, "weight_block_size") and quant_config.weight_block_size:
-                    fp8_block_size = quant_config.weight_block_size[0]
+        assert (
+            quant_config is None
+        ), "ParaS unified layout requires unquantized BF16 weights"
+        assert (
+            torch.get_default_dtype() == torch.bfloat16
+        ), "ParaS unified layout requires BF16 dtype"
 
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
@@ -165,7 +162,7 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
         import os
         configure_method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
 
-        plan_qwen_moe_layout(
+        reserve_model_weights(
             manager,
             num_layers=config.num_hidden_layers,
             num_experts=config.num_experts,
@@ -178,54 +175,26 @@ class Qwen3MoeForCausalLMParaS(Qwen3MoeForCausalLM):
             tp_size=get_paras_tp_size(),
             dp_size=dp_size,
             moe_tp_size=moe_tp_size,
-            quant_name=quant_name,
-            fp8_block_size=fp8_block_size,
             num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
             configure_method=configure_method,
             prefix="model",
+            top_k=config.num_experts_per_tok,
         )
 
-        plan = manager.plan_mha_kv_capacity(
-            config=config,
-            tp_size=get_paras_tp_size(),
-            head_dim=head_dim,
-        )
-
-        manager.reserve_kv_cache(
-            num_layers=config.num_hidden_layers,
-            ep_max_tokens=plan.ep_max_tokens,
-            tp_max_tokens=plan.tp_max_tokens,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=head_dim,
-            tp_size=get_paras_tp_size(),
-            kv_dtype=plan.kv_dtype,
-            page_size=getattr(get_global_server_args(), "page_size", 1),
-            prefix="model",
-        )
-
-        manager.materialize()
-        create_paras_moe_aliases(manager, config.num_hidden_layers, prefix="model")
+        plan = manager.plan_layout(config)
+        manager.materialize(plan)
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
 
-        # Pre-initialize NVLink peer access during model init to avoid overhead at switch time.
-        # cudaIpcOpenMemHandle() is slow on first call (~6s for NVLink connection setup).
-        try:
-            from sglang.srt.paras.peer_access import init_peer_access
-            self._fused_peer_access_ctx = init_peer_access(
-                manager, get_paras_tp_group().device_group, get_paras_tp_size()
-            )
-            logger.info("ParaS fused peer access pre-initialized.")
-        except Exception as e:
-            logger.warning(f"ParaS fused peer access pre-init failed (will retry at switch): {e}")
-            self._fused_peer_access_ctx = None
+        from sglang.srt.paras.peer_access import init_peer_access
 
+        self._fused_peer_access_ctx = init_peer_access(
+            manager, get_paras_tp_group().device_group, get_paras_tp_size()
+        )
         self.model = Qwen3MoeModelParaS(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        # Inject pre-initialized peer access context so the switch doesn't pay 6s init cost
-        if self._fused_peer_access_ctx is not None:
-            self.model._peer_access_ctx = self._fused_peer_access_ctx
+        self.model.paras_init_peer_access(self._fused_peer_access_ctx)
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,

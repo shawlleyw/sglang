@@ -23,7 +23,9 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+from sglang.srt.paras.workspace import flashinfer_workspace_size
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
@@ -158,13 +160,14 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
-        # Qwen2/Qwen3 models require higher flashinfer workspace size
-        if (
-            "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
-        ):
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
+        # Use the same allocation-free sizing policy as the UMM planner.
+        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(
+            flashinfer_workspace_size(
+                model_runner.model_config.hf_config.architectures,
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                model_runner.server_args.enable_deterministic_inference,
+            )
+        )
 
         # When deterministic inference is enabled, tensor cores should be used for decode
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
@@ -184,26 +187,32 @@ class FlashInferAttnBackend(AttentionBackend):
                 "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
             )
             self.disable_cuda_graph_kv_split = True
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
-        # Allocate buffers
+        self._paras_workspace_mode = ParaSMode.EP
+        self._paras_memory_manager = get_global_paras_memory_manager()
+        managed_workspace = self._paras_workspace()
+
+        # Allocate buffers. Managed attention scratch is disjoint from MoE;
+        # never create the external global allocation when using its UMM view.
         global global_workspace_buffer
-        if global_workspace_buffer is None:
-            # different from flashinfer zero_init_global_workspace_buffer
-            global_workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
-            global_workspace_buffer = torch.empty(
-                global_workspace_size,
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
-        if init_new_workspace:
-            self.workspace_buffer = torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
+        if managed_workspace is not None:
+            self.workspace_buffer = managed_workspace.zero_()
         else:
-            self.workspace_buffer = global_workspace_buffer
+            if global_workspace_buffer is None:
+                global_workspace_buffer = torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+            self.workspace_buffer = (
+                torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+                if init_new_workspace
+                else global_workspace_buffer
+            )
         max_bs = model_runner.req_to_token_pool.size
         # ParaS: when EP↔TP switching is enabled, ``req_to_token_pool`` can
         # grow to the UMM-planned TP request capacity. Pre-size these
@@ -307,6 +316,37 @@ class FlashInferAttnBackend(AttentionBackend):
     # ParaS: EP↔TP attention backend reconfiguration
     # ------------------------------------------------------------------
 
+    def _paras_workspace(self):
+        mgr = self._paras_memory_manager
+        if mgr is None:
+            return None
+        return mgr.get_attention_workspace_buffer(
+            "flashinfer", self._paras_workspace_mode
+        )
+
+    def _paras_bind_workspace(self, mode: ParaSMode):
+        self._paras_workspace_mode = mode
+        workspace = self._paras_workspace()
+        if workspace is None:
+            return
+        # Only rebind here: the target scratch can still contain source weights.
+        self.workspace_buffer = workspace
+        wrappers = (
+            [self.prefill_wrapper_ragged]
+            + self.prefill_wrappers_paged
+            + self.prefill_wrappers_verify
+            + self.decode_wrappers
+        )
+        for wrapper in wrappers:
+            # Keep each wrapper's integer plan and pinned staging allocation.
+            # reset_workspace_buffer would reallocate the latter on every switch.
+            wrapper._float_workspace_buffer = workspace
+
+    def paras_initialize_workspace(self):
+        mgr = self._paras_memory_manager
+        if mgr is not None:
+            mgr.initialize_attention_workspace(self._paras_workspace_mode)
+
     def paras_configure_helper(self):
         """Recompute derived state after head counts change."""
         # Recompute whether to use tensor cores (depends on GQA group size)
@@ -319,6 +359,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def paras_configure_tp(self, paras_tp_size: int, req_to_token: "torch.Tensor"):
         """Update cached state for TP mode after ParaS switch."""
+        self._paras_bind_workspace(ParaSMode.TP)
         num_qo_heads = self.total_num_attention_heads // paras_tp_size
         num_kv_heads = self._get_num_kv_heads(paras_tp_size)
         for updater_attr in ('indices_updater_decode', 'indices_updater_prefill'):
@@ -331,6 +372,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def paras_configure_ep(self, req_to_token: "torch.Tensor"):
         """Revert cached state for EP mode after ParaS switch."""
+        self._paras_bind_workspace(ParaSMode.EP)
         # EP mode uses DP attention: each rank has all heads, tp_size=1
         num_qo_heads = self.total_num_attention_heads
         num_kv_heads = self._get_num_kv_heads(1)

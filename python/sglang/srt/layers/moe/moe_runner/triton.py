@@ -172,8 +172,21 @@ class TritonRunnerCore(MoeRunnerCore):
             tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
         )
 
-        intermediate_cache1 = torch.empty(
-            (M, topk_ids.shape[1], N),
+        from sglang.srt.paras.workspace import moe_workspace_views, workspace_or_empty
+
+        moe_workspace = self.config.paras_workspace
+        intermediate_shape = (M, topk_ids.shape[1], N)
+        activation_shape = (M * topk_ids.shape[1], N // 2)
+        intermediate_workspace, activation_workspace = moe_workspace_views(
+            moe_workspace.buffer if moe_workspace is not None else None,
+            intermediate_shape,
+            activation_shape,
+            hidden_states.dtype,
+            hidden_states.device,
+        )
+        intermediate_cache1 = workspace_or_empty(
+            intermediate_workspace,
+            intermediate_shape,
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
@@ -203,8 +216,9 @@ class TritonRunnerCore(MoeRunnerCore):
             block_shape=block_shape,
         )
 
-        intermediate_cache2 = torch.empty(
-            (M * topk_ids.shape[1], N // 2),
+        intermediate_cache2 = workspace_or_empty(
+            activation_workspace,
+            activation_shape,
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
@@ -233,6 +247,7 @@ class TritonRunnerCore(MoeRunnerCore):
                 masked_m,
                 gemm1_alpha,
                 gemm1_limit,
+                output=intermediate_cache2.view(num_experts, e_tokens, N // 2),
             ).view(num_experts * e_tokens, N // 2)
         elif activation == "silu":
             if gemm1_alpha is not None:
@@ -241,6 +256,7 @@ class TritonRunnerCore(MoeRunnerCore):
                     intermediate_cache1.view(-1, N),
                     gemm1_alpha,
                     gemm1_limit,
+                    output=intermediate_cache2,
                 )
             elif _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
@@ -260,10 +276,15 @@ class TritonRunnerCore(MoeRunnerCore):
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
 
-        intermediate_cache3 = torch.empty(
-            (M, topk_ids.shape[1], w2.shape[1]),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+        # no_combine writes GEMM2 directly into the returned output.
+        intermediate_cache3 = (
+            None
+            if no_combine
+            else torch.empty(
+                (M, topk_ids.shape[1], w2.shape[1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         )
 
         if no_combine:

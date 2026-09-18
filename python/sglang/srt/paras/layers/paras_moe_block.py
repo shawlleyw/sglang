@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.paras_parallel_state import (
     get_paras_dp_group,
     get_paras_dp_rank,
@@ -185,8 +186,16 @@ class ParaSMoeBlockMixin:
             set_weight_attrs(w2_param, self.tp_experts.extra_weight_attrs)
             self.tp_experts.register_parameter("w2_weight", w2_param)
 
+        if mgr is not None:
+            self.ep_experts.moe_runner_config.paras_workspace = mgr.bind_moe_workspace(
+                ParaSMode.EP
+            )
+            self.tp_experts.moe_runner_config.paras_workspace = mgr.bind_moe_workspace(
+                ParaSMode.TP
+            )
+
         # Start in EP mode; will switch to TP after paras_configure_tp()
-        self.parallelism_config = "ep"
+        self.parallelism_config = ParaSMode.EP
 
     # ------------------------------------------------------------------
     # Weight redistribution helpers
@@ -515,10 +524,9 @@ class ParaSMoeBlockMixin:
     ):
         """Launch NVLink-optimized v2 peer access kernels for this layer. NO barriers — caller manages them.
 
-        The N+1 slot design guarantees no inter-layer aliasing:
-          - Layer i reads local slot[i+1], writes to peer slot[i]
-          - Layer i+1 reads local slot[i+2], writes to peer slot[i+1]
-          - Different slots → no race → barriers only needed at sweep start/end.
+        The unified plan separates each layer's source and destination.
+        The caller orders layers and synchronizes peer reads before reusing
+        their source memory for subsequent destinations.
 
         w13 layout dispatch:
           - Qwen3 (concat [g0..g_I, u0..u_I]): num_gates=2, chunk=I'*H per (e, k)
@@ -576,7 +584,7 @@ class ParaSMoeBlockMixin:
     def paras_configure_ep_mlp_naive(self):
         """Naive TP→EP reverse weight transfer via NCCL all_to_all (inverse of EP→TP).
 
-        Reads from TP slot[i], all_to_all, inverse permute, writes to EP slot[i+1].
+        Reads from the layer's TP region, all_to_all, inverse permute, writes to the layer's EP region.
         Currently only supports dp_size==1.
         """
         mgr = get_global_paras_memory_manager()
@@ -732,14 +740,14 @@ class ParaSMoeBlockMixin:
     @paras_func
     def paras_configure_tp(self, paras_tp_size: int, paras_tp_rank: int):
         """Configure the block for TP mode."""
-        self.parallelism_config = "tp"
+        self.parallelism_config = ParaSMode.TP
         self.tp_size = paras_tp_size
         self.experts = self.tp_experts
 
     @paras_func
     def paras_configure_ep(self):
         """Configure the block back to EP mode."""
-        self.parallelism_config = "ep"
+        self.parallelism_config = ParaSMode.EP
         self.tp_size = 1
         self.experts = self.ep_experts
 
@@ -764,7 +772,7 @@ class ParaSMoeBlockMixin:
         - EP + normal backend  → forward_normal
         - TP                   → forward_normal
         """
-        if self.parallelism_config == "ep":
+        if self.parallelism_config == ParaSMode.EP:
             if get_moe_a2a_backend().is_deepep():
                 return self.forward_deepep(hidden_states, forward_batch)
             else:

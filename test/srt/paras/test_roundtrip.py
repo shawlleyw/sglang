@@ -296,50 +296,13 @@ def _snapshot_local_kv(kv_pool, req_to_token_pool, reqs):
 # ---------------------------------------------------------------------------
 
 def _build_weight_manager(rank, world_size):
-    """Create ParaSMemoryManager with MoE weight slots."""
-    from sglang.srt.paras.paras_memory_manager import (
-        ParaSMemoryManager,
-        create_paras_moe_aliases,
-        set_global_paras_memory_manager,
+    from test.srt.paras.unified_memory_test_utils import build_weight_manager
+    from sglang.srt.paras.paras_memory_manager import set_global_paras_memory_manager
+
+    mgr, num_local = build_weight_manager(
+        rank, world_size, NUM_LAYERS, NUM_EXPERTS, HIDDEN, INTERMEDIATE,
+        with_bias=False,
     )
-
-    ep_size = world_size
-    num_local = NUM_EXPERTS // ep_size
-
-    mgr = ParaSMemoryManager(device=f"cuda:{rank}")
-
-    # N+1 generic physical slots
-    for slot in range(NUM_LAYERS + 1):
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w13",
-            (num_local, 2 * INTERMEDIATE, HIDDEN),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w2",
-            (num_local, HIDDEN, INTERMEDIATE),
-            torch.bfloat16,
-        )
-
-    # 'experts' aliases → slot i+1
-    for i in range(NUM_LAYERS):
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w13"
-        ]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w2"
-        ]
-
-    # Staging buffers
-    staging_experts = num_local
-    w13_staging_shape = (staging_experts, 2 * INTERMEDIATE, HIDDEN)
-    w2_staging_shape = (staging_experts, HIDDEN, INTERMEDIATE)
-    for sfx in ("", "_1", "_2"):
-        mgr.reserve(f"staging.w13_pre_permute{sfx}", w13_staging_shape, torch.bfloat16)
-        mgr.reserve(f"staging.w2_pre_permute{sfx}", w2_staging_shape, torch.bfloat16)
-
-    mgr.materialize()
-    create_paras_moe_aliases(mgr, NUM_LAYERS)
     set_global_paras_memory_manager(mgr)
     return mgr, num_local
 

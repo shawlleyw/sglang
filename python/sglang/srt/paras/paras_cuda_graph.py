@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Dict
 import torch
 
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.utils import (
     get_available_gpu_memory,
     require_attn_tp_gather,
@@ -293,10 +294,10 @@ def paras_refresh_cuda_graph_settings(runner: CudaGraphRunner):
     runner.dp_size = sa.dp_size
 
 
-def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: str):
+def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: ParaSMode):
     """Save graphs, output buffers, DeepEP state, attention-backend
     cuda-graph state, mode-dependent settings, and the graph memory pool
-    handle for *mode* ('ep' or 'tp').
+    handle for *mode*.
 
     Saving the graph memory pool is required so that EP and TP can each
     own an isolated pool; ``paras_load_cuda_graph_state`` restores it so
@@ -328,7 +329,7 @@ def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: str):
     runner._paras_saved[mode] = state
 
 
-def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: str):
+def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: ParaSMode):
     """Restore graphs, output buffers, DeepEP state, attention-backend
     cuda-graph state, mode-dependent settings, the graph memory pool
     handle for *mode*.
@@ -363,7 +364,7 @@ def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: str):
 # ---------------------------------------------------------------------------
 
 
-def paras_swap_cuda_graphs(model_runner: ModelRunner, mode: str):
+def paras_swap_cuda_graphs(model_runner: ModelRunner, mode: ParaSMode):
     """Swap to *mode*'s CUDA graph set if dual graphs were captured."""
     gr = model_runner.graph_runner
     if gr and hasattr(gr, "_paras_saved") and mode in gr._paras_saved:
@@ -418,7 +419,7 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     logger.info(f"ParaS: saving EP graphs (ep_pool={ep_pool})")
 
     # 1. Save EP graph state (includes EP's graph memory pool handle)
-    paras_save_cuda_graph_state(gr, "ep")
+    paras_save_cuda_graph_state(gr, ParaSMode.EP)
 
     # 2. Switch to TP mode — temporarily modify server_args & global state
     saved_args = {
@@ -442,9 +443,10 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
             paras_tp_size, model_runner.req_to_token_pool.req_to_token
         )
     model_runner.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
+    model_runner.attn_backend.paras_initialize_workspace()
 
     # 3. Clear the live graph dicts before capturing TP. The EP graph
-    #    objects are still referenced via ``runner._paras_saved["ep"]``
+    #    objects are still referenced via ``runner._paras_saved[ParaSMode.EP]``
     #    (see ``paras_save_cuda_graph_state`` which stores copies), so
     #    no EP state is lost. This prevents stale EP entries from
     #    leaking into TP's saved state if the two modes end up with
@@ -492,7 +494,7 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     )
 
     # 6. Save TP graph state (includes TP's fresh pool handle)
-    paras_save_cuda_graph_state(gr, "tp")
+    paras_save_cuda_graph_state(gr, ParaSMode.TP)
 
     # 7. Switch back to EP mode
     model_runner.server_args.enable_dp_attention = saved_args["enable_dp_attention"]
@@ -508,10 +510,11 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
             model_runner.req_to_token_pool.req_to_token
         )
     model_runner.model.paras_configure_ep()
+    model_runner.attn_backend.paras_initialize_workspace()
 
     # 8. Load EP graph state — restores EP's graphs/buffers and the EP
     #    graph memory pool as the global pool. Ready to serve in EP mode.
-    paras_load_cuda_graph_state(gr, "ep")
+    paras_load_cuda_graph_state(gr, ParaSMode.EP)
     model_runner.max_total_num_tokens = model_runner.token_to_kv_pool_allocator.size
     model_runner.max_running_requests = model_runner.req_to_token_pool.size
 

@@ -59,6 +59,7 @@ from sglang.srt.distributed import (
     set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.paras.paras_parallel_state import (
     initialize_paras_parallel,
     get_paras_dp_group,
@@ -792,13 +793,14 @@ class ModelRunner:
         # so that create_weights() inside the model class can pull tensor views
         # from the manager via the global accessor. The manager owns its own
         # device/gpu_id/server_args/cpu_group state, which is the input that
-        # plan_mha_kv_capacity / plan_hybrid_swa_kv_capacity will later read.
+        # plan_layout will later read.
         if self.server_args.enable_paras_moe:
             paras_world = get_world_group()
             paras_manager = ParaSMemoryManager(
                 device=self.device,
                 gpu_id=self.gpu_id,
                 server_args=self.server_args,
+                context_len=self.model_config.context_len,
                 cpu_group=paras_world.cpu_group if paras_world.world_size > 1 else None,
                 world_size=paras_world.world_size,
             )
@@ -1860,12 +1862,12 @@ class ModelRunner:
                     ):
                         _full_ep_k, _full_ep_v = _paras_mgr.get_kv_views(
                             num_layers=len(self.model_config.full_attention_layer_ids),
-                            mode="ep",
+                            mode=ParaSMode.EP,
                             layer_ids=self.model_config.full_attention_layer_ids,
                         )
                         _swa_ep_k, _swa_ep_v = _paras_mgr.get_kv_views(
                             num_layers=len(self.model_config.swa_attention_layer_ids),
-                            mode="ep",
+                            mode=ParaSMode.EP,
                             layer_ids=self.model_config.swa_attention_layer_ids,
                         )
 
@@ -1922,9 +1924,7 @@ class ModelRunner:
                 ):
                     _paras_external_k, _paras_external_v = _paras_mgr.get_kv_views(
                         num_layers=self.num_effective_layers,
-                        mode="ep",
-                        tp_size=1,  # EP mode: tp_size=1 for KV heads
-                        page_size=self.page_size,
+                        mode=ParaSMode.EP,
                         prefix="model",
                     )
 
@@ -2563,10 +2563,11 @@ class ModelRunner:
             "Use ParaSModelMixin from sglang.srt.paras.paras_model."
         )
         self.model.paras_configure_tp(paras_tp_size, paras_tp_rank)
+        self.attn_backend.paras_initialize_workspace()
 
         from sglang.srt.paras.paras_cuda_graph import paras_swap_cuda_graphs
 
-        paras_swap_cuda_graphs(self, "tp")
+        paras_swap_cuda_graphs(self, ParaSMode.TP)
 
     @paras_func
     def paras_configure_ep(self):
@@ -2583,10 +2584,11 @@ class ModelRunner:
             self.attn_backend.paras_configure_ep(self.req_to_token_pool.req_to_token)
 
         self.model.paras_configure_ep()
+        self.attn_backend.paras_initialize_workspace()
 
         from sglang.srt.paras.paras_cuda_graph import paras_swap_cuda_graphs
 
-        paras_swap_cuda_graphs(self, "ep")
+        paras_swap_cuda_graphs(self, ParaSMode.EP)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

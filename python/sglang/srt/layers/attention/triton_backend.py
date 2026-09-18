@@ -12,11 +12,13 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.paras.mode import ParaSMode
+from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+from sglang.srt.paras.workspace import triton_attention_split_config
 from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
-    get_int_env_var,
     next_power_of_2,
 )
 
@@ -107,34 +109,24 @@ class TritonAttnBackend(AttentionBackend):
             ]
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
+        self._paras_workspace_mode = ParaSMode.EP
+        self._paras_memory_manager = get_global_paras_memory_manager()
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
-        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        self.max_kv_splits, self.split_tile_size = triton_attention_split_config(
+            model_runner.server_args, self.max_context_len
+        )
 
         # Decide whether enable deterministic inference with batch-invariant operations
         self.enable_deterministic = (
             model_runner.server_args.enable_deterministic_inference
         )
 
-        # Configure deterministic inference settings
         if self.enable_deterministic:
-            # Use fixed split tile size for batch invariance
-            self.split_tile_size = get_int_env_var(
-                "SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256
-            )
             # Set static_kv_splits to False to use deterministic logic instead
             self.static_kv_splits = False
-        else:
-            self.split_tile_size = (
-                model_runner.server_args.triton_attention_split_tile_size
-            )
-
-        if self.split_tile_size is not None:
-            self.max_kv_splits = (
-                self.max_context_len + self.split_tile_size - 1
-            ) // self.split_tile_size
 
         # Check arguments
         assert not (
@@ -191,6 +183,7 @@ class TritonAttnBackend(AttentionBackend):
         Callers in the cuda-graph path then restore mode-appropriate
         buffer references via ``paras_load_cuda_graph_state``.
         """
+        self._paras_workspace_mode = ParaSMode.TP
         self.num_head = self.total_num_attention_heads // paras_tp_size
         self.num_kv_head = self._get_num_kv_heads(paras_tp_size)
         self.req_to_token = req_to_token
@@ -201,6 +194,7 @@ class TritonAttnBackend(AttentionBackend):
 
         See ``paras_configure_tp`` for the buffer-allocation contract.
         """
+        self._paras_workspace_mode = ParaSMode.EP
         self.num_head = self.total_num_attention_heads
         self.num_kv_head = self._get_num_kv_heads(1)
         self.req_to_token = req_to_token
@@ -264,6 +258,35 @@ class TritonAttnBackend(AttentionBackend):
                 self._paras_cuda_graph_max_bs,
                 self._paras_cuda_graph_max_num_tokens,
             )
+
+    def _allocate_decode_workspace(self, tokens, *, zero=False):
+        shapes = [
+            (tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
+            (tokens, self.num_head, self.max_kv_splits),
+        ]
+        mgr = self._paras_memory_manager
+        views = (
+            mgr.get_attention_workspace(
+                "triton", self._paras_workspace_mode, shapes, torch.float32, self.device
+            )
+            if mgr is not None
+            else None
+        )
+        if views is None:
+            allocate = torch.zeros if zero else torch.empty
+            return [
+                allocate(shape, dtype=torch.float32, device=self.device)
+                for shape in shapes
+            ]
+        # Do not write managed storage during reconfiguration: it can still
+        # contain source weights. Decode kernels write their partial results
+        # before reading them; initialization after transfer is handled below.
+        return views
+
+    def paras_initialize_workspace(self):
+        mgr = self._paras_memory_manager
+        if mgr is not None:
+            mgr.initialize_attention_workspace(self._paras_workspace_mode)
 
     def get_num_kv_splits(
         self,
@@ -369,16 +392,7 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
 
-            attn_logits = torch.empty(
-                (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            attn_lse = torch.empty(
-                (bs, self.num_head, self.max_kv_splits),
-                dtype=torch.float32,
-                device=self.device,
-            )
+            attn_logits, attn_lse = self._allocate_decode_workspace(bs)
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
             self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
 
@@ -528,15 +542,8 @@ class TritonAttnBackend(AttentionBackend):
     ):
         self._paras_cuda_graph_max_bs = max_bs
         self._paras_cuda_graph_max_num_tokens = max_num_tokens
-        self.cuda_graph_attn_logits = torch.zeros(
-            (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.cuda_graph_attn_lse = torch.zeros(
-            (max_num_tokens, self.num_head, self.max_kv_splits),
-            dtype=torch.float32,
-            device=self.device,
+        self.cuda_graph_attn_logits, self.cuda_graph_attn_lse = (
+            self._allocate_decode_workspace(max_num_tokens, zero=True)
         )
 
         if cuda_graph_num_kv_splits_buf is None:

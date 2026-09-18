@@ -1247,54 +1247,19 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_v_head_end = tp_v_head_start + tp_num_kv_heads
 
         self.full_weight = self.weight
-        full_weight_tensor = self.full_weight.data
         hs = self.head_size
-
-        q_rows = tp_num_heads * hs
-        kv_rows = tp_num_kv_heads * hs
 
         from sglang.srt.paras.paras_memory_manager import (
             get_global_paras_memory_manager,
         )
 
         mgr = get_global_paras_memory_manager()
-        tp_entry_name = (
-            f"{self.prefix}.tp_weight" if getattr(self, "prefix", "") else None
+        self._paras_tp_weight = torch.nn.Parameter(
+            mgr.get_view(f"{self.prefix}.tp_weight"), requires_grad=False
         )
-
-        if (
-            mgr is not None
-            and mgr.materialized
-            and tp_entry_name is not None
-            and tp_entry_name in mgr._entries
-        ):
-            tp_weight_data = mgr.get_view(tp_entry_name)
-            assert tp_weight_data.dtype == full_weight_tensor.dtype, (
-                f"UMM-reserved tp_weight dtype {tp_weight_data.dtype} != "
-                f"actual weight dtype {full_weight_tensor.dtype} for {self.prefix}"
-            )
-            self._paras_tp_weight = torch.nn.Parameter(
-                tp_weight_data, requires_grad=False
-            )
-        else:
-            self._paras_tp_weight = torch.nn.Parameter(
-                torch.empty(
-                    (q_rows + 2 * kv_rows, full_weight_tensor.shape[1]),
-                    dtype=full_weight_tensor.dtype,
-                    device=full_weight_tensor.device,
-                ),
-                requires_grad=False,
-            )
         set_weight_attrs(self._paras_tp_weight, {"input_dim": 1, "output_dim": 0})
-        self._paras_tp_weight.data[:q_rows].copy_(
-            full_weight_tensor[tp_head_start * hs : tp_head_end * hs]
-        )
-        self._paras_tp_weight.data[q_rows : q_rows + kv_rows].copy_(
-            full_weight_tensor[tp_k_head_start * hs : tp_k_head_end * hs]
-        )
-        self._paras_tp_weight.data[q_rows + kv_rows : q_rows + 2 * kv_rows].copy_(
-            full_weight_tensor[tp_v_head_start * hs : tp_v_head_end * hs]
-        )
+        # These addresses can still hold live EP weights from another layer.
+        # Populate them only during the ordered transfer.
 
         scale_attr_name = None
         if hasattr(self, "weight_scale_inv"):
@@ -1564,46 +1529,20 @@ class RowParallelLinear(LinearBase):
         TP CUDA graph references stable data_ptrs across all switches.
         """
         input_size_per_partition = divide(self.input_size, paras_tp_size)
-        row_start = paras_tp_rank * input_size_per_partition
-        row_end = (paras_tp_rank + 1) * input_size_per_partition
 
         self.full_weight = self.weight
-        full_weight_tensor = self.full_weight.data
 
         from sglang.srt.paras.paras_memory_manager import (
             get_global_paras_memory_manager,
         )
 
         mgr = get_global_paras_memory_manager()
-        tp_entry_name = (
-            f"{self.prefix}.tp_weight" if getattr(self, "prefix", "") else None
+        self._paras_tp_weight = torch.nn.Parameter(
+            mgr.get_view(f"{self.prefix}.tp_weight"), requires_grad=False
         )
-
-        if (
-            mgr is not None
-            and mgr.materialized
-            and tp_entry_name is not None
-            and tp_entry_name in mgr._entries
-        ):
-            tp_weight_data = mgr.get_view(tp_entry_name)
-            assert tp_weight_data.dtype == full_weight_tensor.dtype, (
-                f"UMM-reserved tp_weight dtype {tp_weight_data.dtype} != "
-                f"actual weight dtype {full_weight_tensor.dtype} for {self.prefix}"
-            )
-            self._paras_tp_weight = torch.nn.Parameter(
-                tp_weight_data, requires_grad=False
-            )
-        else:
-            self._paras_tp_weight = torch.nn.Parameter(
-                torch.empty(
-                    (full_weight_tensor.shape[0], input_size_per_partition),
-                    dtype=full_weight_tensor.dtype,
-                    device=full_weight_tensor.device,
-                ),
-                requires_grad=False,
-            )
         set_weight_attrs(self._paras_tp_weight, {"input_dim": 1, "output_dim": 0})
-        self._paras_tp_weight.data.copy_(full_weight_tensor[:, row_start:row_end])
+        # These addresses can still hold live EP weights from another layer.
+        # Populate them only during the ordered transfer.
 
         scale_attr_name = None
         if hasattr(self, "weight_scale_inv"):

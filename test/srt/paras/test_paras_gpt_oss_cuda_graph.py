@@ -21,6 +21,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from sglang.srt.paras.mode import ParaSMode
+
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.join(_TEST_DIR, "..", "..", "..")
 sys.path.insert(0, os.path.join(_ROOT_DIR, "python"))
@@ -86,50 +88,13 @@ def setup_paras_state(rank, world_size):
 
 
 def build_manager(rank, world_size):
-    from sglang.srt.paras.paras_memory_manager import (
-        ParaSMemoryManager,
-        create_paras_moe_aliases,
-        set_global_paras_memory_manager,
+    from test.srt.paras.unified_memory_test_utils import build_weight_manager
+    from sglang.srt.paras.paras_memory_manager import set_global_paras_memory_manager
+
+    mgr, num_local = build_weight_manager(
+        rank, world_size, NUM_LAYERS, NUM_EXPERTS, HIDDEN, INTERMEDIATE,
+        with_bias=False,
     )
-
-    ep_size = world_size
-    num_local = NUM_EXPERTS // ep_size
-
-    mgr = ParaSMemoryManager(device=f"cuda:{rank}")
-
-    for slot in range(NUM_LAYERS + 1):
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w13",
-            (num_local, 2 * INTERMEDIATE, HIDDEN),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w2",
-            (num_local, HIDDEN, INTERMEDIATE),
-            torch.bfloat16,
-        )
-
-    for i in range(NUM_LAYERS):
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w13"
-        ]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w2"
-        ]
-
-    staging_experts = num_local
-    w13_staging_shape = (staging_experts, 2 * INTERMEDIATE, HIDDEN)
-    w2_staging_shape = (staging_experts, HIDDEN, INTERMEDIATE)
-    for sfx in ("", "_1", "_2"):
-        mgr.reserve(
-            f"staging.w13_pre_permute{sfx}", w13_staging_shape, torch.bfloat16
-        )
-        mgr.reserve(
-            f"staging.w2_pre_permute{sfx}", w2_staging_shape, torch.bfloat16
-        )
-
-    mgr.materialize()
-    create_paras_moe_aliases(mgr, NUM_LAYERS)
     set_global_paras_memory_manager(mgr)
     return mgr, num_local
 
@@ -371,68 +336,13 @@ def test_ep_tp_ep_weight_roundtrip_and_cuda_graph():
 
 
 def build_manager_with_bias(rank, world_size):
-    """Build manager with w13/w2 weight slots, w13_bias slots, and all staging buffers."""
-    from sglang.srt.paras.paras_memory_manager import (
-        ParaSMemoryManager,
-        create_paras_moe_aliases,
-        set_global_paras_memory_manager,
+    from test.srt.paras.unified_memory_test_utils import build_weight_manager
+    from sglang.srt.paras.paras_memory_manager import set_global_paras_memory_manager
+
+    mgr, num_local = build_weight_manager(
+        rank, world_size, NUM_LAYERS, NUM_EXPERTS, HIDDEN, INTERMEDIATE,
+        with_bias=True,
     )
-
-    ep_size = world_size
-    num_local = NUM_EXPERTS // ep_size
-
-    mgr = ParaSMemoryManager(device=f"cuda:{rank}")
-
-    for slot in range(NUM_LAYERS + 1):
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w13",
-            (num_local, 2 * INTERMEDIATE, HIDDEN),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w2",
-            (num_local, HIDDEN, INTERMEDIATE),
-            torch.bfloat16,
-        )
-
-    for slot in range(NUM_LAYERS + 1):
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w13_bias",
-            (num_local, 2 * INTERMEDIATE),
-            torch.float32,
-        )
-
-    for i in range(NUM_LAYERS):
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w13"
-        ]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w2"
-        ]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight_bias"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w13_bias"
-        ]
-
-    staging_experts = num_local
-    for sfx in ("", "_1", "_2"):
-        mgr.reserve(
-            f"staging.w13_pre_permute{sfx}",
-            (staging_experts, 2 * INTERMEDIATE, HIDDEN),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"staging.w2_pre_permute{sfx}",
-            (staging_experts, HIDDEN, INTERMEDIATE),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"staging.w13_bias_pre_permute{sfx}",
-            (staging_experts, 2 * INTERMEDIATE),
-            torch.float32,
-        )
-
-    mgr.materialize()
-    create_paras_moe_aliases(mgr, NUM_LAYERS)
     set_global_paras_memory_manager(mgr)
     return mgr, num_local
 
@@ -839,58 +749,58 @@ def test_policy_switches_ep_to_tp_when_avg_below_low():
     p = _make_policy()
     for v in [3, 3, 3, 3]:
         p.observe(v, now=0.0)
-    assert p.pick_target("EP", now=0.0) == "TP"
+    assert p.pick_target(ParaSMode.EP, now=0.0) == ParaSMode.TP
 
 
 def test_policy_switches_tp_to_ep_when_avg_above_high():
     p = _make_policy()
     for v in [20, 20, 20, 20]:
         p.observe(v, now=0.0)
-    assert p.pick_target("TP", now=0.0) == "EP"
+    assert p.pick_target(ParaSMode.TP, now=0.0) == ParaSMode.EP
 
 
 def test_policy_no_switch_in_dead_zone():
     p = _make_policy(low=4, high=16, window=4)
     for v in [10, 10, 10, 10]:
         p.observe(v, now=0.0)
-    assert p.pick_target("EP", now=0.0) is None
-    assert p.pick_target("TP", now=0.0) is None
+    assert p.pick_target(ParaSMode.EP, now=0.0) is None
+    assert p.pick_target(ParaSMode.TP, now=0.0) is None
 
 
 def test_policy_no_switch_until_window_full():
     p = _make_policy(window=4)
     for v in [3, 3, 3]:
         p.observe(v, now=0.0)
-    assert p.pick_target("EP", now=0.0) is None
+    assert p.pick_target(ParaSMode.EP, now=0.0) is None
 
 
 def test_policy_cooldown_blocks_immediate_reswitch():
     p = _make_policy(cooldown=10.0)
     for v in [3, 3, 3, 3]:
         p.observe(v, now=0.0)
-    assert p.pick_target("EP", now=0.0) == "TP"
+    assert p.pick_target(ParaSMode.EP, now=0.0) == ParaSMode.TP
     for v in [20, 20, 20, 20]:
         p.observe(v, now=1.0)
-    assert p.pick_target("TP", now=1.0) is None
-    assert p.pick_target("TP", now=9.9) is None
-    assert p.pick_target("TP", now=10.1) == "EP"
+    assert p.pick_target(ParaSMode.TP, now=1.0) is None
+    assert p.pick_target(ParaSMode.TP, now=9.9) is None
+    assert p.pick_target(ParaSMode.TP, now=10.1) == ParaSMode.EP
 
 
 def test_policy_zero_global_batch_ignored():
     p = _make_policy(window=4)
     for v in [0, 0, 0, 3, 3, 3, 3]:
         p.observe(v, now=0.0)
-    assert p.pick_target("EP", now=0.0) == "TP"
+    assert p.pick_target(ParaSMode.EP, now=0.0) == ParaSMode.TP
 
 
 def test_policy_window_clears_after_switch():
     p = _make_policy(cooldown=0.0)
     for v in [3, 3, 3, 3]:
         p.observe(v, now=0.0)
-    p.pick_target("EP", now=0.0)
+    p.pick_target(ParaSMode.EP, now=0.0)
     for v in [3]:
         p.observe(v, now=0.0)
-    assert p.pick_target("TP", now=0.0) is None
+    assert p.pick_target(ParaSMode.TP, now=0.0) is None
 
 
 if __name__ == "__main__":

@@ -44,6 +44,8 @@ from test_kv_cache_transfer import (
     _SimpleGroupCoordinator,
 )
 
+from sglang.srt.paras.mode import ParaSMode
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -81,7 +83,7 @@ def make_swa_pattern(rank, layer, head, num_tokens):
 
 
 def make_layer_specs():
-    from sglang.srt.paras.cache_transfer.base import LayerCacheSpec
+    from sglang.srt.paras.layers.utils import LayerCacheSpec
 
     specs = []
     for i in range(NUM_LAYERS):
@@ -120,7 +122,7 @@ def make_layer_specs():
 def setup_mgr_and_pool(rank, world_size):
     """Create ParaSMemoryManager (uniform layout) and SWAKVPool.
 
-    Uses a uniform buffer (no layer_specs in reserve_kv_cache) so that
+    Uses a uniform cache plan so that
     every layer gets the same large buffer.  This avoids the TP buffer
     under-sizing issue that occurs when layer_specs shrinks SWA layers
     below the space needed for replication gather.
@@ -145,27 +147,29 @@ def setup_mgr_and_pool(rank, world_size):
     ep_max_tokens = max(max(TOKENS_PER_RANK) + 10, sum(TOKENS_PER_RANK) // NUM_KV_HEADS)
 
     mgr = ParaSMemoryManager(device=device)
-    mgr.reserve_kv_cache(
+    from test.srt.paras.unified_memory_test_utils import materialize_test_cache
+
+    materialize_test_cache(mgr,
         num_layers=NUM_LAYERS,
         ep_max_tokens=ep_max_tokens,
-        tp_max_tokens=0,
+        tp_max_tokens=(ep_max_tokens + PAGE_SIZE) * NUM_KV_HEADS - PAGE_SIZE,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         kv_dtype=DTYPE,
+        tp_size=world_size,
         page_size=PAGE_SIZE,
     )
-    mgr.materialize()
     set_global_paras_memory_manager(mgr)
 
     # Get EP views as external buffers for SWAKVPool
     full_ep_k, full_ep_v = mgr.get_kv_views(
         num_layers=len(FULL_LAYER_IDS),
-        mode="ep",
+        mode=ParaSMode.EP,
         layer_ids=FULL_LAYER_IDS,
     )
     swa_ep_k, swa_ep_v = mgr.get_kv_views(
         num_layers=len(SWA_LAYER_IDS),
-        mode="ep",
+        mode=ParaSMode.EP,
         layer_ids=SWA_LAYER_IDS,
     )
 

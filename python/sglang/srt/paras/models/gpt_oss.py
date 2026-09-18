@@ -7,8 +7,7 @@ All ParaS-specific logic for GPT-OSS lives here.  The base model file
 GPT-OSS uses heterogeneous layers: each layer is either "full_attention"
 or "sliding_attention" (see config.layer_types).  This module mirrors the
 Qwen3-MoE ParaS pattern (sglang/srt/paras/models/qwen3_moe.py) while
-handling the per-layer attention geometry and MXFP4 weight loading that
-are unique to GPT-OSS.
+handling GPT-OSS per-layer attention geometry and bias views.
 
 Parameter management under ParaS
 --------------------------------
@@ -19,11 +18,8 @@ Everything else is loaded through the normal PyTorch parameter path
 and stays untouched across switches.  Concretely for GPT-OSS:
 
   Managed by the UMM:
-    * paras.moe_slot.{i}.w13 / w2  (N+1 slot layout, EP<->TP transport)
-    * self_attn.qkv_proj.weight / tp_weight
-    * self_attn.o_proj.weight
-    * FP8 weight scales (when quant_name == "fp8")
-    * Staging buffers (when configure_method != "peer_access")
+    * Per-mode expert and attention weight views
+    * KV cache and attention/MoE scratch
 
   Replicated across all ranks, not in the UMM:
     * input_layernorm.weight, post_attention_layernorm.weight
@@ -53,9 +49,8 @@ from sglang.srt.paras.layers.paras_decoder_layer import ParaSDecoderLayerMixin
 from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 from sglang.srt.paras.paras_memory_manager import (
-    create_paras_moe_aliases,
     get_global_paras_memory_manager,
-    plan_gpt_oss_moe_layout,
+    reserve_model_weights,
 )
 from sglang.srt.paras.paras_parallel_state import (
     get_paras_dp_size,
@@ -286,17 +281,12 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
             "created it before get_model() under enable_paras_moe."
         )
 
-        quant_name = None
-        fp8_block_size = None
-        if quant_config is not None:
-            qn = quant_config.get_name()
-            if qn == "fp8":
-                quant_name = "fp8"
-                if (
-                    hasattr(quant_config, "weight_block_size")
-                    and quant_config.weight_block_size
-                ):
-                    fp8_block_size = quant_config.weight_block_size[0]
+        assert (
+            quant_config is None
+        ), "ParaS unified layout requires unquantized BF16 weights"
+        assert (
+            torch.get_default_dtype() == torch.bfloat16
+        ), "ParaS unified layout requires BF16 dtype"
 
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
@@ -307,7 +297,7 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
 
         configure_method = os.environ.get("PARAS_CONFIGURE_METHOD", "peer_access")
 
-        plan_gpt_oss_moe_layout(
+        reserve_model_weights(
             manager,
             num_layers=config.num_hidden_layers,
             num_experts=config.num_experts,
@@ -320,64 +310,28 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
             tp_size=get_paras_tp_size(),
             dp_size=dp_size,
             moe_tp_size=moe_tp_size,
-            quant_name=quant_name,
-            fp8_block_size=fp8_block_size,
             num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
             configure_method=configure_method,
             prefix="model",
+            top_k=config.num_experts_per_tok,
+            with_bias=True,
         )
 
-        plan = manager.plan_hybrid_swa_kv_capacity(
-            config=config,
-            tp_size=get_paras_tp_size(),
-            head_dim=head_dim,
-        )
-
-        manager.reserve_kv_cache(
-            num_layers=config.num_hidden_layers,
-            ep_max_tokens=plan.ep_max_tokens,
-            tp_max_tokens=plan.tp_max_tokens,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=head_dim,
-            tp_size=get_paras_tp_size(),
-            kv_dtype=plan.kv_dtype,
-            page_size=getattr(get_global_server_args(), "page_size", 1),
-            prefix="model",
-            layer_specs=plan.layer_specs,
-        )
-
-        manager.materialize()
-        create_paras_moe_aliases(manager, config.num_hidden_layers, prefix="model")
+        plan = manager.plan_layout(config)
+        manager.materialize(plan)
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
         self.paras_layer_specs = plan.layer_specs
 
-        # Skip peer access pre-init when using NCCL transfer (no benefit
-        # and seems to interact badly with NCCL on A100).  Set
-        # PARAS_DISABLE_PEER_ACCESS=0 to re-enable for peer_access path.
-        if os.environ.get("PARAS_DISABLE_PEER_ACCESS", "1") == "1":
-            self._fused_peer_access_ctx = None
-        else:
-            try:
-                from sglang.srt.paras.peer_access import init_peer_access
+        from sglang.srt.paras.peer_access import init_peer_access
 
-                self._fused_peer_access_ctx = init_peer_access(
-                    manager, get_paras_tp_group().device_group, get_paras_tp_size()
-                )
-                logger.info("ParaS fused peer access pre-initialized.")
-            except Exception as e:
-                logger.warning(
-                    "ParaS fused peer access pre-init failed (will retry at switch): %s", e
-                )
-                self._fused_peer_access_ctx = None
-
+        self._fused_peer_access_ctx = init_peer_access(
+            manager, get_paras_tp_group().device_group, get_paras_tp_size()
+        )
         self.model = GptOssModelParaS(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        # Inject pre-initialized peer access context so the switch
-        # doesn't pay 6s init cost
-        if self._fused_peer_access_ctx is not None:
-            self.model._peer_access_ctx = self._fused_peer_access_ctx
+        self.model.paras_init_peer_access(self._fused_peer_access_ctx)
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,

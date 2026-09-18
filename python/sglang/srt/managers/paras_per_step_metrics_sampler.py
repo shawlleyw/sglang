@@ -48,6 +48,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from sglang.srt.paras.mode import ParaSMode
+
 logger = logging.getLogger(__name__)
 
 
@@ -164,9 +166,9 @@ class ParasPerStepMetricsSampler:
         else:
             sa = getattr(scheduler, "server_args", None)
             if sa is not None and getattr(sa, "enable_dp_attention", False):
-                mode = "EP"
+                mode = ParaSMode.EP
             else:
-                mode = "TP"
+                mode = ParaSMode.TP
 
         fwd = getattr(batch, "forward_mode", None) if batch is not None else None
         forward_mode = fwd.name if fwd is not None else "NONE"
@@ -174,7 +176,7 @@ class ParasPerStepMetricsSampler:
         reqs = getattr(batch, "reqs", None) if batch is not None else None
         bs_local = len(reqs) if reqs else 0
         bs_global = bs_local
-        if mode == "EP" and batch is not None:
+        if mode == ParaSMode.EP and batch is not None:
             global_running = getattr(batch, "global_running_reqs", None)
             if global_running:
                 try:
@@ -197,7 +199,7 @@ class ParasPerStepMetricsSampler:
             "step_idx": getattr(scheduler, "forward_ct", 0),
             "timestamp_iso": datetime.now(timezone.utc).isoformat(),
             "elapsed_s": elapsed,
-            "mode": mode,
+            "mode": mode.name,
             "forward_mode": forward_mode,
             "batch_size_local": bs_local,
             "batch_size_global": bs_global,

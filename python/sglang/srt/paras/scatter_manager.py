@@ -559,7 +559,7 @@ class ParaSReqScatterManager:
                 source_full_to_swa_mapping=self.source_full_to_swa_mapping,
             )
 
-        # Per-layer dispatch in REVERSE order (preserves N+1 slot invariant).
+        # Per-layer dispatch in REVERSE order preserves live TP source bytes.
         num_layers = kv_cache.layer_num
         barrier_tensor = (
             torch.zeros(1, device="cuda") if method == "peer_access" else None

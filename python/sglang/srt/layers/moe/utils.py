@@ -248,3 +248,23 @@ def speculative_moe_backend_context():
         yield
     finally:
         MOE_RUNNER_BACKEND = original_backend
+
+
+def use_deep_gemm_bf16(
+    moe_ep_size: int,
+    *,
+    with_bias: bool = False,
+    activation: str = "silu",
+    gemm1_alpha=None,
+) -> bool:
+    """BF16 DeepGEMM needs DeepEP dispatch and the ordinary SiLU activation."""
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    return (
+        moe_ep_size > 1
+        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and get_moe_a2a_backend().is_deepep()
+        and not with_bias
+        and activation == "silu"
+        and gemm1_alpha is None
+    )

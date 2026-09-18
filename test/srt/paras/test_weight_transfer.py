@@ -18,6 +18,8 @@ import sys
 import torch
 import torch.distributed as dist
 
+from sglang.srt.paras.mode import ParaSMode
+
 # Add sglang to path
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.join(_TEST_DIR, "..", "..", "..")
@@ -109,54 +111,13 @@ def setup_paras_state(rank, world_size):
 
 
 def build_manager(rank, world_size):
-    """Create ParaSMemoryManager with N+1 slots + staging buffers."""
-    from sglang.srt.paras.paras_memory_manager import (
-        ParaSMemoryManager,
-        create_paras_moe_aliases,
-        set_global_paras_memory_manager,
+    from test.srt.paras.unified_memory_test_utils import build_weight_manager
+    from sglang.srt.paras.paras_memory_manager import set_global_paras_memory_manager
+
+    mgr, num_local = build_weight_manager(
+        rank, world_size, NUM_LAYERS, NUM_EXPERTS, HIDDEN, INTERMEDIATE,
+        with_bias=False,
     )
-
-    ep_size = world_size
-    num_local = NUM_EXPERTS // ep_size
-
-    mgr = ParaSMemoryManager(device=f"cuda:{rank}")
-
-    # N+1 generic physical slots (non-triton shape: E_local, 2*I, H / E_local, H, I)
-    for slot in range(NUM_LAYERS + 1):
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w13",
-            (num_local, 2 * INTERMEDIATE, HIDDEN),
-            torch.bfloat16,
-        )
-        mgr.reserve(
-            f"paras.moe_slot.{slot}.w2",
-            (num_local, HIDDEN, INTERMEDIATE),
-            torch.bfloat16,
-        )
-
-    # 'experts' aliases → slot i+1 (for weight loading / EP access)
-    for i in range(NUM_LAYERS):
-        mgr._entries[f"model.layers.{i}.mlp.experts.w13_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w13"
-        ]
-        mgr._entries[f"model.layers.{i}.mlp.experts.w2_weight"] = mgr._entries[
-            f"paras.moe_slot.{i + 1}.w2"
-        ]
-
-    # Staging buffers for NCCL all-to-all and overlap paths
-    staging_experts = num_local
-    w13_staging_shape = (staging_experts, 2 * INTERMEDIATE, HIDDEN)
-    w2_staging_shape = (staging_experts, HIDDEN, INTERMEDIATE)
-    for sfx in ("", "_1", "_2"):
-        mgr.reserve(
-            f"staging.w13_pre_permute{sfx}", w13_staging_shape, torch.bfloat16
-        )
-        mgr.reserve(
-            f"staging.w2_pre_permute{sfx}", w2_staging_shape, torch.bfloat16
-        )
-
-    mgr.materialize()
-    create_paras_moe_aliases(mgr, NUM_LAYERS)
     set_global_paras_memory_manager(mgr)
     return mgr, num_local
 
@@ -582,13 +543,13 @@ class TestTPtoEPWeightRestore:
             def __init__(self, tag):
                 self.tag = tag
 
-        ep_exp = _TaggedExperts("ep")
-        tp_exp = _TaggedExperts("tp")
+        ep_exp = _TaggedExperts(ParaSMode.EP)
+        tp_exp = _TaggedExperts(ParaSMode.TP)
 
         m.ep_experts = ep_exp
         m.tp_experts = tp_exp
         m.experts = ep_exp
-        m.parallelism_config = "ep"
+        m.parallelism_config = ParaSMode.EP
         m.tp_size = 1
 
         # Switch to TP
@@ -596,14 +557,14 @@ class TestTPtoEPWeightRestore:
         assert (
             m.experts is tp_exp
         ), "After configure_tp, experts should be tp_experts"
-        assert m.parallelism_config == "tp"
+        assert m.parallelism_config == ParaSMode.TP
 
         # Switch back to EP
         m.paras_configure_ep()
         assert (
             m.experts is ep_exp
         ), "After configure_ep, experts should be ep_experts"
-        assert m.parallelism_config == "ep"
+        assert m.parallelism_config == ParaSMode.EP
 
         if self.rank == 0:
             print(
@@ -630,7 +591,7 @@ class TestWeightRoundTrip:
         run_naive_path(self.mgr, self.num_local)
 
         # TP→EP via NCCL naive reverse — MUST be in reversed layer order
-        # to respect N+1 slot aliasing (EP slot[i+1] = TP slot[i+1])
+        # to preserve live sources in the overlapping unified layout
         for layer_id in reversed(range(NUM_LAYERS)):
             mixin = _make_mixin(layer_id, self.num_local, self.mgr)
             mixin.paras_configure_ep_mlp_naive()
