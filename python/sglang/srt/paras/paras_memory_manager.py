@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.paras.layers.utils import LayerCacheSpec
     from sglang.srt.paras.unified_layout import UnifiedLayout
+    from sglang.srt.paras.workspace_buffer import MoEWorkspace
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -488,6 +489,20 @@ class ParaSMemoryManager:
     def get_moe_workspace(self, mode: ParaSMode, shapes, dtype, device):
         return self._get_workspace(mode, "moe", shapes, dtype, device)
 
+    def bind_moe_workspace(self, mode: ParaSMode) -> Optional["MoEWorkspace"]:
+        """Bind an expert runner to its fixed region without initializing it."""
+        from sglang.srt.paras.workspace_buffer import MoEWorkspace
+
+        if not self.unified_workspace_enabled:
+            return None
+        requirement = self._unified_spec.for_mode(mode).workspaces.moe
+        if requirement.size_bytes is None:
+            return None
+        (buffer,) = self.get_moe_workspace(
+            mode, [(requirement.reserved_bytes,)], torch.uint8, self.device
+        )
+        return MoEWorkspace(mode, buffer)
+
     def get_attention_workspace(self, backend, mode: ParaSMode, shapes, dtype, device):
         """Return typed scratch views, or None when the backend owns its storage."""
         if not self.unified_workspace_enabled:
@@ -534,34 +549,22 @@ class ParaSMemoryManager:
         """Typed, non-owning scratch views at the mode's fixed endpoint."""
         if not self.unified_workspace_enabled:
             return None
-        from sglang.srt.paras.unified_layout import align_up
+        from sglang.srt.paras.workspace_buffer import workspace_views
 
-        requested_device = torch.device(device)
-        if requested_device.type == "cuda" and requested_device.index is None:
-            requested_device = torch.device("cuda", torch.cuda.current_device())
-        if self._buffer is None or requested_device != self._buffer.device:
-            raise RuntimeError(f"{kind} workspace requested on a different device")
+        if self._buffer is None:
+            raise RuntimeError("Workspace requested before materialization")
         offset, _ = self._unified_layout.workspace(mode)
         relative_offset, capacity = self._unified_spec.for_mode(mode).workspaces.region(
             kind
         )
         offset += relative_offset
-        cursor = 0
-        result = []
-        for shape in shapes:
-            size = math.prod(shape) * dtype.itemsize
-            cursor = align_up(cursor)
-            if cursor + size > capacity:
-                raise RuntimeError(
-                    f"ParaS {mode.value} {kind} workspace overflow: {cursor + size} > {capacity}"
-                )
-            result.append(
-                self._buffer[offset + cursor : offset + cursor + size]
-                .view(dtype)
-                .view(shape)
-            )
-            cursor += size
-        return result
+        return workspace_views(
+            self._buffer[offset : offset + capacity],
+            shapes,
+            dtype,
+            device,
+            label=f"ParaS {mode.value} {kind} workspace",
+        )
 
     def _materialize_unified(self):
         layout, spec = self._unified_layout, self._unified_spec
@@ -610,14 +613,6 @@ class ParaSMemoryManager:
         self._buffer = torch.empty(layout.budget, dtype=torch.uint8, device=self.device)
         self._buffer_start = self._buffer.data_ptr()
         self._buffer_end = self._buffer_start + layout.budget
-        self._workspace_weight_modes = {
-            (
-                self._buffer_start + self._entries[names[0]].offset_bytes,
-                self._entries[names[0]].shape,
-            ): mode
-            for mode in (ParaSMode.EP, ParaSMode.TP)
-            for names in spec.for_mode(mode).weight_names
-        }
         self._materialized = True
         return layout.budget
 
@@ -1475,27 +1470,6 @@ def set_global_paras_memory_manager(manager: Optional[ParaSMemoryManager]) -> No
 
 def get_global_paras_memory_manager() -> Optional[ParaSMemoryManager]:
     return _global_paras_memory_manager
-
-
-def get_paras_workspace_mode(weight) -> Optional[ParaSMode]:
-    mgr = get_global_paras_memory_manager()
-    if mgr is None or not mgr.unified_workspace_enabled or not mgr.materialized:
-        return None
-    # Opposite-mode views may start at the same address (EP layer 0 and
-    # TP layer 1, for example). Their expert dimensions distinguish them.
-    return mgr._workspace_weight_modes.get((weight.data_ptr(), tuple(weight.shape)))
-
-
-def get_paras_moe_workspace(weight, shapes, dtype, device, *, block_sizes=()):
-    mode = get_paras_workspace_mode(weight)
-    if mode is None:
-        return None
-    from sglang.srt.paras.unified_layout import validate_triton_workspace_blocks
-
-    validate_triton_workspace_blocks(*block_sizes)
-    return get_global_paras_memory_manager().get_moe_workspace(
-        mode, shapes, dtype, device
-    )
 
 
 # ---------------------------------------------------------------------------

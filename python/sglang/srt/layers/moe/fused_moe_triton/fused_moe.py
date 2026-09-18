@@ -84,6 +84,7 @@ def inplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -113,6 +114,7 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
+        workspace_buffer=workspace_buffer,
     )
 
 
@@ -142,6 +144,7 @@ def inplace_fused_experts_fake(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> None:
     pass
 
@@ -149,7 +152,7 @@ def inplace_fused_experts_fake(
 direct_register_custom_op(
     op_name="inplace_fused_experts",
     op_func=inplace_fused_experts,
-    mutates_args=["hidden_states"],
+    mutates_args=["hidden_states", "workspace_buffer"],
     fake_impl=inplace_fused_experts_fake,
 )
 
@@ -181,6 +184,7 @@ def outplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -210,6 +214,7 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
+        workspace_buffer=workspace_buffer,
     )
 
 
@@ -240,6 +245,7 @@ def outplace_fused_experts_fake(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -247,7 +253,7 @@ def outplace_fused_experts_fake(
 direct_register_custom_op(
     op_name="outplace_fused_experts",
     op_func=outplace_fused_experts,
-    mutates_args=[],
+    mutates_args=["workspace_buffer"],
     fake_impl=outplace_fused_experts_fake,
 )
 
@@ -273,6 +279,8 @@ def fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
 ):
+    binding = moe_runner_config.paras_workspace
+    workspace_buffer = binding.buffer if binding is not None else None
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
         moe_runner_config.num_experts is None
@@ -306,6 +314,7 @@ def fused_experts(
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
+            workspace_buffer=workspace_buffer,
         )
         return hidden_states
     else:
@@ -336,6 +345,7 @@ def fused_experts(
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
+            workspace_buffer=workspace_buffer,
         )
 
 
@@ -512,6 +522,7 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -569,10 +580,10 @@ def fused_experts_impl(
         min(M * topk, E + 1) * (max_block_m - 1) if down_moe_use_tma else 0
     )
     total_tokens = M * topk + max_padded_tokens
-    from sglang.srt.paras.paras_memory_manager import get_paras_moe_workspace
+    from sglang.srt.paras.workspace_buffer import moe_workspace_views
 
-    workspace = get_paras_moe_workspace(
-        w1,
+    workspace = moe_workspace_views(
+        workspace_buffer,
         [(total_tokens * max(N, w2.shape[1]),), (total_tokens, N // 2)],
         hidden_states.dtype,
         hidden_states.device,

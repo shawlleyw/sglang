@@ -94,8 +94,10 @@ serializes layer computation.
 4. Backend reconfiguration binds views without writing them: the target
    workspace can still contain live source weights. Initialize scratch only
    after migration, then restore the target mode's graph metadata.
-5. Captured graphs retain stable per-mode addresses. Workspace ownership
-   uses both weight address and shape to disambiguate overlapping EP/TP views.
+5. Captured graphs retain stable per-mode addresses. Each EP/TP expert runner
+   holds its own `MoEWorkspace` binding in `MoeRunnerConfig`; switching selects
+   the corresponding expert object. Fused custom ops receive the scratch tensor
+   explicitly and declare its writes. No weight-address lookup is needed.
 
 These invariants apply to both startup dual capture and runtime switching.
 Scratch contents are disposable; plans and escaped outputs are not.

@@ -111,49 +111,57 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> TritonRunnerOutput:
 
-        from sglang.srt.paras.paras_memory_manager import get_paras_workspace_mode
         from sglang.srt.paras.unified_layout import (
             triton_moe_chunk_size as max_dispatched_rows_per_chunk,
         )
 
-        mode = get_paras_workspace_mode(quant_info.w13_weight)
+        binding = self.config.paras_workspace
         rows = runner_input.hidden_states.shape[0]
         if (
-            mode == ParaSMode.EP
+            binding is not None
+            and binding.mode == ParaSMode.EP
             and running_state.get("masked_m") is None
             and rows > max_dispatched_rows_per_chunk
         ):
-            # Normal DeepEP dispatch expands tokens into expert rows. Bound
-            # internal scratch independently of long requests/routing skew.
-            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-                moe_align_block_size,
+            return self._run_chunked_dispatched_rows(
+                runner_input, quant_info, running_state, max_dispatched_rows_per_chunk
             )
-
-            assert self.config.no_combine and runner_input.topk_ids.shape[1] == 1
-            output = torch.empty(
-                (rows, 1, quant_info.w2_weight.shape[1]),
-                dtype=runner_input.hidden_states.dtype,
-                device=runner_input.hidden_states.device,
-            )
-            for start in range(0, rows, max_dispatched_rows_per_chunk):
-                end = min(start + max_dispatched_rows_per_chunk, rows)
-                ids = runner_input.topk_ids[start:end]
-                sorted_ids, experts, padded = moe_align_block_size(
-                    ids,
-                    running_state["config"]["BLOCK_SIZE_M"],
-                    quant_info.w13_weight.shape[0],
-                )
-                chunk = TritonRunnerInput(
-                    runner_input.hidden_states[start:end],
-                    runner_input.topk_weights[start:end],
-                    ids,
-                    sorted_ids,
-                    experts,
-                    padded,
-                )
-                self._run_impl(chunk, quant_info, running_state, output[start:end])
-            return TritonRunnerOutput(hidden_states=output)
         return self._run_impl(runner_input, quant_info, running_state)
+
+    def _run_chunked_dispatched_rows(
+        self, runner_input, quant_info, running_state, max_dispatched_rows_per_chunk
+    ):
+        rows = runner_input.hidden_states.shape[0]
+        # Normal DeepEP dispatch expands tokens into expert rows. Bound
+        # internal scratch independently of long requests/routing skew.
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            moe_align_block_size,
+        )
+
+        assert self.config.no_combine and runner_input.topk_ids.shape[1] == 1
+        output = torch.empty(
+            (rows, 1, quant_info.w2_weight.shape[1]),
+            dtype=runner_input.hidden_states.dtype,
+            device=runner_input.hidden_states.device,
+        )
+        for start in range(0, rows, max_dispatched_rows_per_chunk):
+            end = min(start + max_dispatched_rows_per_chunk, rows)
+            ids = runner_input.topk_ids[start:end]
+            sorted_ids, experts, padded = moe_align_block_size(
+                ids,
+                running_state["config"]["BLOCK_SIZE_M"],
+                quant_info.w13_weight.shape[0],
+            )
+            chunk = TritonRunnerInput(
+                runner_input.hidden_states[start:end],
+                runner_input.topk_weights[start:end],
+                ids,
+                sorted_ids,
+                experts,
+                padded,
+            )
+            self._run_impl(chunk, quant_info, running_state, output[start:end])
+        return TritonRunnerOutput(hidden_states=output)
 
     def _run_impl(self, runner_input, quant_info, running_state, output_buffer=None):
 
@@ -219,10 +227,11 @@ class TritonRunnerCore(MoeRunnerCore):
             tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
         )
 
-        from sglang.srt.paras.paras_memory_manager import get_paras_moe_workspace
+        from sglang.srt.paras.workspace_buffer import moe_workspace_views
 
-        workspace = get_paras_moe_workspace(
-            w13,
+        binding = self.config.paras_workspace
+        workspace = moe_workspace_views(
+            binding.buffer if binding is not None else None,
             [(M, topk_ids.shape[1], N), (M * topk_ids.shape[1], N // 2)],
             hidden_states.dtype,
             hidden_states.device,

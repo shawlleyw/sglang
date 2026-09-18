@@ -1,4 +1,4 @@
-"""Physical workspace views must preserve live weights and disambiguate aliases."""
+"""Bound workspace views preserve live weights even when weight addresses alias."""
 
 import pytest
 import torch
@@ -57,17 +57,22 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(
         tp_size=4,
     )
     mgr.materialize()
-    monkeypatch.setattr(memory, "_global_paras_memory_manager", mgr)
     ep_weight = mgr.get_view("model.layers.0.mlp.ep_experts.w13_weight")
     tp_weight = mgr.get_view("model.layers.1.mlp.tp_experts.w13_weight")
     if attention_bytes < 400_000:
         assert ep_weight.data_ptr() == tp_weight.data_ptr()
-    assert memory.get_paras_workspace_mode(ep_weight) == ParaSMode.EP
-    assert memory.get_paras_workspace_mode(tp_weight) == ParaSMode.TP
     for mode in (ParaSMode.EP, ParaSMode.TP):
         mgr._buffer.fill_(23)
         shapes = [(3, 17), (7, 19)]
-        scratch = mgr.get_moe_workspace(mode, shapes, torch.bfloat16, "cpu")
+        from sglang.srt.paras.workspace_buffer import moe_workspace_views
+
+        binding = mgr.bind_moe_workspace(mode)
+        assert binding.mode is mode
+        scratch = moe_workspace_views(binding.buffer, shapes, torch.bfloat16, "cpu")
+        assert (
+            binding.buffer.data_ptr()
+            == mgr._buffer.data_ptr() + layout.workspace(mode)[0]
+        )
         for view in scratch:
             assert (view.data_ptr() - mgr._buffer.data_ptr()) % 256 == 0
             view.fill_(1)
@@ -75,7 +80,7 @@ def test_workspace_ownership_when_mode_weight_addresses_coincide(
         assert torch.all(mgr._buffer[:offset] == 23)
         assert torch.all(mgr._buffer[offset + size :] == 23)
         with pytest.raises(RuntimeError, match="overflow"):
-            mgr.get_moe_workspace(mode, [(size,)], torch.bfloat16, "cpu")
+            moe_workspace_views(binding.buffer, [(size,)], torch.bfloat16, "cpu")
         attention = mgr.get_attention_workspace(
             "test", mode, [(attention_bytes,)], torch.uint8, "cpu"
         )[0]

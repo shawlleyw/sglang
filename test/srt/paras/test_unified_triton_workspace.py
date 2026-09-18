@@ -9,10 +9,13 @@ from sglang.srt.paras.mode import ParaSMode
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("mode", [ParaSMode.EP, ParaSMode.TP])
-def test_managed_triton_matches_original_allocations(monkeypatch, mode):
+@pytest.mark.parametrize(
+    "mode,inplace",
+    [(ParaSMode.EP, False), (ParaSMode.TP, False), (ParaSMode.TP, True)],
+)
+def test_managed_triton_matches_original_allocations(monkeypatch, mode, inplace):
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-        fused_experts_impl,
+        fused_experts,
         moe_align_block_size,
     )
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -21,6 +24,7 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode):
         TritonRunnerCore,
         TritonRunnerInput,
     )
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.paras import paras_memory_manager as memory
     from sglang.srt.paras import unified_layout
     from sglang.srt.paras.workspace import ModeWorkspaces, WorkspaceRequirement
@@ -41,6 +45,7 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode):
     ids = torch.randint(e, (m, k), device="cuda", dtype=torch.int64)
     weights = torch.rand((m, k), device="cuda")
     monkeypatch.setattr(memory, "_global_paras_memory_manager", None)
+    runner_config = MoeRunnerConfig(no_combine=mode == ParaSMode.EP, inplace=inplace)
     if mode == ParaSMode.EP:
         config = dict(
             BLOCK_SIZE_M=16,
@@ -51,7 +56,7 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode):
             num_stages=2,
         )
         aligned = moe_align_block_size(ids, config["BLOCK_SIZE_M"], e)
-        runner = TritonRunnerCore(MoeRunnerConfig(no_combine=True, inplace=False))
+        runner = TritonRunnerCore(runner_config)
         inputs = TritonRunnerInput(x, weights, ids, *aligned)
         quant = TritonMoeQuantInfo(w1, w2)
 
@@ -61,7 +66,13 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode):
     else:
 
         def run():
-            return fused_experts_impl(x, w1, w2, weights, ids)
+            return fused_experts(
+                x.clone() if inplace else x,
+                w1,
+                w2,
+                StandardTopKOutput(weights, ids, None),
+                runner_config,
+            )
 
     expected = run()
 
@@ -90,14 +101,17 @@ def test_managed_triton_matches_original_allocations(monkeypatch, mode):
     mgr._unified_layout = SimpleNamespace(workspace=lambda _: (256, size))
     mgr._buffer = torch.full((size + 512,), 23, device="cuda", dtype=torch.uint8)
     mgr._materialized = True
-    mgr._workspace_weight_modes = {(w1.data_ptr(), tuple(w1.shape)): mode}
-    monkeypatch.setattr(memory, "_global_paras_memory_manager", mgr)
+    # Binding works without a global manager or a weight-address registry.
+    runner_config.paras_workspace = mgr.bind_moe_workspace(mode)
     with monkeypatch.context() as bounds:
         bounds.setattr(unified_layout, "MOE_MAX_BLOCK_M", 1)
         with pytest.raises(ValueError, match="selected configuration"):
             run()
     actual = run()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if mode == ParaSMode.TP:
+        compiled = torch.compile(run, backend="eager", fullgraph=True)
+        torch.testing.assert_close(compiled(), expected, rtol=0, atol=0)
     # Returned outputs must survive reuse by subsequent layers.
     mgr._buffer[256:-256].fill_(0)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

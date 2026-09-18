@@ -186,6 +186,14 @@ class ParaSMoeBlockMixin:
             set_weight_attrs(w2_param, self.tp_experts.extra_weight_attrs)
             self.tp_experts.register_parameter("w2_weight", w2_param)
 
+        if mgr is not None and mgr.unified_workspace_enabled:
+            self.ep_experts.moe_runner_config.paras_workspace = mgr.bind_moe_workspace(
+                ParaSMode.EP
+            )
+            self.tp_experts.moe_runner_config.paras_workspace = mgr.bind_moe_workspace(
+                ParaSMode.TP
+            )
+
         # Start in EP mode; will switch to TP after paras_configure_tp()
         self.parallelism_config = ParaSMode.EP
 
