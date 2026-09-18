@@ -172,19 +172,20 @@ class TritonRunnerCore(MoeRunnerCore):
             tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
         )
 
-        from sglang.srt.paras.workspace_buffer import moe_workspace_views
+        from sglang.srt.paras.workspace import moe_workspace_views
 
         binding = self.config.paras_workspace
-        workspace = moe_workspace_views(
+        intermediate_workspace, activation_workspace = moe_workspace_views(
             binding.buffer if binding is not None else None,
-            [(M, topk_ids.shape[1], N), (M * topk_ids.shape[1], N // 2)],
+            (M, topk_ids.shape[1], N),
+            (M * topk_ids.shape[1], N // 2),
             hidden_states.dtype,
             hidden_states.device,
             block_sizes=(running_state["config"]["BLOCK_SIZE_M"],),
         )
         intermediate_cache1 = (
-            workspace[0]
-            if workspace is not None
+            intermediate_workspace
+            if intermediate_workspace is not None
             else torch.empty(
                 (M, topk_ids.shape[1], N),
                 device=hidden_states.device,
@@ -218,8 +219,8 @@ class TritonRunnerCore(MoeRunnerCore):
         )
 
         intermediate_cache2 = (
-            workspace[1]
-            if workspace is not None
+            activation_workspace
+            if activation_workspace is not None
             else torch.empty(
                 (M * topk_ids.shape[1], N // 2),
                 device=hidden_states.device,
@@ -251,6 +252,7 @@ class TritonRunnerCore(MoeRunnerCore):
                 masked_m,
                 gemm1_alpha,
                 gemm1_limit,
+                output=intermediate_cache2.view(num_experts, e_tokens, N // 2),
             ).view(num_experts * e_tokens, N // 2)
         elif activation == "silu":
             if gemm1_alpha is not None:
@@ -259,6 +261,7 @@ class TritonRunnerCore(MoeRunnerCore):
                     intermediate_cache1.view(-1, N),
                     gemm1_alpha,
                     gemm1_limit,
+                    output=intermediate_cache2,
                 )
             elif _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)

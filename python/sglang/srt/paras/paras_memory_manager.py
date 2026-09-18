@@ -1,31 +1,8 @@
-"""
-ParaSMemoryManager: Static contiguous weight buffer for ParaS EP↔TP switching.
-V1 scope: Qwen sparse-MoE (no shared experts, no dense MLPs).
-Supported dtypes: BF16/FP16 (unquantized) and FP8.
+"""Shared BF16 weight, KV, and backend workspace buffer for ParaS.
 
-LIFECYCLE & DESIGN:
-  The manager pre-plans a single contiguous uint8 buffer that holds all weight tensors
-  needed for Expert Parallelism (EP) ↔ Tensor Parallelism (TP) switching. This design
-  avoids repeated allocations and fragmentation during dynamic reconfiguration.
-
-  1. plan_qwen_moe_layout(manager, ...)  — reserves tensor slots (name, shape, dtype)
-  2. manager.materialize()                — computes aligned offsets, allocates one GPU buffer
-  3. manager.get_view("name")             — returns typed, shaped view for module to wrap as nn.Parameter
-
-MEMORY LAYOUT EXAMPLE (1 layer, BF16, 8 experts, ep_size=2, tp_size=4):
-  [EP_w13 | EP_w2 | TP_w13 | TP_w2 | QKV_full | O_proj | QKV_TP_buf | ...]
-   ^-- all in one contiguous torch.uint8 buffer, 256-byte aligned for GPU access
-
-WHY THIS APPROACH:
-  - Single allocation: Avoids GPU memory fragmentation and repeated malloc/free overhead.
-  - Deterministic offsets: Reservation order → fixed offsets enables reproducible layouts.
-  - Dtype-agnostic storage: uint8 buffer holds any dtype; views reinterpret as needed.
-  - Aligned access: 256-byte alignment matches GPU memory coalescing patterns.
-
-HETEROGENEOUS LAYERS (layer_specs):
-  When layer_specs differ per layer, each slot is sized for its layer's family
-  (full vs SWA). Two families may have different per-layer bytes, but within
-  a family all slots have the same bytes per layer.
+Qwen3 MoE and GPT-OSS use fixed EP/TP views into one allocation. The planner
+keeps each transfer destination disjoint from live source layers. Full and
+sliding-window KV pools retain separate capacities within this layout.
 """
 
 import json
@@ -44,7 +21,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.paras.layers.utils import LayerCacheSpec
     from sglang.srt.paras.unified_layout import UnifiedLayout
-    from sglang.srt.paras.workspace_buffer import MoEWorkspace
+    from sglang.srt.paras.workspace import MoEWorkspace
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -184,10 +161,10 @@ def _validate_v1_scope(
             f"(num_fused_shared_experts={num_fused_shared_experts}). "
             "Only pure sparse-MoE layers are supported."
         )
-    if quant_name not in (None, "", "fp8"):
+    if quant_name is not None:
         raise ValueError(
             f"ParaS V1 does not support quantization format '{quant_name}'. "
-            "Only unquantized (BF16/FP16) and FP8 are supported."
+            "Only unquantized BF16 weights are supported."
         )
 
 
@@ -373,128 +350,13 @@ class ParaSMemoryManager:
 
     # ----- KV cache reservation -------------------------------------------
 
-    @property
-    def unified_workspace_enabled(self) -> bool:
-        return self._unified_spec is not None
-
-    def plan_unified_qwen(
-        self,
-        *,
-        num_layers,
-        num_experts,
-        hidden_size,
-        intermediate_size,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        ep_size,
-        tp_size,
-        top_k,
-        prefix,
-    ):
-        """Register both layouts without reserving duplicate physical weights."""
-        from sglang.srt.paras.unified_layout import align_up, triton_workspace_sizes
-        from sglang.srt.utils import get_int_env_var
-
-        if ep_size != tp_size or num_experts % ep_size or intermediate_size % tp_size:
-            raise ValueError(
-                "Unified Qwen workspace requires equal EP/TP groups and divisible experts"
-            )
-        if num_heads % tp_size or (
-            tp_size % num_kv_heads
-            if tp_size >= num_kv_heads
-            else num_kv_heads % tp_size
-        ):
-            raise ValueError("Attention heads do not divide the configured TP group")
-        capacity = get_int_env_var(
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
-        )
-        ep_workspace_bytes, tp_workspace_bytes = triton_workspace_sizes(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            top_k=top_k,
-            tp_size=tp_size,
-            dispatch_capacity=capacity,
-        )
-        spec = UnifiedLayoutSpec(
-            num_layers=num_layers,
-            prefix=prefix,
-            ep=UnifiedModeSpec(
-                ModeWorkspaces(
-                    WorkspaceRequirement("triton", ep_workspace_bytes),
-                    WorkspaceRequirement("unconfigured", None),
-                )
-            ),
-            tp=UnifiedModeSpec(
-                ModeWorkspaces(
-                    WorkspaceRequirement("triton", tp_workspace_bytes),
-                    WorkspaceRequirement("unconfigured", None),
-                )
-            ),
-            tp_size=tp_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            hidden_size=hidden_size,
-        )
-        for mode in (ParaSMode.EP, ParaSMode.TP):
-            mode_spec = spec.for_mode(mode)
-            experts = num_experts // ep_size if mode == ParaSMode.EP else num_experts
-            inter = (
-                intermediate_size if mode == ParaSMode.EP else intermediate_size // tp_size
-            )
-            q = (
-                num_heads * head_dim
-                if mode == ParaSMode.EP
-                else num_heads // tp_size * head_dim
-            )
-            kv = (
-                num_kv_heads * head_dim
-                if mode == ParaSMode.EP
-                else max(1, num_kv_heads // tp_size) * head_dim
-            )
-            for i in range(num_layers):
-                lp = f"{prefix}.layers.{i}"
-                suffix = "weight" if mode == ParaSMode.EP else "tp_weight"
-                entries = [
-                    (
-                        f"{lp}.mlp.{mode.value}_experts.w13_weight",
-                        (experts, 2 * inter, hidden_size),
-                    ),
-                    (
-                        f"{lp}.mlp.{mode.value}_experts.w2_weight",
-                        (experts, hidden_size, inter),
-                    ),
-                    (f"{lp}.self_attn.qkv_proj.{suffix}", (q + 2 * kv, hidden_size)),
-                    (f"{lp}.self_attn.o_proj.{suffix}", (hidden_size, q)),
-                ]
-                names = []
-                for name, shape in entries:
-                    self.reserve(name, shape, torch.bfloat16)
-                    self._reservation_order.remove(name)
-                    names.append(name)
-                mode_spec.weight_names.append(names)
-                if mode == ParaSMode.EP:
-                    for weight in ("w13", "w2"):
-                        self._entries[f"{lp}.mlp.experts.{weight}_weight"] = (
-                            self._entries[f"{lp}.mlp.ep_experts.{weight}_weight"]
-                        )
-            mode_spec.weight_bytes = sum(
-                align_up(self._entries[n].size_bytes)
-                for n in mode_spec.weight_names[0]
-            )
-        self._unified_spec = spec
-
     def get_moe_workspace(self, mode: ParaSMode, shapes, dtype, device):
         return self._get_workspace(mode, "moe", shapes, dtype, device)
 
     def bind_moe_workspace(self, mode: ParaSMode) -> Optional["MoEWorkspace"]:
         """Bind an expert runner to its fixed region without initializing it."""
-        from sglang.srt.paras.workspace_buffer import MoEWorkspace
+        from sglang.srt.paras.workspace import MoEWorkspace
 
-        if not self.unified_workspace_enabled:
-            return None
         requirement = self._unified_spec.for_mode(mode).workspaces.moe
         if requirement.size_bytes is None:
             return None
@@ -505,8 +367,6 @@ class ParaSMemoryManager:
 
     def get_attention_workspace(self, backend, mode: ParaSMode, shapes, dtype, device):
         """Return typed scratch views, or None when the backend owns its storage."""
-        if not self.unified_workspace_enabled:
-            return None
         requirement = self._unified_spec.for_mode(mode).workspaces.attention
         if requirement.size_bytes is None:
             return None
@@ -524,8 +384,6 @@ class ParaSMemoryManager:
         The manager owns its planned capacity; callers need neither tensor
         shapes nor knowledge of the multi-view workspace API.
         """
-        if not self.unified_workspace_enabled:
-            return None
         requirement = self._unified_spec.for_mode(mode).workspaces.attention
         if requirement.size_bytes is None:
             return None
@@ -536,8 +394,6 @@ class ParaSMemoryManager:
 
     def initialize_attention_workspace(self, mode: ParaSMode):
         """Call only after migration; the target region may hold source weights."""
-        if not self.unified_workspace_enabled:
-            return
         requirement = self._unified_spec.for_mode(mode).workspaces.attention
         workspace_buffer = self.get_attention_workspace_buffer(
             requirement.backend, mode
@@ -547,9 +403,7 @@ class ParaSMemoryManager:
 
     def _get_workspace(self, mode: ParaSMode, kind, shapes, dtype, device):
         """Typed, non-owning scratch views at the mode's fixed endpoint."""
-        if not self.unified_workspace_enabled:
-            return None
-        from sglang.srt.paras.workspace_buffer import workspace_views
+        from sglang.srt.paras.workspace import workspace_views
 
         if self._buffer is None:
             raise RuntimeError("Workspace requested before materialization")
@@ -573,7 +427,7 @@ class ParaSMemoryManager:
             raise RuntimeError(
                 "Unified layout requires capacity planning and KV reservation"
             )
-        if (layout.ep_tokens, layout.tp_tokens) != (
+        if (layout.ep_cache.full_tokens, layout.tp_cache.full_tokens) != (
             self.ep_max_kv_tokens,
             self.tp_max_kv_tokens,
         ):
@@ -586,7 +440,9 @@ class ParaSMemoryManager:
                 else pending.layer_tp_shapes
             )
             sizes = (
-                pending.layer_ep_bytes if mode == ParaSMode.EP else pending.layer_tp_bytes
+                pending.layer_ep_bytes
+                if mode == ParaSMode.EP
+                else pending.layer_tp_bytes
             )
             for i, names in enumerate(spec.for_mode(mode).weight_names):
                 offset = layout.weight_offset(mode, i)
@@ -595,7 +451,12 @@ class ParaSMemoryManager:
                     entry.offset_bytes = offset
                     offset += self._align_up(entry.size_bytes, self.ALIGNMENT)
                 shape, size = shapes[i], sizes[i]
-                for side, displacement in (("k", 0), ("v", size)):
+                cache = layout.ep_cache if mode == ParaSMode.EP else layout.tp_cache
+                aligned_size = self._align_up(size, self.ALIGNMENT)
+                assert (
+                    aligned_size * 2 == cache.layer_bytes[i]
+                ), "KV reservation differs from capacity plan"
+                for side, displacement in (("k", 0), ("v", aligned_size)):
                     name = f"{spec.prefix}.layers.{i}.kv.{mode.value}.{side}"
                     entry = LayoutEntry(
                         name,
@@ -790,162 +651,14 @@ class ParaSMemoryManager:
             avail_now_gib,
         )
 
-    def plan_mha_kv_capacity(
+    def plan_kv_capacity(
         self,
         *,
         config,
         tp_size: int,
         head_dim: int,
     ) -> ParaSKVCapacityPlan:
-        """End-to-end MHA KV capacity planner.
-
-        Reads device / gpu_id / server_args / cpu_group / world_size from
-        ``self`` (set at construction in model_runner). Calls
-        ``get_available_gpu_memory``, computes the UMM and KV byte budgets,
-        derives EP and TP per-token caps, populates ``self.ep_max_kv_tokens``
-        and ``self.tp_max_kv_tokens``, logs at INFO level, and returns the
-        plan including the resolved ``kv_dtype`` for downstream
-        ``reserve_kv_cache``.
-        """
-        kv_dtype = self._resolve_kv_store_dtype()
-        elem_size = (
-            kv_dtype.itemsize
-            if hasattr(kv_dtype, "itemsize")
-            else torch.tensor([], dtype=kv_dtype).element_size()
-        )
-
-        (
-            avail_now_bytes,
-            total_gpu_bytes,
-            dynamic_reserve_bytes,
-            umm_budget_bytes,
-            kv_budget_bytes,
-            non_umm_static_bytes,
-            avail_now_gib,
-        ) = self._compute_kv_budget_bytes(config)
-
-        num_layers = config.num_hidden_layers
-        num_kv_heads = config.num_key_value_heads
-
-        if self.unified_workspace_enabled:
-            from sglang.srt.paras.unified_layout import plan_unified_layout
-            from sglang.srt.paras.workspace import attention_workspace_requirements
-
-            spec = self._unified_spec
-            attention = attention_workspace_requirements(
-                self.server_args, config, tp_size, head_dim, context_len=self.context_len
-            )
-            for mode, requirement in zip((ParaSMode.EP, ParaSMode.TP), attention):
-                spec.for_mode(mode).workspaces = ModeWorkspaces(
-                    spec.for_mode(mode).workspaces.moe, requirement
-                )
-            ep_row = num_kv_heads * head_dim * 2 * elem_size
-            tp_row = max(1, num_kv_heads // tp_size) * head_dim * 2 * elem_size
-            layout = plan_unified_layout(
-                num_layers=num_layers,
-                budget=umm_budget_bytes - non_umm_static_bytes,
-                ep_weight_bytes=spec.ep.weight_bytes,
-                tp_weight_bytes=spec.tp.weight_bytes,
-                ep_workspace_bytes=spec.ep.workspaces.size_bytes,
-                tp_workspace_bytes=spec.tp.workspaces.size_bytes,
-                ep_kv_row_bytes=ep_row,
-                tp_kv_row_bytes=tp_row,
-                page_size=self.server_args.page_size,
-            )
-            self._unified_layout = layout
-            self.ep_max_kv_tokens, self.tp_max_kv_tokens = (
-                layout.ep_tokens,
-                layout.tp_tokens,
-            )
-            logger.info("ParaS unified weights/KV/workspace: %s", layout)
-            for mode in (ParaSMode.EP, ParaSMode.TP):
-                requirements = spec.for_mode(mode).workspaces
-                logger.info(
-                    "ParaS %s workspace: %s; unused padding=%d bytes",
-                    mode.value,
-                    requirements,
-                    layout.workspace(mode)[1] - requirements.size_bytes,
-                )
-            return ParaSKVCapacityPlan(
-                available_gpu_memory_bytes=avail_now_bytes,
-                total_gpu_memory_bytes=total_gpu_bytes,
-                dynamic_reserve_bytes=dynamic_reserve_bytes,
-                umm_budget_bytes=layout.budget,
-                weights_only_bytes=self.weights_only_bytes,
-                non_umm_static_bytes=non_umm_static_bytes,
-                kv_budget_bytes=num_layers * layout.ep_cache_bytes,
-                kv_dtype=kv_dtype,
-                ep_max_tokens=layout.ep_tokens,
-                tp_max_tokens=layout.tp_tokens,
-                ep_cell_bytes=num_layers * ep_row,
-                tp_cell_bytes=num_layers * tp_row,
-                ep_kv_heads=num_kv_heads,
-                tp_kv_heads=max(1, num_kv_heads // tp_size),
-                full_layers=num_layers,
-            )
-
-        ep_kv_heads = num_kv_heads
-        tp_kv_heads = max(1, num_kv_heads // tp_size)
-        # (num_layers + 1) reserves one layer's K+V for the EP/TP cache-transfer
-        # overlap_gap baked into _create_kv_layout (line 783). Without this the
-        # materialized KV region exceeds kv_budget by one max-layer worth.
-        ep_cell_bytes = ep_kv_heads * head_dim * (num_layers + 1) * 2 * elem_size
-        tp_cell_bytes = tp_kv_heads * head_dim * (num_layers + 1) * 2 * elem_size
-        ep_max_tokens = max(1, int(kv_budget_bytes // ep_cell_bytes))
-        tp_max_tokens = max(1, int(kv_budget_bytes // tp_cell_bytes))
-
-        self.ep_max_kv_tokens = ep_max_tokens
-        self.tp_max_kv_tokens = tp_max_tokens
-
-        logger.info(
-            f"ParaS KV budget: avail_now={avail_now_gib:.3f}GiB  "
-            f"total={total_gpu_bytes / (1 << 30):.3f}GiB  "
-            f"dynamic_reserve={dynamic_reserve_bytes / (1 << 30):.3f}GiB  "
-            f"umm_budget={umm_budget_bytes / (1 << 30):.3f}GiB  "
-            f"weights_only={self.weights_only_bytes / (1 << 30):.3f}GiB  "
-            f"non_umm_static={non_umm_static_bytes / (1 << 30):.3f}GiB  "
-            f"kv_budget={kv_budget_bytes / (1 << 30):.3f}GiB  "
-            f"ep_max_tokens={ep_max_tokens}  "
-            f"tp_max_tokens={tp_max_tokens}  "
-            f"ep_kv_heads={ep_kv_heads}  "
-            f"tp_kv_heads={tp_kv_heads}"
-        )
-
-        return ParaSKVCapacityPlan(
-            available_gpu_memory_bytes=avail_now_bytes,
-            total_gpu_memory_bytes=total_gpu_bytes,
-            dynamic_reserve_bytes=dynamic_reserve_bytes,
-            umm_budget_bytes=umm_budget_bytes,
-            weights_only_bytes=self.weights_only_bytes,
-            non_umm_static_bytes=non_umm_static_bytes,
-            kv_budget_bytes=kv_budget_bytes,
-            kv_dtype=kv_dtype,
-            ep_max_tokens=ep_max_tokens,
-            tp_max_tokens=tp_max_tokens,
-            ep_cell_bytes=ep_cell_bytes,
-            tp_cell_bytes=tp_cell_bytes,
-            ep_kv_heads=ep_kv_heads,
-            tp_kv_heads=tp_kv_heads,
-            full_layers=num_layers,
-        )
-
-    def plan_hybrid_swa_kv_capacity(
-        self,
-        *,
-        config,
-        tp_size: int,
-        head_dim: int,
-    ) -> ParaSKVCapacityPlan:
-        """End-to-end SWA-aware KV capacity planner for hybrid full / SWA models.
-
-        Same prelude as :meth:`plan_mha_kv_capacity` (reads device, gpu_id,
-        cpu_group, world_size, server_args from ``self``). Then splits the
-        per-layer-token budget across full and SWA layers using
-        ``plan_hybrid_kv_budget`` with ``server_args.swa_full_tokens_ratio``,
-        builds per-layer specs via :func:`classify_layers_from_config`, and
-        returns a plan whose ``layer_specs`` is consumed downstream by
-        :meth:`reserve_kv_cache`.
-        """
+        """Plan weights, backend scratch, and per-layer full/SWA KV capacities."""
         from sglang.srt.paras.layers.utils import classify_layers_from_config
 
         kv_dtype = self._resolve_kv_store_dtype()
@@ -968,85 +681,89 @@ class ParaSMemoryManager:
         num_layers = config.num_hidden_layers
         num_kv_heads = config.num_key_value_heads
 
-        layer_types = getattr(config, "layer_types", None) or (
-            ["full_attention"] * num_layers
+        from sglang.srt.paras.unified_layout import plan_unified_layout
+        from sglang.srt.paras.workspace import attention_workspace_requirements
+
+        spec = self._unified_spec
+        attention = attention_workspace_requirements(
+            self.server_args, config, tp_size, head_dim, context_len=self.context_len
         )
-        n_full = sum(1 for t in layer_types if t == "full_attention")
-        n_swa = sum(1 for t in layer_types if t == "sliding_attention")
-
-        ep_kv_heads = num_kv_heads
-        tp_kv_heads = max(1, num_kv_heads // tp_size)
-        cell_bytes = num_kv_heads * head_dim * 2 * elem_size
-
-        def _solve_tokens(kv_budget: int) -> Tuple[int, int]:
-            tt = max(1, int(kv_budget // cell_bytes))
-            if n_swa > 0:
-                swa_ratio = getattr(self.server_args, "swa_full_tokens_ratio", 0.5)
-                return plan_hybrid_kv_budget(tt, n_full, n_swa, swa_ratio)
-            return max(1, tt // num_layers), 0
-
-        # Two-pass: pass 1 estimates full_max_tokens, pass 2 subtracts the
-        # _create_kv_layout overlap_gap (one max-layer of K+V bytes) and
-        # re-solves. Single iteration converges because overlap_gap << kv_budget.
-        full_max_tokens_pass1, _ = _solve_tokens(kv_budget_bytes)
-        overlap_gap_bytes = full_max_tokens_pass1 * cell_bytes
-        kv_budget_bytes = max(0, kv_budget_bytes - overlap_gap_bytes)
-        full_max_tokens, swa_max_tokens = _solve_tokens(kv_budget_bytes)
-
-        ep_max_tokens = full_max_tokens
-        tp_max_tokens = full_max_tokens * tp_size
-        ep_max_tokens_swa = swa_max_tokens
-        tp_max_tokens_swa = swa_max_tokens * tp_size
-
+        for mode, requirement in zip((ParaSMode.EP, ParaSMode.TP), attention):
+            spec.for_mode(mode).workspaces = ModeWorkspaces(
+                spec.for_mode(mode).workspaces.moe, requirement
+            )
+        ep_row = num_kv_heads * head_dim * 2 * elem_size
+        tp_row = max(1, num_kv_heads // tp_size) * head_dim * 2 * elem_size
+        layer_types = (
+            getattr(config, "layer_types", None) or ["full_attention"] * num_layers
+        )
+        swa_ratio = self.server_args.swa_full_tokens_ratio
+        ratios = tuple(
+            swa_ratio if kind == "sliding_attention" else 1.0 for kind in layer_types
+        )
+        layout = plan_unified_layout(
+            num_layers=num_layers,
+            budget=umm_budget_bytes - non_umm_static_bytes,
+            ep_weight_bytes=spec.ep.weight_bytes,
+            tp_weight_bytes=spec.tp.weight_bytes,
+            ep_workspace_bytes=spec.ep.workspaces.size_bytes,
+            tp_workspace_bytes=spec.tp.workspaces.size_bytes,
+            ep_kv_row_bytes=ep_row,
+            tp_kv_row_bytes=tp_row,
+            page_size=self.server_args.page_size,
+            layer_token_ratios=ratios,
+        )
+        self._unified_layout = layout
+        self.ep_max_kv_tokens, self.tp_max_kv_tokens = (
+            layout.ep_cache.full_tokens,
+            layout.tp_cache.full_tokens,
+        )
+        swa_layer = next(
+            (i for i, kind in enumerate(layer_types) if kind == "sliding_attention"),
+            None,
+        )
+        self.ep_max_kv_tokens_swa = (
+            layout.ep_cache.layer_tokens[swa_layer] if swa_layer is not None else 0
+        )
+        self.tp_max_kv_tokens_swa = (
+            layout.tp_cache.layer_tokens[swa_layer] if swa_layer is not None else 0
+        )
         layer_specs = classify_layers_from_config(
             config,
             tp_size=tp_size,
-            ep_tokens_full=ep_max_tokens,
-            tp_tokens_full=tp_max_tokens,
-            ep_tokens_swa=ep_max_tokens_swa,
-            tp_tokens_swa=tp_max_tokens_swa,
+            ep_tokens_full=self.ep_max_kv_tokens,
+            tp_tokens_full=self.tp_max_kv_tokens,
+            ep_tokens_swa=self.ep_max_kv_tokens_swa,
+            tp_tokens_swa=self.tp_max_kv_tokens_swa,
         )
-
-        self.ep_max_kv_tokens = ep_max_tokens
-        self.tp_max_kv_tokens = tp_max_tokens
-        self.ep_max_kv_tokens_swa = ep_max_tokens_swa
-        self.tp_max_kv_tokens_swa = tp_max_tokens_swa
-
-        ep_cell_bytes = ep_kv_heads * head_dim * num_layers * 2 * elem_size
-        tp_cell_bytes = tp_kv_heads * head_dim * num_layers * 2 * elem_size
-
-        logger.info(
-            f"ParaS SWA KV budget: avail_now={avail_now_gib:.3f}GiB  "
-            f"total={total_gpu_bytes / (1 << 30):.3f}GiB  "
-            f"dynamic_reserve={dynamic_reserve_bytes / (1 << 30):.3f}GiB  "
-            f"umm_budget={umm_budget_bytes / (1 << 30):.3f}GiB  "
-            f"weights_only={self.weights_only_bytes / (1 << 30):.3f}GiB  "
-            f"non_umm_static={non_umm_static_bytes / (1 << 30):.3f}GiB  "
-            f"overlap_gap={overlap_gap_bytes / (1 << 30):.3f}GiB  "
-            f"kv_budget={kv_budget_bytes / (1 << 30):.3f}GiB  "
-            f"full_max_tokens={full_max_tokens}  swa_max_tokens={swa_max_tokens}  "
-            f"layers={num_layers} (full={n_full} swa={n_swa})"
-        )
-
+        logger.info("ParaS unified weights/KV/workspace: %s", layout)
+        for mode in (ParaSMode.EP, ParaSMode.TP):
+            requirements = spec.for_mode(mode).workspaces
+            logger.info(
+                "ParaS %s workspace: %s; unused padding=%d bytes",
+                mode.value,
+                requirements,
+                layout.workspace(mode)[1] - requirements.size_bytes,
+            )
         return ParaSKVCapacityPlan(
             available_gpu_memory_bytes=avail_now_bytes,
             total_gpu_memory_bytes=total_gpu_bytes,
             dynamic_reserve_bytes=dynamic_reserve_bytes,
-            umm_budget_bytes=umm_budget_bytes,
+            umm_budget_bytes=layout.budget,
             weights_only_bytes=self.weights_only_bytes,
             non_umm_static_bytes=non_umm_static_bytes,
-            kv_budget_bytes=kv_budget_bytes,
+            kv_budget_bytes=layout.ep_cache.total_bytes,
             kv_dtype=kv_dtype,
-            ep_max_tokens=ep_max_tokens,
-            tp_max_tokens=tp_max_tokens,
-            ep_cell_bytes=ep_cell_bytes,
-            tp_cell_bytes=tp_cell_bytes,
-            ep_kv_heads=ep_kv_heads,
-            tp_kv_heads=tp_kv_heads,
-            full_layers=n_full,
-            swa_layers=n_swa,
-            ep_max_tokens_swa=ep_max_tokens_swa,
-            tp_max_tokens_swa=tp_max_tokens_swa,
+            ep_max_tokens=layout.ep_cache.full_tokens,
+            tp_max_tokens=layout.tp_cache.full_tokens,
+            ep_cell_bytes=num_layers * ep_row,
+            tp_cell_bytes=num_layers * tp_row,
+            ep_kv_heads=num_kv_heads,
+            tp_kv_heads=max(1, num_kv_heads // tp_size),
+            full_layers=layer_types.count("full_attention"),
+            swa_layers=layer_types.count("sliding_attention"),
+            ep_max_tokens_swa=self.ep_max_kv_tokens_swa,
+            tp_max_tokens_swa=self.tp_max_kv_tokens_swa,
             layer_specs=layer_specs,
         )
 
@@ -1143,7 +860,7 @@ class ParaSMemoryManager:
           falls within our managed buffer. This is used to distinguish managed vs. external
           tensors during parameter wrapping.
         """
-        if self.unified_workspace_enabled:
+        if self._unified_spec is not None:
             return self._materialize_unified()
         offset = 0
         for name in self._reservation_order:
@@ -1430,7 +1147,7 @@ class ParaSMemoryManager:
     @property
     def weights_only_bytes(self) -> int:
         """Total reserved bytes NOT including KV cache entries (for KV sizing)."""
-        if self.unified_workspace_enabled:
+        if self._unified_spec is not None:
             return self._unified_spec.num_layers * self._unified_spec.ep.weight_bytes
         return sum(
             self._entries[n].size_bytes
@@ -1492,143 +1209,126 @@ def plan_qwen_moe_layout(
     dp_size: int,
     moe_tp_size: int,
     quant_name: Optional[str] = None,
-    fp8_block_size: Optional[int] = None,
     num_fused_shared_experts: int = 0,
     configure_method: str = "peer_access",
     prefix: str = "model",
-    unified_workspace: bool = False,
     top_k: int = 8,
+    with_bias: bool = False,
 ) -> None:
-    """
-    Reserve all weight tensors for a Qwen sparse-MoE model.
-
-    This is the main entry point for planning the contiguous buffer layout.
-    KV cache is reserved separately via reserve_kv_cache(). Call that before
-    materialize() to include KV buffers in the same contiguous allocation.
-    After calling this function (and optionally reserve_kv_cache), call
-    manager.materialize() to allocate the GPU buffer.
-
-    NAMING CONVENTION:
-      Tensor names follow the pattern: {prefix}.layers.{i}.mlp.experts.{ep|tp}.{w13|w2}_weight
-      This naming MUST match what consumers (e.g., model loading code) expect to look up.
-      Changing names here requires coordinating with all code that wraps these tensors as nn.Parameter.
-
-    QKV TP BUFFER:
-      The QKV_TP buffer is separate from QKV_full because TP reconfiguration requires
-      copying q/k/v slices from the full QKV weight into this buffer. This avoids
-      modifying the original full weight and enables efficient in-place operations.
-    """
+    """Reserve the shared BF16 EP/TP layout for Qwen and GPT-OSS."""
+    assert quant_name is None, "ParaS unified layout requires unquantized BF16 weights"
+    assert (
+        configure_method == "peer_access"
+    ), "ParaS unified layout requires peer_access"
+    assert moe_tp_size == dp_size == 1, "ParaS requires MoE TP=1 and ParaS DP=1"
+    assert (
+        ep_size == tp_size and tp_size > 1
+    ), "ParaS requires matching EP/TP groups > 1"
+    if manager.server_args is not None:
+        assert manager.server_args.moe_runner_backend in (
+            "auto",
+            "triton",
+            "deep_gemm",
+        ), "ParaS unified layout supports DeepGEMM/Triton EP and Triton TP"
     _validate_v1_scope(num_fused_shared_experts, quant_name)
 
-    if unified_workspace:
-        if (
-            quant_name
-            or moe_tp_size != 1
-            or dp_size != 1
-            or configure_method != "peer_access"
-        ):
-            raise ValueError(
-                "Unified attention/workspace currently requires BF16, equal EP/TP, and peer_access"
+    from sglang.srt.paras.unified_layout import align_up, bf16_moe_workspace_sizes
+    from sglang.srt.utils import get_int_env_var
+
+    if ep_size != tp_size or num_experts % ep_size or intermediate_size % tp_size:
+        raise ValueError(
+            "Unified workspace requires equal EP/TP groups and divisible experts"
+        )
+    if num_heads % tp_size or (
+        tp_size % num_kv_heads if tp_size >= num_kv_heads else num_kv_heads % tp_size
+    ):
+        raise ValueError("Attention heads do not divide the configured TP group")
+    from sglang.srt.layers.moe.utils import use_deep_gemm_bf16
+
+    ep_backend = (
+        "deep_gemm" if use_deep_gemm_bf16(ep_size, with_bias=with_bias) else "triton"
+    )
+    capacity = get_int_env_var("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128)
+    ep_workspace_bytes, tp_workspace_bytes = bf16_moe_workspace_sizes(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        tp_size=tp_size,
+        dispatch_capacity=capacity,
+    )
+    spec = UnifiedLayoutSpec(
+        num_layers=num_layers,
+        prefix=prefix,
+        ep=UnifiedModeSpec(
+            ModeWorkspaces(
+                WorkspaceRequirement(ep_backend, ep_workspace_bytes),
+                WorkspaceRequirement("unconfigured", None),
             )
-        manager.plan_unified_qwen(
-            num_layers=num_layers,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            ep_size=ep_size,
-            tp_size=tp_size,
-            top_k=top_k,
-            prefix=prefix,
+        ),
+        tp=UnifiedModeSpec(
+            ModeWorkspaces(
+                WorkspaceRequirement("triton", tp_workspace_bytes),
+                WorkspaceRequirement("unconfigured", None),
+            )
+        ),
+        tp_size=tp_size,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        hidden_size=hidden_size,
+    )
+    for mode in (ParaSMode.EP, ParaSMode.TP):
+        mode_spec = spec.for_mode(mode)
+        experts = num_experts // ep_size if mode == ParaSMode.EP else num_experts
+        inter = (
+            intermediate_size if mode == ParaSMode.EP else intermediate_size // tp_size
         )
-        return
-
-    is_fp8 = quant_name == "fp8"
-    weight_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
-    ep_local_experts = num_experts // ep_size
-    inter_per_partition = intermediate_size // moe_tp_size
-    w13_shape = (ep_local_experts, 2 * inter_per_partition, hidden_size)
-    w2_shape = (ep_local_experts, hidden_size, inter_per_partition)
-
-    for slot in range(num_layers + 1):
-        manager.reserve(f"paras.moe_slot.{slot}.w13", w13_shape, weight_dtype)
-        manager.reserve(f"paras.moe_slot.{slot}.w2", w2_shape, weight_dtype)
-
-    # w13 and w2 biases are NOT stored in the UMM.  Biases are replicated
-    # on every rank as one full-expert tensor per layer (see
-    # paras_moe_block.py: self._full_w{13,2}_bias), and the EP and TP
-    # forward paths read through Parameter views into that replicated
-    # storage.  Total replicated bias memory is <=0.1% of weight storage,
-    # far cheaper than the UMM-staged transport path it replaces.
-
-    # Create 'experts' aliases for create_weights() / weight loading compatibility.
-    # These point to the same LayoutEntry objects as slot i+1 — no copy, no duplication.
-    # materialize() processes _reservation_order, so aliases won't be double-processed.
-    for i in range(num_layers):
-        manager._entries[f"{prefix}.layers.{i}.mlp.experts.w13_weight"] = manager._entries[f"paras.moe_slot.{i+1}.w13"]
-        manager._entries[f"{prefix}.layers.{i}.mlp.experts.w2_weight"] = manager._entries[f"paras.moe_slot.{i+1}.w2"]
-
-    for i in range(num_layers):
-        lp = f"{prefix}.layers.{i}"
-
-        # FP8 weight scales: see docs/paras/paras_fp8_support.md
-        # (replicated full-buffer + EP/TP slice Parameter views, not UMM).
-
-        # -- Attention weights ---------------------------------------------
-        qkv_out = num_heads * head_dim + 2 * num_kv_heads * head_dim
-        manager.reserve(
-            f"{lp}.self_attn.qkv_proj.weight",
-            (qkv_out, hidden_size),
-            weight_dtype,
+        q = (
+            num_heads * head_dim
+            if mode == ParaSMode.EP
+            else num_heads // tp_size * head_dim
         )
-        manager.reserve(
-            f"{lp}.self_attn.o_proj.weight",
-            (hidden_size, num_heads * head_dim),
-            weight_dtype,
+        kv = (
+            num_kv_heads * head_dim
+            if mode == ParaSMode.EP
+            else max(1, num_kv_heads // tp_size) * head_dim
         )
-
-        # -- QKV / O TP buffers -------------------------------------------
-        # GQA replication: when tp_size > num_kv_heads, each rank holds 1 KV
-        # head (replicated across rank groups). Mirrors model_config.get_num_kv_heads
-        # (configs/model_config.py L497) and QKVParallelLinear.__init__ (L818-824).
-        tp_q_size = (num_heads // tp_size) * head_dim
-        tp_kv_size = max(1, num_kv_heads // tp_size) * head_dim
-        tp_attn_out = (num_heads // tp_size) * head_dim
-        manager.reserve(
-            f"{lp}.self_attn.qkv_proj.tp_weight",
-            (tp_q_size + 2 * tp_kv_size, hidden_size),
-            weight_dtype,
+        for i in range(num_layers):
+            lp = f"{prefix}.layers.{i}"
+            suffix = "weight" if mode == ParaSMode.EP else "tp_weight"
+            entries = [
+                (
+                    f"{lp}.mlp.{mode.value}_experts.w13_weight",
+                    (experts, 2 * inter, hidden_size),
+                ),
+                (
+                    f"{lp}.mlp.{mode.value}_experts.w2_weight",
+                    (experts, hidden_size, inter),
+                ),
+                (f"{lp}.self_attn.qkv_proj.{suffix}", (q + 2 * kv, hidden_size)),
+                (f"{lp}.self_attn.o_proj.{suffix}", (hidden_size, q)),
+            ]
+            names = []
+            for name, shape in entries:
+                manager.reserve(name, shape, torch.bfloat16)
+                names.append(name)
+            mode_spec.weight_names.append(names)
+            if mode == ParaSMode.EP:
+                for weight in ("w13", "w2"):
+                    manager._entries[f"{lp}.mlp.experts.{weight}_weight"] = (
+                        manager._entries[f"{lp}.mlp.ep_experts.{weight}_weight"]
+                    )
+        mode_spec.weight_bytes = sum(
+            align_up(manager._entries[n].size_bytes) for n in mode_spec.weight_names[0]
         )
-        manager.reserve(
-            f"{lp}.self_attn.o_proj.tp_weight",
-            (hidden_size, tp_attn_out),
-            weight_dtype,
-        )
-
-    if configure_method != "peer_access":
-        staging_dtype = torch.float8_e4m3fn if is_fp8 else torch.bfloat16
-        staging_experts = (num_experts // ep_size) * dp_size
-        w13_shape = (staging_experts, 2 * intermediate_size, hidden_size)
-        w2_shape = (staging_experts, hidden_size, intermediate_size)
-
-        if configure_method == "overlap":
-            suffixes = ("_1", "_2")
-        else:
-            suffixes = ("",)
-
-        for sfx in suffixes:
-            manager.reserve(f"staging.w13_pre_permute{sfx}", w13_shape, staging_dtype)
-            manager.reserve(f"staging.w2_pre_permute{sfx}", w2_shape, staging_dtype)
-            if dp_size > 1:
-                manager.reserve(f"staging.w13_gather{sfx}", w13_shape, staging_dtype)
-                manager.reserve(f"staging.w2_gather{sfx}", w2_shape, staging_dtype)
+    manager._unified_spec = spec
 
 
 # ---------------------------------------------------------------------------
 # GPT-OSS MoE layout planning
 # ---------------------------------------------------------------------------
+
 
 def plan_gpt_oss_moe_layout(
     manager: ParaSMemoryManager,
@@ -1645,34 +1345,12 @@ def plan_gpt_oss_moe_layout(
     dp_size: int,
     moe_tp_size: int,
     quant_name: Optional[str] = None,
-    fp8_block_size: Optional[int] = None,
     num_fused_shared_experts: int = 0,
     configure_method: str = "peer_access",
     prefix: str = "model",
+    top_k: int = 8,
 ) -> None:
-    """Reserve all weight tensors for a GPT-OSS sparse-MoE model.
-
-    GPT-OSS shares the Qwen3-MoE layout exactly for the tensors ParaS
-    manages: w13/w2 expert weights (N+1 slot layout for EP<->TP switch),
-    QKV/O attention projections, FP8 weight scales, and pre-permute /
-    gather staging buffers for non-peer_access transfer methods.  Both
-    models are pure sparse MoE with no shared experts and identical
-    attention projection geometry.
-
-    Tensors that differ between the two models (GPT-OSS has biases on
-    expert weights and the router; Qwen3 does not) are intentionally
-    excluded from the ParaS layout in both cases.  ParaS only manages
-    tensors that switch between EP and TP modes; biases, norms, and
-    other model-static parameters live in regular PyTorch param storage
-    allocated by FusedMoE / ReplicatedLinear / RMSNorm directly.  MXFP4
-    is a checkpoint format only -- it is decompressed at load time and
-    never appears in the ParaS buffer.
-
-    Delegates to ``plan_qwen_moe_layout``.  If GPT-OSS ever needs a
-    distinct staging layout (different intermediate_size handling,
-    MXFP4-specific buffers, expert-bias switching), specialise here
-    instead of polluting the Qwen path.
-    """
+    """GPT-OSS uses the same weight geometry, with separately owned biases."""
     plan_qwen_moe_layout(
         manager,
         num_layers=num_layers,
@@ -1687,10 +1365,11 @@ def plan_gpt_oss_moe_layout(
         dp_size=dp_size,
         moe_tp_size=moe_tp_size,
         quant_name=quant_name,
-        fp8_block_size=fp8_block_size,
         num_fused_shared_experts=num_fused_shared_experts,
         configure_method=configure_method,
         prefix=prefix,
+        top_k=top_k,
+        with_bias=True,
     )
 
 
@@ -1710,7 +1389,7 @@ def create_paras_moe_aliases(
     ep_experts layer i → slot i+1 (same physical buffer as EP weights)
     tp_experts layer i → slot i   (one slot before EP, for fused transfer)
     """
-    if manager.unified_workspace_enabled:
+    if manager._unified_spec is not None:
         return
     for i in range(num_layers):
         manager.alias(f"{prefix}.layers.{i}.mlp.ep_experts.w13_weight", f"paras.moe_slot.{i+1}.w13")

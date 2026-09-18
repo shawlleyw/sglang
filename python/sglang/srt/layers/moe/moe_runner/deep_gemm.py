@@ -239,11 +239,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             N % 2 == 0
         ), f"w13 output dimension must be even for silu_and_mul, got {N}"
 
-        gateup_output = torch.empty(
+        from sglang.srt.paras.workspace import moe_workspace_views
+
+        binding = self.config.paras_workspace
+        gateup_output, down_input = moe_workspace_views(
+            binding.buffer if binding is not None else None,
             (all_tokens, N),
-            device=hidden_states_device,
-            dtype=torch.bfloat16,
+            (all_tokens, N // 2),
+            torch.bfloat16,
+            hidden_states_device,
         )
+        if gateup_output is None:
+            gateup_output = torch.empty(
+                (all_tokens, N), device=hidden_states_device, dtype=torch.bfloat16
+            )
         deep_gemm_wrapper.grouped_gemm_nt_bf16bf16bf16_contig(
             hidden_states,
             w13_weight,
@@ -255,11 +264,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if hidden_states_scale is not None:
             dispose_tensor(hidden_states_scale)
 
-        down_input = torch.empty(
-            (all_tokens, N // 2),
-            device=hidden_states_device,
-            dtype=torch.bfloat16,
-        )
+        if down_input is None:
+            down_input = torch.empty(
+                (all_tokens, N // 2), device=hidden_states_device, dtype=torch.bfloat16
+            )
         if _is_npu or _is_hip:
             gate, up = torch.split(gateup_output, N // 2, dim=-1)
             down_input.copy_(torch.silu(gate) * up)
@@ -439,9 +447,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             n % 2 == 0
         ), f"w13 output dimension must be even for silu_and_mul, got {n}"
 
-        gateup_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+        from sglang.srt.paras.workspace import moe_workspace_views
+
+        binding = self.config.paras_workspace
+        gateup_output, down_input = moe_workspace_views(
+            binding.buffer if binding is not None else None,
+            (num_groups, m, n),
+            (num_groups, m, n // 2),
+            torch.bfloat16,
+            hidden_states_device,
         )
+        if gateup_output is None:
+            gateup_output = torch.empty(
+                (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
         deep_gemm_wrapper.grouped_gemm_nt_bf16bf16bf16_masked(
             hidden_states,
             w13_weight,
@@ -453,11 +472,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if hidden_states_scale is not None:
             dispose_tensor(hidden_states_scale)
 
-        down_input = torch.empty(
-            (num_groups, m, n // 2),
-            device=hidden_states_device,
-            dtype=torch.bfloat16,
-        )
+        if down_input is None:
+            down_input = torch.empty(
+                (num_groups, m, n // 2),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
         if _is_npu or _is_hip:
             gate, up = torch.split(gateup_output, n // 2, dim=-1)
             down_input.copy_(torch.silu(gate) * up)

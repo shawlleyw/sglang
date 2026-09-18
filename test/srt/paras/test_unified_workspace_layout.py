@@ -5,7 +5,10 @@ import random
 import pytest
 
 from sglang.srt.paras.mode import ParaSMode
-from sglang.srt.paras.unified_layout import plan_unified_layout, triton_workspace_sizes
+from sglang.srt.paras.unified_layout import (
+    plan_unified_layout,
+    bf16_moe_workspace_sizes,
+)
 
 
 def assert_safe(layout):
@@ -23,7 +26,7 @@ def assert_safe(layout):
                 (
                     "c",
                     layout.cache_offset(mode, i),
-                    getattr(layout, f"{mode.value}_cache_bytes"),
+                    getattr(layout, f"{mode.value}_cache").layer_bytes[i],
                 ),
             ):
                 assert offset % 256 == 0
@@ -60,8 +63,8 @@ def test_qwen235_asymmetric_workspaces():
     )
     assert layout.ep_front == 594 * mib
     assert layout.tp_tail == 1280 * mib
-    assert layout.ep_cache_bytes * 94 == 68784345088
-    assert layout.tp_cache_bytes * 94 == 79695925248
+    assert layout.ep_cache.total_bytes == 68784345088
+    assert layout.tp_cache.total_bytes == 79695925248
     assert_safe(layout)
 
 
@@ -83,7 +86,11 @@ def test_transfer_safety_with_rounding(page_size):
             tp_kv_row_bytes=512,
             page_size=page_size,
         )
-        assert layout.ep_tokens % page_size == layout.tp_tokens % page_size == 0
+        assert (
+            layout.ep_cache.full_tokens % page_size
+            == layout.tp_cache.full_tokens % page_size
+            == 0
+        )
         assert_safe(layout)
 
 
@@ -102,7 +109,7 @@ def test_insufficient_budget_fails_before_allocation():
 
 
 def test_qwen30_tp_workspace_exceeds_attention_saving():
-    ep_ws, tp_ws = triton_workspace_sizes(
+    ep_ws, tp_ws = bf16_moe_workspace_sizes(
         hidden_size=2048,
         intermediate_size=768,
         num_experts=128,
@@ -122,5 +129,31 @@ def test_qwen30_tp_workspace_exceeds_attention_saving():
     )
     assert layout.ep_front >= tp_ws - 48 * (27 << 20)
     assert layout.ep_front > max(ep_ws, 297 << 20)
-    assert layout.tp_cache_bytes >= layout.ep_cache_bytes
+    assert max(layout.tp_cache.layer_bytes) >= max(layout.ep_cache.layer_bytes)
+    assert_safe(layout)
+
+
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("swa_ratio", [0.5, 0.8, 1.0])
+@pytest.mark.parametrize("tp_row_bytes", [256, 512])
+def test_gpt_oss_hybrid_cache_transfer_safety(page_size, swa_ratio, tp_row_bytes):
+    layout = plan_unified_layout(
+        num_layers=36,
+        budget=130 << 30,
+        ep_weight_bytes=900 << 20,
+        tp_weight_bytes=820 << 20,
+        ep_workspace_bytes=768 << 20,
+        tp_workspace_bytes=2 << 30,
+        ep_kv_row_bytes=2048,
+        tp_kv_row_bytes=tp_row_bytes,
+        page_size=page_size,
+        layer_token_ratios=(swa_ratio, 1.0) * 18,
+    )
+    for cache in (layout.ep_cache, layout.tp_cache):
+        assert (
+            cache.layer_tokens[0]
+            == int(cache.full_tokens * swa_ratio) // page_size * page_size
+        )
+        assert cache.layer_tokens[1] == cache.full_tokens
+        assert cache.layer_bytes[0] <= cache.layer_bytes[1]
     assert_safe(layout)

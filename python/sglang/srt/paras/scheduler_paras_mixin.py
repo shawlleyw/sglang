@@ -686,7 +686,7 @@ class SchedulerParasMixin:
         # weights first, but keep EP attention/cache metadata until migration.
         model = self.tp_worker.model_runner.model
         mgr = getattr(model, "paras_memory_manager", None)
-        if mgr is not None and mgr.unified_workspace_enabled:
+        if mgr is not None:
             with TimeReporter("transfer_unified_weights"):
                 model.model.paras_transfer_unified_weights(ParaSMode.TP, self.paras_tp_rank)
 

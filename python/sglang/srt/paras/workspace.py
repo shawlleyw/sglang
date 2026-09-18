@@ -1,13 +1,16 @@
-"""Allocation-free workspace requirements for the unified memory planner.
+"""Workspace requirements and non-owning tensor views for the unified memory planner.
 
 Numerical attention and MoE scratch occupy disjoint regions. Backend planning
 metadata and outputs that escape an operator are not part of these regions.
 """
 
+import math
 from dataclasses import dataclass
 
+import torch
+
 from sglang.srt.paras.mode import ParaSMode
-from sglang.srt.paras.unified_layout import align_up
+from sglang.srt.paras.unified_layout import align_up, validate_triton_workspace_blocks
 
 
 @dataclass(frozen=True)
@@ -114,19 +117,52 @@ def attention_workspace_requirements(
         graph_tokens = max(
             server_args.cuda_graph_bs + (server_args.paras_tp_cuda_graph_bs or [])
         )
-    requests = server_args.max_running_requests
-    return tuple(
-        WorkspaceRequirement(
-            backend,
-            triton_attention_workspace_size(
-                max(
-                    graph_tokens,
-                    requests // tp_size if mode == ParaSMode.EP else requests,
-                ),
-                config.num_attention_heads // (tp_size if mode == ParaSMode.TP else 1),
-                splits,
-                head_dim,
-            ),
-        )
-        for mode in (ParaSMode.EP, ParaSMode.TP)
+    ep_tokens = max(graph_tokens, server_args.max_running_requests // tp_size)
+    tp_tokens = max(graph_tokens, server_args.max_running_requests)
+    ep_heads = config.num_attention_heads
+    tp_heads = ep_heads // tp_size
+    ep = triton_attention_workspace_size(ep_tokens, ep_heads, splits, head_dim)
+    tp = triton_attention_workspace_size(tp_tokens, tp_heads, splits, head_dim)
+    return WorkspaceRequirement(backend, ep), WorkspaceRequirement(backend, tp)
+
+
+def workspace_views(buffer, shapes, dtype, device, *, label="workspace"):
+    """Build aligned typed views within a contiguous uint8 scratch region."""
+    requested_device = torch.device(device)
+    if requested_device.type == "cuda" and requested_device.index is None:
+        requested_device = torch.device("cuda", torch.cuda.current_device())
+    if requested_device != buffer.device:
+        raise RuntimeError(f"{label} requested on a different device")
+    cursor = 0
+    result = []
+    for shape in shapes:
+        size = math.prod(shape) * dtype.itemsize
+        cursor = align_up(cursor)
+        if cursor + size > buffer.numel():
+            raise RuntimeError(f"{label} overflow: {cursor + size} > {buffer.numel()}")
+        result.append(buffer[cursor : cursor + size].view(dtype).view(shape))
+        cursor += size
+    return result
+
+
+def moe_workspace_views(
+    buffer, intermediate_shape, activation_shape, dtype, device, *, block_sizes=()
+):
+    """Return (intermediate, activation) views, or (None, None) for dynamic allocation."""
+    shapes = (intermediate_shape, activation_shape)
+    size = sum(align_up(math.prod(shape) * dtype.itemsize) for shape in shapes)
+    if buffer is None or size > buffer.numel():
+        return None, None
+    validate_triton_workspace_blocks(*block_sizes)
+    intermediate, activation = workspace_views(
+        buffer, shapes, dtype, device, label="ParaS MoE workspace"
     )
+    return intermediate, activation
+
+
+@dataclass(frozen=True)
+class MoEWorkspace:
+    """Fixed mode and scratch region belonging to one expert runner."""
+
+    mode: ParaSMode
+    buffer: torch.Tensor

@@ -1,10 +1,10 @@
 # Unified weights, KV, and backend workspace
 
-This document describes the implemented layout for unquantized Qwen3 MoE
-with equal EP/TP groups, peer-access switching, and Triton MoE. Other
-configurations retain their existing layout. Historical alternatives and
-DeepGEMM proposals are deferred; they remain available in the
-[previous revision](https://github.com/shawlleyw/sglang/blob/b7d8f3d5cb604815e1393602a2b3dc9f396ae24b/docs/paras/memory_reuse_design.md#proposed-unified-layout-after-the-backend-audit).
+This document describes the mandatory layout for BF16 Qwen3 MoE and GPT-OSS
+with equal EP/TP groups (>1), MoE TP=1, ParaS DP=1, and peer-access switching.
+Initialization rejects quantized weights and non-BF16 dtype. Qwen EP uses
+DeepGEMM where its existing DeepEP path selects it; TP uses Triton. GPT-OSS
+uses Triton in both modes to preserve its biases and activation.
 
 ## Layout and capacity
 
@@ -17,7 +17,7 @@ TP: [TP weights][TP KV][MoE scratch][attention scratch][padding]
 
 W_mode = align_up(MoE_bytes, 256) + align_up(attention_bytes, 256)
 EP_front >= max(one_TP_weight_layer, W_EP)
-TP_tail   = align_up(max(one_EP_KV_layer, W_TP), 256)
+TP_tail   = align_up(max(largest_EP_KV_layer, W_TP), 256)
 padding   = endpoint_capacity - W_mode
 ```
 
@@ -31,6 +31,9 @@ expand the endpoint before KV capacity is calculated.
 When TP workspace exceeds the weight savings, this can enlarge the EP
 front. The planner finds the smallest aligned front satisfying this
 constraint and recomputes the TP gap from the resulting EP KV capacity.
+GPT-OSS full-attention and sliding-window layers have separate page-aligned
+capacities using the existing `swa_full_tokens_ratio`. Cache offsets use
+per-layer byte counts, preserving the same forward/reverse transfer order.
 
 Weights include expert w13/w2 and attention QKV/O. TP retains no full DP
 attention backup. Per-mode views and offsets are fixed before graph capture.
@@ -41,7 +44,7 @@ be subtracted from the amount available to the UMM.
 
 ## Backend requirements
 
-`workspace.py` declares numerical scratch requirements before backend
+`workspace.py` contains the named MoE scratch pair and declares numerical scratch requirements before backend
 construction. Each requirement records the backend and a byte count;
 `None` means externally allocated, not zero scratch. The manager validates
 backend identity, alignment, and each subregion's capacity when returning
@@ -49,7 +52,7 @@ views. Neither operator can consume the other's region or unused padding.
 
 | Backend | Managed numerical scratch | Sizing |
 | --- | --- | --- |
-| Triton MoE, EP | Gate/up and activation intermediates | Reserved capacity for 65,536 dispatched expert rows, or the larger padded masked-decode receive bound |
+| BF16 DeepGEMM / Triton MoE, EP | Gate/up and activation intermediates | Reserved capacity for 65,536 dispatched expert rows, or the larger padded masked-decode receive bound |
 | Triton MoE, TP | Gate/up and down share storage; activation is separate | Up to 65,536 input tokens per chunk, routed top-k rows, and conservative block padding |
 | FlashInfer attention | Partial outputs and normalization statistics | Configured capacity: normally 384 MiB for Qwen3 MoE; 2 GiB in deterministic mode |
 | Triton attention | FP32 partial outputs and LSE | Separately aligned tensors with payload `tokens * local_query_heads * KV_splits * (head_dim + 1) * 4` bytes |
@@ -76,7 +79,7 @@ plans, pinned CPU staging, KV indices, and other attention metadata remain
 external. FlashAttention has no caller-owned scratch binding here and
 remains external, as do composite backends, speculative workers, PDMux,
 and two-batch overlap. Triton attention without an explicit maximum
-running-request count also remains external. DeepGEMM is not integrated.
+running-request count also remains external.
 
 DeepEP communication buffers, dispatch/permutation metadata, inputs, and
 outputs that outlive an operator remain external. Overlapping compute

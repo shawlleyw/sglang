@@ -4,6 +4,7 @@ This module deliberately has no torch/CUDA imports so the transfer geometry
 can be exhaustively checked before allocating GPU memory.
 """
 
+import math
 from dataclasses import dataclass
 
 from sglang.srt.paras.mode import ParaSMode
@@ -14,6 +15,17 @@ def align_up(n: int, alignment: int = 256) -> int:
 
 
 @dataclass(frozen=True)
+class CacheCapacity:
+    full_tokens: int
+    layer_tokens: tuple[int, ...]
+    layer_bytes: tuple[int, ...]
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(self.layer_bytes)
+
+
+@dataclass(frozen=True)
 class UnifiedLayout:
     num_layers: int
     budget: int
@@ -21,10 +33,8 @@ class UnifiedLayout:
     tp_weight_bytes: int
     ep_front: int
     tp_tail: int
-    ep_cache_bytes: int
-    tp_cache_bytes: int
-    ep_tokens: int
-    tp_tokens: int
+    ep_cache: CacheCapacity
+    tp_cache: CacheCapacity
 
     def weight_offset(self, mode: ParaSMode, layer: int) -> int:
         if mode == ParaSMode.EP:
@@ -35,9 +45,11 @@ class UnifiedLayout:
 
     def cache_offset(self, mode: ParaSMode, layer: int) -> int:
         if mode == ParaSMode.EP:
-            return self.budget - (self.num_layers - layer) * self.ep_cache_bytes
+            return self.budget - sum(self.ep_cache.layer_bytes[layer:])
         if mode == ParaSMode.TP:
-            return self.num_layers * self.tp_weight_bytes + layer * self.tp_cache_bytes
+            return self.num_layers * self.tp_weight_bytes + sum(
+                self.tp_cache.layer_bytes[:layer]
+            )
         raise ValueError(mode)
 
     def workspace(self, mode: ParaSMode) -> tuple[int, int]:
@@ -59,6 +71,7 @@ def plan_unified_layout(
     ep_kv_row_bytes: int,
     tp_kv_row_bytes: int,
     page_size: int = 1,
+    layer_token_ratios: tuple[float, ...] | None = None,
 ) -> UnifiedLayout:
     if min(num_layers, ep_kv_row_bytes, tp_kv_row_bytes, page_size) <= 0:
         raise ValueError("Layer count, KV row sizes, and page size must be positive")
@@ -70,26 +83,43 @@ def plan_unified_layout(
         max(wt, ep_workspace_bytes, tp_workspace_bytes - num_layers * (we - wt))
     )
 
+    ratios = layer_token_ratios or (1.0,) * num_layers
+    assert len(ratios) == num_layers and min(ratios) > 0
+
+    def capacity_for_tokens(full_tokens, row_bytes):
+        tokens = tuple(
+            int(full_tokens * ratio) // page_size * page_size for ratio in ratios
+        )
+        sizes = tuple(2 * align_up((n + page_size) * row_bytes // 2) for n in tokens)
+        return CacheCapacity(full_tokens, tokens, sizes)
+
+    minimum_tokens = math.ceil(page_size / min(ratios) / page_size) * page_size
+
     def cache_capacity(available, row_bytes):
-        tokens = available // num_layers // row_bytes - page_size
-        tokens = tokens // page_size * page_size
-        if tokens < page_size:
+        # Preserve the configured full/SWA ratio, rounding each pool to pages.
+        lo = minimum_tokens // page_size
+        hi = max(lo, int(available / row_bytes / sum(ratios)) // page_size)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if capacity_for_tokens(mid * page_size, row_bytes).total_bytes <= available:
+                lo = mid
+            else:
+                hi = mid - 1
+        capacity = capacity_for_tokens(lo * page_size, row_bytes)
+        if capacity.total_bytes > available:
             raise ValueError(
                 "Unified memory budget cannot hold weights, workspace, and KV"
             )
-        # K and V are individually aligned by all supported head dimensions.
-        size = (tokens + page_size) * row_bytes
-        if (size // 2) % 256:
-            raise ValueError("K/V layer buffers must be individually 256-byte aligned")
-        return tokens, size
+        return capacity
 
     def capacities(front):
-        ep_tokens, ce = cache_capacity(
-            budget - front - num_layers * we, ep_kv_row_bytes
-        )
-        tail = align_up(max(ce, tp_workspace_bytes))
-        tp_tokens, ct = cache_capacity(budget - tail - num_layers * wt, tp_kv_row_bytes)
-        return ep_tokens, ce, tail, tp_tokens, ct
+        ep = cache_capacity(budget - front - num_layers * we, ep_kv_row_bytes)
+        tail = align_up(max(max(ep.layer_bytes), tp_workspace_bytes))
+        tp = cache_capacity(budget - tail - num_layers * wt, tp_kv_row_bytes)
+        return ep, tail, tp
+
+    def migration_fits(ep, tp):
+        return all(t >= e for e, t in zip(ep.layer_bytes, tp.layer_bytes))
 
     # Ordered cache migration requires ct >= ce. A large TP workspace can
     # consume more than the weight saving; reserve the difference at EP's
@@ -97,24 +127,24 @@ def plan_unified_layout(
     # Find the smallest aligned front satisfying both constraints.
     lo = front // 256
     hi = (
-        budget - num_layers * we - num_layers * 2 * page_size * ep_kv_row_bytes
+        budget
+        - num_layers * we
+        - capacity_for_tokens(minimum_tokens, ep_kv_row_bytes).total_bytes
     ) // 256
     if hi < lo:
         raise ValueError("Unified memory budget cannot hold weights, workspace, and KV")
     while lo < hi:
         mid = (lo + hi) // 2
-        _, ce, _, _, ct = capacities(mid * 256)
-        if ct >= ce:
+        ep, _, tp = capacities(mid * 256)
+        if migration_fits(ep, tp):
             hi = mid
         else:
             lo = mid + 1
     front = lo * 256
-    ep_tokens, ce, tail, tp_tokens, ct = capacities(front)
-    if ct < ce:
+    ep, tail, tp = capacities(front)
+    if not migration_fits(ep, tp):
         raise ValueError("Unified memory budget cannot support ordered cache migration")
-    return UnifiedLayout(
-        num_layers, budget, we, wt, front, tail, ce, ct, ep_tokens, tp_tokens
-    )
+    return UnifiedLayout(num_layers, budget, we, wt, front, tail, ep, tp)
 
 
 # Existing Triton execution limit, shared by workspace planning and runners.
@@ -134,7 +164,7 @@ def validate_triton_workspace_blocks(*block_sizes):
             )
 
 
-def triton_workspace_sizes(
+def bf16_moe_workspace_sizes(
     *,
     hidden_size: int,
     intermediate_size: int,

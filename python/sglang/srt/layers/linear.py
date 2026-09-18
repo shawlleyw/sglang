@@ -1288,7 +1288,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         set_weight_attrs(self._paras_tp_weight, {"input_dim": 1, "output_dim": 0})
         # In the overlapping layout TP addresses may contain another layer's
         # live EP weights. Populate only during the ordered weight transfer.
-        if mgr is None or not mgr.unified_workspace_enabled:
+        if mgr is None:
             self._paras_tp_weight.data[:q_rows].copy_(
                 full_weight_tensor[tp_head_start * hs : tp_head_end * hs]
             )
@@ -1606,7 +1606,7 @@ class RowParallelLinear(LinearBase):
                 requires_grad=False,
             )
         set_weight_attrs(self._paras_tp_weight, {"input_dim": 1, "output_dim": 0})
-        if mgr is None or not mgr.unified_workspace_enabled:
+        if mgr is None:
             self._paras_tp_weight.data.copy_(full_weight_tensor[:, row_start:row_end])
 
         scale_attr_name = None

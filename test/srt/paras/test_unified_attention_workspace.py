@@ -132,8 +132,8 @@ def test_combined_workspace_on_either_side_of_transfer_gap(attention_mib):
     )
     assert layout.ep_front == max(594 * mib, ep.size_bytes)
     # Recompute the TP gap from the resulting EP KV capacity.
-    assert layout.tp_tail == max(layout.ep_cache_bytes, tp.size_bytes)
-    assert layout.tp_cache_bytes >= layout.ep_cache_bytes
+    assert layout.tp_tail == max(max(layout.ep_cache.layer_bytes), tp.size_bytes)
+    assert max(layout.tp_cache.layer_bytes) >= max(layout.ep_cache.layer_bytes)
 
 
 def test_suballocation_alignment_and_validation():

@@ -9,6 +9,7 @@ from sglang.srt.paras.mode import ParaSMode
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("gpt_oss", [False, True])
 @pytest.mark.parametrize(
     "mode,inplace,reserved_rows",
     [
@@ -19,7 +20,7 @@ from sglang.srt.paras.mode import ParaSMode
     ],
 )
 def test_managed_triton_matches_original_allocations(
-    monkeypatch, mode, inplace, reserved_rows
+    monkeypatch, mode, inplace, reserved_rows, gpt_oss
 ):
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
         fused_experts,
@@ -52,7 +53,12 @@ def test_managed_triton_matches_original_allocations(
     ids = torch.randint(e, (m, k), device="cuda", dtype=torch.int64)
     weights = torch.rand((m, k), device="cuda")
     monkeypatch.setattr(memory, "_global_paras_memory_manager", None)
-    runner_config = MoeRunnerConfig(no_combine=mode == ParaSMode.EP, inplace=inplace)
+    runner_config = MoeRunnerConfig(
+        no_combine=mode == ParaSMode.EP,
+        inplace=inplace,
+        gemm1_alpha=1.702 if gpt_oss else None,
+        gemm1_clamp_limit=7.0 if gpt_oss else None,
+    )
     if mode == ParaSMode.EP:
         config = dict(
             BLOCK_SIZE_M=16,

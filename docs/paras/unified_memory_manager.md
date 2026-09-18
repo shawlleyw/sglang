@@ -2,10 +2,11 @@
 
 ## Asymmetric attention and workspace layout
 
-Unquantized Qwen3 MoE with equal EP/TP groups, `peer_access`, and Triton MoE
-now uses the asymmetric layout described in
+BF16 Qwen3 MoE and GPT-OSS use the asymmetric layout described in
 [Attention layout switching and MoE workspace reuse](memory_reuse_design.md).
-The remaining sections describe the legacy layout retained by other configurations.
+The unified layout is mandatory: initialization rejects quantized weights,
+non-BF16 dtype, non-peer-access transfer, and unsupported EP/TP topology.
+The remaining sections document the historical layout, not a runtime fallback.
 
 ```
 EP: [MoE scratch][attention scratch][padding][EP weights][EP KV]
@@ -14,7 +15,7 @@ TP: [TP weights][TP KV][MoE scratch][attention scratch][padding]
 
 Weights include experts and QKV/O attention projections. Attention switches
 live; TP mode retains no full DP attention backup. Each endpoint holds
-mode-specific Triton intermediates, with larger TP token batches accounted
+mode-specific MoE intermediates, with larger TP token batches accounted
 for before KV capacity is chosen. One endpoint is shared across all layers.
 The endpoint capacity is sized from the **sum** of separately aligned MoE
 and attention requirements, bounded below by the transfer gap. Attention

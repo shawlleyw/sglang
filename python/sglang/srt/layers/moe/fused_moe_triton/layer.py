@@ -217,18 +217,13 @@ class FusedMoE(torch.nn.Module):
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix)
         if self.quant_method is None:
-            from sglang.srt.layers import deep_gemm_wrapper
+            from sglang.srt.layers.moe.utils import use_deep_gemm_bf16
 
-            # moe_ep_deepgemm_preprocess (standard->deep_gemm) hardcodes fp8 activation
-            # quantization, so DeepGEMM EP only works on the DeepEP dispatch path. For
-            # unquantized BF16 + AllReduce-EP (standard dispatch, e.g. --tp N --ep-size N)
-            # it feeds fp8 activations into the bf16 masked GEMM and trips the
-            # gemm.hpp:506 a.scalar_type()==kBFloat16 assertion. Gate DeepGEMM to the
-            # DeepEP path; all other configs fall back to the Triton MoE runner.
-            use_deep_gemm = (
-                self.moe_ep_size > 1
-                and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and get_moe_a2a_backend().is_deepep()
+            use_deep_gemm = use_deep_gemm_bf16(
+                self.moe_ep_size,
+                with_bias=with_bias,
+                activation=activation,
+                gemm1_alpha=gemm1_alpha,
             )
             self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels, use_deep_gemm=use_deep_gemm)
 
@@ -250,7 +245,7 @@ class FusedMoE(torch.nn.Module):
             top_k=top_k,
             with_bias=with_bias,
         )
-        
+
         # A hack for using deepep with triton kernels: the token combination should be skipped in moe runner.
         # Skip when paras_force_standard_dispatcher is set — the StandardDispatcher handles combining.
         if get_moe_a2a_backend().is_deepep() and not paras_force_standard_dispatcher:
@@ -989,7 +984,7 @@ class FusedMoE(torch.nn.Module):
             for expert_id in range(num_experts)
             for shard_id in ["w1", "w2", "w3"]
         ]
-        
+
     def paras_drop_params(self, params_name):
         assert params_name in [
             "w13_weight",
@@ -997,7 +992,7 @@ class FusedMoE(torch.nn.Module):
         ], f"Unsupported parameter name: {params_name}"
         if params_name in self._parameters:
             del self._parameters[params_name]
-    
+
     def paras_load_params(self, params_data, params_name):
         if params_name == "w13_weight":
             w13_weight = torch.nn.Parameter(

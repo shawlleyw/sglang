@@ -53,7 +53,6 @@ from sglang.srt.paras.layers.paras_decoder_layer import ParaSDecoderLayerMixin
 from sglang.srt.paras.layers.paras_moe_block import ParaSMoeBlockMixin
 from sglang.srt.paras.layers.paras_model import ParaSModelMixin
 from sglang.srt.paras.paras_memory_manager import (
-    create_paras_moe_aliases,
     get_global_paras_memory_manager,
     plan_gpt_oss_moe_layout,
 )
@@ -286,17 +285,12 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
             "created it before get_model() under enable_paras_moe."
         )
 
-        quant_name = None
-        fp8_block_size = None
-        if quant_config is not None:
-            qn = quant_config.get_name()
-            if qn == "fp8":
-                quant_name = "fp8"
-                if (
-                    hasattr(quant_config, "weight_block_size")
-                    and quant_config.weight_block_size
-                ):
-                    fp8_block_size = quant_config.weight_block_size[0]
+        assert (
+            quant_config is None
+        ), "ParaS unified layout requires unquantized BF16 weights"
+        assert (
+            torch.get_default_dtype() == torch.bfloat16
+        ), "ParaS unified layout requires BF16 dtype"
 
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
@@ -320,14 +314,13 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
             tp_size=get_paras_tp_size(),
             dp_size=dp_size,
             moe_tp_size=moe_tp_size,
-            quant_name=quant_name,
-            fp8_block_size=fp8_block_size,
             num_fused_shared_experts=getattr(config, "num_fused_shared_experts", 0),
             configure_method=configure_method,
             prefix="model",
+            top_k=config.num_experts_per_tok,
         )
 
-        plan = manager.plan_hybrid_swa_kv_capacity(
+        plan = manager.plan_kv_capacity(
             config=config,
             tp_size=get_paras_tp_size(),
             head_dim=head_dim,
@@ -347,7 +340,6 @@ class GptOssForCausalLMParaS(GptOssForCausalLM):
         )
 
         manager.materialize()
-        create_paras_moe_aliases(manager, config.num_hidden_layers, prefix="model")
         logger.info("ParaSMemoryManager materialized: %s", manager)
         self.paras_memory_manager = manager
         self.paras_layer_specs = plan.layer_specs

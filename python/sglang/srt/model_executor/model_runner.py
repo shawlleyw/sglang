@@ -793,7 +793,7 @@ class ModelRunner:
         # so that create_weights() inside the model class can pull tensor views
         # from the manager via the global accessor. The manager owns its own
         # device/gpu_id/server_args/cpu_group state, which is the input that
-        # plan_mha_kv_capacity / plan_hybrid_swa_kv_capacity will later read.
+        # plan_kv_capacity will later read.
         if self.server_args.enable_paras_moe:
             paras_world = get_world_group()
             paras_manager = ParaSMemoryManager(

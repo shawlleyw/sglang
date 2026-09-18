@@ -20,7 +20,7 @@ if TYPE_CHECKING:
         DispatchOutput,
         DispatchOutputFormat,
     )
-    from sglang.srt.paras.workspace_buffer import MoEWorkspace
+    from sglang.srt.paras.workspace import MoEWorkspace
 
 
 @dataclass
