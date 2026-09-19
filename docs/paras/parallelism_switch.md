@@ -5,7 +5,7 @@
 Mixture-of-Experts (MoE) models can be served with two parallelism strategies:
 
 - **Expert Parallelism (EP)**: Each GPU owns a subset of experts. Tokens are routed across GPUs via all-to-all dispatch. Each GPU runs attention on its local batch only (DP attention).
-- **Tensor Parallelism (TP)**: Each GPU owns a shard of every expert (and every attention head). All GPUs process all tokens together, synchronized by AllReduce.
+- **Tensor Parallelism (TP)**: Each GPU owns a shard of every expert and a subset of attention heads (KV heads may be replicated). All GPUs process all tokens together, synchronized by AllReduce.
 
 Neither strategy is universally better. Their relative performance depends on batch size:
 
@@ -26,7 +26,7 @@ Reference measurements (Qwen3-30B-A3B, 8×A100, CUDA graphs):
 
 ParaS enables the system to switch between EP and TP **at runtime** — without restarting the server, reloading weights, or dropping requests.
 
-Current ParaS model support covers both Qwen3-MoE (MHA-only) and GPT-OSS (hybrid full + sliding-window attention). Each model has a dedicated ParaS subclass registered in the ParaS model registry.
+Current ParaS model support covers unquantized BF16 Qwen3-MoE (MHA-only) and GPT-OSS (hybrid full + sliding-window attention). Each model has a dedicated ParaS subclass registered in the ParaS model registry.
 
 | Scenario | Direction | Why |
 |----------|-----------|-----|
@@ -41,8 +41,8 @@ Both directions transform the model's runtime state between EP and TP layouts:
 | Component | EP Layout | TP Layout |
 |-----------|-----------|-----------|
 | MoE weights | `num_experts/ep_size` complete experts per GPU | ALL experts, sharded along intermediate dimension |
-| KV cache | All `num_kv_heads` heads, local tokens only | `num_kv_heads/tp_size` heads, ALL tokens |
-| Attention | Full QKV projection (DP attention) | Sharded QKV projection (TP attention) |
+| KV cache | All `num_kv_heads` heads, local tokens only | `max(1, num_kv_heads/tp_size)` heads, ALL tokens |
+| Attention | Full QKV/O projections (DP attention) | Sharded QKV/O projections (TP attention) |
 | Requests | Each GPU owns a disjoint subset | All GPUs share the identical set |
 
 ### Asymmetry Between Directions
@@ -51,32 +51,30 @@ Both directions transform the model's runtime state between EP and TP layouts:
 |--------|----------------|-----------------|
 | Requests | Gather local subsets into global set (simple concat) | **Partition** global set into disjoint subsets (load-balancing problem) |
 | KV cache | Head-split: all heads → subset heads | **Head-gather**: subset heads → all heads |
-| MoE weights | all-to-all redistribution | **Reverse all-to-all** (EP weights destroyed during EP→TP; see N+1 Slot section) |
+| MoE weights | all-to-all redistribution | **Reverse all-to-all** (EP weights destroyed during EP→TP; see the unified layout below) |
 | Layer order | Forward (0, 1, ..., N-1) | **Reverse** (N-1, ..., 0) |
 
 ## The Unified Memory Manager
 
-The foundation of fast switching. Allocates ALL persistent GPU memory — expert weights, attention weights, KV cache — in a single contiguous buffer at model init time.
+The [unified memory manager](unified_memory_manager.md) plans expert weights,
+attention QKV/O weights, KV storage, and managed backend scratch in one
+allocation. EP and TP have fixed, overlapping views with different weight
+and KV sizes. Embeddings, auxiliary weights, communication buffers, and
+graph allocations remain external.
 
-**Key insight**: EP and TP layouts use the **same total bytes** per layer. An expert with shape `(E_local, 2I, H)` in EP becomes `(E_total, 2I/tp, H)` in TP — same bytes, different interpretation. The switch overwrites the same physical memory with the new layout, avoiding any allocation or deallocation.
+The canonical memory reference defines the
+[layout and endpoint sizing](unified_memory_manager.md#capacity-calculation).
+The required migration sequence is:
 
-### N+1 Slot Design
-
-Prevents read/write races during transfer. For N model layers, N+1 slots are allocated:
-
+```text
+EP -> TP: complete weight bundles, layers 0..N-1; then KV, layers 0..N-1
+TP -> EP: KV, layers N-1..0; then complete weight bundles, layers N-1..0
 ```
-Slots:  [ 0 | 1 | 2 | ... | N ]
-TP:       0   1   2         N-1      ← layer i TP in slot[i]
-EP:           0   1         N-2  N-1 ← layer i EP in slot[i+1]
-```
 
-**EP→TP** reads from slot[i+1] (EP), writes to slot[i] (TP). Forward order is safe.
-
-**TP→EP** reads from slot[i] (TP), writes to slot[i+1] (EP). **Reverse order is required** because slot[i+1] = layer (i+1)'s TP source.
-
-**Critical implication**: EP→TP **destroys EP weight data** in slots 1..N-1 (each becomes the next layer's TP target). TP→EP cannot use a pointer swap — it must perform an actual reverse weight transfer to reconstruct EP data.
-
-See: `unified_memory_manager.md`
+Each bundle includes experts and attention, with a cross-rank fence after
+each layer. Backend reconfiguration binds views without initializing target
+scratch until migration finishes. Inactive-mode data is overwritten, so
+returning to EP requires reconstruction, not just a pointer swap.
 
 ## NVLink Peer Access Transfers
 
@@ -87,13 +85,13 @@ Custom CUDA kernels write directly to peer GPU memory via NVLink, avoiding NCCL'
 **Weight transfer** (`peer_access_fused_transfer_w13_v2`, `peer_access_fused_transfer_w2_v2`):
 - Reads EP weights from local buffer, writes TP weight slices to each peer's TP slot via NVLink
 - Fused kernel — one launch per layer handles all peers
-- 1.57× faster than NCCL sequential
+- Historical expert-transfer benchmarks measured 1.57× versus NCCL sequential
 
 **KV cache transfer** (`peer_access_kv_transfer`):
 - Reads EP KV cache from scattered token positions, writes to each peer's TP KV slot
 - Fused K+V in a single kernel
 - Handles head replication via `ep_head = peer * num_kv_heads / tp_size`
-- 2.74× faster than NCCL at scale
+- Historical cache-transfer benchmarks measured 2.74× versus NCCL at scale
 
 ### TP→EP Direction
 
@@ -123,17 +121,19 @@ Cross-process NVLink stores require mapping peer GPU memory into the local addre
 
 See: `exploration_notes_kv_cache_peer_access.md` §2
 
-## NCCL Fallback Path
+## NCCL KV Transport
+
+Weight switching requires peer access; the old `naive` / `overlap` model
+paths are no longer supported by the unified planner. KV transport is
+independent: `PARAS_KV_TRANSFER_METHOD=nccl` still selects NCCL helpers,
+with temporary allocations outside the unified buffer. The launch scripts
+select `peer_access` for both weight and KV transfer.
 
 ### EP→TP
-
-**Weight transfer**: `all_to_all_single` with optional pipelining (overlap method).
 
 **KV cache transfer**: `gather_kv_and_permute` → `repeat_interleave` (for head replication) → `all_to_all_single` → `permute_and_scatter_kv`.
 
 ### TP→EP
-
-**Weight transfer**: Reverse all-to-all (inverse permute + `all_to_all_single`), layers in reverse order.
 
 **KV cache scatter**: A single unified code path handles both R=1 and R>1. With head replication, each subgroup member sends a disjoint 1/R token slice. On the receive side, contiguous subgroup chunks naturally concatenate via reshape — the only conditional is:
 ```python
@@ -201,7 +201,7 @@ Three invariants together ensure correctness when user requests, control message
 
 ### Forward-Pass Boundary
 
-`recv_requests` and `process_input_requests` run at the top of `event_loop_normal`, before `run_batch`. `ParaSConfigureReqInput` arriving at the ZMQ socket during a forward pass sits in the kernel buffer until the next iteration; it cannot interrupt an in-flight forward. After the switch returns, `self.last_batch = None` invalidates the pre-switch batch reference (its `req_pool_idx` points into the destroyed pool layout) so `get_next_batch_to_run` starts the new mode with a clean slate.
+`recv_requests` and `process_input_requests` run before the next batch is launched. When overlap scheduling is active, the configure handler drains the previous batch pipeline before migration. `ParaSConfigureReqInput` arriving at the ZMQ socket during a forward pass sits in the kernel buffer until the next iteration; it cannot interrupt an in-flight forward. After the switch returns, `self.last_batch = None` invalidates the pre-switch batch reference (its `req_pool_idx` points into the destroyed pool layout) so `get_next_batch_to_run` starts the new mode with a clean slate.
 
 ### Signal Path and Latency
 
@@ -232,13 +232,18 @@ Unlimited round-trips are supported without explicit state caching:
 
 | Component | Why it works |
 |-----------|-------------|
-| **Weight aliases** | `ep_experts` → slot[i+1] and `tp_experts` → slot[i] are permanent. Each direction reconstructs its target slots from the source. |
-| **KV aliases** | Same principle: `kv.ep` → slot[i+1], `kv.tp` → slot[i]. |
+| **Weight aliases** | Per-mode expert views keep fixed planned offsets. Each direction reconstructs the target from the active source. |
+| **KV aliases** | `kv.ep` and `kv.tp` have separate planned shapes/offsets in the same allocation; migration populates the target. |
 | **Communication groups** | Created at init (PARAS_TP, PARAS_DP, PARAS_EP), never destroyed. |
 | **Dual LayerCommunicator** | EP and TP communicator objects co-exist. The switch swaps which one is active. |
-| **QKV weights** | Full (EP) and sharded (TP) weight views are permanent. |
+| **QKV weights** | Full EP and sharded TP views have stable addresses; transfers reconstruct their contents, including O projections. |
 
-## Verified Performance (Qwen3-30B-A3B, 4×A100)
+## Historical Performance (Qwen3-30B-A3B, 4×A100)
+
+The measurements and test counts below predate the combined workspace
+layout. They document earlier validation, not current buffer overhead or
+an up-to-date test inventory. Current layout tests are linked from the
+[memory reference](unified_memory_manager.md#validation-references).
 
 ### Switch Timings
 
@@ -279,7 +284,7 @@ Unlimited round-trips are supported without explicit state caching:
 
 | Document | Contents |
 |----------|----------|
-| `unified_memory_manager.md` | Contiguous buffer allocation, N+1 slot design, alias system, KV cache integration |
+| `unified_memory_manager.md` | Current asymmetric weights/KV/workspace layout, capacity, ownership, and migration safety |
 | `nvlink_peer_access_weight_transfer.md` | w13/w2 CUDA kernels (EP→TP + TP→EP reverse), data flow, performance comparison |
 | `nvlink_peer_access_kv_cache_transfer.md` | Fused K+V kernel (EP→TP + TP→EP scatter), head replication, NCCL fallback |
 | `nvlink_peer_access_guielines.md` | NVLink store optimization guidelines (grid config, vectorization, alignment) |
@@ -287,21 +292,27 @@ Unlimited round-trips are supported without explicit state caching:
 
 ## Unsupported Features (hard constraints)
 
-ParaS migration interacts with several scheduler subsystems in ways that are not currently safe. The following features must be **disabled** when `--enable-paras-moe` is set; the relevant assertions live in [`server_args._check_paras_config`](file:///home/shaoyuw/sglang/python/sglang/srt/server_args.py) and [`scheduler_paras_mixin`](file:///home/shaoyuw/sglang/python/sglang/srt/paras/scheduler_paras_mixin.py).
+ParaS migration interacts with several scheduler subsystems in ways that are not currently safe. The following features must be **disabled** when `--enable-paras-moe` is set; the relevant assertions live in [`server_args._check_paras_config`](../../python/sglang/srt/server_args.py) and [`scheduler_paras_mixin`](../../python/sglang/srt/paras/scheduler_paras_mixin.py).
 
 | Feature | Required flag | Why |
 |---|---|---|
 | Radix cache | `--disable-radix-cache` | ParaS uses `ChunkCache` / `SWAChunkCache`. The radix cache's tree state (lock_refs, tombstones, LRU lists) would not survive `tree.reset()` at switch boundaries, and prefix sharing is not a project priority for ParaS. |
 | Chunked prefill | `--chunked-prefill-size -1` | ParaS migration cannot preserve mid-chunked-prefill state: `chunked_req` is not part of the gather/scatter request set, and per-token `kv_indices` in `req.prefix_indices` reference the pre-resize slot layout that paras_resize_and_clear destroys. |
-| Overlap scheduler | `--disable-overlap-schedule` | The overlap scheduler runs the next forward pass while the previous result is still being processed. Switching mode mid-overlap would require migrating an in-flight forward's intermediate state, which is not modeled by the gather/scatter contract. Asserted at runtime in `SchedulerParasMixin.paras_configure_*`. |
+
+The overlap scheduler is supported on this branch. Both switch entry points
+call `_paras_drain_overlap_pipeline()` and synchronize before modifying
+weights or KV. This drains queued results, merges unfinished requests,
+filters completed ones, and releases stale batch references. This is
+separate from the two-batch-overlap attention workspace exclusion.
 
 In addition, ParaS asserts these positive requirements at startup:
 
 - `--enable-dp-attention` and `--enable-dp-lm-head` (DP attention is the EP-mode shape).
 - `0 < --paras-tp-size <= 8`.
 - `--tp-size == --dp-size` (i.e., `attn_tp_size == 1`).
+- Matching EP/ParaS-TP groups greater than one, MoE TP=1, ParaS DP=1, and peer-access weight transfer (validated during weight planning).
 
-Both launch scripts under [`scripts/paras/eval/`](file:///home/shaoyuw/sglang/scripts/paras/eval/) bake all of the above into `PARAS_FLAGS` automatically when `ENABLE_PARAS=1`.
+The DP/EP launch scripts under [`scripts/paras/eval/`](../../scripts/paras/eval/) supply the ParaS flags and peer-access defaults when `ENABLE_PARAS=1`; model and topology validation still applies.
 
 ## Limitations and Future Work
 
@@ -309,6 +320,6 @@ Both launch scripts under [`scripts/paras/eval/`](file:///home/shaoyuw/sglang/sc
 
 2. **`dp_size > 1`**: Currently only `paras_dp_size == 1` is supported.
 
-3. **FP8 support**: Kernels and memory manager support FP8 weights but FP8 KV cache is not yet wired through.
+3. **Quantized weights**: The unified runtime requires unquantized BF16 weights. FP8 KV storage is a separate planner setting; hybrid SWA with FP8 KV is unsupported.
 
 4. **Cross-request prefix sharing**: not available for ParaS (we run with `--disable-radix-cache`). Re-enabling would require porting tombstone-aware insert from PR #17220 to the ParaS path. Not on the roadmap.

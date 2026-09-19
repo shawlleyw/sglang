@@ -1,434 +1,346 @@
-# ParaS Unified Memory Manager
+# ParaS unified memory manager
 
-## Asymmetric attention and workspace layout
+This is the current reference for ParaS buffer ownership, layout, workspace
+sizing, and migration safety. The implementation is in
+[`paras_memory_manager.py`](../../python/sglang/srt/paras/paras_memory_manager.py),
+[`unified_layout.py`](../../python/sglang/srt/paras/unified_layout.py), and
+[`workspace.py`](../../python/sglang/srt/paras/workspace.py).
 
-BF16 Qwen3 MoE and GPT-OSS use the asymmetric layout described in
-[Attention layout switching and MoE workspace reuse](memory_reuse_design.md).
-The unified layout is mandatory: initialization rejects quantized weights,
-non-BF16 dtype, non-peer-access transfer, and unsupported EP/TP topology.
-The remaining sections document the historical layout, not a runtime fallback.
+ParaS uses this layout for unquantized **BF16 Qwen3 MoE and GPT-OSS**. It
+requires equal EP/TP groups greater than one, MoE TP=1, ParaS DP=1, and
+`PARAS_CONFIGURE_METHOD=peer_access` for weight switching. Quantized weights
+(including FP8 and MXFP4), non-BF16 weights, and shared experts are rejected.
+KV dtype is a separate setting: the planner handles BF16 and FP8 KV storage;
+hybrid SWA with FP8 KV is outside the supported scope.
 
-```
-EP: [MoE scratch][attention scratch][padding][EP weights][EP KV]
-TP: [TP weights][TP KV][MoE scratch][attention scratch][padding]
-```
+## Ownership and layout
 
-Weights include experts and QKV/O attention projections. Attention switches
-live; TP mode retains no full DP attention backup. Each endpoint holds
-mode-specific MoE intermediates, with larger TP token batches accounted
-for before KV capacity is chosen. One endpoint is shared across all layers.
-The endpoint capacity is sized from the **sum** of separately aligned MoE
-and attention requirements, bounded below by the transfer gap. Attention
-and MoE never alias each other. `workspace.py` declares backend requirements
-before construction; the manager binds their views after allocation.
+One `torch.empty(budget, dtype=torch.uint8)` allocation has two overlapping
+interpretations. Only the active mode's contents are valid. EP uses DP
+attention; TP shards attention as well as experts.
 
-FlashInfer's numerical workspace and Triton's decode partial-output/LSE
-buffers are managed. FlashAttention scratch remains external because its
-binding does not accept caller-owned workspace. FlashInfer integer plans,
-KV indices, graph metadata, DeepEP transport buffers, and outputs that
-outlive the runner remain external. Startup logs distinguish an external
-requirement (`size_bytes=None`) from a backend requiring zero scratch.
-
-Backend reconfiguration only changes references. Initializing target scratch
-is delayed until weight/KV migration completes, since that address range can
-still contain source weights during a switch. CUDA graphs retain stable
-per-mode addresses.
-
-Before attention workspace integration, for Qwen3-30B-A3B BF16 on four A100s
-at static fraction 0.7, the measured
-plan is 52.865405 GiB per GPU: EP has a 1.059124 GiB front, 15.187500 GiB
-weights and 36.618713 GiB KV; TP has 13.921875 GiB weights, 36.618759 GiB KV
-and a 2.324749 GiB tail. The linked design describes the current contract
-and links to the historical 235B DEP8/TP8 calculations.
-
-## Overview
-
-The ParaS Unified Memory Manager (`ParaSMemoryManager`) is a static, contiguous GPU memory allocator that owns **all** persistent memory for ParaS-enabled MoE models: expert weights, attention weights, staging buffers, and KV cache — in a single `torch.empty(..., dtype=torch.uint8)` allocation.
-
-This design eliminates GPU memory fragmentation and enables zero-allocation parallelism switching between Expert Parallelism (EP) and Tensor Parallelism (TP) at runtime.
-
-## Motivation
-
-### The Problem
-
-Without the memory manager, a ParaS-enabled model allocates memory in dozens of independent `torch.empty` calls:
-
-- Each `FusedMoE` layer allocates `w13_weight` and `w2_weight` separately
-- Each attention layer allocates `qkv_proj.weight` and `o_proj.weight` separately
-- The KV cache pool allocates per-layer K and V buffers separately
-- During EP→TP switching, new weight buffers are allocated for the TP layout, old EP buffers are freed
-
-This leads to:
-
-1. **Memory fragmentation** — hundreds of small allocations create gaps that can't be reused
-2. **Allocation overhead during switch** — `torch.empty` calls during the critical switching path add latency
-3. **Unpredictable addresses** — makes zero-copy RDMA/NCCL transfers difficult
-4. **Double memory peaks** — during the switch, both EP and TP buffers exist briefly
-
-### The Solution
-
-One contiguous buffer. All tensors are views into it. The EP→TP switch overwrites the same bytes with a different interpretation — no allocation, no deallocation, no fragmentation.
-
-## Architecture
-
-### Buffer Layout (Qwen3-30B-A3B Example)
-
-For a 2-GPU setup with `ep_size=2, tp_size=2, paras_tp_size=2`:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Contiguous uint8 Buffer                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─── MoE Weight Slots (×(N+1) = 49 for 48 layers) ─────────┐  │
-│  │  paras.moe_slot.0.w13  (16, 3072, 2048) bf16  ~192 MB    │  │
-│  │  paras.moe_slot.0.w2   (16, 2048, 1536) bf16  ~96 MB     │  │
-│  │  ...                                                       │  │
-│  │  paras.moe_slot.48.w13 (16, 3072, 2048) bf16  ~192 MB    │  │
-│  │  paras.moe_slot.48.w2  (16, 2048, 1536) bf16  ~96 MB     │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  ┌─── Per-Layer Attention + KV (×48 layers) ─────────────────┐  │
-│  │  QKV full weight    (2560, 2048)     bf16   ~10 MB        │  │
-│  │  O_proj weight      (2048, 2048)     bf16   ~8 MB         │  │
-│  │  QKV TP buffer      (640, 2048)      bf16   ~2.5 MB       │  │
-│  │  KV cache K         (ep_tokens+1, 4, 128) bf16            │  │
-│  │  KV cache V         (ep_tokens+1, 4, 128) bf16            │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  ┌─── Staging Buffers (NCCL path only, optional) ────────────┐  │
-│  │  staging.w13_pre_permute / gather and                     │  │
-│  │  staging.w2_pre_permute / gather  ~1.16 GB total         │  │
-│  │  (Skipped when using peer_access method)                   │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+```text
+low address                                                        high address
+EP: [MoE scratch][attention scratch][padding][EP weights][seam][EP KV]
+    |<----------- front F ---------------->|
+TP: [TP weights][TP KV][seam][MoE scratch][attention scratch][padding]
+                            |<-------------- tail T -------------->|
 ```
 
-Each entry is 256-byte aligned. All tensors share one backing allocation.
+Each mode's weight region contains N layer bundles, in layer order:
+`[expert w13][expert w2][attention QKV][attention O]`. The expert weight bytes
+are equal between modes when EP=TP. Attention weight bytes differ: EP stores
+full projections, TP stores shards, with replicated K/V heads when there
+are fewer KV heads than TP ranks. TP retains no separate full-attention
+backup. Layer bundle sizes therefore differ between modes.
 
-### N+1 Slot Layout with EP/TP Aliases
+Each mode's KV region contains N K/V pairs. EP KV is packed against the end
+of the allocation; TP KV starts immediately after TP weights. Token/page
+rounding can leave a small seam beside the KV region, and unused bytes
+inside each reserved K/V region.
 
-EP and TP modes use the **same total bytes** per MoE module when `ep_size == tp_size`. However, they cannot share the same physical memory during the transfer — one GPU reads its EP data while another writes TP data simultaneously. The N+1 slot design solves this.
+The front and tail serve two purposes:
 
-**Physical slots**: The manager reserves N+1 identical MoE weight slots (`paras.moe_slot.0` through `paras.moe_slot.N`) for a model with N layers.
+- **Scratch** is the sum of separately aligned MoE and attention workspace
+  reservations. They are disjoint and reused across sequential layers.
+- **Padding** is the remainder of the endpoint after scratch. Transfer
+  geometry can require more space than the backends need. If scratch is
+  larger, the planner expands the endpoint and reduces KV capacity.
 
-**Virtual-to-physical mapping** (via `alias()`):
+The same endpoint bytes provide migration headroom after inference drains.
+There is no separately allocated extra layer slot, permanent transfer
+staging buffer, or alternate N+1-slot allocator. Transfer headroom still
+costs capacity, but backend scratch can use it during inference.
+
+The allocation does **not** include all GPU memory. Embeddings, LM head,
+norms, routing weights, GPT-OSS biases/sinks, DeepEP transport buffers,
+request/index metadata, CUDA graph allocations, and outputs that escape an
+operator remain outside. Backend-specific exclusions are listed below.
+
+## Capacity calculation
+
+All sizes below are per GPU. `align(x)` rounds up to 256 bytes. Let:
+
+| Symbol | Meaning |
+| --- | --- |
+| `B` | UMM byte budget, rounded down to 256 bytes |
+| `N` | Number of layers |
+| `we`, `wt` | EP/TP bytes per weight bundle, summing individually aligned tensors |
+| `S_EP`, `S_TP` | Sum of aligned managed MoE and attention scratch in each mode |
+| `D = N * (we - wt)` | Weight bytes saved in TP mode |
+| `A = B - N * wt` | TP bytes available after weights |
+| `r` | Largest layer's KV budget share: `max(ratios) / sum(ratios)` |
+
+The planner computes the endpoints directly, without searching:
+
+```text
+F = align(max(wt, S_EP, S_TP - D, ceil(A*r/(1+r)) - D))
+EP cache budget = B - N*we - F
+
+T = align(max(largest reserved EP K+V layer, S_TP))
+TP cache budget = A - T
 ```
-Physical slots:  [ slot 0 | slot 1 | slot 2 | ... | slot N ]
 
-experts     (weight loading):  layer i → slot i+1
-ep_experts  (explicit EP):     layer i → slot i+1
-tp_experts  (explicit TP):     layer i → slot i
+`F >= wt` provides space for a TP weight layer. `T` holds at least the
+largest EP K/V layer. The other bounds ensure each TP KV region is at least
+as large as its EP counterpart, so ordered migration never overwrites an
+unread source layer. For uniform attention `r=1/N`. GPT-OSS uses ratio 1
+for full-attention layers and `swa_full_tokens_ratio` for sliding layers.
+
+`CacheCapacity.from_budget` divides each mode's cache budget by those
+ratios and rounds each layer's K+V reservation down to 512 bytes. K and V
+get equal, individually 256-byte-aligned halves. V starts at the midpoint
+of the **reserved region**, which may be after the logical K tensor ends.
+
+Token capacities fit inside those regions, round down to pages, and reserve
+one additional page per tensor. A layer's logical K or V shape is:
+
+```text
+(layer_token_capacity + page_size, local_KV_heads, head_dim)
+EP local_KV_heads = num_kv_heads
+TP local_KV_heads = max(1, num_kv_heads // tp_size)
 ```
 
-- `model.layers.{i}.mlp.experts.w13_weight` → slot i+1 (for `create_weights()` and checkpoint loading)
-- `model.layers.{i}.mlp.ep_experts.w13_weight` → slot i+1 (explicit EP alias)
-- `model.layers.{i}.mlp.tp_experts.w13_weight` → slot i (explicit TP alias)
+TP token capacity is not necessarily `EP_capacity * tp_size`. For TP8 with
+four KV heads, each TP rank holds one head and each head has two replicas.
+Even equal KV bytes give only four times the EP per-rank token capacity.
+Migration also checks that live requests fit the target mode.
 
-The `experts` aliases are created before `materialize()` (as dict references to the same `LayoutEntry` objects) so that `create_weights()` in `unquant.py` can find them during model construction. The `ep_experts` and `tp_experts` aliases are created after `materialize()` via `create_paras_moe_aliases()`.
+### Runtime budget and overhead accounting
 
-Both EP and TP views are established at model init time and **never change** — eliminating the need for `update_views()` after weight transfer.
+Without an explicit planning budget, the manager uses:
+
+```text
+B = available_GPU_bytes
+    - total_GPU_bytes * (1 - mem_fraction_static)
+    - replicated_embedding_and_lm_head_bytes
+```
+
+Available memory is measured before materializing the model, taking the
+minimum across ranks. Tied embeddings are counted once. The formula leaves
+the configured dynamic reserve; it does not itemize every later external
+allocation. An illustrative budget for the UMM alone is different from a
+cap on all static memory.
+
+Unused endpoint padding is `F - S_EP` in EP or `T - S_TP` in TP. It
+measures transfer headroom beyond the **reserved** scratch. It is not the
+complete overhead relative to an original single-mode server.
+
+For a matched total-memory budget, compare the endpoint against scratch the
+baseline actually allocates: `endpoint - baseline_scratch`, then account
+for alignment/page slack and external differences such as dual graphs and
+replicated auxiliary tensors. In particular, TP reserves for a full Triton
+64K-token chunk, while the native backend sizes temporaries to
+`min(actual_input_tokens, 65536)` and the selected kernel's padding. A
+smaller runtime batch can therefore leave unused space **inside** the TP
+scratch reservation even when endpoint padding is zero. Backend execution
+behavior is preserved, but worst-case reservation is not the same as the
+baseline's live allocation. Total overhead needs a matched runtime
+measurement; the diagrams alone cannot establish it.
+
+## Backend workspace
+
+`WorkspaceRequirement` records a backend name and `size_bytes`. `None`
+means the backend allocates externally; it does not mean zero workspace.
+`ModeWorkspaces` places MoE first and attention second. Neither can consume
+the other's reservation or the unused padding.
+
+### MoE
+
+Qwen EP selects BF16 DeepGEMM where the existing DeepEP backend supports
+it, otherwise Triton. TP uses fused Triton. GPT-OSS uses Triton for its
+biases and activation. Reservations follow each backend's existing
+execution policy.
+
+For hidden size `H`, expert intermediate size `I`, expert count `E`, top-k
+`K`, TP size `P`, and DeepEP dispatch capacity `C`, BF16 scratch is:
+
+```text
+EP rows = E * C
+EP scratch = align(EP_rows * 2*I * 2) + align(EP_rows * I * 2)
+
+TP I = I / P
+TP rows = 65536*K + (E+1)*(256-1)
+TP scratch = align(TP_rows * max(2*TP_I, H) * 2)
+           + align(TP_rows * TP_I * 2)
+```
+
+EP reserves gate/up and activation intermediates for DeepEP's low-latency
+padded receive shape: `local_experts * (EP_size * C)`. Masked DeepGEMM
+consumes that shape directly; Triton EP flattens it. Normal dispatch uses
+actual received rows. EP has no 64K chunk limit or reservation floor.
+
+TP preserves `triton_moe_chunk_size = 64 * 1024` **input tokens per chunk**.
+It includes top-k expansion and the fused TMA padding bound
+`MOE_MAX_BLOCK_M = 256`. Gate/up and down share the first scratch tensor,
+so its width is `max(2*TP_I, H)`; activation occupies a separate tensor.
+This reservation does not shrink to the decode batch size.
+
+`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` supplies `C` (dispatcher
+default 128). The [shared launch settings](../../scripts/paras/eval/launch_common.sh)
+set it to `MAX_RUNNING_REQUESTS / NUM_GPUS` unless overridden: 256 for
+2,048 requests on eight GPUs. TP can process the full global batch.
+
+When actual MoE intermediates exceed their reservation, both views fall
+back to the backend's original dynamic allocations at the original call
+sites. Dispatch inputs, transport/routing/permutation buffers, and returned
+outputs remain external. Thus the UMM does not guarantee an allocation-free
+forward pass.
+
+### Attention
+
+| Backend | Managed storage | Sizing |
+| --- | --- | --- |
+| FlashInfer | Numerical/float workspace shared by its wrappers | Configured capacity, normally 384 MiB for Qwen3 MoE; 2 GiB in deterministic mode |
+| Triton | FP32 partial output and LSE tensors | `align(tokens*local_query_heads*splits*head_dim*4) + align(tokens*local_query_heads*splits*4)` |
+| Other backends, including FlashAttention | External | No caller-owned workspace integration here |
+
+FlashInfer integer plans, pinned CPU staging, KV indices, and graph metadata
+remain external. The numerical workspace size is configured through
+`SGLANG_FLASHINFER_WORKSPACE_SIZE`; the existing architecture-specific
+512 MiB overrides are preserved.
+
+Triton uses the resolved model context length when calculating splits,
+including RoPE scaling and context overrides. With CUDA graphs enabled,
+both modes preserve the existing graph allocation capacity:
+`G = max(EP graph batches, TP graph batches)`. Scratch tokens are
+`max(G, max_running_requests / P)` in EP and
+`max(G, max_running_requests)` in TP; query heads are full in EP and
+sharded in TP. Without graphs, `G=0`.
+
+Composite/mixed prefill-decode configurations, speculative workers, PDMux,
+and two-batch overlap retain external attention allocation. Triton without
+an explicit maximum running-request count also remains external. Marking
+a workspace external does not imply that all such configurations support
+ParaS switching.
+
+### Qwen3-235B BF16 example: EP8 / TP8
+
+This is a **planner calculation**, not a measured H200 footprint. Assume
+130 GiB is available to the UMM **after external allocations**, BF16 KV,
+page size 1, 94 layers, `H=4096`, `I=1536`, 128 experts, top-k 8, 64 query
+heads, four KV heads, and head dimension 128. Use the H200 launch request
+settings above (`C=256`) and, for Triton attention, eight KV splits and a
+maximum graph batch of 2,048. All diagram sizes below are **MiB per GPU**:
+
+```text
+FlashInfer attention:
+EP: [MoE 288][attention 384][padding 0][weights 66,928][seam 0.0264][KV 65,519.9736]
+    |<--------- front 672 --------->|
+TP: [weights 55,836][KV 72,342.9600][seam 0.0012][MoE 4,557.0388][attention 384][padding 0]
+                                               |<---------- tail 4,941.0388 ---------->|
+
+Triton attention:
+EP: [MoE 288][attention 516][padding 0][weights 66,928][seam 0.0303][KV 65,387.9697]
+    |<--------- front 804 --------->|
+TP: [weights 55,836][KV 72,662.4590][seam 0.0022][MoE 4,557.0388][attention 64.5][padding 0]
+                                               |<---------- tail 4,621.5388 ---------->|
+```
+
+Weights are 576 MiB of experts plus 136 MiB of attention per EP layer;
+TP has the same experts plus 18 MiB of attention per layer. The diagrams
+show reserved KV bytes; page-rounded usable tokens are 356,873 EP /
+1,576,152 TP for FlashInfer and 356,154 EP / 1,583,113 TP for Triton.
+These are local EP versus global TP token capacities.
+
+Here both endpoints are workspace-bound, leaving zero unused endpoint
+padding. The TP reservation still covers 65,536 input tokens even though
+the example's decode batch tops out at 2,048. This reservation slack and
+external allocations must be included in a comparison with native TP;
+zero endpoint padding does not mean zero ParaS overhead. Other settings
+can also leave nonzero endpoint padding.
+
+## Initialization and views
+
+1. The model creates and registers a `ParaSMemoryManager`.
+2. `reserve_model_weights` declares both modes' weight shapes and native
+   MoE requirements. GPT-OSS passes `with_bias=True` for backend selection;
+   bias storage remains external.
+3. `manager.plan_layout(config)` resolves budget and attention requirements,
+   computes `UnifiedLayout`, and derives tensor offsets and `LayerCacheSpec`
+   capacities. It returns a typed `UnifiedMemoryPlan` before allocating GPU
+   storage. An explicit `budget=` is available for offline planning.
+4. `manager.materialize(plan)` allocates the buffer and publishes the planned
+   entries. It does not recalculate geometry or place tensors by reservation
+   order.
+5. Weight construction in `unquant.py` uses managed views instead of allocating
+   those weights. The model loads EP weights and establishes stable per-mode
+   Parameters. Peer IPC mappings are initialized once before switching.
+6. `ModelRunner` binds the planned K/V views to `MHATokenToKVPool` or the
+   full/SWA sub-pools of `SWAKVPool`. Each expert runner holds a fixed
+   `MoEWorkspace`; attention backends bind named workspace views.
+
+Important types are `UnifiedLayoutSpec` / `UnifiedModeSpec` for requirements,
+`UnifiedLayout` / `CacheCapacity` for geometry, and `UnifiedMemoryPlan` for
+completed tensor entries and cache specs. Mode arguments use `ParaSMode.EP`
+and `ParaSMode.TP`; string values are used only in names/configuration.
 
 ```python
-# EP mode: layer 0's weights at slot 1
-ep_view = manager.get_view("model.layers.0.mlp.ep_experts.w13_weight")
+from sglang.srt.paras.mode import ParaSMode
 
-# TP mode: layer 0's weights at slot 0 (different physical memory)
-tp_view = manager.get_view("model.layers.0.mlp.tp_experts.w13_weight")
-
-# ep_view.data_ptr() != tp_view.data_ptr() — separate slots, no aliasing
+# Given an initialized manager:
+ep_k, ep_v = manager.get_kv_views(num_layers, ParaSMode.EP)
+tp_k, tp_v = manager.get_kv_views(num_layers, ParaSMode.TP)
+ep_weights = manager.get_view("model.layers.0.mlp.ep_experts.w13_weight")
+tp_weights = manager.get_view("model.layers.0.mlp.tp_experts.w13_weight")
 ```
 
-## Lifecycle
+Checkpoint-loading names `mlp.experts.*` alias the EP entries. Likewise,
+`kv.k/v` alias `kv.ep.k/v`. Explicit `kv.tp.k/v` entries already have their
+TP shapes and offsets; `get_kv_views` does not reconstruct them by
+reinterpreting EP storage. Summing all entries in `dump_layout()` would
+double-count overlapping views and aliases; use `total_bytes` for the
+allocation size.
 
-### 1. Planning Phase (model `__init__`)
+## Migration safety
 
-```
-plan_qwen_moe_layout(manager, ...)                 # or plan_gpt_oss_moe_layout(...)
-    │
-    ├── Reserve N+1 MoE weight slots:
-    │   └── paras.moe_slot.{0..N}.w13, paras.moe_slot.{0..N}.w2
-    │
-    ├── Create 'experts' aliases (before materialize):
-    │   └── model.layers.{i}.mlp.experts.w13_weight → slot i+1
-    │
-    ├── For each layer:
-    │   └── Reserve attention weights (QKV full, O_proj, QKV TP buffer)
-    │
-    ├── If configure_method != "peer_access":
-    │   └── Reserve staging buffers (pre_permute, gather; overlap uses _1/_2)
-    │
-    └── FP8 models also reserve scale tensors per layer
+The scheduler drains outstanding inference, including the overlap pipeline,
+before migration. Logical weights/cache state can overlap the destination's
+scratch, so binding a view must not initialize it prematurely.
 
-reserve_kv_cache(manager, ..., layer_specs=optional)
-    └── Reserve per-layer K/V slots and register kv.ep / kv.tp entries
-
-manager.materialize()
-    ├── Assign aligned offsets in reservation order
-    ├── Allocate one torch.empty(total_bytes, dtype=uint8, device="cuda")
-    └── Build typed views for all weight and KV entries
-
-create_paras_moe_aliases(manager, num_layers)
-    ├── ep_experts alias: layer i → slot i+1
-    └── tp_experts alias: layer i → slot i
+```text
+EP -> TP: weights layer 0..N-1 -> KV layer 0..N-1 -> finish reconfiguration
+TP -> EP: KV layer N-1..0 -> weights layer N-1..0 -> finish reconfiguration
 ```
 
-### 2. Materialization
-
-```python
-manager.materialize()
-# → Assigns 256-byte-aligned offsets in reservation order
-# → Allocates one torch.empty(total_bytes, dtype=uint8, device="cuda")
-# → Records buffer pointer range for is_managed() checks
-```
-
-### 3. Weight Allocation via Global Intercept
-
-The manager is set as a global singleton. During model construction, `create_weights()` in `unquant.py` checks the global manager:
-
-```python
-# In UnquantizedLinearMethod.create_weights():
-mgr = get_global_paras_memory_manager()
-if mgr and mgr.materialized:
-    entry_name = f"{layer.prefix}.weight"
-    if entry_name in mgr._entries:
-        weight = Parameter(mgr.get_view(entry_name), requires_grad=False)
-        # → No torch.empty, weight is a view into the contiguous buffer
-```
-
-This intercept is transparent — non-ParaS models see `mgr=None` and take the normal `torch.empty` path.
-
-Similarly for MoE weights in `UnquantizedFusedMoEMethod.create_weights()`:
-
-```python
-if use_manager:
-    w13_name = f"model.layers.{layer.layer_id}.mlp.experts.w13_weight"
-    if w13_name in mgr._entries:
-        w13_weight = Parameter(mgr.get_view(w13_name), requires_grad=False)
-```
-
-### 4. KV Cache Integration
-
-ParaS can wire either the MHA-only pool or the hybrid SWA pool into managed buffers:
-
-```python
-# MHA-only models (Qwen3-MoE)
-k_bufs, v_bufs = manager.get_kv_views(num_layers, mode="ep")
-pool = MHATokenToKVPool(..., external_k_buffers=k_bufs, external_v_buffers=v_bufs)
-
-# Hybrid full + sliding-window models (GPT-OSS)
-pool = SWAKVPool(
-    ...,
-    full_external_k_buffers=full_k_bufs,
-    full_external_v_buffers=full_v_bufs,
-    swa_external_k_buffers=swa_k_bufs,
-    swa_external_v_buffers=swa_v_bufs,
-)
-```
-
-`MHATokenToKVPool` uses one external K/V buffer pair per layer. `SWAKVPool` uses two sub-pools: one for full-attention layers and one for sliding-window layers. Each layer is routed by its `LayerCacheSpec.kind`. The allocator logic (free slots, eviction, resize/rebind) is unchanged; only the backing buffers come from the manager.
-
-### 5. EP→TP Switch
-
-Three methods are available, selected via `PARAS_CONFIGURE_METHOD` environment variable:
-
-**Method: `naive` (NCCL sequential)**
-
-Per layer, sequentially:
-1. All-gather EP weights across DP group (DP>1 only; no-op for DP=1)
-2. Permute EP weights → staging buffer
-3. NCCL `all_to_all_single`: staging → TP slot (slot i) directly
-4. Reconfigure attention and switch mode
-
-**Method: `overlap` (NCCL pipelined)**
-
-Same as naive but with dual CUDA streams:
-- Stream 1: all-to-all for layer i
-- Stream 2: all-gather for layer i+1 (overlapped)
-- Streams swap between layers
-
-**Method: `peer_access` (NVLink direct, fastest)**
-
-Per layer, no barriers between layers:
-1. Custom CUDA kernel reads EP slot (i+1) with strided access
-2. Kernel writes directly to peer GPU's TP slot (i) via NVLink
-3. No staging buffer, no NCCL overhead
-
-See `nvlink_peer_access_weight_transfer.md` for kernel design details.
-
-All three methods write TP data to the TP slot (slot i), where `tp_experts` already points from init. No `update_views()` is needed.
-
-**KV cache migration flow:**
-
-```
-1. gather_cache() calls paras_resize_cache() per layer:
-   → Uses mgr.get_view_as() to reinterpret EP KV region as TP shape
-   → gather_kv_and_permute() + all_to_all + permute_and_scatter_kv()
-   → TP KV data written into the same managed buffer region
-```
-
-## Concrete Numbers (Qwen3-30B-A3B, 2×H100 80GB)
-
-| Component | EP Mode | TP Mode | Bytes |
-|-----------|---------|---------|-------|
-| MoE w13 per layer | (64, 2048, 1536) bf16 | (128, 768, 2048) bf16 | 402 MB |
-| MoE w2 per layer | (64, 768, 2048) bf16 | (128, 2048, 384) bf16 | 201 MB |
-| QKV full per layer | (2560, 2048) bf16 | same | 10 MB |
-| O_proj per layer | (2048, 2048) bf16 | same (slice) | 8 MB |
-| QKV TP buffer per layer | (640, 2048) bf16 | used during switch | 2.5 MB |
-| KV K per layer | (361K+1, 4, 128) bf16 | (722K+1, 2, 128) bf16 | ~370 MB |
-| KV V per layer | same | same | ~370 MB |
-| **Total per layer** | | | **~1.36 GB** |
-| **48 layers** | | | **~65 GB** |
-| Staging (shared) | 4 buffers | | ~1.16 GB |
-| **Grand total** | | | **~65 GiB** |
-
-With `mem_fraction_static=0.8`:
-- Buffer: 64.9 GiB (340 entries)
-- EP KV tokens: 361K
-- TP KV tokens: 722K
-- Switch time: 170ms weights + 181ms total
-- Available GPU memory after allocation: ~10.8 GiB
-
-## API Reference
-
-### ParaSMemoryManager
-
-```python
-manager = ParaSMemoryManager(device="cuda")
-
-# Planning phase
-manager.reserve(name, shape, dtype) -> LayoutEntry
-plan_qwen_moe_layout(...) -> None
-plan_gpt_oss_moe_layout(...) -> None
-manager.reserve_kv_cache(num_layers, ep_max_tokens, tp_max_tokens, ..., layer_specs=None)
-
-# Materialization
-manager.materialize() -> int  # returns total bytes
-
-# View access
-manager.get_view(name) -> torch.Tensor           # typed view with reserved shape
-manager.get_view_as(name, shape, dtype) -> Tensor # same bytes, different shape
-
-# KV cache views
-manager.get_kv_views(num_layers, mode="ep"|"tp", tp_size, page_size)
-    -> (List[Tensor], List[Tensor])  # k_buffers, v_buffers
-
-# Aliasing (post-materialize for MoE; KV aliases are registered during reserve_kv_cache/materialize)
-manager.alias(alias_name, target_name)    # create entry sharing target's offset
-create_paras_moe_aliases(manager, num_layers)  # create ep_experts + tp_experts aliases
-
-# Queries
-manager.is_managed(tensor) -> bool
-manager.dump_layout() -> List[Dict]
-manager.weights_only_bytes -> int  # excludes KV entries
-manager.ep_max_kv_tokens -> int
-manager.tp_max_kv_tokens -> int
-```
-
-### Global Accessor
-
-```python
-set_global_paras_memory_manager(manager)  # called during model init
-get_global_paras_memory_manager() -> Optional[ParaSMemoryManager]
-```
-
-### KV Pool Extensions
-
-```python
-# MHA-only external buffer support
-pool = MHATokenToKVPool(...,
-    external_k_buffers=List[Tensor],  # from manager.get_kv_views()
-    external_v_buffers=List[Tensor],
-)
-
-# Hybrid SWA pool support
-pool = SWAKVPool(...,
-    full_external_k_buffers=List[Tensor],
-    full_external_v_buffers=List[Tensor],
-    swa_external_k_buffers=List[Tensor],
-    swa_external_v_buffers=List[Tensor],
-)
-
-# Buffer swap during switch / pool resize
-pool.replace_buffers(...)
-```
-
-## File Map
-
-| File | Role |
-|------|------|
-| `paras/paras_memory_manager.py` | Core manager: reserve, materialize, get_view, `plan_qwen_moe_layout`, `plan_gpt_oss_moe_layout`, KV layout registration |
-| `paras/models/qwen3_moe.py` | Creates manager, plans Qwen3 layout, computes KV budget, sets global |
-| `paras/models/gpt_oss.py` | Creates manager, plans GPT-OSS layout, computes heterogeneous full+SWA KV budget, sets global |
-| `paras/layers/paras_moe_block.py` | EP→TP switch logic using staging buffers and get_view_as |
-| `paras/cache_transfer/{base,mha,swa,utils}.py` | Cache-transfer backends and shared per-layer gather/scatter helpers |
-| `layers/quantization/unquant.py` | Intercepts create_weights for both linear and MoE modules |
-| `mem_cache/memory_pool.py` | `MHATokenToKVPool` and `SWAKVPool` external buffer support + rebind helpers |
-| `model_executor/model_runner.py` | Wires KV pool to manager, uses manager token counts |
-| `layers/linear.py` | Stores `self.prefix` on LinearBase for manager lookups |
-
-## Future Improvements
-
-### 1. Eliminate the QKV row_stack Copy
-
-Currently, QKV TP reconfiguration still copies q/k/v slices from the full weight into a separate `qkv_proj.tp_weight` buffer via `torch.row_stack`. This is because Q, K, and V are interleaved in the full weight and need to be re-sliced for the TP shard.
-
-**Improvement**: Store the full QKV weight in a layout where the TP shard is a contiguous slice (e.g., store Q heads, then K heads, then V heads in head-major order instead of interleaved). Then TP reconfiguration becomes a single `view()` instead of a copy. This would also eliminate the separate `qkv_proj.tp_weight` reservation, saving ~2.5 MB per layer (120 MB for 48 layers).
-
-### 2. Carve Staging Buffers from KV Cache Region
-
-Staging buffers are now conditional via `configure_method`: they are skipped entirely for `peer_access`, which writes directly to TP slots via NVLink. For the NCCL `naive` / `overlap` paths, the staging buffers still occupy ~1.16 GiB permanently.
-
-**Improvement**: Instead of separate staging reservations, dynamically carve scratch space from the end of the KV cache region during the switch. This reclaims ~1.16 GiB for KV tokens during normal operation. The manager would need a `get_scratch(size_bytes)` method that returns a view into the KV tail.
-
-### 3. TP→EP Reverse Switch (Implemented)
-
-Reverse switching is implemented. TP→EP restores EP expert weights via reverse transfer, restores EP KV layout via per-layer scatter, and rebinds the attention / KV-pool state back to EP mode. See `parallelism_switch.md` for the control flow.
-
-### 4. Support Shared Experts
-
-Qwen models can have fused shared experts that run alongside routed experts. These are currently excluded from the manager (V1 scope).
-
-**Improvement**: Reserve shared expert weights in the managed buffer. They don't participate in EP→TP redistribution (they're replicated on all ranks), so they just need a fixed reservation with no union layout.
-
-### 5. Fused Cross-Rank Weight Transfer (Implemented)
-
-The contiguous layout now powers fused NVLink peer-access kernels for both directions. The remaining future work is to collapse the NCCL fallback from a per-layer loop to a coarser-grained collective over the MoE region.
-
-### 6. Profile-Guided Buffer Sizing
-
-Currently, KV token counts are computed from `mem_fraction_static * total_gpu_memory - weight_bytes`. This doesn't account for PyTorch's CUDA allocator overhead, activation memory, or other runtime allocations.
-
-**Improvement**: Run a short profiling step (like the existing `profile_max_num_token`) that actually allocates the buffer, runs a dummy forward pass, and measures remaining free memory. This would give a more accurate KV budget.
-
-### 7. Remove Legacy ParaSWeightBuffer
-
-The old `ParaSWeightBuffer` class in `paras/layers/utils.py` is a dynamic pool that's no longer used for MoE weight redistribution (replaced by static staging buffers). It may still be referenced elsewhere.
-
-**Improvement**: Audit all usages and remove the class entirely once all callers use the manager's staging buffers.
-
-### 8. FP8 Scale Transfer for Peer Access
-
-The peer access kernels transfer weight data (w13, w2) but do not yet handle FP8 scale tensors (`w13_weight_scale`, `w2_weight_scale`). For FP8 quantized models, these scales must also be redistributed during EP→TP switching via the same NVLink peer access mechanism.
-
-**Improvement**: Add scale transfer kernels or extend the existing v2 kernels to also copy the corresponding scale tensors alongside the weights.
-
-### 9. FP8 KV Cache Support
-
-The manager supports FP8 weight dtypes but the KV cache reservation currently uses BF16. FP8 KV cache would halve the KV memory, doubling the token capacity.
-
-**Improvement**: Wire `kv_cache_dtype=fp8` through to `reserve_kv_cache()` and ensure the pool's `store_dtype` (uint8 for FP8) matches the manager's reservation dtype.
-
-### 9. Multi-Model / Pipeline Parallelism Support
-
-The current global manager pattern supports one model per process. Pipeline parallelism with different model shards per rank would need per-shard managers.
-
-**Improvement**: Replace the global singleton with a registry keyed by model instance or pipeline stage. The `create_weights` intercept would look up the appropriate manager for the current module.
-
-### 10. Memory Accounting and Monitoring
-
-The manager tracks byte offsets but doesn't expose runtime memory accounting (how much of the KV region is actually in use, fragmentation metrics, etc.).
-
-**Improvement**: Add a `status()` method that reports: total buffer bytes, weight bytes, KV bytes reserved, KV bytes in use (from pool allocator), staging bytes, and waste from alignment padding. This would help with capacity planning and debugging OOM issues.
+Each weight step transfers a complete bundle: expert w13/w2 plus attention
+QKV/O, followed by a cross-rank fence. KV transfers also fence per layer.
+Layer order and weight-versus-KV order are both required by the overlap
+geometry. The scheduler's early EP→TP weight transfer leaves EP cache/backend
+metadata intact until KV migration has finished.
+
+Attention EP→TP copies this rank's Q/K/V slices and O columns from the local
+full projection into the planned TP views. TP→EP reads peer TP shards
+directly to reconstruct full projections. Q and O use all ranks; replicated
+K/V use one representative per head. With TP8 and four KV heads, those
+representatives are ranks 0, 2, 4, and 6. No persistent full-weight backup or
+full-size gather staging buffer is needed.
+
+Backend reconfiguration changes references without writing target scratch.
+Attention scratch is initialized only after migration, then the target
+mode's graph metadata is restored. Both modes retain stable addresses
+across graph capture and repeated switching; stable views alone do not
+preserve inactive-mode contents.
+
+See [parallelism switching](parallelism_switch.md) for request/control flow,
+[weight transfer](nvlink_peer_access_weight_transfer.md) for expert kernels,
+and [KV transfer](nvlink_peer_access_kv_cache_transfer.md) for routing.
+Weight switching requires peer access. KV transport is independently selected
+by `PARAS_KV_TRANSFER_METHOD`; its NCCL path still exists and allocates
+transient communication buffers outside the UMM. The launch scripts select
+peer access for both.
+
+## Validation references
+
+Existing focused tests include `test_unified_workspace_layout.py`,
+`test_unified_attention_workspace.py`, `test_unified_workspace_views.py`,
+`test_unified_triton_workspace.py`, `test_unified_deepgemm_workspace.py`, and
+`test_unified_attention_transfer_tp8.py` under
+[`test/srt/paras`](../../test/srt/paras/). They cover geometry, backend sizing,
+workspace views, operator results, and attention reconstruction with replicated
+KV heads. The manual switch procedure is
+[`e2e_test.sh`](../../scripts/paras/eval/paras_cmd/e2e_test.sh).
+
+[Memory analysis](memory_analysis.md) records measurements of the older slot
+allocator. Its overhead totals and removed APIs are historical and must not
+be used to describe this layout.

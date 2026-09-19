@@ -2,9 +2,17 @@
 
 ## Overview
 
-This document describes the NVLink peer access weight transfer optimization for the ParaS EP→TP parallelism switch. Instead of using NCCL `all_to_all` collectives for MoE weight redistribution, we use custom CUDA kernels that write directly to peer GPU memory via NVLink.
+This document describes expert-weight redistribution kernels. Buffer ownership,
+workspace reuse, attention reconstruction, and migration ordering are defined
+in the [unified memory manager reference](unified_memory_manager.md).
+The runtime requires peer-access weight switching; legacy NCCL model-level
+`naive` and `overlap` strategies are no longer supported by the planner.
 
-### Performance Summary (Qwen3-30B-A3B, 48 layers, 4×A100-80GB)
+The current model calls the v2 expert kernels through `peer_access.py`.
+That module also exposes optional v3 variants for explicit callers; their
+presence does not change the default runtime selection.
+
+### Historical Performance Summary (Qwen3-30B-A3B, 48 layers, 4×A100-80GB)
 
 | Method | transfer_weights | configure TP total | vs naive |
 |--------|-----------------|-------------------|----------|
@@ -12,11 +20,13 @@ This document describes the NVLink peer access weight transfer optimization for 
 | `overlap` (NCCL pipelined) | ~83 ms | ~100 ms | 1.17× |
 | `peer_access` (NVLink direct) | **~61 ms** | **~97 ms** | **1.57×** |
 
-The peer access kernel time is only **~9 ms** for all 48 layers. The remaining `transfer_weights` time is dominated by attention and TP reconfiguration overhead shared by all methods. The `configure TP` total includes cache migration, request gathering, and weight transfer.
+These measurements predate the combined weights/KV/workspace layout and
+are not current end-to-end switch measurements. In that run, peer access
+kernel time was only **~9 ms** for all 48 layers. The remaining `transfer_weights` time is dominated by attention and TP reconfiguration overhead shared by all methods. The `configure TP` total includes cache migration, request gathering, and weight transfer.
 
 ## Background
 
-The ParaS Unified Memory Manager allocates all MoE weights in a single contiguous buffer with deterministic offsets (see `unified_memory_manager.md`). During EP→TP switching, each GPU must redistribute its local expert weights to all peers. The NCCL path uses:
+The ParaS Unified Memory Manager allocates all MoE weights in a single contiguous buffer with deterministic offsets (see `unified_memory_manager.md`). During EP→TP switching, each GPU must redistribute its local expert weights to all peers. The earlier NCCL weight path used:
 
 1. Permute EP weights into a staging buffer (HBM write)
 2. NCCL `all_to_all_single` (NVLink transfer)
@@ -37,40 +47,30 @@ In sglang's multi-process architecture (`torchrun`), each GPU runs in a separate
 
 This initialization takes ~6 seconds (NVLink connection setup) and is performed once during model loading, not during the switch.
 
-### 2. N+1 Slot Design: Eliminating Staging Buffers
+### 2. Planned Source and Destination Views
 
-**The problem**: In the original memory manager, EP and TP modes share the same physical buffer for each layer via `get_view_as()`. During transfer, one GPU reads its EP data from slot `i` while another GPU writes TP data to the same slot `i` — a race condition.
+`plan_layout` assigns fixed per-mode offsets for
+`model.layers.{i}.mlp.ep_experts.*` and `mlp.tp_experts.*`. Checkpoint-loading
+names `mlp.experts.*` alias EP entries. The kernels consume these offsets;
+they do not derive addresses from an N+1 slot index.
 
-The NCCL path solves this with staging buffers: EP data is first copied to a staging buffer, then the `all_to_all` reads from staging and writes to the EP/TP buffer. This requires an extra ~1.16 GiB of staging memory and adds an HBM write.
+EP→TP sends intermediate-dimension slices of each local expert to its TP
+owner. TP→EP sends each expert's shards back to its EP owner. Source and
+destination for the current layer are disjoint, while subsequent destinations
+can reuse earlier source bytes. Whole-model transfer order and fences are
+therefore part of the correctness contract.
 
-**Our solution**: Allocate N+1 layer slots instead of N:
-
-```
-Buffer slots:  [ slot 0 | slot 1 | slot 2 | ... | slot N ]
-                  ↑                                   ↑
-              TP layer 0                         EP layer N-1
-                         EP layer 0
-                         TP layer 1
-```
-
-- EP layer `i` lives in slot `i+1`
-- TP layer `i` lives in slot `i`
-- Source (slot `i+1`) and destination (slot `i`) are always different physical regions
-
-This eliminates the aliasing race condition without staging buffers. The overhead is 1 extra layer slot ≈ 288 MB (0.4% of 65 GiB total).
-
-**Virtual-to-physical slot mapping**: The memory manager's `alias()` method creates virtual entries that map to the same physical offset as a target entry. After `materialize()`, `create_paras_moe_aliases()` registers three alias families per layer:
-- `model.layers.{i}.mlp.experts.*` → slot `i+1` (weight loading compatibility)
-- `model.layers.{i}.mlp.ep_experts.*` → slot `i+1` (explicit EP)
-- `model.layers.{i}.mlp.tp_experts.*` → slot `i` (explicit TP)
-
-Both EP and TP views are created at model init time and never change, eliminating the need for `update_views()` after the transfer.
-
-**Layer ordering constraint**: EP→TP must process layers in forward order (0, 1, 2, ..., N-1). Layer `i+1`'s write to slot `i+1` must not overlap with layer `i`'s read from slot `i+1`. Sequential kernel launches on the same CUDA stream enforce intra-rank ordering. Cross-rank ordering requires a per-layer synchronization barrier (see Section 3).
+The model transfers attention QKV/O alongside experts before fencing each
+layer. See [migration safety](unified_memory_manager.md#migration-safety)
+for the local EP→TP slices and direct peer reads used to reconstruct EP
+attention, including replicated KV heads.
 
 ### 3. Cross-Rank Synchronization
 
-**The problem**: The N+1 slot design prevents intra-rank aliasing (layer `i` reads slot `i+1`, writes slot `i` — different slots). However, **cross-rank temporal aliasing** exists: Rank A processing layer `i+1` writes to Rank B's slot `i+1` via NVLink, while Rank B may still be processing layer `i` which reads from its own slot `i+1`. CUDA stream ordering only guarantees ordering on a **single device** — cross-rank NVLink writes have no ordering guarantee.
+**The problem**: Fixed offsets protect the current layer's source from its
+destination, but later transfers can overwrite source storage from earlier
+layers. CUDA stream ordering is local to one device; a fast rank must not
+reuse bytes while another rank is still reading them.
 
 **Solution — per-layer NCCL all-reduce barrier**: After each layer's kernel, a lightweight `dist.all_reduce()` on a 1-element tensor provides GPU-side cross-rank synchronization with near-zero overhead:
 
@@ -78,6 +78,7 @@ Both EP and TP views are created at model init time and never change, eliminatin
 barrier_tensor = torch.zeros(1, device="cuda")
 for layer in self.layers:
     layer.paras_configure_tp_mlp_fused_peer_access_kernel(...)
+    transfer_attention(...)  # Same layer, before releasing its source bytes
     dist.all_reduce(barrier_tensor, group=paras_tp_group)
 ```
 
@@ -172,112 +173,21 @@ Destination: row h of expert (tp_rank × E_local + e) on peer r
 
 Both reads and writes are coalesced within each row. The row stride causes 25% HBM cache utilization (read 768B from 3072B cache line), but HBM bandwidth (3.35 TB/s) is not the bottleneck — NVLink (150 GB/s) is.
 
-### NCCL Path Compatibility
+### GPT-OSS Interleaved w13
 
-The N+1 slot design is not exclusive to peer access — the NCCL naive and overlap paths also use it. This means all three methods share the same memory layout and alias structure:
+For Qwen, gate and up occupy separate contiguous halves. GPT-OSS stores
+interleaved gate/up rows, so the wrapper sets `num_gates=1` and doubles the
+per-peer chunk extent to `2 * I_per_tp * H`. This keeps each gate/up pair
+together without changing the transport kernel. Biases and attention sinks
+remain replicated outside the UMM and use per-mode views; they are not
+transferred by these kernels. See [GPT-OSS support](gpt_oss_support.md).
 
-- **All-to-all output target**: NCCL writes directly to the TP slot (slot `i`) for each layer. Since `tp_experts` already points to slot `i` from init, no copy or view update is needed after the collective completes.
-- **No staging for peer access**: The peer access kernel reads directly from the EP slot with strided access, bypassing the permute step entirely. Staging buffers are skipped when `configure_method="peer_access"`, saving ~1.16 GiB.
+## Historical Latency Measurements
 
-In all cases, the TP slot (slot `i`) holds valid TP data after the transfer, and `tp_experts` views remain correct without any post-transfer alias updates.
-
-#### Staging Buffer Requirements
-
-NCCL's `all_to_all_single` requires contiguous, permuted input. Before calling the collective, EP weights are permuted (rearranging the TP dimension to the leading axis) and written into a **pre_permute** staging buffer. The all-to-all reads from this buffer and writes the result to either the TP slot (DP=1) or back to the gather buffer (DP>1, requiring a post-transpose).
-
-For DP>1, an additional **gather** staging buffer is needed because the all-gather step must first collect EP weights from all DP ranks into a contiguous region before the permute+all-to-all can proceed. The data flow for DP>1 is:
-
-```
-EP slot → [all-gather] → gather buffer → [permute] → pre_permute buffer
-    → [all-to-all] → gather buffer → [transpose] → pre_permute buffer → [copy] → TP slot
-```
-
-This reuses the two buffers alternately: gather receives the all-gather output and the all-to-all output, while pre_permute holds the permuted input and the transposed result. For DP=1, the all-gather is a no-op (EP weights are read directly from the EP slot), so only the pre_permute buffer is needed.
-
-The overlap path pipelines two layers on different streams. Each stream requires its own independent set of staging buffers to avoid cross-stream data races. This doubles the staging requirement.
-
-| Method | DP | Buffers per set | Sets | Buffer names | Memory |
-|--------|-----|----------------|------|--------------|--------|
-| `naive` | =1 | 1 pre_permute | 1 | `staging.{w13,w2}_pre_permute` | ~580 MB |
-| `naive` | >1 | 1 pre_permute + 1 gather | 1 | `staging.{w13,w2}_{pre_permute,gather}` | ~1.16 GiB |
-| `overlap` | =1 | 1 pre_permute | 2 | `staging.{w13,w2}_pre_permute_{1,2}` | ~1.16 GiB |
-| `overlap` | >1 | 1 pre_permute + 1 gather | 2 | `staging.{w13,w2}_{pre_permute,gather}_{1,2}` | ~2.32 GiB |
-| `peer_access` | any | None | 0 | — | 0 |
-
-**Memory formula** (Qwen3-30B-A3B, BF16):
-
-```
-E_local = num_experts / ep_size                           (e.g. 64/4 = 16)
-staging_experts = E_local × dp_size                       (e.g. 16×1 = 16 for DP=1)
-pre_permute size = staging_experts × (2×I×H + H×I) × 2B  (w13 + w2, BF16)
-                 = 16 × (2×1536×2048 + 2048×1536) × 2    = 580 MB
-gather size      = same as pre_permute                    = 580 MB  (DP>1 only)
-```
-
-For DP>1 the `staging_experts` grows by `dp_size`, making each buffer proportionally larger. With `dp_size=2`, each buffer is 2× larger (1.16 GiB), and the overlap path needs 4 such buffers (4.64 GiB total). This makes peer_access especially attractive for DP>1 configurations where staging memory pressure is highest.
-
-The `plan_qwen_moe_layout()` and `plan_gpt_oss_moe_layout()` functions accept `configure_method` to reserve only the buffers needed, controlled by the `PARAS_CONFIGURE_METHOD` environment variable.
-
-#### Overlap Path: Dual-Stream Pipelining and NCCL Stream Behavior
-
-The overlap path pipelines the all-gather of layer `i+1` with the all-to-all of layer `i` using two CUDA streams (`stream_1`, `stream_2`). Each stream uses its own staging buffer set, identified by a suffix (`_1` or `_2`). The streams and suffixes swap each iteration:
-
-```python
-stream_1, stream_2 = stream_2, stream_1
-staging_1, staging_2 = staging_2, staging_1  # "_1" ↔ "_2"
-```
-
-**Why two staging buffer sets are required**: Without separate sets, both layers write their permuted EP data to the same `pre_permute` buffer concurrently on different streams — a data race. Each stream's suffix (`_1` or `_2`) selects an independent `pre_permute` (and for DP>1, `gather`) buffer.
-
-**NCCL stream behavior**: Despite being issued from different user streams (`stream_1`, `stream_2`), all NCCL collectives execute on a **single internal NCCL stream** managed by PyTorch's `ProcessGroupNCCL`. When `dist.all_to_all_single(async_op=True)` is called:
-
-1. PyTorch records an event on the current user stream
-2. The NCCL stream waits on that event (ensuring the permute completes)
-3. NCCL enqueues the all-to-all on its own stream
-4. `handle.wait()` later makes the user stream wait on the NCCL completion
-
-This means NCCL collectives **serialize** on the NCCL stream regardless of which user stream issued them. The overlap benefit comes from the **permute/copy** on user streams running concurrently with NCCL work, not from NCCL ops overlapping each other. In profiler traces, all `all_to_all` operations appear on the same NCCL stream.
-
-## Method Comparison: Memory Footprint and Latency
-
-All numbers are for Qwen3-30B-A3B (48 MoE layers, 64 experts, hidden=2048, intermediate=1536) on 4×A100-80GB SXM with NVLink.
-
-### Per-Layer Weight Sizes
-
-| Weight | Shape (EP, per GPU) | Size (BF16) |
-|--------|-------------------|-------------|
-| w13 (gate+up) | (16, 3072, 2048) | 192 MB |
-| w2 (down) | (16, 2048, 1536) | 96 MB |
-| **Total per layer** | | **288 MB** |
-
-### Memory Footprint (per GPU)
-
-The table below shows the **inherent memory overhead** of each method vs the original N-slot system (no ParaS). The naive and overlap methods only require staging buffers — they could work with the original N-slot layout. The peer_access method requires the N+1 extra slot to avoid source/destination aliasing but needs no staging. (In the current implementation, all methods share the N+1 layout for code simplicity, but the inherent cost is what matters for comparison.)
-
-Each staging buffer (pre_permute or gather) holds one layer's worth of MoE weights (`E_local × dp_size` experts for w13 + w2), which is exactly the same size as a physical slot for DP=1 (288 MB). This makes the overhead directly comparable in units of "slots."
-
-**DP=1** (current production configuration):
-
-| Component | naive | overlap | peer_access |
-|-----------|------:|--------:|------------:|
-| N+1 extra slot | — | — | +1 slot |
-| Staging: pre_permute | +1 slot (×1) | +1 slot (×2) | — |
-| **Total inherent overhead** | **1 slot (288 MB)** | **2 slots (576 MB)** | **1 slot (288 MB)** |
-
-Naive and peer_access have identical memory overhead (1 slot each). Peer_access wins purely on latency.
-
-**DP=2** (hypothetical, ep_size=2, tp_size=4):
-
-Each staging buffer grows by `dp_size×` (holding `E_local × dp_size` experts), so each buffer = `dp_size` slots = 2 slots (576 MB).
-
-| Component | naive | overlap | peer_access |
-|-----------|------:|--------:|------------:|
-| N+1 extra slot | — | — | +1 slot |
-| Staging: pre_permute (2 slots each) | +2 slots (×1) | +2 slots (×2) | — |
-| Staging: gather (2 slots each) | +2 slots (×1) | +2 slots (×2) | — |
-| **Total inherent overhead** | **4 slots (1.13 GiB)** | **8 slots (2.25 GiB)** | **1 slot (288 MB)** |
-
-At DP=2, the peer_access memory advantage grows to **4× vs naive** and **8× vs overlap**. The overhead gap widens further at higher DP sizes since staging scales as `O(dp_size × num_pipeline_stages)` while peer_access remains fixed at 1 slot.
+The following tables are retained from the earlier slot-based implementation.
+They compare kernel/collective behavior, not the current buffer footprint.
+For present-day memory accounting, use the
+[canonical reference](unified_memory_manager.md#runtime-budget-and-overhead-accounting).
 
 ### Latency Breakdown (E2E, `configure_tp`)
 
@@ -330,19 +240,19 @@ The v2 kernel time (9 ms) is well below the NVLink-bound theoretical minimum (69
 | `paras/csrc/setup.py` | Standalone CUDA extension build (`pip install -e`) |
 | `paras/peer_access.py` | Peer access init (IPC handles), Python kernel wrappers |
 | `paras/layers/paras_moe_block.py` | Per-layer kernel launch (`paras_configure_tp_fused_peer_access_kernel`) |
-| `paras/layers/paras_model.py` | No-barrier orchestration, `@paras_func` handles sync via `paras_configure_helper()` |
+| `paras/layers/paras_model.py` | Complete layer bundles with attention transfer and per-layer cross-rank fences |
 | `paras/models/qwen3_moe.py` | Qwen3 ParaS model init, pre-initializes peer access |
 | `paras/models/gpt_oss.py` | GPT-OSS ParaS model init, pre-initializes peer access |
-| `paras/paras_memory_manager.py` | N+1 slot reservation (`paras.moe_slot.{0..N}.*`), `alias()`, `create_paras_moe_aliases()` |
-| `test/srt/test_paras_peer_access.py` | 4-GPU correctness + benchmark test |
+| `paras/paras_memory_manager.py` | Per-mode tensor offsets from the unified plan |
+| `test/srt/paras/test_paras_peer_access.py` | 4-GPU correctness + benchmark test |
 
 ## Future Work
 
-1. **FP8 scale transfer**: The peer access kernels currently only transfer weight data (w13, w2). FP8 quantized models also need their per-expert scale tensors (`w13_weight_scale`, `w2_weight_scale`) redistributed during EP→TP switching. This is not yet implemented.
+1. **FP8 scale transfer**: The runtime rejects quantized weights. Supporting FP8 would require a weight/scale layout and transfer contract, not just accepting one-byte elements in the expert transport kernels.
 
 2. **KV cache migration**: Peer-access kernels now exist for both EP→TP gather and TP→EP scatter. The remaining work is deeper kernel tuning and broader production coverage, not initial support.
 
-3. **Larger TP groups (8 GPUs)**: More peers = more NVLink bandwidth available. The warp-level peer assignment scales naturally.
+3. **Eight-GPU tuning**: TP8 is already supported, including replicated attention KV heads. Larger groups change the peer traffic balance and warrant separate performance measurements.
 
 4. **Kernel fusion**: Fusing w13 and w2 into a single kernel launch per layer halves launch overhead. A combined kernel was prototyped but showed marginal improvement (~0.1ms) since NVLink bandwidth dominates.
 
@@ -352,7 +262,10 @@ The v2 kernel time (9 ms) is well below the NVLink-bound theoretical minimum (69
 
 1. **Eliminate index division**: The inner loop computes `chunk_id = idx / int4_per_chunk` and `pos = idx % int4_per_chunk` per element. Restructuring to iterate over (chunk, position) pairs would remove this (~20 cycles per division × millions of iterations).
 
-2. **Reduce per-layer barrier overhead**: The current per-layer NCCL all-reduce barrier is lightweight but adds up over many layers. An N+2 slot design (EP layer `i` → slot `i+2`, TP layer `i` → slot `i`) would allow processing consecutive layer pairs simultaneously, halving the number of barriers from N to N/2. More generally, an offset of `d` allows groups of `d` layers per phase with `⌈N/d⌉ - 1` barriers, at the cost of `d` extra slots. With the current N+1 (offset 1) design, every consecutive layer pair shares a slot, making per-layer barriers unavoidable.
+2. **Reduce per-layer barrier overhead**: Any grouping of layers must first
+   prove that every grouped destination is disjoint from all unread source
+   layers in the asymmetric layout. The current implementation fences every
+   complete layer; increasing scratch alone does not remove that requirement.
 
 3. **Warp specialization**: Dedicate specific warps to specific chunk sizes. w13 chunks (1.5MB) benefit from many warps; w2 rows (768B) might benefit from fewer warps with better cache locality.
 
@@ -366,17 +279,19 @@ The reverse kernels (`peer_access_fused_transfer_w13_ep`, `peer_access_fused_tra
 
 | Aspect | EP→TP (v2) | TP→EP (ep) |
 |--------|-----------|-----------|
-| Source | Local EP slot[i+1], strided layout | Local TP slot[i], contiguous layout |
-| Destination | Peer TP slot[i], contiguous layout | Peer EP slot[i+1], strided layout |
+| Source | Local planned EP view, strided layout | Local planned TP view, contiguous layout |
+| Destination | Peer planned TP view, contiguous layout | Peer planned EP view, strided layout |
 | Layer order | Forward (0→N-1) | **Reverse** (N-1→0) |
 
 ### Why Reverse Weight Transfer is Mandatory
 
-The N+1 slot design means EP→TP **destroys EP weight slots**: when layer `i+1`'s EP→TP processes, it writes TP data to slot[i+1], which IS layer `i`'s EP slot. After EP→TP completes, slots 1..N-1 contain TP data, not the original EP weights. A pointer swap back to `ep_experts` would return stale/wrong data.
+The EP and TP interpretations overlap across layers. EP→TP overwrites EP
+source bytes with TP weights, KV, and workspace contents. A pointer swap
+back to EP would expose stale data. TP→EP first migrates KV, then transfers
+weight bundles in reverse layer order to reconstruct experts and full
+attention weights.
 
-Therefore, TP→EP must perform an actual reverse transfer: read from TP slots (which contain correct TP data written during EP→TP), reconstruct EP layout via inverse permute, and write to EP slots.
-
-### Performance
+### Historical Performance
 
 The reverse kernels use identical NVLink optimizations (warp-level peer assignment, int4 stores, 8-unrolling, `__ldg`, self-write bypass, uint32 fast division) and achieve comparable performance:
 

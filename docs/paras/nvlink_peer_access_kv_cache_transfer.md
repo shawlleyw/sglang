@@ -6,7 +6,7 @@ This document describes the NVLink peer access KV cache transfer optimization fo
 
 The peer access approach uses a custom CUDA kernel that reads from the local EP KV buffer and writes directly to peer GPUs' TP KV buffers via NVLink, eliminating the intermediate permutation buffers and NCCL collectives used by the fallback path.
 
-### Performance Summary (Qwen3-30B-A3B dimensions, 3 layers, 4 KV heads, head_dim=128, bf16)
+### Historical Performance Summary (Qwen3-30B-A3B dimensions, 3 layers, 4 KV heads, head_dim=128, bf16)
 
 | Config | Method | Latency (ms) | Speedup |
 |--------|--------|-------------|---------|
@@ -48,24 +48,19 @@ This involves **3 HBM operations + 1 NVLink transfer** per element. The peer acc
 
 ## Key Design Decisions
 
-### 1. N+1 KV Slot Design
+### 1. Planned EP/TP KV Regions
 
-Identical to the N+1 MoE weight slot design (see `nvlink_peer_access_weight_transfer.md`). The memory manager reserves N+1 KV slots for N layers:
+The [unified memory manager](unified_memory_manager.md) plans per-layer
+`kv.ep.k/v` and `kv.tp.k/v` entries with independent shapes and offsets.
+EP KV is packed against the buffer end; TP KV follows TP weights. K and V
+occupy aligned halves of each reserved layer region. There is no separate
+N+1 KV-slot allocation or post-materialization alias pass.
 
-```
-KV slots:  [ slot 0 | slot 1 | slot 2 | ... | slot N ]
-              ↑                                   ↑
-          TP layer 0                         EP layer N-1
-                     EP layer 0
-                     TP layer 1
-```
-
-- EP layer `i` KV lives in slot `i+1`
-- TP layer `i` KV lives in slot `i`
-
-This eliminates aliasing between source (EP) and destination (TP) without staging buffers. The overhead is one extra KV slot (~740 MB for Qwen3-30B-A3B with 4 heads, bf16).
-
-EP/TP aliases (`model.layers.{i}.kv.ep.k/v` → slot `i+1`, `model.layers.{i}.kv.tp.k/v` → slot `i`) are registered by `reserve_kv_cache()` and materialized by the manager's internal KV layout builder. No separate post-materialize helper is needed.
+The [layout bounds](unified_memory_manager.md#capacity-calculation) and
+[migration order](unified_memory_manager.md#migration-safety) protect unread
+source data. EP→TP transfers weights before KV and visits KV layers forward.
+TP→EP transfers KV before weights and visits KV layers backward. Headroom
+at the buffer endpoints also holds backend scratch during inference.
 
 ### 2. Fused K+V CUDA Kernel
 
@@ -107,7 +102,7 @@ The `__syncthreads()` overhead (2 per stride × hundreds of iterations) dominate
 
 ### 4. Synchronization
 
-Per-layer `dist.all_reduce(barrier_tensor)` ensures all ranks finish writing to slot `i` before the next layer reads from slot `i+1`. Sequential kernel launches on the same CUDA stream enforce intra-layer ordering.
+Per-layer `dist.all_reduce(barrier_tensor)` ensures all ranks finish reading and writing the current layer before a subsequent destination can reuse its source region. Local CUDA stream ordering alone cannot protect cross-rank accesses.
 
 ### 5. CUDA IPC Without cudaDeviceEnablePeerAccess
 
@@ -120,7 +115,7 @@ The lazy IPC flag is sufficient for NVLink stores. This matches DeepEP's approac
 ### Source: EP KV Buffer (scattered read)
 
 ```
-EP KV slot[i+1]: (ep_max_tokens + page_size, num_kv_heads, head_dim) bf16
+EP KV layer i: (ep_max_tokens + page_size, num_kv_heads, head_dim) bf16
 
 For each local token t (position = local_token_indices[t]):
   For each peer p:
@@ -131,7 +126,7 @@ For each local token t (position = local_token_indices[t]):
 ### Destination: Peer TP KV Buffer (contiguous write via NVLink)
 
 ```
-TP KV slot[i] on peer p: (tp_view_tokens, heads_per_peer, head_dim) bf16
+TP KV layer i on peer p: (tp_view_tokens, heads_per_peer, head_dim) bf16
 
 dst_token = dst_token_start + t   (contiguous, dst_token_start = sum(global_num_tokens[:tp_rank]))
 Write: peer_tp_k[dst_token, 0 : heads_per_peer, :]
@@ -154,7 +149,7 @@ Head replication (`num_kv_heads < paras_tp_size`) works in the SWA path with the
 
 ### gather_kv_and_permute Dimension Ordering
 
-The permutation outputs `[heads, tokens, KV, dim]` (NOT `[heads, KV, tokens, dim]`). This is critical: each head's chunk in the flat buffer is token-interleaved (`t0_K, t0_V, t1_K, t1_V, ...`). After `all_to_all` splits by head and concatenates received chunks, the result is `[total_tokens, KV, heads, dim]`, which `permute_and_scatter_kv` expects.
+The permutation outputs `[destination_rank, tokens, KV, sharded_heads, dim]`. Each destination chunk is token-interleaved. After `all_to_all` concatenates chunks from all senders, the receiver has `[total_tokens, KV, sharded_heads, dim]`, which `permute_and_scatter_kv` expects. The shorter `[heads, tokens, KV, dim]` description applies only when each destination owns one head.
 
 The previous ordering `[heads, KV, tokens, dim]` made each received chunk KV-grouped (`K_all_tokens, V_all_tokens`), causing K/V misalignment for N>1 tokens per sender.
 
@@ -196,11 +191,11 @@ if replication_factor > 1:
 | `paras/cache_transfer/utils.py` | Stateless NCCL and peer-access gather/scatter helpers |
 | `paras/gather_manager.py` | EP→TP orchestration across layers |
 | `paras/scatter_manager.py` | TP→EP orchestration across layers |
-| `paras/paras_memory_manager.py` | N+1 KV slot reservation and KV layout registration |
+| `paras/paras_memory_manager.py` | Plans per-mode KV capacities, shapes, and offsets |
 | `paras/models/qwen3_moe.py` | Qwen3 MHA-only manager wiring |
 | `paras/models/gpt_oss.py` | GPT-OSS hybrid full+SWA manager wiring |
 | `paras/scheduler_paras_mixin.py` | Passes `peer_ctx` and `PARAS_KV_TRANSFER_METHOD` to gather manager |
-| `mem_cache/memory_pool.py` | `paras_resize_cache()` N+1 TP alias path |
+| `mem_cache/memory_pool.py` | Binds planned mode-specific K/V views |
 | `test/srt/paras/test_kv_cache_transfer.py` | MHA correctness tests |
 | `test/srt/paras/test_kv_cache_transfer_replication.py` | MHA replication tests |
 | `test/srt/paras/test_swa_kv_cache_transfer_replication.py` | SWA replication tests |
@@ -226,6 +221,6 @@ See `parallelism_switch.md` for the full design and `scatter_manager.py` for the
 
 ## Future Work
 
-1. **FP8 KV cache**: Wire `kv_cache_dtype=fp8` through to `reserve_kv_cache()` and kernel elem_size.
+1. **Hybrid FP8 KV cache**: The planner already resolves FP8 KV dtype for non-hybrid models. SWA with FP8 KV remains outside the supported runtime scope; enabling it requires validating the pool storage and transfer paths together.
 
 2. **NVSHMEM migration**: Replace CUDA IPC with NVSHMEM symmetric heap allocation (`nvshmem_align` + `nvshmemi_get_p2p_ptr`). Would eliminate IPC handle exchange entirely. Medium-large effort — requires coordinating with DeepEP's NVSHMEM init and wrapping NVSHMEM memory as torch tensors. Not needed now that `cudaDeviceEnablePeerAccess` overhead is eliminated.

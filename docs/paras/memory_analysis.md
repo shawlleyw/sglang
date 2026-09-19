@@ -1,4 +1,10 @@
-# ParaS Memory Analysis
+# Historical ParaS Memory Analysis
+
+> Historical measurements from `paras_memory_opt`, before asymmetric attention
+> weights and backend workspace integration. The N+1 slots, removed planner
+> APIs, and overhead totals below describe that implementation only. For the
+> current mechanism and accounting, use the
+> [unified memory manager reference](unified_memory_manager.md).
 
 Empirical accounting of the GPU memory overhead ParaS adds on top of baseline EP, with measured numbers, root-cause attributions, applied optimizations, and remaining reclaimable items.
 
@@ -17,7 +23,7 @@ Two optimizations reclaimed **3.89 GB per GPU** of ParaS overhead without any fu
 | **After budget semantics fix** | **56.30 GB** | **−1.46 GB** | **+3.03 GB** |
 | Baseline EP | 53.27 GB | — | 0 |
 
-The remaining +3.03 GB of ParaS overhead is fully accounted for: ~1.0 GB is the N+1 slot feature cost (reclaimable only with algorithmic redesign), ~0.5 GB is structural (dual CUDA graph pool + peer-access IPC mappings), and the rest is allocator accounting and a few identified small items.
+The measured +3.03 GB residual was only partly attributed (the table below includes an unaccounted residual): ~1.0 GB is the N+1 slot feature cost (reclaimable only with algorithmic redesign), ~0.5 GB is structural (dual CUDA graph pool + peer-access IPC mappings), and the rest is allocator accounting and a few identified small items.
 
 ---
 

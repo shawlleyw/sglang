@@ -3,11 +3,38 @@
 ## Reader
 
 This document is written for a ParaS contributor who already understands the
-core EP↔TP switch, the unified memory manager, and the N+1 slot design (see
-`parallelism_switch.md` and `unified_memory_manager.md`), and now needs to
-understand what GPT-OSS adds to that baseline. The last session's bug-probing
-chronicle is preserved at the end as a worked example of how to localize
-failures in this codebase.
+core [EP↔TP switch](parallelism_switch.md) and
+[unified memory layout](unified_memory_manager.md), and now needs to
+understand what GPT-OSS adds to that baseline. The bug-probing chronicles below are historical worked examples; their
+removed APIs and earlier fixes are not the current memory-manager contract.
+The supported ParaS runtime requires BF16 weights; references to MXFP4
+below describe checkpoint formats, not supported ParaS quantization.
+
+## Replicated LM head for static TP comparisons
+
+Static GPT-OSS normally shards its vocabulary projection across TP ranks.
+Set `SGLANG_GPTOSS_REPLICATED_LM_HEAD=1` when launching static TP to keep a
+full LM head on every rank and disable the logits all-gather. Attention,
+experts, and input embeddings retain their ordinary TP layouts. Unset the
+variable or set it to `0` to retain the default behavior.
+
+This option requires unquantized weights and rejects `--enable-dp-attention`
+and `--enable-dp-lm-head`. It was validated with GPT-OSS 120B BF16 on eight
+A100 GPUs. Replication increases per-rank head memory and projection work;
+removing the logits collective does not guarantee better performance.
+
+The existing `--enable-dp-lm-head` option serves a different configuration:
+it shards the vocabulary within the attention TP group. With TP=8 and DP=8,
+that group has size one, so DP attention already gets full heads without
+this environment variable. At DP=1 the flag is disabled by argument
+normalization, and it cannot independently replicate the head while keeping
+TP attention. ParaS uses its own model constructor and retains its existing
+head layout across switches; the new variable affects only static GPT-OSS.
+
+For the underlying layer API, `ParallelLMHead(enable_tp=False)` opts into a
+full head. Callers must also disable the matching logits all-gather. Existing
+callers keep `enable_tp=True` by default. CPU regression coverage is in
+[`test_gpt_oss_replicated_lm_head.py`](../../test/srt/test_gpt_oss_replicated_lm_head.py).
 
 ## Why GPT-OSS Is Different from Qwen3-MoE
 
@@ -29,12 +56,12 @@ The ParaS GPT-OSS adaptation lives in five files:
   (`GptOssSparseMoeBlockParaS`, `GptOssAttentionParaS`,
   `GptOssDecoderLayerParaS`, `GptOssModelParaS`, `GptOssForCausalLMParaS`)
 - `python/sglang/srt/paras/layers/paras_moe_block.py` — MoE block mixin, w13
-  interleaved weight transport, replicated-bias views and all-gather helper
+  interleaved weight transport, replicated-bias views and expert transfer helpers
 - `python/sglang/srt/paras/layers/paras_attention.py` — attention mixin
 - `python/sglang/srt/paras/layers/paras_decoder_layer.py` — per-layer
   communicator switch
 - `python/sglang/srt/paras/paras_memory_manager.py` — layout planner for
-  fused weights, heterogeneous KV reservation
+  weights, workspace requirements, and heterogeneous KV planning
 
 ## Five Adaptations in Detail
 
@@ -70,11 +97,11 @@ a simple split.
 
 When EP→TP switches the w13 tensor via all-to-all redistribution, the
 interleaved pairs must stay together inside each rank's I/TP-size slab.
-`paras_configure_tp_all_to_all` in `paras_moe_block.py:295-320` handles this
-by viewing the EP tensor as `(num_local_experts, paras_tp_size, 2 *
-I_per_tp_rank * H)` — one contiguous block per (local expert, destination
-rank) pair — before the all-to-all. The `self._paras_interleaved_w13` flag
-(set to `True` in `GptOssSparseMoeBlockParaS.__init__`) gates this path.
+The current peer-access call sites in `paras_moe_block.py` set
+`num_gates=1` and use a contiguous `2 * I_per_tp_rank * H` chunk for each
+(local expert, destination rank) pair. The `_paras_interleaved_w13` flag
+(set by `GptOssSparseMoeBlockParaS`) selects this interpretation. Kernel
+bytes preserve adjacent gate/up pairs in both directions.
 
 The interleaved w13 transport was added in commit `6efd00aad` with
 bf16-exact unit tests at
@@ -94,8 +121,8 @@ All three follow the same pattern:
 
 1. **One shared full-size tensor per rank.** `GptOssSparseMoeBlockParaS`
    owns `self._full_w13_bias`, `self._full_w2_bias`. `GptOssAttentionParaS`
-   owns `self._full_sinks`. Each is allocated once at
-   construction / first-switch time on every rank.
+   owns `self._full_sinks`. Each is allocated at
+   model initialization on every rank.
 2. **EP and TP forward paths read through Parameter views into the shared
    tensor.** Switching mode rebinds the Parameter; the underlying storage
    never moves. `ep_experts.w{13,2}_weight_bias.data` points to
@@ -146,24 +173,25 @@ much less KV cache (window-sized) than full layers (sequence-sized). The
 ParaS memory manager must reserve different KV budgets per layer type, and
 the switch must preserve this distinction.
 
-`plan_gpt_oss_moe_layout` in `paras/models/gpt_oss.py:260-278` plans the
-expert layout. `plan_hybrid_kv_budget` (imported from
-`paras_memory_manager`) splits the global KV budget across full and
-sliding layer counts according to `swa_full_tokens_ratio`. The resulting
-`_full_max_tokens` and `_swa_max_tokens` are then fed into
-`classify_layers_from_config`, which produces per-layer
-`LayerCacheSpec` entries that `manager.reserve_kv_cache` uses to materialize
-the right KV pool layout.
+Both model families call `reserve_model_weights`, then
+`manager.plan_layout(config)` and `manager.materialize(plan)`. GPT-OSS uses
+`with_bias=True` for MoE backend selection; the bias tensors remain external.
+The shared planner partitions KV bytes using `config.layer_types` and
+`swa_full_tokens_ratio`, rounds capacities to pages, and derives per-layer
+`LayerCacheSpec` entries. Full and SWA pools bind the already-planned EP/TP
+views through `get_kv_views(..., mode=mode, layer_ids=...)`, with `mode` set to
+`ParaSMode.EP` or `ParaSMode.TP`.
+See the [capacity calculation](unified_memory_manager.md#capacity-calculation)
+for endpoint headroom and heterogeneous layer sizing.
 
 The hybrid SWA+ParaS path is enabled by default. The runtime instantiates
 `SWAKVPool` (a container of `full_kv_pool` + `swa_kv_pool` with per-layer
 routing via `layers_mapping`) and `SWATokenToKVPoolAllocator` (dual sub-allocators
-plus a `full_to_swa_index_mapping` tensor). The scheduler reserves heterogeneous
-KV using `plan_hybrid_kv_budget` and `classify_layers_from_config`. Three
-defects had to be fixed before the dual-pool path was end-to-end correct
+plus a `full_to_swa_index_mapping` tensor). The model publishes the planner's
+layer specs to the scheduler and cache-transfer backends. Three
+historical defects had to be fixed before the dual-pool path was end-to-end correct
 on the gpt-oss-120b-bf16 + 4×A100 + Triton + cuda-graph configuration:
-(1) `SWAKVPool.paras_configure_tp/ep` used `get_view` (which returns the
-EP-shaped LayoutEntry) instead of `get_view_as` with an explicit TP shape,
+(1) `SWAKVPool.paras_configure_tp/ep` used `get_view` with the EP entry rather than the planned TP view,
 so the inner sub-pools' k/v buffers kept the EP head count after the switch;
 (2) `Scheduler.full_tokens_per_layer` and `swa_tokens_per_layer` were not
 refreshed after the allocator resized, so the runtime memory-leak detector
@@ -797,7 +825,7 @@ This request holds the node from another tree` in
 path: with `--disable-radix-cache` enforced, neither `RadixCache` nor
 `SWARadixCache` is constructed. Prefix sharing in ParaS would require
 migrating the radix tree across switches; this is documented as future
-work in [`future/radix_cache.md`](file:///home/shaoyuw/sglang/docs/paras/future/radix_cache.md).
+work in [`future/radix_cache.md`](future/radix_cache.md).
 
 References for this update:
 
@@ -929,7 +957,7 @@ New open items from Chronicle 2:
 ## References
 
 - `parallelism_switch.md` — overall ParaS EP↔TP switch design
-- `unified_memory_manager.md` — memory layout and N+1 slot design
+- `unified_memory_manager.md` — current asymmetric weights/KV/workspace layout
 - `cuda_graph.md` — dual CUDA graph capture for EP and TP
 - `runs/2026-04-23-paras-swa-bias-transport.md` — earlier SWA+bias session
 - `runs/2026-04-24-paras-gptoss-tp-degenerate.md` — Chronicle 1 session 1

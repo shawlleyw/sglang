@@ -21,12 +21,12 @@ For hybrid SWA models, sglang carries **two K/V pools** wired into a single allo
 - **Full pool**: stores K/V for the full-attention layers (or for the full-attention-equivalent slots when `--disable-hybrid-swa-memory` is set). Size: `full_max_tokens` per layer.
 - **SWA pool**: stores K/V for the sliding-window layers. Size: `swa_max_tokens` per layer, typically smaller than the full pool (e.g., `swa_full_tokens_ratio = 0.8`).
 
-Both pools are managed by [`SWATokenToKVPoolAllocator`](file:///home/shaoyuw/sglang/python/sglang/srt/mem_cache/allocator.py), which performs **lockstep allocation** (`alloc(N)` returns N full slots AND N SWA slots together) and maintains a translation tensor `full_to_swa_index_mapping[full_slot] → swa_slot`. Reads and writes from SWA layers go through this mapping.
+Both pools are managed by [`SWATokenToKVPoolAllocator`](../../python/sglang/srt/mem_cache/allocator.py), which performs **lockstep allocation** (`alloc(N)` returns N full slots AND N SWA slots together) and maintains a translation tensor `full_to_swa_index_mapping[full_slot] → swa_slot`. Reads and writes from SWA layers go through this mapping.
 
 The tree cache for hybrid SWA models is one of:
 
-- [`SWARadixCache`](file:///home/shaoyuw/sglang/python/sglang/srt/mem_cache/swa_radix_cache.py) — default, with prefix-matching and tombstone-aware nodes. Used when radix cache is enabled. See [`radix_cache.md`](file:///home/shaoyuw/sglang/docs/paras/radix_cache.md) for why ParaS doesn't use this.
-- [`SWAChunkCache`](file:///home/shaoyuw/sglang/python/sglang/srt/mem_cache/chunk_cache.py) — used when `--disable-radix-cache` is set. No tree, no prefix matching; just per-request slot tracking through `req_to_token_pool`. **This is what ParaS uses.**
+- [`SWARadixCache`](../../python/sglang/srt/mem_cache/swa_radix_cache.py) — default, with prefix-matching and tombstone-aware nodes. Used when radix cache is enabled. See [`radix_cache.md`](radix_cache.md) for why ParaS doesn't use this.
+- [`SWAChunkCache`](../../python/sglang/srt/mem_cache/chunk_cache.py) — used when `--disable-radix-cache` is set. No tree, no prefix matching; just per-request slot tracking through `req_to_token_pool`. **This is what ParaS uses.**
 
 A request's `req_to_token_pool[req_pool_idx, p]` holds the full-pool slot index for position `p`. SWA reads translate to the SWA pool via `full_to_swa_index_mapping[full_slot]`. Mapping value `0` means "no SWA slot for this position" — attention reads padding from slot 0 (the reserved padding slot).
 
@@ -37,7 +37,7 @@ Prior to PR #17220, sglang did NOT evict in-flight requests' SWA slots during de
 [PR #17220](https://github.com/sgl-project/sglang/pull/17220) added runtime SWA eviction during decode. The mechanism is per-Req:
 
 - `Req.swa_evicted_seqlen: int` — counts how many leading SWA slots have been freed for this request.
-- `ScheduleBatch.maybe_evict_swa()` — called at the top of `alloc_for_extend` and `alloc_for_decode` in [`mem_cache/common.py`](file:///home/shaoyuw/sglang/python/sglang/srt/mem_cache/common.py).
+- `ScheduleBatch.maybe_evict_swa()` — called at the top of `alloc_for_extend` and `alloc_for_decode` in [`mem_cache/common.py`](../../python/sglang/srt/mem_cache/common.py).
 - For each in-flight req in decode mode:
   ```python
   new_swa_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
@@ -55,11 +55,11 @@ Key invariants:
 
 Steady-state SWA pool occupancy per request: `min(W, P + decode_steps) ≈ W` once `decode_steps > W`. For 32 concurrent reqs with `W = 128`, total SWA pool usage stabilizes at ~32 × 128 = 4096 tokens regardless of how long each request has been decoding.
 
-ParaS adopts this mechanism by porting the per-Req field and the eviction methods (without the radix-cache tombstone machinery, since ParaS uses `SWAChunkCache`). See `swa_evicted_seqlen` and `ScheduleBatch.maybe_evict_swa` in [`schedule_batch.py`](file:///home/shaoyuw/sglang/python/sglang/srt/managers/schedule_batch.py).
+ParaS adopts this mechanism by porting the per-Req field and the eviction methods (without the radix-cache tombstone machinery, since ParaS uses `SWAChunkCache`). See `swa_evicted_seqlen` and `ScheduleBatch.maybe_evict_swa` in [`schedule_batch.py`](../../python/sglang/srt/managers/schedule_batch.py).
 
 ## ParaS SWA cache transfer: current implementation
 
-When ParaS switches between EP and TP, in-flight requests' K/V must be redistributed across ranks. Each layer's K/V is transferred independently via per-layer dispatch through `MHACacheTransfer` (full layers) or [`SWACacheTransfer`](file:///home/shaoyuw/sglang/python/sglang/srt/paras/cache_transfer/swa.py) (sliding-window layers).
+When ParaS switches between EP and TP, in-flight requests' K/V must be redistributed across ranks. Each layer's K/V is transferred independently via per-layer dispatch through `MHACacheTransfer` (full layers) or [`SWACacheTransfer`](../../python/sglang/srt/paras/cache_transfer/swa.py) (sliding-window layers).
 
 The current strategy is **transfer-then-tighten**:
 
@@ -91,7 +91,7 @@ For SWA layers, `SWACacheTransfer.gather_one_layer` / `scatter_one_layer`:
 
 ### Step 4: Destination tightening (`_tighten_swa_pool_to_in_window`)
 
-After the alloc loop, [`gather_manager`](file:///home/shaoyuw/sglang/python/sglang/srt/paras/gather_manager.py) and [`scatter_manager`](file:///home/shaoyuw/sglang/python/sglang/srt/paras/scatter_manager.py) run a fixup:
+After the alloc loop, [`gather_manager`](../../python/sglang/srt/paras/gather_manager.py) and [`scatter_manager`](../../python/sglang/srt/paras/scatter_manager.py) run a fixup:
 
 ```python
 for req in reqs:
@@ -194,11 +194,11 @@ Not implemented. The current `_tighten` solution is correct and validated, and t
 
 ## References
 
-- [`schedule_batch.py:maybe_evict_swa`](file:///home/shaoyuw/sglang/python/sglang/srt/managers/schedule_batch.py) — per-decode-step dynamic SWA eviction.
-- [`mem_cache/allocator.py:SWATokenToKVPoolAllocator`](file:///home/shaoyuw/sglang/python/sglang/srt/mem_cache/allocator.py) — lockstep alloc and `free_swa`.
-- [`mem_cache/chunk_cache.py:SWAChunkCache`](file:///home/shaoyuw/sglang/python/sglang/srt/mem_cache/chunk_cache.py) — tree-less cache used by ParaS.
-- [`paras/gather_manager.py:_tighten_swa_pool_to_in_window`](file:///home/shaoyuw/sglang/python/sglang/srt/paras/gather_manager.py) — destination-side post-alloc fixup.
-- [`paras/cache_transfer/swa.py:SWACacheTransfer`](file:///home/shaoyuw/sglang/python/sglang/srt/paras/cache_transfer/swa.py) — per-layer SWA transfer dispatch.
-- [`docs/paras/radix_cache.md`](file:///home/shaoyuw/sglang/docs/paras/radix_cache.md) — why ParaS does not use `SWARadixCache`.
-- [`docs/paras/parallelism_switch.md`](file:///home/shaoyuw/sglang/docs/paras/parallelism_switch.md) — overall EP↔TP switch design.
+- [`schedule_batch.py:maybe_evict_swa`](../../python/sglang/srt/managers/schedule_batch.py) — per-decode-step dynamic SWA eviction.
+- [`mem_cache/allocator.py:SWATokenToKVPoolAllocator`](../../python/sglang/srt/mem_cache/allocator.py) — lockstep alloc and `free_swa`.
+- [`mem_cache/chunk_cache.py:SWAChunkCache`](../../python/sglang/srt/mem_cache/chunk_cache.py) — tree-less cache used by ParaS.
+- [`paras/gather_manager.py:_tighten_swa_pool_to_in_window`](../../python/sglang/srt/paras/gather_manager.py) — destination-side post-alloc fixup.
+- [`paras/cache_transfer/swa.py:SWACacheTransfer`](../../python/sglang/srt/paras/cache_transfer/swa.py) — per-layer SWA transfer dispatch.
+- [`docs/paras/radix_cache.md`](radix_cache.md) — why ParaS does not use `SWARadixCache`.
+- [`docs/paras/parallelism_switch.md`](parallelism_switch.md) — overall EP↔TP switch design.
 - PR #17220 (commit `ce8a6ac69`) on sglang main — the dynamic SWA eviction concept ParaS adopted.

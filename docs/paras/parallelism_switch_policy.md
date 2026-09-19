@@ -404,7 +404,7 @@ Investigation records and per-row forensics for the 2026-05-15 work are filed un
 
 ## 9. References
 
-- `parallelism_switch.md` — base EP↔TP switch design (gather/scatter, weight transfer, N+1 slot, control plane)
+- `parallelism_switch.md` — base EP↔TP switch design (gather/scatter, weight transfer, unified buffer, control plane)
 - `parallelism_configuration.md` — why DP/EP and TP/TP are the two practical configurations and where the crossover is
 - `cuda_graph.md` — dual graph capture and per-mode state preservation
 - `gpt_oss_support.md` — model-specific adaptations including the in-flight switch correctness chronicle

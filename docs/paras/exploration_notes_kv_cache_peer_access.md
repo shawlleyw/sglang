@@ -2,6 +2,10 @@
 
 These notes document discoveries, bugs found, and design decisions made during the development of NVLink peer access for KV cache transfer (April 2026).
 
+For current buffer geometry and transfer ordering, see the
+[unified memory manager](unified_memory_manager.md). These development notes
+retain historical implementations and should not be read as the runtime API.
+
 ## 1. gather_kv_and_permute Dimension Ordering Bug
 
 **Discovery**: The original `gather_kv_and_permute` used `.permute(2, 0, 1, 3)` producing layout `[heads, KV, tokens, dim]`. After `all_to_all` splits by head, each received chunk was `[K_all_tokens, V_all_tokens]` (KV-grouped). The subsequent `permute_and_scatter_kv` did `.view(total_tokens, 2, heads, dim)` which assumed token-interleaved layout `[t0_K, t0_V, t1_K, t1_V, ...]`.

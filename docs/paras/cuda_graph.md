@@ -4,7 +4,13 @@
 
 ParaS maintains two sets of CUDA graphs — one for EP mode and one for TP mode — so that mode switches at runtime don't require re-capturing graphs. Each set owns an **isolated** CUDA graph memory pool, and they are swapped via `paras_swap_cuda_graphs`.
 
-All ParaS-specific CUDA graph logic lives in `python/sglang/srt/paras/paras_cuda_graph.py`. The `CudaGraphRunner` and `ModelRunner` classes have no ParaS-specific code beyond the memory-breakdown log hook.
+Capture/save/restore orchestration lives in
+[`paras_cuda_graph.py`](../../python/sglang/srt/paras/paras_cuda_graph.py),
+with integration hooks in `CudaGraphRunner`, `ModelRunner`, and attention
+backends. Graph-pool isolation applies to allocations owned by those pools.
+Managed weights, KV, and backend scratch use the overlapping per-mode views
+in the [unified memory buffer](unified_memory_manager.md); dual graph pools
+do not duplicate that allocation.
 
 Hybrid sliding-window-attention models now use the same dual-pool capture design. The earlier startup restriction that rejected SWA + ParaS under CUDA graphs was removed once the EP↔TP hot-switch path was verified to run outside the captured region.
 
@@ -15,14 +21,14 @@ Hybrid sliding-window-attention models now use the same dual-pool capture design
 1. `CudaGraphRunner.__init__` captures EP graphs into the current `global_graph_memory_pool` (standard sglang path). This pool becomes EP's private pool (typically `(0, 1)`).
 2. `model_runner.init_device_graphs` calls `paras_init_dual_cuda_graphs(model_runner)`.
 3. Inside `paras_init_dual_cuda_graphs`:
-   - **Save EP state**: `paras_save_cuda_graph_state(gr, "ep")` — snapshots `graphs`, `output_buffers`, `deepep_mode`, FlashInfer metadata, mode-dependent settings, **and the graph memory pool handle**.
-   - **Switch to TP mode**: modify `server_args` (disable dp_attention, set dp_size=1, ep_size=1, moe_a2a_backend="none"), call `paras_comm_configure_tp()`, reconfigure `token_to_kv_pool`, `attn_backend`, and model weights.
-   - **Clear live graph dicts**: `gr.graphs.clear()` + `gr.output_buffers.clear()`. EP state is preserved via the dict copies stored in `_paras_saved["ep"]`.
+   - **Save EP state**: `paras_save_cuda_graph_state(gr, ParaSMode.EP)` — snapshots `graphs`, `output_buffers`, `deepep_mode`, FlashInfer metadata, mode-dependent settings, **and the graph memory pool handle**.
+   - **Switch to TP mode**: modify `server_args` (disable dp_attention, set dp_size=1, ep_size=1, moe_a2a_backend="none"), call `paras_comm_configure_tp()`, rebind `token_to_kv_pool` and `attn_backend` views, transfer model weights, then initialize target attention scratch. Startup has no live request KV to migrate.
+   - **Clear live graph dicts**: `gr.graphs.clear()` + `gr.output_buffers.clear()`. EP state is preserved via the dict copies stored in `_paras_saved[ParaSMode.EP]`.
    - **Reset global pool**: `set_global_graph_memory_pool(None)` so the TP capture allocates a fresh pool via `graph_pool_handle()` on the first batch size.
-   - **Capture TP graphs**: `paras_refresh_cuda_graph_settings(gr)` then `gr.capture()` — uses the same `capture_bs` list as EP but a **separate** CUDA graph memory pool (typically `(0, 2)`).
-   - **Save TP state**: `paras_save_cuda_graph_state(gr, "tp")` — captures TP's distinct pool handle.
-   - **Switch back to EP mode**: restore `server_args`, call `paras_comm_configure_ep()`, reconfigure pools/backend/model.
-   - **Load EP state**: `paras_load_cuda_graph_state(gr, "ep")` — restores EP's graphs, buffers, settings, FlashInfer metadata, **and republishes EP's pool handle** via `set_global_graph_memory_pool`. Server starts in EP mode.
+   - **Capture TP graphs**: `paras_refresh_cuda_graph_settings(gr)` then `gr.capture()` — uses TP-specific capture batch sizes when configured, otherwise EP's list, and a **separate** CUDA graph memory pool (typically `(0, 2)`). Runner buffers are sized for the maximum of the two lists.
+   - **Save TP state**: `paras_save_cuda_graph_state(gr, ParaSMode.TP)` — captures TP's distinct pool handle.
+   - **Switch back to EP mode**: restore `server_args`, call `paras_comm_configure_ep()`, rebind pools/backend, restore EP weights, then initialize EP attention scratch.
+   - **Load EP state**: `paras_load_cuda_graph_state(gr, ParaSMode.EP)` — restores EP's graphs, buffers, settings, FlashInfer metadata, **and republishes EP's pool handle** via `set_global_graph_memory_pool`. Server starts in EP mode.
 
 ### Saved state per mode
 
@@ -34,22 +40,25 @@ Each mode's saved state (`runner._paras_saved[mode]`) contains:
 | `output_buffers` | `dict[int, tensor]` — batch size → output buffer |
 | `deepep_mode` | DeepEP captured mode (low_latency / normal) |
 | `graph_memory_pool` | CUDA graph pool handle tuple (e.g. `(0, 1)` for EP, `(0, 2)` for TP) |
-| FlashInfer metadata | `decode_cuda_graph_metadata`, `prefill_cuda_graph_metadata`, `draft_extend_cuda_graph_metadata` |
-| Settings | `require_gathered_buffer`, `require_mlp_tp_gather`, `require_mlp_sync`, `require_attn_tp_gather`, `attn_tp_size`, `attn_tp_rank`, `tp_size`, `dp_size` |
+| `attn_backend` | Backend-owned state through `paras_save_cuda_graph_state` / `paras_load_cuda_graph_state`: FlashInfer metadata or Triton graph-buffer references |
+| Settings | `require_gathered_buffer`, `require_mlp_tp_gather`, `require_mlp_sync`, `require_attn_tp_gather`, `attn_tp_size`, `attn_tp_rank`, `tp_size`, `dp_size`, `capture_bs`, `compile_bs` |
 
 ## Runtime Swap
 
-When `model_runner.paras_configure_tp()` or `paras_configure_ep()` is called (triggered by `/paras_configure_tp` or `/paras_configure_ep` HTTP endpoints):
+The scheduler first drains inference and migrates live state in the
+[required order](unified_memory_manager.md#migration-safety): weights then
+KV for EP→TP, KV then weights for TP→EP. ModelRunner rebinds backend views,
+finishes weight configuration, initializes target attention scratch, and
+calls `paras_swap_cuda_graphs(model_runner, mode)` using `ParaSMode.TP`
+or `ParaSMode.EP`.
 
-1. Model weights are transferred (peer access).
-2. KV cache pool and attention backend are reconfigured.
-3. `paras_swap_cuda_graphs(model_runner, "tp" or "ep")` swaps the active graph set by calling `paras_load_cuda_graph_state`, which also republishes the active mode's graph pool handle globally.
+The swap restores captured graph references, mode settings, backend graph
+metadata, and the active graph pool handle. It does not recapture graphs,
+restore old request/allocator state, or reconstruct overwritten weights/KV;
+those transfers must already have completed. Stable per-mode UMM addresses
+allow the captured graphs to remain valid across repeated switches.
 
-No re-capture or re-instantiation happens — it's a Python dict reference swap. Measured switch time: ~80–90 ms total (including weight transfer ~67 ms) on 4×A100-80GB.
-
-**Correctness**: EP generation output is byte-for-byte identical before and after any EP↔TP round-trip (verified on Qwen3-30B with greedy sampling).
-
-## Fixed bugs (commit `8313fb698`)
+## Historical fixes (commit `8313fb698`)
 
 ### 1. EP state leaking into TP capture
 
@@ -97,7 +106,11 @@ Field definitions:
   - **`nccl_est`**: `len(live NCCL communicators) × 144 MiB`. An **upper-bound estimate** based on `≈9 MiB × 8 channels × 2 (send+recv)` per communicator (NCCL 2.27.7 defaults). Live comms counted: `_WORLD`, `_TP`, `_PP`, `_MOE_EP`, `_MOE_TP`, `_PDMUX_PREFILL_TP_GROUP`. Note: on our setup **both EP and TP configs create 5 NCCL comms** (because sglang initializes `_MOE_EP`/`_MOE_TP` as trivial 1-rank groups in the TP-only case).
   - **`other`**: residual — dominated by NCCL CUDA-graph-capture VMM scratch (NCCL 2.19+ with `NCCL_CUMEM_ENABLE=1` allocates per-graph `cuMemCreate`/`cuMemMap` buffers, see NCCL issue #1234), plus lazy cuBLAS workspaces, plus any unaccounted driver state.
 
-## Memory Footprint
+## Historical Memory Footprint
+
+These measurements predate the combined backend workspace layout. They
+illustrate the instrumentation and the earlier implementation's costs;
+they are not current ParaS overhead estimates.
 
 All measurements on Qwen3-30B-A3B-Instruct-2507, 4×A100-80GB, `--mem-fraction-static 0.6`, `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`, `--cuda-graph-max-bs 256` (36 batch sizes), DP0 unless noted. Captured with the instrumentation in commit `6ff7c38d1`. Raw logs in `artifacts/{ep,tp,paras}_bs256_v2.log`.
 
