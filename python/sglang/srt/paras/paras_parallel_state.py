@@ -83,48 +83,69 @@ def initialize_paras_parallel(
     _PARAS_EP_RANK = global_rank
 
     # Build the ParaS tensor model-parallel groups.
+    #
+    # Memory optimization: when the paras_tp group ranks are identical to an
+    # existing group's ranks, alias the existing group instead of creating a new
+    # torch.distributed ProcessGroup + NCCL communicator. This saves one full
+    # NCCL communicator per ParaS group (ncclCommInitRank, channel buffers,
+    # per-comm NCCL scratch) and avoids the warmup collective.
+    #
+    # Default config (--tp-size 4 --dp-size 1 --ep-size 4, world_size=4):
+    #   paras_tp ranks == _TP ranks (all world ranks) → alias to _TP.
+    #   paras_dp ranks == _MOE_TP ranks (singletons)   → alias to _MOE_TP.
     num_paras_tensor_model_parallel_groups: int = world_size // tp_size
-    
     assert _PARAS_TP is None, "ParaS tensor parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_paras_tensor_model_parallel_groups):
-        ranks = list(
-            range(i * tp_size, (i + 1) * tp_size)
-        )
-        group_ranks.append(ranks)
 
-    _PARAS_TP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_message_queue_broadcaster=get_bool_env_var(
-            "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
-        ),
-        group_name="paras_tp",
-    )
-    x = torch.ones(128 * _PARAS_TP_SIZE, dtype=torch.bfloat16, device=_PARAS_TP.device)
-    scattered_x = torch.empty_like(x)
-    dist.all_to_all_single(scattered_x, x, group=_PARAS_TP.device_group)
+    # paras_tp: alias _TP when ranks match exactly
+    if tp_size == world_size:
+        _PARAS_TP = parallel_state._TP
+    else:
+        group_ranks = []
+        for i in range(num_paras_tensor_model_parallel_groups):
+            ranks = list(range(i * tp_size, (i + 1) * tp_size))
+            group_ranks.append(ranks)
+
+        _PARAS_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=get_bool_env_var(
+                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
+            ),
+            group_name="paras_tp",
+        )
+        # Warmup only for freshly-created groups: the aliased _TP has already
+        # been warmed up by sglang's normal init.
+        x = torch.ones(128 * _PARAS_TP_SIZE, dtype=torch.bfloat16, device=_PARAS_TP.device)
+        scattered_x = torch.empty_like(x)
+        dist.all_to_all_single(scattered_x, x, group=_PARAS_TP.device_group)
 
     # Build the ParaS data model-parallel groups.
     num_paras_data_model_parallel_groups: int = world_size // dp_size
     global _PARAS_DP
     assert _PARAS_DP is None, "ParaS data parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_paras_data_model_parallel_groups):
-        ranks = list(range(i, world_size, num_paras_data_model_parallel_groups))
-        group_ranks.append(ranks)
-    
-    _PARAS_DP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_custom_allreduce=False,
-        group_name="paras_dp",
-    )
-    x = torch.ones(128, dtype=torch.bfloat16, device=_PARAS_DP.device)
-    gathered_x = torch.zeros((x.shape[0] * _PARAS_DP_SIZE), dtype=torch.bfloat16, device=_PARAS_DP.device)
-    dist.all_gather_into_tensor(gathered_x, x, group=_PARAS_DP.device_group)
+
+    # paras_dp: alias _MOE_TP when ranks match. When dp_size == 1, each paras_dp
+    # group is a singleton {rank} — same shape as _MOE_TP in the default config
+    # (where moe_tp_size == 1). _MOE_TP already contains the local rank only.
+    if dp_size == 1 and parallel_state._MOE_TP is not None and parallel_state._MOE_TP.world_size == 1:
+        _PARAS_DP = parallel_state._MOE_TP
+    else:
+        group_ranks = []
+        for i in range(num_paras_data_model_parallel_groups):
+            ranks = list(range(i, world_size, num_paras_data_model_parallel_groups))
+            group_ranks.append(ranks)
+
+        _PARAS_DP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="paras_dp",
+        )
+        x = torch.ones(128, dtype=torch.bfloat16, device=_PARAS_DP.device)
+        gathered_x = torch.zeros((x.shape[0] * _PARAS_DP_SIZE), dtype=torch.bfloat16, device=_PARAS_DP.device)
+        dist.all_gather_into_tensor(gathered_x, x, group=_PARAS_DP.device_group)
 
 def get_paras_tp_size() -> int:
     assert _PARAS_TP_SIZE is not None, "ParaS tensor parallel size is not initialized"

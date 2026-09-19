@@ -248,8 +248,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         content["meta_info"]["output_token_logprobs"]
                     )
 
-                # Generate delta
-                delta = text[len(stream_buffer) :]
+                # Generate delta (out_dict["text"] is already the per-step delta)
+                delta = text
                 stream_buffers[index] = stream_buffer + delta
                 finish_reason = content["meta_info"]["finish_reason"]
 

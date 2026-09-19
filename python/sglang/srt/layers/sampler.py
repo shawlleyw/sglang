@@ -39,6 +39,8 @@ class Sampler(nn.Module):
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
 
+        self.force_sync_token_ids = False
+
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
     ) -> torch.Tensor:
@@ -187,7 +189,11 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             ]
 
-        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+        if (
+            SYNC_TOKEN_IDS_ACROSS_TP
+            or sampling_info.grammars
+            or self.force_sync_token_ids
+        ):
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
@@ -200,6 +206,17 @@ class Sampler(nn.Module):
                 op=dist.ReduceOp.MIN,
                 group=self.tp_sync_group,
             )
+
+        # Defense in depth: BF16 numerical drift during long-tail decode can
+        # push NaN/Inf into logits. flashinfer top_k_top_p_sampling_from_probs
+        # has unspecified behavior on NaN probs and may return OOB int32 ids
+        # (including negative sentinels). A MIN all-reduce above propagates
+        # such values rank-wide. embed_tokens runs the tp_size==1 (no-mask)
+        # path under DP attention (vocab_parallel_embedding.py:473-477), so an
+        # OOB id will assert at IndexKernel.cu:113 in the next forward.
+        # Clamp here keeps the input domain valid; the matching Fix B in
+        # vocab_parallel_embedding is the second layer.
+        batch_next_token_ids.clamp_(0, sampling_info.vocab_size - 1)
 
         return batch_next_token_ids
 

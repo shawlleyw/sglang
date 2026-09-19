@@ -37,6 +37,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -70,7 +71,13 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+from sglang.srt.utils import (
+    LazyValue,
+    add_prefix,
+    get_bool_env_var,
+    is_cuda,
+    make_layers,
+)
 
 _is_cuda = is_cuda()
 
@@ -118,7 +125,9 @@ class GptOssSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         experts_type = get_moe_impl_class(quant_config)
         extra_kwargs = {}
-        if experts_type.__name__ == "FusedMoE":
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        if issubclass(experts_type, FusedMoE):
             quant_config_name = (
                 quant_config.get_name() if quant_config is not None else None
             )
@@ -160,8 +169,36 @@ class GptOssSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(hidden_states, should_allreduce_fusion)
+        return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        # Mirror Qwen3MoeSparseMoeBlock.forward_deepep: no TP all-reduce
+        # here (DeepEPMoE's combine already reduces across expert-parallel
+        # ranks; adding a TP all-reduce after it causes a collective
+        # deadlock when idle DP ranks and non-idle DP ranks enter MoE with
+        # diverging token counts under --enable-dp-attention).
+        if hidden_states.shape[0] > 0:
+            router_logits, _ = self.router(hidden_states)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
         else:
-            raise Exception("forward_deepep branch not implemented yet")
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+        )
+        return final_hidden_states
 
     def get_moe_weights(self):
         return [
@@ -574,6 +611,20 @@ class GptOssForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        # Keep the transformer TP-sharded while optionally replicating the
+        # vocabulary projection, as ParaS does in held TP mode.
+        server_args = get_global_server_args()
+        replicated_lm_head = get_bool_env_var("SGLANG_GPTOSS_REPLICATED_LM_HEAD")
+        if replicated_lm_head:
+            if server_args.enable_dp_attention or server_args.enable_dp_lm_head:
+                raise ValueError(
+                    "SGLANG_GPTOSS_REPLICATED_LM_HEAD requires TP attention. "
+                    "For DP attention, use --enable-dp-lm-head instead."
+                )
+            if quant_config is not None:
+                raise ValueError(
+                    "SGLANG_GPTOSS_REPLICATED_LM_HEAD requires unquantized weights."
+                )
         self.model = GptOssModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -582,9 +633,20 @@ class GptOssForCausalLM(nn.Module):
             config.hidden_size,
             # quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            enable_tp=not replicated_lm_head,
+            use_attn_tp_group=server_args.enable_dp_lm_head,
         )
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(
+            config, skip_all_gather=replicated_lm_head
+        )
+        if replicated_lm_head:
+            logger.info(
+                "GPTOSS_LM_HEAD_LAYOUT replicated=True head_tp_size=%s "
+                "weight_shape=%s logits_all_gather=%s",
+                self.lm_head.tp_size,
+                tuple(self.lm_head.weight.shape),
+                self.logits_processor.do_tensor_parallel_all_gather,
+            )
         self.capture_aux_hidden_states = False
 
         self._routed_experts_weights_of_layer = LazyValue(
@@ -933,6 +995,28 @@ class GptOssForCausalLM(nn.Module):
         weights = _canonicalize_weights(self.config, weights)
         weights = sorted(weights, key=lambda x: x[0])  # Sort by name for consistency
 
+        # Expert parallelism slicing for the fused checkpoint format.
+        # GPT-OSS ships MoE weights as fused tensors whose dim 0 indexes all
+        # ``num_local_experts`` experts; when ``moe_ep_size > 1`` each rank
+        # holds only ``num_global_experts // moe_ep_size`` of them.  Narrow
+        # along dim 0 here so ``weight_loader_fused`` sees per-rank shapes.
+        # The mxfp4 path has its own equivalent slicing in
+        # ``_load_mxfp4_experts_weights``.
+        moe_ep_size = get_moe_expert_parallel_world_size()
+        moe_ep_rank = get_moe_expert_parallel_rank()
+        moe_num_global_experts = self.config.num_local_experts
+        if moe_ep_size > 1:
+            assert moe_num_global_experts % moe_ep_size == 0, (
+                f"num_experts {moe_num_global_experts} must be divisible by "
+                f"moe_ep_size {moe_ep_size}"
+            )
+            moe_num_local_experts = moe_num_global_experts // moe_ep_size
+            moe_ep_start = moe_ep_rank * moe_num_local_experts
+            moe_ep_end = moe_ep_start + moe_num_local_experts
+        else:
+            moe_ep_start = 0
+            moe_ep_end = moe_num_global_experts
+
         new_weights = []
         for name, p in weights:
             if "qkv.weight" in name:
@@ -1045,6 +1129,14 @@ class GptOssForCausalLM(nn.Module):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
+                    if (
+                        moe_ep_size > 1
+                        and loaded_weight.dim() >= 1
+                        and loaded_weight.shape[0] == moe_num_global_experts
+                    ):
+                        loaded_weight = loaded_weight[
+                            moe_ep_start:moe_ep_end
+                        ].contiguous()
                     if "bias" not in name:
                         loaded_weight = loaded_weight.transpose(-2, -1)
                     if "w2_weight_bias" in name and get_moe_tensor_parallel_rank() != 0:
@@ -1115,24 +1207,40 @@ class GptOssForCausalLM(nn.Module):
 
 
 def _canonicalize_weights(config, weights_in: Iterable[Tuple[str, torch.Tensor]]):
-    weights_out_dict = dict(weights_in)
-
-    for layer_id in range(config.num_hidden_layers):
-        for name_chunk in ["mlp1_weight", "mlp2_weight"]:
-            name_prefix = f"block.{layer_id}.mlp.{name_chunk}"
-            w_blocks = weights_out_dict.pop(f"{name_prefix}.blocks", None)
-            w_scales = weights_out_dict.pop(f"{name_prefix}.scales", None)
-            if w_blocks is not None:
-                weights_out_dict[name_prefix] = _WeightCreator(
+    # Stream weights through instead of `dict(weights_in)`: the upstream
+    # safetensors iterator yields mmap-backed lazy tensors and uses tqdm to
+    # report shard-loading progress. A `dict(weights_in)` drains every yield
+    # without ever touching the bytes, so tqdm reaches 100% in <1s while the
+    # actual disk I/O happens later when the model copies the data. By cloning
+    # each tensor as it arrives we force the read to happen here, in lockstep
+    # with the tqdm bar. Bf16 tensors flow straight through; only the mxfp4
+    # `.blocks` / `.scales` pairs need cross-tensor buffering.
+    pending: dict = {}
+    for name, tensor in weights_in:
+        materialized = tensor.clone()
+        if name.endswith(".blocks") or name.endswith(".scales"):
+            suffix = "blocks" if name.endswith(".blocks") else "scales"
+            prefix = name[: -(len(suffix) + 1)]
+            slot = pending.setdefault(prefix, {})
+            slot[suffix] = materialized
+            if "blocks" in slot and "scales" in slot:
+                pair = pending.pop(prefix)
+                yield prefix, _WeightCreator(
                     partial(
                         _dequant_mlp_weight,
-                        debug_name=name_prefix,
-                        w_blocks=w_blocks,
-                        w_scales=w_scales,
+                        debug_name=prefix,
+                        w_blocks=pair["blocks"],
+                        w_scales=pair["scales"],
                     )
                 )
+        else:
+            yield name, materialized
 
-    return list(weights_out_dict.items())
+    if pending:
+        raise ValueError(
+            f"Incomplete mxfp4 quantization pairs (missing matched .blocks/.scales): "
+            f"{sorted(pending.keys())}"
+        )
 
 
 def _dequant_mlp_weight(debug_name, w_blocks, w_scales):

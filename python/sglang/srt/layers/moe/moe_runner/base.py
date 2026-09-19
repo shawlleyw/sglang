@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         DispatchOutput,
         DispatchOutputFormat,
     )
+    from sglang.srt.paras.workspace import MoEWorkspace
 
 
 @dataclass
@@ -43,6 +44,8 @@ class MoeRunnerConfig:
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
+    # EP and TP expert modules retain separate bindings across switches.
+    paras_workspace: Optional[MoEWorkspace] = None
 
 
 @dataclass

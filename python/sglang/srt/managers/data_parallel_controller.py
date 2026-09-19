@@ -29,6 +29,8 @@ import zmq
 
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
     BlockReqInput,
     ParaSConfigureReqType,
     ParaSConfigureReqInput,
@@ -198,11 +200,20 @@ class DataParallelController:
             [
                 (TokenizedGenerateReqInput, self.dispatching_with_trace),
                 (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
+                (BatchTokenizedGenerateReqInput, self.dispatch_batch),
+                (BatchTokenizedEmbeddingReqInput, self.dispatch_batch),
                 (BlockReqInput, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
+
+    def dispatch_batch(self, batch):
+        # TokenizerManager also batches pre-tokenized input_ids. These are data
+        # requests, not control messages: route each one through load balancing
+        # (including any explicit DP-rank override).
+        for req in batch:
+            self.dispatching_with_trace(req)
 
     def paras_worker_init(self):
         self.paras_ep_workers = self.workers

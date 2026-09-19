@@ -1556,6 +1556,14 @@ class ParaSConfigureReqType(Enum):
     CONFIGURE_TP = 1
     CONFIGURE_EP = 2
 
+
+class ParasAutoSwitchPolicyType(Enum):
+    PREFILL = 1
+    DECODE = 2
+    HYBRID = 3
+    ROLLOUT = 4
+
+
 @dataclass
 class ParaSConfigureReqInput(BaseReq):
     type: ParaSConfigureReqType
@@ -1563,6 +1571,11 @@ class ParaSConfigureReqInput(BaseReq):
 @dataclass
 class ParaSConfigureReqOutput(BaseReq):
     pass
+
+
+@dataclass
+class ParaSAutoSwitchReq(BaseReq):
+    target: ParaSConfigureReqType
 
 
 def _check_all_req_types():

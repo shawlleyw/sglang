@@ -18,6 +18,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.moe_kernel_balance import get_global_moe_kernel_balance_recorder
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
@@ -216,7 +217,15 @@ class FusedMoE(torch.nn.Module):
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix)
         if self.quant_method is None:
-            self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels, use_deep_gemm=(self.moe_ep_size > 1))
+            from sglang.srt.layers.moe.utils import use_deep_gemm_bf16
+
+            use_deep_gemm = use_deep_gemm_bf16(
+                self.moe_ep_size,
+                with_bias=with_bias,
+                activation=activation,
+                gemm1_alpha=gemm1_alpha,
+            )
+            self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels, use_deep_gemm=use_deep_gemm)
 
         self.skip_weights_init = skip_weights_init
         weights_init_func = self.quant_method.create_weights if not skip_weights_init else self.quant_method.paras_set_extra_weight_attrs
@@ -236,6 +245,12 @@ class FusedMoE(torch.nn.Module):
             top_k=top_k,
             with_bias=with_bias,
         )
+
+        # A hack for using deepep with triton kernels: the token combination should be skipped in moe runner.
+        # Skip when paras_force_standard_dispatcher is set — the StandardDispatcher handles combining.
+        if get_moe_a2a_backend().is_deepep() and not paras_force_standard_dispatcher:
+            if not use_deep_gemm:
+                self.moe_runner_config.no_combine = True
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config, paras_force_standard_dispatcher)
@@ -847,10 +862,13 @@ class FusedMoE(torch.nn.Module):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
+        recorder = get_global_moe_kernel_balance_recorder()
+        recorder.record_start(self.layer_id, batch_size=hidden_states.shape[0])
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
             **kwargs,
         )
+        recorder.record_end(self.layer_id)
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -966,7 +984,7 @@ class FusedMoE(torch.nn.Module):
             for expert_id in range(num_experts)
             for shard_id in ["w1", "w2", "w3"]
         ]
-        
+
     def paras_drop_params(self, params_name):
         assert params_name in [
             "w13_weight",
@@ -974,7 +992,7 @@ class FusedMoE(torch.nn.Module):
         ], f"Unsupported parameter name: {params_name}"
         if params_name in self._parameters:
             del self._parameters[params_name]
-    
+
     def paras_load_params(self, params_data, params_name):
         if params_name == "w13_weight":
             w13_weight = torch.nn.Parameter(

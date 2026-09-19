@@ -166,6 +166,38 @@ MOE_RUNNER_BACKEND_CHOICES = [
 
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
+@dataclasses.dataclass(frozen=True)
+class ParasAutoSwitchDefaults:
+    """Per-policy defaults for the ParaS auto-switch knobs.
+
+    `threshold_per_gpu` is multiplied by world_size at resolution time so the
+    per-GPU work that justifies switching is constant. `window` and
+    `cooldown_sec` are absolute.
+
+    `low_ratio` is hybrid-only: the EP -> TP threshold is computed as
+    `threshold * low_ratio`. A smaller ratio means stickier EP (we stay in EP
+    until the system is very quiet).
+    """
+
+    threshold_per_gpu: int
+    window: int
+    cooldown_sec: float
+    low_ratio: Optional[float] = None
+
+
+PARAS_AUTO_SWITCH_POLICY_DEFAULTS: Dict[str, ParasAutoSwitchDefaults] = {
+    "prefill": ParasAutoSwitchDefaults(threshold_per_gpu=1024, window=8, cooldown_sec=10.0),
+    "decode": ParasAutoSwitchDefaults(threshold_per_gpu=64, window=32, cooldown_sec=60.0),
+    "rollout": ParasAutoSwitchDefaults(threshold_per_gpu=8, window=1, cooldown_sec=5.0),
+    "hybrid": ParasAutoSwitchDefaults(
+        threshold_per_gpu=32,
+        window=8,
+        cooldown_sec=5.0,
+        low_ratio=0.20,
+    ),
+}
+PARAS_AUTO_SWITCH_POLICY_CHOICES = list(PARAS_AUTO_SWITCH_POLICY_DEFAULTS)
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -415,6 +447,16 @@ class ServerArgs:
     mooncake_ib_device: Optional[str] = None
     enable_paras_moe: bool = False
     paras_tp_size: int = 4
+    paras_tp_cuda_graph_max_bs: Optional[int] = None
+    paras_tp_cuda_graph_bs: Optional[List[int]] = None
+    paras_auto_switch: bool = True
+    paras_auto_switch_policy: str = "decode"
+    paras_auto_switch_threshold: Optional[int] = None
+    paras_auto_switch_window: Optional[int] = None
+    paras_auto_switch_cooldown_sec: Optional[float] = None
+    paras_auto_switch_low_ratio: Optional[float] = None
+    paras_metrics_file: Optional[str] = None
+    paras_per_step_metrics_file: Optional[str] = None
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -611,6 +653,7 @@ class ServerArgs:
         self._handle_a2a_moe()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
+        self._handle_paras_auto_switch()
         self._check_paras_config()
 
         # Handle pipeline parallelism.
@@ -780,6 +823,18 @@ class ServerArgs:
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
+        if self.enable_paras_moe:
+            if self.paras_tp_cuda_graph_bs is not None:
+                self.paras_tp_cuda_graph_max_bs = max(self.paras_tp_cuda_graph_bs)
+            else:
+                if self.paras_tp_cuda_graph_max_bs is None:
+                    self.paras_tp_cuda_graph_max_bs = (
+                        self.cuda_graph_max_bs * self.paras_tp_size
+                    )
+                self.paras_tp_cuda_graph_bs = self._generate_cuda_graph_batch_sizes(
+                    max_bs=self.paras_tp_cuda_graph_max_bs
+                )
+
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
                 self._generate_piecewise_cuda_graph_tokens()
@@ -831,21 +886,28 @@ class ServerArgs:
             if model_config.is_multimodal:
                 self.adjust_mem_fraction_for_vlm(model_config)
 
-    def _generate_cuda_graph_batch_sizes(self):
+    def _generate_cuda_graph_batch_sizes(self, max_bs: Optional[int] = None):
         """
-        Generate the list of batch sizes for CUDA graph capture based on cuda_graph_max_bs.
+        Generate the list of batch sizes for CUDA graph capture based on max_bs.
         This integrates the logic from cuda_graph_runner.py.
+
+        If max_bs is None, defaults to self.cuda_graph_max_bs (backward-compatible).
+        Pass an explicit max_bs (e.g., self.paras_tp_cuda_graph_max_bs) to generate
+        a list scaled to a different maximum without mutating self.cuda_graph_max_bs.
         """
+        if max_bs is None:
+            max_bs = self.cuda_graph_max_bs
+
         # Handle disable_cuda_graph_padding as the first condition for both spec and non-spec
         if self.disable_cuda_graph_padding:
-            capture_bs = list(range(1, self.cuda_graph_max_bs + 1))
+            capture_bs = list(range(1, max_bs + 1))
         elif self.speculative_algorithm is None:
-            # Normal case: [1, 2, 4, 8, 12] + list(range(16, 257, 8)) + list(range(272, 512, 16)) + list(range(512, cuda_graph_max_bs + 1))
+            # Normal case: [1, 2, 4, 8, 12] + list(range(16, 257, 8)) + list(range(272, 512, 16)) + list(range(512, max_bs + 1))
             capture_bs = (
                 [1, 2, 4, 8, 12]
                 + list(range(16, 257, 8))
                 + list(range(272, 512, 16))
-                + list(range(512, self.cuda_graph_max_bs + 1, 32))
+                + list(range(512, max_bs + 1, 32))
             )
         else:
             # Spec decoding case: list(range(1, 9, 1)) + list(range(10, 33, 2)) + list(range(40, 64, 4)) + list(range(72, 257, 8))
@@ -854,10 +916,10 @@ class ServerArgs:
                 + list(range(10, 33, 2))
                 + list(range(40, 65, 4))
                 + list(range(72, 257, 8))
-                + list(range(272, self.cuda_graph_max_bs + 1, 16))
+                + list(range(272, max_bs + 1, 16))
             )
 
-        capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
+        capture_bs = [bs for bs in capture_bs if bs <= max_bs]
 
         return capture_bs
 
@@ -997,7 +1059,6 @@ class ServerArgs:
                 assert (
                     self.ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
-            self.disable_hybrid_swa_memory = True
 
         elif "Llama4" in model_arch and self.device != "cpu":
             assert self.attention_backend in {
@@ -1478,12 +1539,74 @@ class ServerArgs:
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
     
+    def _handle_paras_auto_switch(self):
+        """Resolve the auto-switch knobs from the selected policy's defaults.
+
+        Threshold scales with `tp_size`; window and cooldown are absolute. Any
+        knob the user explicitly passed via CLI overrides the policy default.
+        Called from __post_init__ before _check_paras_config so the rest of
+        the paras checks see fully-resolved values.
+        """
+        if not self.enable_paras_moe or not self.paras_auto_switch:
+            return
+        assert self.paras_auto_switch_policy in PARAS_AUTO_SWITCH_POLICY_CHOICES, (
+            f"--paras-auto-switch-policy must be one of "
+            f"{PARAS_AUTO_SWITCH_POLICY_CHOICES}, got "
+            f"{self.paras_auto_switch_policy!r}"
+        )
+        defaults = PARAS_AUTO_SWITCH_POLICY_DEFAULTS[self.paras_auto_switch_policy]
+        if self.paras_auto_switch_threshold is None:
+            self.paras_auto_switch_threshold = (
+                defaults.threshold_per_gpu * self.tp_size
+            )
+        if self.paras_auto_switch_window is None:
+            self.paras_auto_switch_window = defaults.window
+        if self.paras_auto_switch_cooldown_sec is None:
+            self.paras_auto_switch_cooldown_sec = defaults.cooldown_sec
+        if self.paras_auto_switch_low_ratio is None:
+            self.paras_auto_switch_low_ratio = defaults.low_ratio
+        assert self.paras_auto_switch_threshold > 0, (
+            "--paras-auto-switch-threshold must be positive"
+        )
+        assert self.paras_auto_switch_window > 0, (
+            "--paras-auto-switch-window must be positive"
+        )
+        assert self.paras_auto_switch_cooldown_sec >= 0, (
+            "--paras-auto-switch-cooldown-sec must be non-negative"
+        )
+        if self.paras_auto_switch_policy == "hybrid":
+            assert self.paras_auto_switch_low_ratio is not None, (
+                "--paras-auto-switch-low-ratio is required for hybrid policy"
+            )
+            assert 0.0 < self.paras_auto_switch_low_ratio <= 1.0, (
+                "--paras-auto-switch-low-ratio must be in (0, 1]"
+            )
+
     def _check_paras_config(self):
         if self.enable_paras_moe:
             assert self.enable_dp_lm_head, "enable_dp_lm_head must be set when enable_paras_moe is set"
             assert self.enable_dp_attention, "enable_dp_attention must be set when enable_paras_moe is set"
             assert self.paras_tp_size <= 8 and self.paras_tp_size > 0, "paras_tp_size must be positive when enable_paras_moe is set"
             assert self.tp_size == self.dp_size, "paras moe requires tp_size == dp_size, which means attn tp size is 1"
+            assert self.disable_radix_cache, (
+                "ParaS requires --disable-radix-cache (uses ChunkCache / SWAChunkCache). "
+                "Prefix sharing is not used by ParaS, and the radix cache's tree state "
+                "would not survive EP<->TP switches anyway. Pass --disable-radix-cache "
+                "when --enable-paras-moe is set."
+            )
+            assert self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0, (
+                "ParaS migration cannot preserve mid-chunked-prefill state "
+                "(chunked_req is not part of the gather/scatter set, and per-token "
+                "kv_indices in req.prefix_indices reference the pre-resize slot "
+                "layout). Pass --chunked-prefill-size -1 when --enable-paras-moe is set."
+            )
+        else:
+            assert self.paras_tp_cuda_graph_max_bs is None, (
+                "--paras-tp-cuda-graph-max-bs requires --enable-paras-moe"
+            )
+            assert self.paras_tp_cuda_graph_bs is None, (
+                "--paras-tp-cuda-graph-bs requires --enable-paras-moe"
+            )
 
     def _handle_pipeline_parallelism(self):
         if self.pp_size > 1:
@@ -2956,6 +3079,116 @@ class ServerArgs:
             type=int,
             default=ServerArgs.paras_tp_size,
             help="TP size for ParaS MoE layers.",
+        )
+        parser.add_argument(
+            "--paras-tp-cuda-graph-max-bs",
+            type=int,
+            default=ServerArgs.paras_tp_cuda_graph_max_bs,
+            help=(
+                "Maximum cuda graph batch size for ParaS TP-mode capture. "
+                "TP per-rank batch is paras_tp_size x larger than EP per-rank "
+                "batch for the same global workload, so TP graphs typically "
+                "need a larger range. Defaults to cuda_graph_max_bs * "
+                "paras_tp_size when --enable-paras-moe is set."
+            ),
+        )
+        parser.add_argument(
+            "--paras-tp-cuda-graph-bs",
+            type=int,
+            nargs="+",
+            help=(
+                "Explicit list of cuda graph batch sizes for ParaS TP-mode "
+                "capture. If omitted, auto-generated from "
+                "--paras-tp-cuda-graph-max-bs."
+            ),
+        )
+        parser.add_argument(
+            "--paras-auto-switch",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.paras_auto_switch,
+            help=(
+                "Enable automatic EP<->TP switching driven by observed "
+                "global batch size. Default on when --enable-paras-moe."
+            ),
+        )
+        parser.add_argument(
+            "--paras-auto-switch-policy",
+            type=str,
+            default=ServerArgs.paras_auto_switch_policy,
+            choices=PARAS_AUTO_SWITCH_POLICY_CHOICES,
+            help=(
+                "Auto-switch policy variant. 'decode' fires on the global "
+                "decode batch (default threshold 64 * world_size, window 32, "
+                "cooldown 60s). 'prefill' fires on global prefill tokens "
+                "(default threshold 1024 * world_size, window 8, cooldown "
+                "10s). 'rollout' fires on global pending reqs (running + "
+                "waiting; default threshold 8 * world_size, window 1, "
+                "cooldown 5s). 'hybrid' fires on global ingested reqs "
+                "(running + waiting + prefilling, all-gathered across DP "
+                "ranks). TP -> EP fires on the latest observation > threshold; "
+                "EP -> TP fires on the windowed avg < threshold * low_ratio "
+                "(default threshold 32 * world_size, low_ratio 0.20, window 8, "
+                "cooldown 5s)."
+            ),
+        )
+        parser.add_argument(
+            "--paras-auto-switch-threshold",
+            type=int,
+            default=ServerArgs.paras_auto_switch_threshold,
+            help=(
+                "Single switch threshold for the auto-switch policy. When "
+                "unset, defaults to the policy's per-GPU magic number times "
+                "world_size (see --paras-auto-switch-policy)."
+            ),
+        )
+        parser.add_argument(
+            "--paras-auto-switch-window",
+            type=int,
+            default=ServerArgs.paras_auto_switch_window,
+            help=(
+                "Sliding-window size (iterations) for the auto-switch policy. "
+                "When unset, defaults to the policy's value (see "
+                "--paras-auto-switch-policy)."
+            ),
+        )
+        parser.add_argument(
+            "--paras-auto-switch-cooldown-sec",
+            type=float,
+            default=ServerArgs.paras_auto_switch_cooldown_sec,
+            help=(
+                "Wall-clock seconds between successive auto-switch decisions. "
+                "When unset, defaults to the policy's value (see "
+                "--paras-auto-switch-policy)."
+            ),
+        )
+        parser.add_argument(
+            "--paras-auto-switch-low-ratio",
+            type=float,
+            default=ServerArgs.paras_auto_switch_low_ratio,
+            help=(
+                "EP -> TP low-threshold ratio for the hybrid auto-switch "
+                "policy. EP -> TP fires when the windowed avg < threshold * "
+                "low_ratio. Smaller values make EP stickier (we stay in EP "
+                "until the system is very quiet). Ignored by other policies. "
+                "When unset, defaults to the policy's value (0.20 for hybrid)."
+            ),
+        )
+        parser.add_argument(
+            "--paras-metrics-file",
+            type=str,
+            default=ServerArgs.paras_metrics_file,
+            help="CSV path for per-second ParaS metrics (mode, running, waiting, throughput). Only tp_rank 0 writes.",
+        )
+        parser.add_argument(
+            "--paras-per-step-metrics-file",
+            type=str,
+            default=ServerArgs.paras_per_step_metrics_file,
+            help=(
+                "CSV path for per-forward-step ParaS metrics (one row per scheduler step: "
+                "step_idx, mode, forward_mode, batch sizes, num_tokens, step_latency_ms, ...). "
+                "Adds torch.cuda.synchronize() per step to measure GPU-completed forward "
+                "latency; intended for batch-size microbench, NOT production. Only tp_rank 0 writes."
+            ),
         )
         parser.add_argument(
             "--elastic-ep-backend",
