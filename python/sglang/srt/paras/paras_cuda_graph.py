@@ -281,6 +281,26 @@ _SETTINGS_KEYS = (
 )
 
 
+# Every tensor sliced by capture_one_batch_size must follow its graph set.
+_BUFFER_KEYS = (
+    "input_ids",
+    "req_pool_indices",
+    "seq_lens",
+    "seq_lens_cpu",
+    "out_cache_loc",
+    "positions",
+    "mrope_positions",
+    "num_token_non_padded",
+    "tbo_plugin",
+    "pp_proxy_tensors",
+    "encoder_lens",
+    "global_num_tokens_gpu",
+    "global_num_tokens_for_logprob_gpu",
+    "custom_mask",
+    "next_token_logits_buffer",
+)
+
+
 def paras_refresh_cuda_graph_settings(runner: CudaGraphRunner):
     """Recompute mode-dependent settings from current global state."""
     sa = runner.model_runner.server_args
@@ -326,6 +346,9 @@ def paras_save_cuda_graph_state(runner: CudaGraphRunner, mode: ParaSMode):
     for key in _SETTINGS_KEYS:
         state[key] = getattr(runner, key)
 
+    state["buffers"] = {
+        key: getattr(runner, key) for key in _BUFFER_KEYS if hasattr(runner, key)
+    }
     runner._paras_saved[mode] = state
 
 
@@ -347,7 +370,15 @@ def paras_load_cuda_graph_state(runner: CudaGraphRunner, mode: ParaSMode):
         set_global_graph_memory_pool,
     )
 
+    memory = getattr(runner, "_paras_runtime_memory", None)
+    if memory is not None:
+        memory.activate(mode)
     state = runner._paras_saved[mode]
+    for key in _BUFFER_KEYS:
+        if key in state["buffers"]:
+            setattr(runner, key, state["buffers"][key])
+        elif hasattr(runner, key):
+            delattr(runner, key)
     runner.graphs = state["graphs"]
     runner.output_buffers = state["output_buffers"]
     runner.deepep_adapter._captured_deepep_mode = state["deepep_mode"]
@@ -465,8 +496,7 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     # 4b. Swap to TP-specific capture batch sizes if configured. The
     #     TP per-rank batch is paras_tp_size x larger than EP for the
     #     same global workload, so TP graphs typically need a wider
-    #     range. The runner's input/output buffers were sized for
-    #     max(ep_bs, tp_bs) at __init__ so all TP captures fit.
+    #     range. Allocate separate inputs/output storage for TP below.
     #     ``capture_bs`` is in _SETTINGS_KEYS, so each mode's value is
     #     saved with its state and restored on ``paras_swap_cuda_graphs``.
     #     ``compile_bs`` likewise — no recompute needed here.
@@ -482,6 +512,12 @@ def paras_init_dual_cuda_graphs(model_runner: ModelRunner):
     #    memory breakdown is emitted by
     #    ``cuda_graph_runner.capture()`` via ``paras_log_memory_breakdown``.
     paras_refresh_cuda_graph_settings(gr)
+    gr.max_bs = max(gr.capture_bs)
+    gr.max_num_token = gr.max_bs * gr.num_tokens_per_bs
+    if gr._paras_runtime_memory is not None:
+        gr._paras_runtime_memory.activate(ParaSMode.TP)
+    model_runner.attn_backend.init_cuda_graph_state(gr.max_bs, gr.max_num_token)
+    gr.init_graph_buffers()
     with model_capture_mode():
         gr.capture()
 

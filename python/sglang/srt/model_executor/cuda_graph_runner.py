@@ -292,11 +292,17 @@ class CudaGraphRunner:
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
+        self._paras_runtime_memory = None
+        if getattr(sa, "paras_vmm_runtime_states", False):
+            from sglang.srt.paras.runtime_memory import CudaModeRuntimeMemory
+
+            self._paras_runtime_memory = CudaModeRuntimeMemory(self.device)
+            self.model_runner.attn_backend._paras_runtime_memory = (
+                self._paras_runtime_memory
+            )
+
         # Attention backend
-        if self._paras_tp_capture_bs:
-            self.max_bs = max(max(self.capture_bs), max(self._paras_tp_capture_bs))
-        else:
-            self.max_bs = max(self.capture_bs)
+        self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
         self.model_runner.attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
@@ -306,15 +312,31 @@ class CudaGraphRunner:
         )
 
         self.encoder_len_fill_value = 0
-        self.seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-        )
 
         if self.enable_torch_compile:
             set_torch_compile_config()
 
         if self.model_runner.server_args.enable_lora:
-            self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
+            # LoRA keeps shared metadata outside the mode-local graph inputs.
+            lora_max_bs = max([self.max_bs] + (self._paras_tp_capture_bs or []))
+            self.model_runner.lora_manager.init_cuda_graph_batch_info(lora_max_bs)
+
+        self.init_graph_buffers()
+
+        # Capture
+        try:
+            with model_capture_mode():
+                self.capture()
+        except RuntimeError as e:
+            raise Exception(
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+            )
+
+    def init_graph_buffers(self):
+        """Allocate inputs and logits for the active mode's capture sizes."""
+        self.seq_lens_cpu = torch.full(
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+        )
 
         # Graph inputs
         with torch.device(self.device):
@@ -347,7 +369,7 @@ class CudaGraphRunner:
                 }
 
             # Speculative_inference
-            if model_runner.spec_algorithm.is_eagle3():
+            if self.model_runner.spec_algorithm.is_eagle3():
                 self.model_runner.model.set_eagle3_layers_to_capture()
 
             if self.is_encoder_decoder:
@@ -384,20 +406,18 @@ class CudaGraphRunner:
                 dtype=torch.bool,
                 device=self.device,
             )
-            self.next_token_logits_buffer = torch.zeros(
-                (self.max_num_token, self.model_runner.model_config.vocab_size),
-                dtype=torch.float,
-                device=self.device,
+            logits_shape = (
+                self.max_num_token, self.model_runner.model_config.vocab_size
             )
-
-        # Capture
-        try:
-            with model_capture_mode():
-                self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
-            )
+            memory = self._paras_runtime_memory
+            if memory is None:
+                self.next_token_logits_buffer = torch.zeros(
+                    logits_shape, dtype=torch.float, device=self.device
+                )
+            else:
+                self.next_token_logits_buffer = memory.zeros(
+                    memory.active, "logits", logits_shape, torch.float32
+                )
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -796,6 +816,8 @@ class CudaGraphRunner:
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        if self._paras_runtime_memory is not None:
+            self._paras_runtime_memory.check_ready()
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
@@ -887,6 +909,8 @@ class CudaGraphRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if self._paras_runtime_memory is not None:
+            self._paras_runtime_memory.check_ready()
         self.deepep_adapter.replay()
 
         if not skip_attn_backend_init:
