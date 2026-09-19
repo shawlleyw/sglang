@@ -6,9 +6,9 @@ Cache volume control follows the CLI contract:
     num_resident_tokens_per_rank = int(ep_max_tokens_per_rank * load)
 
 So `--cache-size-gb 20 --load 0.5` yields ~10 GiB of *resident* KV per GPU,
-which is the source-side load measured by the kernel. Both EP→TP and TP→EP
-move `num_resident_tokens_per_rank` tokens per source rank, giving direct
-comparability between the two directions.
+which is the source-side load measured by the kernel. EP→TP moves N resident tokens per EP source. TP→EP moves W*N/R tokens
+per TP source after head-replica deduplication (W ranks, R replicas).
+The routing helper rounds N down to a multiple of R.
 """
 
 from __future__ import annotations
@@ -68,14 +68,15 @@ class KVLayout:
         return self.ep_max_tokens * self.bytes_per_ep_slot
 
 
-def make_kv_layout(model: ModelConfig, tp_size: int,
-                   cache_size_gb: float, load: float) -> KVLayout:
+def make_kv_layout(
+    model: ModelConfig, tp_size: int, cache_size_gb: float, load: float
+) -> KVLayout:
     if cache_size_gb <= 0:
         raise SystemExit(f"--cache-size-gb must be > 0, got {cache_size_gb}")
     if not (0.0 < load <= 1.0):
         raise SystemExit(f"--load must be in (0, 1], got {load}")
 
-    cache_bytes = int(cache_size_gb * (1024 ** 3))
+    cache_bytes = int(cache_size_gb * (1024**3))
     bytes_per_ep_slot = model.num_kv_heads * model.head_dim * model.elem_size * 2
 
     ep_max_tokens = max(2, cache_bytes // bytes_per_ep_slot)
@@ -175,8 +176,16 @@ def make_weight_layout(model: ModelConfig, tp_size: int) -> WeightLayout:
 
 
 def add_volume_args(parser) -> None:
-    parser.add_argument("--cache-size-gb", type=float, default=10.0,
-                        help="Per-GPU EP cache capacity in GiB (default 10)")
-    parser.add_argument("--load", type=float, default=0.5,
-                        help="Fraction of cache resident, in (0, 1]. "
-                             "Cache size * load = resident bytes per GPU. (default 0.5)")
+    parser.add_argument(
+        "--cache-size-gb",
+        type=float,
+        default=10.0,
+        help="Per-GPU EP cache capacity in GiB (default 10)",
+    )
+    parser.add_argument(
+        "--load",
+        type=float,
+        default=0.5,
+        help="Fraction of cache resident, in (0, 1]. "
+        "Cache size * load = resident bytes per GPU. (default 0.5)",
+    )
