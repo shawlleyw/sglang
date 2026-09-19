@@ -26,7 +26,12 @@ import threading
 import tarfile
 import time
 
-from reconfigure.configuration import DIRECTIONS, METHODS, validate_config
+from reconfigure.configuration import (
+    DIRECTIONS,
+    METHODS,
+    METHOD_TRANSPORT,
+    validate_config,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -68,9 +73,11 @@ def manifest(config, args):
     )
     return {
         "schema_version": 1,
+        "experiment_version": 2,
         "created_at": time.time(),
         "config": config,
         "methods": args.methods,
+        "method_weight_transport": {m: METHOD_TRANSPORT[m] for m in args.methods},
         "directions": (
             list(DIRECTIONS) if args.direction == "both" else [args.direction]
         ),

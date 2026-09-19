@@ -1,13 +1,16 @@
 # Empty-state reconfiguration benchmarks
 
 `../bench_reconfigure.py` runs five reusable methods against the real SGLang
-runtime. All five methods were GPU-validated in both directions with GPT-OSS-120B
-BF16 on eight A100-SXM4-80GB GPUs on 2026-09-19. The initial one-trial comparison,
-logs and exact source snapshots are in
-`artifacts/20260919T070046Z_gptoss_120b_switch_eval` at the repository root.
-These are preliminary timings; Qwen3/H200 validation and repeated runtime
-measurements remain separate work. No GPU workload is launched by importing the
-driver or using `--dry-run`.
+runtime. **V1 is archived at `artifacts/paras_switch_v1` and is not an accepted
+production-fidelity evaluation.** Its functional probes passed, but its sparse
+graph coverage, forced disposal GC and other confounds invalidate using those
+timings to claim production switching costs. See the
+[production-fidelity audit](production_fidelity_audit.md).
+
+The current v2 candidate removes those graph/GC overrides and several launch
+and synchronization mismatches. It requires fresh GPU validation and has no v2
+performance results. No GPU workload is launched by importing the driver or
+using `--dry-run`.
 
 ## Methods and boundaries
 
@@ -16,7 +19,7 @@ driver or using `--dry-run`.
 | `rebuild` | Shut down a source SGLang Engine, create a target Engine, load checkpoint weights and capture graphs |
 | `host_reload` | Reload prepared target CPU weight snapshots into fresh GPU tensors, bind them and capture target graphs |
 | `naive_nccl` | Allocate each target layer, pack/exchange/unpack experts and attention using NCCL, release the source layer, bind and capture graphs |
-| `fixed_buffer_recapture` | Production UMM switch, with graph discard and target recapture |
+| `fixed_buffer_recapture` | Production UMM **and fused peer-access transfer**, with graph discard and target recapture; this is not a fixed-buffer NCCL baseline |
 | `full` | Production Scheduler ParaS switch using its prepared UMM views and retained graphs |
 
 Every trial has an empty running/waiting request set. There is no live KV cache,
@@ -67,8 +70,10 @@ parameters, etc.) remain at stable addresses; host reload also copies their CPU
 snapshots back in place. CPU target snapshots are prepared and pinned before the
 measured transition by default. CPU snapshot bytes are reported per rank.
 
-Naive NCCL explicitly waits for each layer's transfers to complete before
-releasing its source storage. Both directions include attention transfers:
+Naive NCCL relies on PyTorch stream/lifetime tracking, with the production-style
+per-layer GPU fence and a final device synchronization. It adds no per-layer
+host wait. Host reload needs no cross-rank fence for its H2D copies.
+Both directions include attention transfers:
 EP→TP takes local QKV/O slices; TP→EP gathers and reconstructs full projections,
 discarding duplicate KV-head replicas. GPT-OSS gate/up interleaving is supported.
 All runtime patches exist only in the fresh benchmark workers, with no production
@@ -77,9 +82,24 @@ server flags, global sitecustomize changes, or modifications to serving code.
 ## Configuration and dry runs
 
 Use the same serving environment as the model launchers. The configs specify
-BF16 weights, eight GPUs, identical graph capture batch sizes in EP/TP, Triton
-backends, disabled prefix caching, and disabled scheduling overlap. Overlap is
-irrelevant to an empty-request boundary but is explicitly fixed for reproduction.
+BF16 weights, eight GPUs, Triton backends, disabled prefix caching and the
+production default of enabled scheduling overlap. Graph maxima follow the
+launcher's request-capacity policy: with 2048 requests and eight GPUs, EP's
+maximum is 256 and TP's is 2048. `ServerArgs` generates the lists; production
+runner initialization applies its filtering and prepares per-mode buffers.
+Recapture uses those resolved per-mode lists rather than regenerating a sparse
+list. Current non-speculative defaults generate 36 EP and 100 TP sizes before
+any runtime capacity filtering. Exact lists are recorded in worker ready events
+and target sizes in results. Explicit maximum overrides remain supported via
+`server_args.cuda_graph_max_bs` and `server_args.paras_tp_cuda_graph_max_bs`;
+handwritten size lists are rejected. Runtime graph disposal only drops
+references and the pool handle. SGLang's own capture GC policy is unchanged.
+
+Full/fixed methods use the launcher's peer-access KV path. Independent-storage
+methods explicitly use NCCL for empty-cache bookkeeping because their backend
+does not own a real UMM IPC arena; the worker records that difference. Static
+TP rebuild enables token-ID synchronization and clears stale DeepEP variables,
+matching the launcher. Remaining scope/configuration caveats are in the audit.
 Supported scope is a single node, PP=1, ordinary Qwen3-MoE/GPT-OSS decoding without
 quantization, speculation, LoRA, memory-saver, or torch.compile.
 
@@ -125,7 +145,8 @@ python benchmark/paras/bench_reconfigure.py \
 ```
 
 For a cheaper graph-capture smoke test, make a config copy with smaller graph
-batch sizes. Such a run must not be pooled with the full graph-coverage results.
+maxima, still using SGLang's generated lists. Such a run must not be pooled with
+the full production-coverage results.
 The driver defaults to a 30-minute timeout per worker stage; `--timeout` overrides
 it. Failures stop the sweep, retain logs, and create failed trial records. Cleanup
 is restricted to process groups created by this driver.

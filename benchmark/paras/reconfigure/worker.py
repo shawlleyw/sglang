@@ -19,7 +19,12 @@ BENCH = Path(__file__).resolve().parents[1]
 REPO = BENCH.parents[1]
 sys.path[:0] = [str(BENCH), str(REPO / "python")]
 
-from reconfigure.configuration import DIRECTIONS, METHODS, server_arguments
+from reconfigure.configuration import (
+    DIRECTIONS,
+    METHODS,
+    METHOD_TRANSPORT,
+    server_arguments,
+)
 
 
 def emit(event, **fields):
@@ -43,6 +48,9 @@ def _rank_worker(
             from sglang.srt.paras.mode import ParaSMode
 
             if method in ("host_reload", "naive_nccl"):
+                # Independent storage has no production IPC weight/KV arena.
+                # Empty-state baseline only: no live cache payload is moved.
+                os.environ["PARAS_KV_TRANSFER_METHOD"] = "nccl"
                 install_independent_storage()
             args = ServerArgs(**args_dict)
             configure_logger(args, prefix=f" benchmark-rank-{rank}")
@@ -55,6 +63,11 @@ def _rank_worker(
                     "stage": "ready",
                     "rank": rank,
                     "graph_batch_sizes": list(runtime.runner.graph_runner.capture_bs),
+                    "graph_batches_by_mode": {
+                        mode.value: sizes
+                        for mode, sizes in runtime.graph_batches.items()
+                    },
+                    "kv_transfer_method": os.environ.get("PARAS_KV_TRANSFER_METHOD"),
                 }
             )
             command = connection.recv()
@@ -147,6 +160,7 @@ def supervise(config, method, direction, directory, timeout):
             "through_probe_ms": max(x["through_probe_ms"] for x in results),
             "rank_results": results,
             "validation": "passed",
+            "weight_transport": METHOD_TRANSPORT[method],
             "scope": "scheduler_worker_reconfiguration_empty_requests",
         }
         emit("result", result=result)
@@ -172,6 +186,15 @@ def engine_worker(config, mode, directory):
     from sglang.srt.entrypoints.engine import Engine
 
     args = server_arguments(config, mode, paras=False)
+    if mode == "tp":
+        # Match launch_common.sh's static TP sampler safety and environment.
+        os.environ["SYNC_TOKEN_IDS_ACROSS_TP"] = "1"
+        for key in (
+            "SGLANG_DEEPEP_BF16_DISPATCH",
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK",
+            "NVSHMEM_QP_DEPTH",
+        ):
+            os.environ.pop(key, None)
     started = time.perf_counter()
     engine = Engine(**args)
     initialized = time.perf_counter()

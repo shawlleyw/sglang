@@ -3,9 +3,9 @@
 import os
 import sys
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(
@@ -17,10 +17,60 @@ from reconfigure.runtime import Runtime
 
 
 class RuntimeOrderingTest(unittest.TestCase):
+    def test_disposal_drops_graph_references_without_explicit_gc(self):
+        import weakref
+
+        class Graph:
+            pass
+
+        runtime, _ = self.runtime(ParaSMode.EP, "fixed_buffer_recapture")
+        graph = Graph()
+        ref = weakref.ref(graph)
+        gr = runtime.runner.graph_runner
+        gr.graphs = {1: graph}
+        gr.output_buffers = {1: graph}
+        gr._paras_saved = {ParaSMode.EP: {"graphs": {1: graph}}}
+        del graph
+        pool_reset = Mock()
+        module = SimpleNamespace(set_global_graph_memory_pool=pool_reset)
+        with patch.dict(
+            sys.modules, {"sglang.srt.model_executor.cuda_graph_runner": module}
+        ), patch("gc.collect", side_effect=AssertionError("explicit GC")):
+            Runtime.discard_graphs(runtime)
+        self.assertIsNone(ref())
+        pool_reset.assert_called_once_with(None)
+
+    def test_recapture_uses_resolved_mode_specific_lists(self):
+        runtime, _ = self.runtime(ParaSMode.EP, "fixed_buffer_recapture")
+        gr = runtime.runner.graph_runner
+        seen = []
+
+        def capture():
+            seen.append(list(gr.capture_bs))
+            gr.graphs = dict.fromkeys(gr.capture_bs)
+
+        gr.capture = capture
+        modules = {
+            "sglang.srt.model_executor.cuda_graph_runner": SimpleNamespace(
+                model_capture_mode=nullcontext
+            ),
+            "sglang.srt.paras.paras_cuda_graph": SimpleNamespace(
+                paras_refresh_cuda_graph_settings=lambda gr: None
+            ),
+        }
+        with patch.dict(sys.modules, modules):
+            Runtime.capture(runtime)
+            runtime.scheduler.paras_parallelism_config = ParaSMode.TP
+            Runtime.capture(runtime)
+        self.assertEqual(seen, [[1, 2], [1, 2, 4, 8]])
+
     def runtime(self, source, method, independent=False, reject=False):
         events = []
         manager = SimpleNamespace()
         runner = SimpleNamespace(
+            graph_runner=SimpleNamespace(
+                capture_bs=[1, 2], _paras_tp_capture_bs=[1, 2, 4, 8]
+            ),
             model=SimpleNamespace(
                 model=SimpleNamespace(), paras_memory_manager=manager
             ),

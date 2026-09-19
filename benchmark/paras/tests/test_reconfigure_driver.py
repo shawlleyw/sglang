@@ -32,7 +32,14 @@ class ReconfigureDriverTest(unittest.TestCase):
                 for paras in (True, False):
                     args = server_arguments(config, mode, paras)
                     self.assertFalse(set(args) - fields, set(args) - fields)
-                    self.assertEqual(args["cuda_graph_bs"], config["graph_batch_sizes"])
+                    self.assertNotIn("cuda_graph_bs", args)
+                    self.assertNotIn("paras_tp_cuda_graph_bs", args)
+                    self.assertEqual(
+                        args["cuda_graph_max_bs"], 256 if mode == "ep" else 2048
+                    )
+                    self.assertEqual(
+                        args["paras_tp_cuda_graph_max_bs"], 2048 if paras else None
+                    )
                     self.assertEqual(
                         args["dp_size"], config["world_size"] if mode == "ep" else 1
                     )
@@ -43,6 +50,63 @@ class ReconfigureDriverTest(unittest.TestCase):
         config["server_args"]["disable_cuda_graph"] = True
         with self.assertRaises(ValueError):
             validate_config(config)
+
+    def test_v1_sparse_lists_are_rejected(self):
+        config = json.loads((BENCH / "configs/gpt_oss_120b_a100.json").read_text())
+        config["graph_batch_sizes"] = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        with self.assertRaisesRegex(ValueError, "v1 override"):
+            validate_config(config)
+
+    def test_production_graph_generator_and_explicit_maxima(self):
+        # Execute the actual ServerArgs method without importing CUDA/runtime.
+        from types import SimpleNamespace
+        from typing import List, Optional
+
+        tree = ast.parse(
+            (BENCH.parents[1] / "python/sglang/srt/server_args.py").read_text()
+        )
+        cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "ServerArgs"
+        )
+        method = next(
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name == "_generate_cuda_graph_batch_sizes"
+        )
+        namespace = {"Optional": Optional, "List": List}
+        exec(
+            compile(
+                ast.Module(body=[method], type_ignores=[]),
+                "production_graph_generator",
+                "exec",
+            ),
+            namespace,
+        )
+        generate = namespace[method.name]
+        config = json.loads((BENCH / "configs/gpt_oss_120b_a100.json").read_text())
+        for mode, expected_count, maximum in (("ep", 36, 256), ("tp", 100, 2048)):
+            args = server_arguments(config, mode, paras=False)
+            state = SimpleNamespace(
+                **args, disable_cuda_graph_padding=False, speculative_algorithm=None
+            )
+            sizes = generate(state)
+            self.assertEqual(len(sizes), expected_count)
+            self.assertEqual(max(sizes), maximum)
+            self.assertIn(12, sizes)
+            self.assertIn(248, sizes)
+        config["server_args"].update(
+            cuda_graph_max_bs=128, paras_tp_cuda_graph_max_bs=1024
+        )
+        self.assertEqual(server_arguments(config, "ep")["cuda_graph_max_bs"], 128)
+        self.assertEqual(
+            server_arguments(config, "ep")["paras_tp_cuda_graph_max_bs"], 1024
+        )
+        self.assertEqual(
+            server_arguments(config, "tp", paras=False)["cuda_graph_max_bs"], 1024
+        )
 
     def test_summary_does_not_count_failed_trials(self):
         rows = [

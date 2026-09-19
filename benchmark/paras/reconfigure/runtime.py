@@ -4,7 +4,6 @@ Patches are installed only in fresh benchmark worker processes. Normal serving
 imports no benchmark code. Each trial executes one switch with no live requests.
 """
 
-import gc
 import time
 from contextlib import contextmanager
 
@@ -16,6 +15,7 @@ from common.weight_bundle import COMPONENTS, weight_name
 from sglang.srt.paras.mode import ParaSMode
 
 from .storage import IndependentWeightMemoryManager
+from .configuration import METHOD_TRANSPORT
 from .transfers import (
     naive_nccl_transfer_layer,
     reload_host_layer,
@@ -100,16 +100,19 @@ def install_independent_storage():
                 manager.replace_weight(
                     weight_name(index, mode, component), target[component]
                 )
-            dist.all_reduce(body._unified_fence, group=group)
-            # CPU tensor destruction may recycle memory. Complete remote reads
-            # on every rank before releasing this layer's source allocations.
-            torch.cuda.synchronize()
+            if getattr(manager, "benchmark_method", "naive_nccl") != "host_reload":
+                dist.all_reduce(body._unified_fence, group=group)
+            # PyTorch NCCL records tensor stream use and establishes current-
+            # stream dependencies. Source/staging allocations can be released
+            # after enqueueing without a device-wide host wait per layer.
+            # H2D reload has no remote source reads and needs no rank fence.
             for component, parameter in source.items():
                 name = weight_name(index, source_mode, component)
                 placeholder = manager.placeholder(name)
                 parameter.data = placeholder
                 manager.replace_weight(name, placeholder)
             del source, target
+        torch.cuda.synchronize()
         body._unified_weights_mode = mode
 
     ParaSModelMixin.paras_transfer_unified_weights = transfer
@@ -147,6 +150,13 @@ class Runtime:
         self.independent = isinstance(self.manager, IndependentWeightMemoryManager)
         self.phases = {}
         self.auxiliary_snapshots = []
+        gr = self.runner.graph_runner
+        # Preserve the lists actually resolved by production initialization,
+        # including EP request-pool/alignment filtering and ParaS TP scaling.
+        self.graph_batches = {
+            ParaSMode.EP: list(gr.capture_bs),
+            ParaSMode.TP: list(gr._paras_tp_capture_bs),
+        }
 
     @property
     def mode(self):
@@ -195,17 +205,18 @@ class Runtime:
         if hasattr(gr, "_paras_saved"):
             gr._paras_saved.clear()
         set_global_graph_memory_pool(None)
-        gc.collect()
 
     def capture(self):
         from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
         from sglang.srt.paras.paras_cuda_graph import paras_refresh_cuda_graph_settings
 
         gr = self.runner.graph_runner
-        gr.capture_bs = sorted(self.config["graph_batch_sizes"])
+        gr.capture_bs = list(self.graph_batches[self.mode])
         paras_refresh_cuda_graph_settings(gr)
         with model_capture_mode():
             gr.capture()
+        if sorted(gr.graphs) != sorted(gr.capture_bs):
+            raise RuntimeError("Recapture did not produce the production graph set")
 
     def switch(self, target, *, measured=False):
         if target not in (ParaSMode.EP, ParaSMode.TP):
@@ -365,5 +376,7 @@ class Runtime:
             )
             + sum(t.numel() * t.element_size() for _, t in self.auxiliary_snapshots),
             "validation": "passed",
+            "weight_transport": METHOD_TRANSPORT[self.method],
+            "graph_batch_sizes": list(self.runner.graph_runner.capture_bs),
             "scope": "scheduler_worker_reconfiguration_empty_requests",
         }
