@@ -23,6 +23,7 @@ from typing import Dict, List, Union
 import psutil
 import setproctitle
 import zmq
+from transformers import PreTrainedTokenizerBase, PreTrainedTokenizerFast
 
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
@@ -149,6 +150,31 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # If it is embedding model, no detokenization is needed.
         return recv_obj
 
+    def batch_decode(
+        self, token_ids, skip_special_tokens, spaces_between_special_tokens
+    ):
+        tokenizer = self.tokenizer
+        # Transformers' default batch_decode loops through Python decode once
+        # per request. Use the native batch operation only when neither wrapper
+        # was customized, and preserve the fast tokenizer's cleanup semantics.
+        if (
+            isinstance(tokenizer, PreTrainedTokenizerFast)
+            and type(tokenizer).batch_decode is PreTrainedTokenizerBase.batch_decode
+            and type(tokenizer).decode is PreTrainedTokenizerBase.decode
+            and type(tokenizer)._decode is PreTrainedTokenizerFast._decode
+        ):
+            texts = tokenizer.backend_tokenizer.decode_batch(
+                token_ids, skip_special_tokens=skip_special_tokens
+            )
+            if tokenizer.clean_up_tokenization_spaces:
+                texts = [tokenizer.clean_up_tokenization(text) for text in texts]
+            return texts
+        return tokenizer.batch_decode(
+            token_ids,
+            skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
+        )
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
 
@@ -200,12 +226,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 )
             ]
         else:
-            surr_texts = self.tokenizer.batch_decode(
+            surr_texts = self.batch_decode(
                 surr_ids,
                 skip_special_tokens=recv_obj.skip_special_tokens[0],
                 spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
             )
-            read_texts = self.tokenizer.batch_decode(
+            read_texts = self.batch_decode(
                 read_ids,
                 skip_special_tokens=recv_obj.skip_special_tokens[0],
                 spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
