@@ -231,10 +231,11 @@ class Runtime:
 
     @torch.inference_mode()
     def probe(self):
-        from sglang.bench_one_batch import extend, _maybe_prepare_mlp_sync_batch
-        from sglang.srt.managers.schedule_batch import Req
+        from sglang.bench_one_batch import _maybe_prepare_mlp_sync_batch
+        from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.sampling.sampling_params import SamplingParams
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.reset_requests()
         prompt = self.config.get("probe_prompt", "The capital of France is")
@@ -248,8 +249,23 @@ class Runtime:
         request.fill_ids = list(tokens)
         request.extend_input_len = len(tokens)
         request.logprob_start_len = len(tokens) - 1
-        ids, logits, batch = extend([request], self.runner)
-        outputs, graph_used = [logits.detach().float().cpu()], []
+        # The scheduler's real cache is required for hybrid/SWA allocation;
+        # bench_one_batch.extend uses a dummy cache that cannot serve GPT-OSS.
+        batch = ScheduleBatch.init_new(
+            reqs=[request],
+            req_to_token_pool=self.runner.req_to_token_pool,
+            token_to_kv_pool_allocator=self.runner.token_to_kv_pool_allocator,
+            tree_cache=self.scheduler.tree_cache,
+            model_config=self.runner.model_config,
+            enable_overlap=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+        )
+        batch.prepare_for_extend()
+        _maybe_prepare_mlp_sync_batch(batch, self.runner)
+        forward = ForwardBatch.init_new(batch.get_model_worker_batch(), self.runner)
+        output, _ = self.runner.forward(forward)
+        ids = self.runner.sample(output, forward)
+        outputs, graph_used = [output.next_token_logits.detach().float().cpu()], []
         for _ in range(self.config.get("probe_decode_steps", 2)):
             batch.output_ids = ids
             batch.prepare_for_decode()

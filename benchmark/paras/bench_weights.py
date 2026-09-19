@@ -30,6 +30,7 @@ from common.weight_bundle import (
     expert_ep_packed_view,
     make_manager,
     reference_values,
+    verification_indices,
     weight_name,
 )
 
@@ -319,17 +320,7 @@ class WeightBench:
                 view = self.manager.get_view(weight_name(layer, mode, component)).view(
                     -1
                 )
-                indices = torch.cat(
-                    (
-                        torch.linspace(
-                            0,
-                            view.numel() - 1,
-                            min(4096, view.numel()),
-                            device=self.ctx.device,
-                        ).long(),
-                        torch.arange(min(4096, view.numel()), device=self.ctx.device),
-                    )
-                )
+                indices = verification_indices(view.numel(), self.ctx.device)
                 expected = reference_values(
                     indices,
                     self.model,
@@ -375,6 +366,23 @@ def main():
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--out-csv")
     args = parser.parse_args()
+    model = resolve_model(args)
+    if (
+        args.method == "peer_access"
+        and args.variant == "v3"
+        and args.kernel != "attention"
+        and (
+            args.tp_size not in (4, 8)
+            or model.interleaved_w13
+            or (model.hidden_size, model.moe_intermediate_size)
+            not in ((4096, 1536), (2048, 768))
+        )
+    ):
+        parser.error(
+            "Current v3 expert kernels only specialize Qwen shapes "
+            "(H,I)=(4096,1536)/(2048,768), separate gates, TP=4/8; "
+            "use --variant v2 for GPT-OSS or other shapes"
+        )
     if args.method == "peer_access":
         global ppa, ppa3
         import paras_peer_access_cuda as ppa
@@ -382,7 +390,6 @@ def main():
         ppa3 = ppa
     if args.iters < 1 or args.warmup < 0:
         parser.error("--iters must be positive and --warmup nonnegative")
-    model = resolve_model(args)
     rank, world = init_torchrun()
     if world != args.tp_size:
         parser.error("torchrun world_size must equal --tp-size")

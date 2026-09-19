@@ -21,11 +21,21 @@ from common.weight_bundle import (
     expert_ep_packed_view,
     make_manager,
     reference_values,
+    verification_indices,
     weight_name,
 )
 
 
 class WeightBundleTest(unittest.TestCase):
+    def test_large_tensor_verification_indices_stay_in_bounds(self):
+        # FP32 linspace rounds numel-1 up to numel at realistic weight sizes.
+        for numel in (1, 17, 2**24, 2**28, 2**30 + 13):
+            indices = verification_indices(numel, "cpu")
+            self.assertEqual(indices.dtype, torch.int64)
+            self.assertEqual(indices.min().item(), 0)
+            self.assertEqual(indices.max().item(), numel - 1)
+            self.assertTrue(bool((indices < numel).all()))
+
     def model(self, interleaved):
         return ModelConfig(
             "tiny",
