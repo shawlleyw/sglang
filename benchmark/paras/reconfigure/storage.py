@@ -94,6 +94,34 @@ class IndependentWeightMemoryManager(ParaSMemoryManager):
         )
         return sum(t.untyped_storage().nbytes() for t in tensors) + 256
 
+    def weight_storage_report(self, active_mode):
+        """Check endpoint ownership without allocating, copying or collecting."""
+        report = {}
+        for mode in (ParaSMode.EP, ParaSMode.TP):
+            physical_bytes = logical_bytes = 0
+            for names in self._unified_spec.for_mode(mode).weight_names:
+                for name in names:
+                    tensor = self.get_view(name)
+                    entry = self._entries[name]
+                    size = tensor.untyped_storage().nbytes()
+                    if mode == active_mode:
+                        if not tensor.is_contiguous() or size < entry.size_bytes:
+                            raise RuntimeError(
+                                f"Active weight is not materialized: {name}"
+                            )
+                    elif size > tensor.element_size():
+                        raise RuntimeError(
+                            f"Inactive weight still owns storage: {name}"
+                        )
+                    physical_bytes += size
+                    logical_bytes += entry.size_bytes
+            report[mode.value] = {
+                "active": mode == active_mode,
+                "logical_bytes": logical_bytes,
+                "backing_bytes": physical_bytes,
+            }
+        return report
+
     def get_view(self, name):
         if not self._materialized:
             raise RuntimeError("Buffer not materialized yet.")

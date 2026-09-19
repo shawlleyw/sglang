@@ -7,10 +7,16 @@ graph coverage, forced disposal GC and other confounds invalidate using those
 timings to claim production switching costs. See the
 [production-fidelity audit](production_fidelity_audit.md).
 
-The current v2 candidate removes those graph/GC overrides and several launch
-and synchronization mismatches. It requires fresh GPU validation and has no v2
-performance results. No GPU workload is launched by importing the driver or
-using `--dry-run`.
+The current v2 implementation removes those graph/GC overrides and several
+launch and synchronization mismatches. On 2026-09-19, all four switching methods
+passed both directions on eight A100-80GB GPUs with GPT-OSS-120B BF16, full graph
+coverage and memory fraction 0.70. All 64 rank results matched reference logits
+exactly. The initial 0.75 attempt ran out of memory during untimed preparation;
+the reduced common memory budget is explicit in the saved configuration.
+See the [v2 smoke report](../../../artifacts/20260919T090553Z_gptoss_120b_switch_v2/README.md).
+This is one trial per method/direction; restart rows are copied v1 references,
+and Qwen still requires GPU validation. No GPU workload is launched by importing
+the driver or using `--dry-run`.
 
 ## Methods and boundaries
 
@@ -181,6 +187,8 @@ is restricted to process groups created by this driver.
   the recorded revision (including serving/runtime changes outside the benchmark).
 - `resolved_config.json`: configuration passed to every worker group.
 - Per-trial commands, normalized `server_args.json`, supervisor and rank logs.
+  `ready-ranks.json` records each worker's prepared source graph sets, active
+  replay limits, KV reservation, memory and CPU placement before measurement.
 - `trials.jsonl`: successful and failed trials, per-rank timings and peak PyTorch
   allocated/reserved memory. Non-rebuild results separate switch-only and probe
   peaks and record driver free memory at each boundary, allocator counter deltas,
@@ -199,7 +207,31 @@ These tests cover complete-tensor simulated NCCL routing, Qwen/GPT gate layouts,
 replicated KV heads, host snapshot independence, allocation/alias lifetime,
 configuration parity, graph operation ordering, and worker error propagation.
 
-## Memory pressure and Engine integration
+### Weights / Graph / Others breakdown
+
+Export an additive breakdown from saved trials without running GPUs:
+
+```bash
+python benchmark/paras/reconfigure/breakdown.py \
+  --trials results/gptoss-reconfigure/trials.jsonl \
+  --output results/gptoss-reconfigure/time-breakdown
+```
+
+Optional `--reference-trials` includes separately labeled reference rows. Each
+trial uses the rank with the largest total duration for every bucket. Weights
+includes the weight-transfer phase and host auxiliary enqueue time; Graph
+includes disposal and capture; Others is the remainder. The CSV also separates
+Others into non-weight runtime reconfiguration and time outside named phases,
+including final synchronization/barrier. Full's retained-graph activation is
+inside runtime reconfiguration, so it remains in Others. Host asynchronous
+copies can complete in later phases; the generated report documents this limit.
+Restart rows with only a combined initialization timer remain total-only.
+
+The exporter writes CSV, JSON and Markdown with exact accounting definitions.
+Failed trials are excluded and recorded separately; missing phase measurements
+are never filled in as zero. The output directory must be new.
+
+## Memory pressure and standalone scope
 
 Keep the real planned KV allocation when comparing system methods. Increase
 `server_args.mem_fraction_static` in separate, explicitly labeled configurations
@@ -217,22 +249,22 @@ SGLang's own GC policy. The new allocator counters expose retries and allocation
 calls where supported; missing counters remain null. A headroom sweep can OOM
 and does not guarantee more collections or a particular performance ordering.
 
-The next system integration can reuse these adapters under real Engine workers:
+The chosen implementation remains standalone under `benchmark/paras`. The four
+switching methods construct real Scheduler/ModelRunner state with production
+weights, KV pools, backends, workspaces and graphs; benchmark adapters select
+the weight-storage, transfer and recapture behavior. Normal SGLang serving has
+no new strategy flags or dependency on benchmark code. Engine-path integration
+and serving selectable strawmen are deferred.
 
-1. Launch all methods through `Engine` and production `run_scheduler_process`,
-   including DataParallelController, tokenizer and scheduler event loops.
-2. Install benchmark-only storage/transport adapters in scheduler child processes;
-   wrap the normal ParaS configure handler with disposal/reload/recapture while
-   preserving its rejection handling and post-switch response routing.
-3. Issue normal tokenizer ParaS control requests and validate with the same
-   batched `Engine.generate` workload for every method. Record client switch
-   acknowledgment time separately from per-rank timing and post-switch decode.
-4. Use existing collective RPC for untimed snapshot preparation and result
-   collection. Keep the production switch methods unchanged.
+Untimed endpoint checks verify active graph coverage and replay limits, both
+saved mode sets for `full`, and absence of saved graphs after recapture. The
+recapture path updates `max_bs`/`max_num_token` just as production graph-state
+restoration does; the largest-mode input allocations remain intact. Fixed-buffer
+initialization may still own both graph sets before a zero-warmup measurement;
+they must be discarded during the measured transition.
 
-This is a moderate harness integration, not a new transfer implementation.
-Full/fixed need mostly the handler wrapper; host/NCCL reuse the independent
-manager. Live KV support is a larger, separate change: its request/page migration
-and IPC assumptions are not implemented by the independent backend. Current
-results remain worker-level and empty-state; this Engine integration is a design,
-not an implemented or validated serving benchmark.
+Independent-storage endpoint checks require materialized active weight entries
+and only scalar placeholders for inactive entries. They report backing bytes by
+mode; this verifies manager ownership, not all possible external references or
+the allocator returning cached memory to CUDA. These checks run outside switch
+timing. Live KV request/page migration remains outside this benchmark's scope.

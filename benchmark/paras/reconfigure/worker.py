@@ -68,6 +68,8 @@ def _rank_worker(
             runtime = Runtime(scheduler, config, method)
             source, target = (ParaSMode(value) for value in DIRECTIONS[direction])
             reference = runtime.prepare(source, target)
+            from reconfigure.diagnostics import kv_reservation, memory_snapshot
+
             connection.send(
                 {
                     "stage": "ready",
@@ -78,6 +80,14 @@ def _rank_worker(
                         for mode, sizes in runtime.graph_batches.items()
                     },
                     "kv_transfer_method": os.environ.get("PARAS_KV_TRANSFER_METHOD"),
+                    "graph_state": runtime.graph_state_report(),
+                    "kv_reservation": kv_reservation(runtime.manager),
+                    "memory": memory_snapshot(),
+                    "independent_weight_storage": (
+                        runtime.manager.weight_storage_report(runtime.mode)
+                        if runtime.independent
+                        else None
+                    ),
                     "cpu_affinity": sorted(os.sched_getaffinity(0)),
                     "numa_node": args.numa_node[rank] if args.numa_node else None,
                 }
@@ -158,6 +168,9 @@ def supervise(config, method, direction, directory, timeout):
             processes.append(process)
             connections.append(parent)
         ready = collect(connections, processes, "ready", timeout)
+        (directory / "ready-ranks.json").write_text(
+            json.dumps(sorted(ready, key=lambda item: item["rank"]), indent=2)
+        )
         emit("ready", ranks=ready)
         command = sys.stdin.readline().strip()
         for connection in connections:

@@ -3,8 +3,12 @@
 V1 (`3eb70791a`) is preserved at `artifacts/paras_switch_v1/results`, with a
 file-by-file checksum manifest in `artifacts/paras_switch_v1/sha256.json`.
 It is a functional smoke experiment, not an accepted production-performance
-evaluation. V2 code corrections below have CPU checks only; no v2 GPU timings
-have been collected. This audit is against this repository's current serving
+evaluation. V2 subsequently passed all four switching methods in both directions
+on eight A100-80GB GPUs with GPT-OSS-120B BF16 at memory fraction 0.70; the 0.75
+attempt hit an untimed preparation OOM. See the
+[v2 smoke report](../../../artifacts/20260919T090553Z_gptoss_120b_switch_v2/README.md)
+for exact configuration, failed attempt, per-rank checks and timings. Restart
+numbers are explicitly copied v1 references. This audit is against the serving
 implementation and `scripts/paras/eval/launch_common.sh`, including the user's
 uncommitted UMM workspace changes. No serving implementation was edited.
 
@@ -28,6 +32,14 @@ request-pool/alignment filtering, per-mode maximum buffer allocation and TP
 scaling. Worker logs record both resolved lists. No arbitrary list is inserted
 by benchmark code. Larger graph coverage can change memory fit as well as
 capture latency; v1 memory-fit results do not validate v2.
+
+Recapture also restores active `max_bs` and `max_num_token`, matching production
+graph-state loading. Previously the benchmark updated the list but could leave
+the prior mode's replay limits in place. Untimed endpoint checks now verify the
+active set/limits, both retained sets for full, and disposal for recapture paths.
+Prepared source reports are persisted in `ready-ranks.json` with KV reservation
+and memory observations. Independent weight entries are checked for active
+materialization and inactive scalar placeholders at source and target endpoints.
 
 V1 explicitly called `gc.collect()` after dropping graph references. The
 candidate removes that call: graph and output dictionaries, saved mode states,
@@ -70,7 +82,7 @@ ablations; do not attribute the row 3→4 gap solely to buffer reuse.
 | Auxiliary weights | Host snapshots all registered Parameters except bulk expert/QKV/O weights, including inactive-mode biases and overlapping sink views; reloads them in place. Naive NCCL retains precomputed biases/sinks. | Now selects active target module aliases, excludes saved mode representations and deduplicates identical views. Registered buffers remain retained, not reconstructed. |
 | Storage/capacities | Independent storage retains max(EP,TP) per-layer KV and separate workspaces for both modes, while production UMM overlaps regions. Equal mem_fraction_static does not imply equal footprint. | Both already allocate real full planned KV. Results now record full/SWA capacities, logical mode extents, independent KV backing bytes, driver headroom, allocator configuration/counter deltas and separate peaks. Common memory fraction is the current policy; no equality claim about capacities/footprints. |
 | Static target placement | Native static TP may shard embedding/vocabulary weights, while ParaS retains EP-built replicated placement. Native allocation differs from UMM. Static TP launcher defaults memory fraction .8 vs .75 used in this comparison. | Rebuild is a whole-system alternative, not identical-runtime ablation. The common .75 budget is an explicit experimental choice, not exact reproduction of every launcher default. |
-| Process wrapper | Four methods construct Scheduler directly; rebuild uses Engine. Direct workers bypassed optional production CPU/NUMA affinity. | Workers now apply production affinity/NUMA policy before allocation and record affinity. Engine messaging/event loops remain excluded; integration design is in README. |
+| Process wrapper | Four methods construct Scheduler directly; rebuild uses Engine. Direct workers bypassed optional production CPU/NUMA affinity. | Workers now apply production affinity/NUMA policy before allocation and record affinity. Engine messaging/event loops remain excluded; the chosen scope stays standalone. |
 | Probe workload | Direct EP probe creates a request on each rank, while Engine probe submitted one request. Direct probes bypass Scheduler's loop. Rebuild validates repeated text; others compare same-mode logits. | All now use world_size global requests and matching token limits. Through-probe timing remains diagnostic: scheduling and correctness endpoints still differ until Engine integration. |
 | Phase instrumentation | Added CUDA synchronization around named phases and a final distributed barrier. | Removed benchmark-added internal CUDA waits. Phases are explicitly host wall time; async enqueue time is not device duration. Total boundary sync/barrier remains. |
 | Peak memory | Counters reset before switching but were read after the validation probe. Non-PyTorch allocations are excluded. | Now records switch-only and separately reset probe peaks, driver boundary headroom and switch allocator deltas. Legacy peaks cover both intervals. Diagnostics between intervals are excluded from through-probe total. |
@@ -97,16 +109,21 @@ GPT-OSS's mixed full/SWA live cache or request migration. Keep these component
 results separate from empty-state system switching. V3 expert kernels lack
 GPT-OSS specializations; only verified v2 results are reported.
 
-## 5. Before measuring v2
+## 5. Validation status and remaining evaluation work
 
-1. Validate exact resolved graph sets and memory fit on all methods with the
-   chosen production launch configuration; never reduce coverage silently.
-2. Validate pointer-only disposal and asynchronous source-release correctness
-   with the updated independent baselines, including full round-trip checks.
+1. All fresh switching trials validated 36 EP / 100 TP graphs and memory fit
+   at the explicitly reduced 0.70 budget. The original 0.75 attempt is preserved
+   as a failure; graph coverage was unchanged. Planned KV capacities matched
+   across all fresh methods and ranks.
+2. CPU lifecycle checks and GPU same-target logits/storage checks passed after
+   pointer-only disposal and asynchronous source release. Full retained both
+   graph sets; non-retaining methods retained none after recapture.
 3. Retain agreed row 4 (fused UMM recapture) with explicit transport labels;
    use microbenchmarks for transport ablations.
-4. Validate the corrected warmup, active auxiliary handling and CPU placement
-   on GPUs; inspect reported capacities and headroom before comparing methods.
+4. Corrected warmup and active auxiliary handling passed GPU validation. CPU
+   placement, capacities and headroom are recorded. No measured switch had an
+   allocator retry; extra weight allocations must not be described as observed
+   pressure-triggered reclamation in these trials.
 5. Collect repeated trials and traces separating allocation, staging, transfer,
    graph destruction and capture. Keep readiness/probe workload consistent.
 
