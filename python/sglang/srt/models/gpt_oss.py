@@ -71,7 +71,13 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+from sglang.srt.utils import (
+    LazyValue,
+    add_prefix,
+    get_bool_env_var,
+    is_cuda,
+    make_layers,
+)
 
 _is_cuda = is_cuda()
 
@@ -120,6 +126,7 @@ class GptOssSparseMoeBlock(nn.Module):
         experts_type = get_moe_impl_class(quant_config)
         extra_kwargs = {}
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
         if issubclass(experts_type, FusedMoE):
             quant_config_name = (
                 quant_config.get_name() if quant_config is not None else None
@@ -604,6 +611,20 @@ class GptOssForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        # Keep the transformer TP-sharded while optionally replicating the
+        # vocabulary projection, as ParaS does in held TP mode.
+        server_args = get_global_server_args()
+        replicated_lm_head = get_bool_env_var("SGLANG_GPTOSS_REPLICATED_LM_HEAD")
+        if replicated_lm_head:
+            if server_args.enable_dp_attention or server_args.enable_dp_lm_head:
+                raise ValueError(
+                    "SGLANG_GPTOSS_REPLICATED_LM_HEAD requires TP attention. "
+                    "For DP attention, use --enable-dp-lm-head instead."
+                )
+            if quant_config is not None:
+                raise ValueError(
+                    "SGLANG_GPTOSS_REPLICATED_LM_HEAD requires unquantized weights."
+                )
         self.model = GptOssModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -612,9 +633,20 @@ class GptOssForCausalLM(nn.Module):
             config.hidden_size,
             # quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            enable_tp=not replicated_lm_head,
+            use_attn_tp_group=server_args.enable_dp_lm_head,
         )
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(
+            config, skip_all_gather=replicated_lm_head
+        )
+        if replicated_lm_head:
+            logger.info(
+                "GPTOSS_LM_HEAD_LAYOUT replicated=True head_tp_size=%s "
+                "weight_shape=%s logits_all_gather=%s",
+                self.lm_head.tp_size,
+                tuple(self.lm_head.weight.shape),
+                self.logits_processor.do_tensor_parallel_all_gather,
+            )
         self.capture_aux_hidden_states = False
 
         self._routed_experts_weights_of_layer = LazyValue(
