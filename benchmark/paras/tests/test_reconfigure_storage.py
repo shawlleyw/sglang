@@ -53,6 +53,23 @@ def independent_manager(model, *, world=4, device="cpu", force_span_collision=Fa
 
 
 class IndependentStorageTest(unittest.TestCase):
+    def test_endpoint_audit_detects_retained_source_or_placeholder_target(self):
+        manager = independent_manager(self.model())
+        report = manager.weight_storage_report(ParaSMode.EP)
+        self.assertEqual(report["ep"]["backing_bytes"], report["ep"]["logical_bytes"])
+        self.assertLess(report["tp"]["backing_bytes"], report["tp"]["logical_bytes"])
+        name = weight_name(0, ParaSMode.TP, "w13")
+        manager.replace_weight(
+            name, torch.empty(manager._entries[name].shape, dtype=torch.bfloat16)
+        )
+        with self.assertRaisesRegex(RuntimeError, "Inactive weight still owns"):
+            manager.weight_storage_report(ParaSMode.EP)
+        manager.replace_weight(name, manager.placeholder(name))
+        name = weight_name(0, ParaSMode.EP, "w13")
+        manager.replace_weight(name, manager.placeholder(name))
+        with self.assertRaisesRegex(RuntimeError, "Active weight is not materialized"):
+            manager.weight_storage_report(ParaSMode.EP)
+
     def model(self):
         return ModelConfig("tiny", 2, 8, 8, 16, 32, 3, num_attention_heads=8)
 

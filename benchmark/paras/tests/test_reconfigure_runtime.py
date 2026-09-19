@@ -127,7 +127,7 @@ class RuntimeOrderingTest(unittest.TestCase):
         seen = []
 
         def capture():
-            seen.append(list(gr.capture_bs))
+            seen.append((list(gr.capture_bs), gr.max_bs, gr.max_num_token))
             gr.graphs = dict.fromkeys(gr.capture_bs)
 
         gr.capture = capture
@@ -143,14 +143,53 @@ class RuntimeOrderingTest(unittest.TestCase):
             Runtime.capture(runtime)
             runtime.scheduler.paras_parallelism_config = ParaSMode.TP
             Runtime.capture(runtime)
-        self.assertEqual(seen, [[1, 2], [1, 2, 4, 8]])
+        self.assertEqual(seen, [([1, 2], 2, 2), ([1, 2, 4, 8], 8, 8)])
+
+    def test_full_graph_report_requires_both_sets_and_correct_replay_limits(self):
+        runtime, _ = self.runtime(ParaSMode.EP, "full")
+        gr = runtime.runner.graph_runner
+        gr.max_bs, gr.max_num_token = 2, 2
+        gr.graphs = dict.fromkeys([1, 2])
+        gr._paras_saved = {
+            mode: {"graphs": dict.fromkeys(sizes)}
+            for mode, sizes in runtime.graph_batches.items()
+        }
+        report = runtime.graph_state_report()
+        self.assertEqual(report["retained_batch_sizes_by_mode"]["tp"], [1, 2, 4, 8])
+        # A stale TP replay maximum must not silently admit missing EP graphs.
+        gr.max_bs = 8
+        with self.assertRaisesRegex(RuntimeError, "replay limits"):
+            runtime.graph_state_report()
+        gr.max_bs = 2
+        del gr._paras_saved[ParaSMode.TP]["graphs"][8]
+        with self.assertRaisesRegex(RuntimeError, "retain both"):
+            runtime.graph_state_report()
+
+    def test_recapture_report_rejects_saved_graphs_after_switch(self):
+        runtime, _ = self.runtime(ParaSMode.EP, "fixed_buffer_recapture")
+        gr = runtime.runner.graph_runner
+        gr.max_bs, gr.max_num_token = 2, 2
+        gr.graphs = dict.fromkeys([1, 2])
+        gr._paras_saved = {ParaSMode.EP: {"graphs": dict(gr.graphs)}}
+        # With zero switch warmups, fixed-buffer initialization can still own
+        # the dual graphs. The measured recapture must discard them all.
+        runtime.graph_state_report()
+        with self.assertRaisesRegex(RuntimeError, "still owns"):
+            runtime.graph_state_report(require_discarded=True)
+        gr._paras_saved.clear()
+        self.assertFalse(runtime.graph_state_report()["retained_batch_sizes_by_mode"])
+        del gr.graphs[2]
+        with self.assertRaisesRegex(RuntimeError, "production set"):
+            runtime.graph_state_report()
 
     def runtime(self, source, method, independent=False, reject=False):
         events = []
         manager = SimpleNamespace()
         runner = SimpleNamespace(
             graph_runner=SimpleNamespace(
-                capture_bs=[1, 2], _paras_tp_capture_bs=[1, 2, 4, 8]
+                capture_bs=[1, 2],
+                _paras_tp_capture_bs=[1, 2, 4, 8],
+                num_tokens_per_bs=1,
             ),
             model=SimpleNamespace(
                 model=SimpleNamespace(), paras_memory_manager=manager

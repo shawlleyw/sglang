@@ -248,11 +248,46 @@ class Runtime:
 
         gr = self.runner.graph_runner
         gr.capture_bs = list(self.graph_batches[self.mode])
+        # The shared input/backend buffers were allocated for the largest
+        # mode during production initialization. These are active replay
+        # limits, matching paras_load_cuda_graph_state, not new allocations.
+        gr.max_bs = max(gr.capture_bs)
+        gr.max_num_token = gr.max_bs * gr.num_tokens_per_bs
         paras_refresh_cuda_graph_settings(gr)
         with model_capture_mode():
             gr.capture()
         if sorted(gr.graphs) != sorted(gr.capture_bs):
             raise RuntimeError("Recapture did not produce the production graph set")
+
+    def graph_state_report(self, *, require_discarded=False):
+        """Validate graph coverage without replaying or retaining graph objects."""
+        gr = self.runner.graph_runner
+        expected = self.graph_batches[self.mode]
+        if list(gr.capture_bs) != expected or sorted(gr.graphs) != sorted(expected):
+            raise RuntimeError("Active graphs differ from the resolved production set")
+        if gr.max_bs != max(expected) or gr.max_num_token != (
+            max(expected) * gr.num_tokens_per_bs
+        ):
+            raise RuntimeError("Active CUDA graph replay limits do not match the mode")
+        saved = getattr(gr, "_paras_saved", {})
+        retained = {
+            mode.value: sorted(state["graphs"]) for mode, state in saved.items()
+        }
+        if self.method == "full":
+            expected_retained = {
+                mode.value: sorted(sizes) for mode, sizes in self.graph_batches.items()
+            }
+            if retained != expected_retained:
+                raise RuntimeError("Full method must retain both production graph sets")
+        elif saved and (self.independent or require_discarded):
+            raise RuntimeError("Non-retaining method still owns saved mode graphs")
+        return {
+            "mode": self.mode.value,
+            "active_batch_sizes": list(gr.capture_bs),
+            "max_batch_size": gr.max_bs,
+            "max_num_tokens": gr.max_num_token,
+            "retained_batch_sizes_by_mode": retained,
+        }
 
     def switch(self, target, *, measured=False):
         if target not in (ParaSMode.EP, ParaSMode.TP):
@@ -415,6 +450,11 @@ class Runtime:
         # Exclude diagnostic memory queries between switch and probe.
         ready_ms = switch_ms + (time.perf_counter() - probe_start) * 1000
         memory_after_probe = memory_snapshot()
+        graph_state = self.graph_state_report(require_discarded=True)
+        if len(actual) != len(reference):
+            raise RuntimeError("Probe and reference have different numbers of steps")
+        if any(a.shape != b.shape for a, b in zip(actual, reference)):
+            raise RuntimeError("Probe and reference have different logit shapes")
         error = max(float((a - b).abs().max()) for a, b in zip(actual, reference))
         for a, b in zip(actual, reference):
             torch.testing.assert_close(
@@ -426,7 +466,7 @@ class Runtime:
         return {
             "switch_ms": switch_ms,
             "through_probe_ms": ready_ms,
-            "phases": self.phases,
+            "phases": dict(self.phases),
             "max_logit_error": error,
             "phase_timing": "host_wall_time_no_added_internal_cuda_sync",
             "warmup_switches": self.config.get("warmup_switches", 1),
@@ -449,6 +489,11 @@ class Runtime:
                 ),
                 "kv_reservation": kv_reservation(self.manager),
                 "allocator": allocator_configuration(),
+                "independent_weight_storage": (
+                    self.manager.weight_storage_report(self.mode)
+                    if self.independent
+                    else None
+                ),
             },
             "host_snapshot_bytes": sum(
                 t.numel() * t.element_size()
@@ -459,5 +504,6 @@ class Runtime:
             "validation": "passed",
             "weight_transport": METHOD_TRANSPORT[self.method],
             "graph_batch_sizes": list(self.runner.graph_runner.capture_bs),
+            "graph_state": graph_state,
             "scope": "scheduler_worker_reconfiguration_empty_requests",
         }
