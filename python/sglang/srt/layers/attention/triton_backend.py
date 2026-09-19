@@ -174,31 +174,20 @@ class TritonAttnBackend(AttentionBackend):
     # ------------------------------------------------------------------
 
     def paras_configure_tp(self, paras_tp_size: int, req_to_token: "torch.Tensor"):
-        """Switch to TP mode: rebind state, allocate fresh buffers.
-
-        Allocates fresh ``kv_indptr`` family + CUDA graph buffers sized for
-        the new (TP) ReqToTokenPool. The previous mode's buffers must
-        already be saved via ``paras_save_cuda_graph_state`` if any
-        captured graph references them; otherwise they are dropped.
-        Callers in the cuda-graph path then restore mode-appropriate
-        buffer references via ``paras_load_cuda_graph_state``.
-        """
+        """Rebind TP heads and reuse its captured buffers when available."""
         self._paras_workspace_mode = ParaSMode.TP
         self.num_head = self.total_num_attention_heads // paras_tp_size
         self.num_kv_head = self._get_num_kv_heads(paras_tp_size)
         self.req_to_token = req_to_token
-        self._paras_alloc_fresh_buffers()
+        self._paras_restore_or_allocate_buffers()
 
     def paras_configure_ep(self, req_to_token: "torch.Tensor"):
-        """Switch to EP mode: rebind state, allocate fresh buffers.
-
-        See ``paras_configure_tp`` for the buffer-allocation contract.
-        """
+        """Rebind EP heads and reuse its captured buffers when available."""
         self._paras_workspace_mode = ParaSMode.EP
         self.num_head = self.total_num_attention_heads
         self.num_kv_head = self._get_num_kv_heads(1)
         self.req_to_token = req_to_token
-        self._paras_alloc_fresh_buffers()
+        self._paras_restore_or_allocate_buffers()
 
     _PARAS_CUDA_GRAPH_BUFFER_ATTRS = (
         "kv_indptr",
@@ -218,24 +207,34 @@ class TritonAttnBackend(AttentionBackend):
     def paras_save_cuda_graph_state(self):
         """Snapshot tensor refs whose ``data_ptr()`` is baked into captured
         graph kernel args. Restoring these refs makes a previously captured
-        graph valid again after a mode switch reallocated them.
+        graph valid again without allocating replacement buffers.
         """
-        return {
+        state = {
             attr: getattr(self, attr)
             for attr in self._PARAS_CUDA_GRAPH_BUFFER_ATTRS
             if hasattr(self, attr)
         }
+        if not hasattr(self, "_paras_graph_states"):
+            self._paras_graph_states = {}
+        self._paras_graph_states[self._paras_workspace_mode] = state
+        return state
 
     def paras_load_cuda_graph_state(self, state):
         for attr, value in state.items():
             setattr(self, attr, value)
 
-    def _paras_alloc_fresh_buffers(self):
-        """Allocate fresh kv_indptr family and (if cuda graph is enabled)
-        cuda graph buffers, sized for the current mode's pool.
+    def _paras_restore_or_allocate_buffers(self):
+        state = getattr(self, "_paras_graph_states", {}).get(self._paras_workspace_mode)
+        if state is not None:
+            self.paras_load_cuda_graph_state(state)
+        else:
+            self._paras_alloc_fresh_buffers()
 
-        Called from paras_configure_tp/ep. Previous mode's buffers stay
-        alive via Python refs in any saved cuda-graph state dict.
+    def _paras_alloc_fresh_buffers(self):
+        """Allocate pointer arrays on first entry to a mode.
+
+        Graph storage is initialized separately with that mode's capture sizes.
+        Runtime switches restore saved tensors without transient allocations.
         """
         max_bs_plus_1 = self.req_to_token.shape[0] + 1
         device = self.device
@@ -252,11 +251,6 @@ class TritonAttnBackend(AttentionBackend):
             )
             self.mask_indptr = torch.zeros(
                 (max_bs_plus_1,), dtype=torch.int64, device=device,
-            )
-        if hasattr(self, "_paras_cuda_graph_max_bs"):
-            self.init_cuda_graph_state(
-                self._paras_cuda_graph_max_bs,
-                self._paras_cuda_graph_max_num_tokens,
             )
 
     def _allocate_decode_workspace(self, tokens, *, zero=False):
@@ -557,15 +551,21 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_num_kv_splits = cuda_graph_num_kv_splits_buf
 
         if kv_indices_buf is None:
-            self.cuda_graph_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.int64,
-                device=self.device,
-            )
+            shape = (max_num_tokens * self.max_context_len,)
+            memory = getattr(self, "_paras_runtime_memory", None)
+            if memory is None:
+                self.cuda_graph_kv_indices = torch.zeros(
+                    shape, dtype=torch.int64, device=self.device
+                )
+            else:
+                self.cuda_graph_kv_indices = memory.zeros(
+                    self._paras_workspace_mode, "kv_indices", shape, torch.int64
+                )
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if not self.skip_prefill:
+        self.cuda_graph_custom_mask = None
+        if not self.skip_prefill and self.num_draft_tokens is not None:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,

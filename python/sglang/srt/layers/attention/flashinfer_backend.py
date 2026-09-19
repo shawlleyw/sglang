@@ -386,6 +386,16 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def paras_save_cuda_graph_state(self):
         return {
+            "graph_buffers": {
+                name: getattr(self, name)
+                for name in (
+                    "cuda_graph_kv_indices",
+                    "cuda_graph_custom_mask",
+                    "cuda_graph_qk_indptr",
+                    "cuda_graph_qo_indptr",
+                )
+                if hasattr(self, name)
+            },
             "decode_cuda_graph_metadata": dict(self.decode_cuda_graph_metadata),
             "prefill_cuda_graph_metadata": dict(self.prefill_cuda_graph_metadata),
             "draft_extend_cuda_graph_metadata": dict(
@@ -394,6 +404,8 @@ class FlashInferAttnBackend(AttentionBackend):
         }
 
     def paras_load_cuda_graph_state(self, state):
+        for name, value in state["graph_buffers"].items():
+            setattr(self, name, value)
         self.decode_cuda_graph_metadata = state["decode_cuda_graph_metadata"]
         self.prefill_cuda_graph_metadata = state["prefill_cuda_graph_metadata"]
         self.draft_extend_cuda_graph_metadata = state[

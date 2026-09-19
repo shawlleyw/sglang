@@ -60,7 +60,10 @@ The [unified memory manager](unified_memory_manager.md) plans expert weights,
 attention QKV/O weights, KV storage, and managed backend scratch in one
 allocation. EP and TP have fixed, overlapping views with different weight
 and KV sizes. Embeddings, auxiliary weights, communication buffers, and
-graph allocations remain external.
+graph allocations remain external. Graph input/output and attention state are
+sized and saved independently for EP and TP. The experimental
+[`--paras-vmm-runtime-states` option](runtime_state_vmm.md) releases inactive
+Triton KV-index/logits backing without destroying either mode's graphs.
 
 The canonical memory reference defines the
 [layout and endpoint sizing](unified_memory_manager.md#capacity-calculation).

@@ -58,16 +58,16 @@ def test_flashinfer_configuration(monkeypatch):
     )
 
 
-def test_triton_preserves_existing_graph_capacity():
+def test_triton_sizes_each_mode_independently():
     ep, tp = requirements("triton")
-    assert ep.size_bytes == 516 << 20
+    assert ep.size_bytes == int(64.5 * (1 << 20))
     assert tp.size_bytes == int(64.5 * (1 << 20))
     ep, tp = requirements("triton", disable_cuda_graph=True)
     assert ep.size_bytes == tp.size_bytes == int(64.5 * (1 << 20))
     ep, tp = requirements(
         "triton", context_length=65536, triton_attention_split_tile_size=4096
     )
-    assert ep.size_bytes == 1032 << 20
+    assert ep.size_bytes == 129 << 20
     assert tp.size_bytes == 129 << 20
 
 
@@ -79,7 +79,7 @@ def test_triton_uses_resolved_rope_context():
         num_heads=32,
         triton_attention_split_tile_size=4096,
     )
-    assert ep.size_bytes == 1032 << 20
+    assert ep.size_bytes == 129 << 20
     assert tp.size_bytes == 129 << 20
 
 

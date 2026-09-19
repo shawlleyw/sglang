@@ -446,6 +446,7 @@ class ServerArgs:
     elastic_ep_backend: Literal[None, "mooncake"] = None
     mooncake_ib_device: Optional[str] = None
     enable_paras_moe: bool = False
+    paras_vmm_runtime_states: bool = False
     paras_tp_size: int = 4
     paras_tp_cuda_graph_max_bs: Optional[int] = None
     paras_tp_cuda_graph_bs: Optional[List[int]] = None
@@ -1583,6 +1584,10 @@ class ServerArgs:
             )
 
     def _check_paras_config(self):
+        if self.paras_vmm_runtime_states:
+            from sglang.srt.paras.runtime_memory import validate_runtime_vmm_config
+
+            validate_runtime_vmm_config(self)
         if self.enable_paras_moe:
             assert self.enable_dp_lm_head, "enable_dp_lm_head must be set when enable_paras_moe is set"
             assert self.enable_dp_attention, "enable_dp_attention must be set when enable_paras_moe is set"
@@ -3073,6 +3078,15 @@ class ServerArgs:
             "--enable-paras-moe",
             action="store_true",
             help="Enabling ParaS MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--paras-vmm-runtime-states",
+            action="store_true",
+            help=(
+                "Experimental: unmap inactive ParaS Triton graph KV indices and "
+                "logits while retaining their virtual addresses. Requires CUDA "
+                "graphs, explicit triton attention, and no speculative decoding."
+            ),
         )
         parser.add_argument(
             "--paras-tp-size",

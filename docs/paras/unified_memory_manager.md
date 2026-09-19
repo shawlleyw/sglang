@@ -202,11 +202,17 @@ remain external. The numerical workspace size is configured through
 
 Triton uses the resolved model context length when calculating splits,
 including RoPE scaling and context overrides. With CUDA graphs enabled,
-both modes preserve the existing graph allocation capacity:
-`G = max(EP graph batches, TP graph batches)`. Scratch tokens are
-`max(G, max_running_requests / P)` in EP and
-`max(G, max_running_requests)` in TP; query heads are full in EP and
-sharded in TP. Without graphs, `G=0`.
+each mode follows its own graph allocation capacity:
+`G_EP = max(EP graph batches)` and `G_TP = max(TP graph batches)`.
+Scratch tokens are `max(G_EP, max_running_requests / P)` in EP and
+`max(G_TP, max_running_requests)` in TP; query heads are full in EP and
+sharded in TP. Without graphs, both graph capacities are zero.
+
+Graph inputs, attention metadata, and logits are also saved separately by
+mode. Ordinary Triton decode no longer allocates a verification-only custom
+mask. The opt-in [runtime-state VMM path](runtime_state_vmm.md) releases
+inactive KV-index/logits backing while keeping captured virtual addresses.
+These allocations remain outside the UMM budget.
 
 Composite/mixed prefill-decode configurations, speculative workers, PDMux,
 and two-batch overlap retain external attention allocation. Triton without
@@ -221,7 +227,8 @@ This is a **planner calculation**, not a measured H200 footprint. Assume
 page size 1, 94 layers, `H=4096`, `I=1536`, 128 experts, top-k 8, 64 query
 heads, four KV heads, and head dimension 128. Use the H200 launch request
 settings above (`C=256`) and, for Triton attention, eight KV splits and a
-maximum graph batch of 2,048. All diagram sizes below are **MiB per GPU**:
+maximum graph batch of 256 in EP and 2,048 in TP. All diagram sizes below
+are **MiB per GPU**:
 
 ```text
 FlashInfer attention:
@@ -231,8 +238,8 @@ TP: [weights 55,836][KV 72,342.9600][seam 0.0012][MoE 4,557.0388][attention 384]
                                                |<---------- tail 4,941.0388 ---------->|
 
 Triton attention:
-EP: [MoE 288][attention 516][padding 0][weights 66,928][seam 0.0303][KV 65,387.9697]
-    |<--------- front 804 --------->|
+EP: [MoE 288][attention 64.5][padding 241.5][weights 66,928][seam 0.0449][KV 65,597.9551]
+    |<-------------- front 594 ------------->|
 TP: [weights 55,836][KV 72,662.4590][seam 0.0022][MoE 4,557.0388][attention 64.5][padding 0]
                                                |<---------- tail 4,621.5388 ---------->|
 ```
@@ -240,11 +247,12 @@ TP: [weights 55,836][KV 72,662.4590][seam 0.0022][MoE 4,557.0388][attention 64.5
 Weights are 576 MiB of experts plus 136 MiB of attention per EP layer;
 TP has the same experts plus 18 MiB of attention per layer. The diagrams
 show reserved KV bytes; page-rounded usable tokens are 356,873 EP /
-1,576,152 TP for FlashInfer and 356,154 EP / 1,583,113 TP for Triton.
+1,576,152 TP for FlashInfer and 357,298 EP / 1,583,113 TP for Triton.
 These are local EP versus global TP token capacities.
 
-Here both endpoints are workspace-bound, leaving zero unused endpoint
-padding. The TP reservation still covers 65,536 input tokens even though
+FlashInfer has two workspace-bound endpoints. Triton's EP front is instead
+bounded by one TP weight layer and has 241.5 MiB of transfer headroom beyond
+scratch. The TP reservation still covers 65,536 input tokens even though
 the example's decode batch tops out at 2,048. This reservation slack and
 external allocations must be included in a comparison with native TP;
 zero endpoint padding does not mean zero ParaS overhead. Other settings
