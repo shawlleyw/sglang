@@ -2,7 +2,6 @@
   "name": "gpt-oss-120b-bf16-a100",
   "model_path": "/data/shaoyuw/models/gpt-oss-120b-BF16-unsloth",
   "world_size": 8,
-  "graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256],
   "seed": 42,
   "probe_prompt": "The capital of France is",
   "probe_decode_steps": 2,
@@ -17,14 +16,15 @@
     "moe_runner_backend": "triton",
     "max_running_requests": 2048,
     "max_prefill_tokens": 8192,
-    "chunked_prefill_size": -1,
-    "disable_overlap_schedule": true
+    "chunked_prefill_size": -1
   },
   "environment": {
     "PARAS_CONFIGURE_METHOD": "peer_access",
-    "PARAS_KV_TRANSFER_METHOD": "nccl",
+    "PARAS_KV_TRANSFER_METHOD": "peer_access",
     "SGLANG_DEEPEP_BF16_DISPATCH": "true",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
-    "SGLANG_ATTN_MAX_BS": "256"
-  }
+    "SGLANG_ATTN_MAX_BS": "256",
+    "NVSHMEM_QP_DEPTH": "2048"
+  },
+  "experiment_version": 2
 }
