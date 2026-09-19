@@ -16,6 +16,12 @@ from sglang.srt.paras.mode import ParaSMode
 
 from .storage import IndependentWeightMemoryManager
 from .configuration import METHOD_TRANSPORT
+from .diagnostics import (
+    allocator_configuration,
+    allocator_delta,
+    kv_reservation,
+    memory_snapshot,
+)
 from .transfers import (
     naive_nccl_transfer_layer,
     reload_host_layer,
@@ -49,6 +55,36 @@ def layer_parameters(layer, mode):
         "qkv": getattr(attention.qkv_proj, attr),
         "o": getattr(attention.o_proj, attr),
     }
+
+
+def active_auxiliary_parameters(model, bulk_ids):
+    """Visit active module aliases, excluding saved EP/TP representations.
+
+    remove_duplicate=False matters: a saved representation can be registered
+    before the active alias. Deduplicate exact tensor views after filtering.
+    """
+    saved = {
+        "ep_experts",
+        "tp_experts",
+        "ep_sinks",
+        "tp_sinks",
+        "ep_qkv_bias",
+        "tp_qkv_bias",
+    }
+    seen = set()
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        if id(parameter) in bulk_ids or saved.intersection(name.split(".")):
+            continue
+        key = (
+            parameter.device,
+            parameter.data_ptr(),
+            parameter.dtype,
+            tuple(parameter.shape),
+            tuple(parameter.stride()),
+        )
+        if key not in seen:
+            seen.add(key)
+            yield parameter
 
 
 def install_independent_storage():
@@ -168,10 +204,10 @@ class Runtime:
 
     @contextmanager
     def phase(self, name):
-        torch.cuda.synchronize()
         start = time.perf_counter()
         yield
-        torch.cuda.synchronize()
+        # Host wall time, including any production waits. Do not insert extra
+        # device barriers inside the switch just to obtain phase timings.
         self.phases[name] = (time.perf_counter() - start) * 1000
 
     def reset_requests(self):
@@ -251,19 +287,29 @@ class Runtime:
         self.reset_requests()
         prompt = self.config.get("probe_prompt", "The capital of France is")
         tokens = self.scheduler.tokenizer.encode(prompt)
-        request = Req(
-            rid="reconfigure-probe",
-            origin_input_text=prompt,
-            origin_input_ids=tokens,
-            sampling_params=SamplingParams(temperature=0, max_new_tokens=8),
-        )
-        request.fill_ids = list(tokens)
-        request.extend_input_len = len(tokens)
-        request.logprob_start_len = len(tokens) - 1
+        # Same global workload in both modes: one request per EP rank, or
+        # world_size requests in the single TP replica.
+        count = self.config["world_size"] if self.mode == ParaSMode.TP else 1
+        requests = []
+        for index in range(count):
+            request = Req(
+                rid=f"reconfigure-probe-{index}",
+                origin_input_text=prompt,
+                origin_input_ids=list(tokens),
+                sampling_params=SamplingParams(
+                    temperature=0,
+                    max_new_tokens=self.config.get("probe_decode_steps", 2) + 1,
+                    ignore_eos=True,
+                ),
+            )
+            request.fill_ids = list(tokens)
+            request.extend_input_len = len(tokens)
+            request.logprob_start_len = len(tokens) - 1
+            requests.append(request)
         # The scheduler's real cache is required for hybrid/SWA allocation;
         # bench_one_batch.extend uses a dummy cache that cannot serve GPT-OSS.
         batch = ScheduleBatch.init_new(
-            reqs=[request],
+            reqs=requests,
             req_to_token_pool=self.runner.req_to_token_pool,
             token_to_kv_pool_allocator=self.runner.token_to_kv_pool_allocator,
             tree_cache=self.scheduler.tree_cache,
@@ -286,7 +332,7 @@ class Runtime:
             ids = self.runner.sample(output, forward)
             outputs.append(output.next_token_logits.detach().float().cpu())
             graph_used.append(bool(used))
-        del batch, forward, request, output
+        del batch, forward, request, requests, output
         self.reset_requests()
         if not all(graph_used):
             raise RuntimeError("Decode probe did not execute captured CUDA graphs")
@@ -314,14 +360,22 @@ class Runtime:
                 for mode in (ParaSMode.EP, ParaSMode.TP)
                 for p in layer_parameters(layer, mode).values()
             }
-            for parameter in self.runner.model.parameters():
-                if id(parameter) not in weight_ids:
-                    snapshot = snapshot_host_tensors(
-                        {"tensor": parameter}, pin_memory=pin
-                    )["tensor"]
-                    self.auxiliary_snapshots.append((parameter, snapshot))
+            for parameter in active_auxiliary_parameters(self.runner.model, weight_ids):
+                snapshot = snapshot_host_tensors({"tensor": parameter}, pin_memory=pin)[
+                    "tensor"
+                ]
+                self.auxiliary_snapshots.append((parameter, snapshot))
         self.switch(source)
         self.probe()
+        # Exercise the actual measured transport/recapture path, including H2D
+        # for host reload. Restoring source uses NCCL because the prepared host
+        # snapshot deliberately contains only the target representation.
+        for _ in range(self.config.get("warmup_switches", 1)):
+            self.execute(target, reference)
+            if self.method == "host_reload":
+                self.manager.benchmark_method = "naive_nccl"
+            self.switch(source, measured=True)
+            self.probe()
         self.phases.clear()
         self.synchronize()
         return reference
@@ -329,7 +383,9 @@ class Runtime:
     def execute(self, target, reference):
         self.reset_requests()
         self.synchronize()
+        self.phases.clear()
         torch.cuda.reset_peak_memory_stats()
+        memory_before = memory_snapshot()
         start = time.perf_counter()
         if self.method == "host_reload":
             self.manager.benchmark_method = "host_reload"
@@ -351,9 +407,14 @@ class Runtime:
             self.body.paras_transfer_unified_weights = original_transfer
         self.synchronize()
         switch_ms = (time.perf_counter() - start) * 1000
+        memory_after_switch = memory_snapshot()
+        torch.cuda.reset_peak_memory_stats()
+        probe_start = time.perf_counter()
         actual = self.probe()
         self.synchronize()
-        ready_ms = (time.perf_counter() - start) * 1000
+        # Exclude diagnostic memory queries between switch and probe.
+        ready_ms = switch_ms + (time.perf_counter() - probe_start) * 1000
+        memory_after_probe = memory_snapshot()
         error = max(float((a - b).abs().max()) for a, b in zip(actual, reference))
         for a, b in zip(actual, reference):
             torch.testing.assert_close(
@@ -367,8 +428,28 @@ class Runtime:
             "through_probe_ms": ready_ms,
             "phases": self.phases,
             "max_logit_error": error,
-            "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
-            "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+            "phase_timing": "host_wall_time_no_added_internal_cuda_sync",
+            "warmup_switches": self.config.get("warmup_switches", 1),
+            "probe_global_requests": self.config["world_size"],
+            "peak_allocated_bytes": max(
+                memory_after_switch["peak_allocated_bytes"],
+                memory_after_probe["peak_allocated_bytes"],
+            ),
+            "peak_reserved_bytes": max(
+                memory_after_switch["peak_reserved_bytes"],
+                memory_after_probe["peak_reserved_bytes"],
+            ),
+            "memory": {
+                "before_switch": memory_before,
+                "after_switch": memory_after_switch,
+                "after_probe": memory_after_probe,
+                "switch_allocator_delta": allocator_delta(
+                    memory_before["allocator_counters"],
+                    memory_after_switch["allocator_counters"],
+                ),
+                "kv_reservation": kv_reservation(self.manager),
+                "allocator": allocator_configuration(),
+            },
             "host_snapshot_bytes": sum(
                 t.numel() * t.element_size()
                 for layer in getattr(self.manager, "host_snapshots", {}).values()

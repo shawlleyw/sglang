@@ -22,7 +22,10 @@ using `--dry-run`.
 | `fixed_buffer_recapture` | Production UMM **and fused peer-access transfer**, with graph discard and target recapture; this is not a fixed-buffer NCCL baseline |
 | `full` | Production Scheduler ParaS switch using its prepared UMM views and retained graphs |
 
-Every trial has an empty running/waiting request set. There is no live KV cache,
+Every trial has an empty running/waiting request set. **The full planned KV
+storage is allocated**, including GPT-OSS full-attention/SWA pools. Empty means
+no resident request tokens, not an absent or minimal GPU cache allocation.
+There is no live KV cache migration,
 request draining, or HTTP latency in these measurements. Methods other than
 `rebuild` instantiate real Scheduler/ModelRunner workers directly; they exclude
 TokenizerManager/DataParallelController messaging. `rebuild` recreates the
@@ -37,8 +40,15 @@ against an untimed reference in the **same target mode**, with configured BF16
 tolerances and finite-value checks. The reference is captured before preparing
 the source mode. Rebuild runs repeat the target inference probe and require equal
 text; its second validation probe is outside the recorded time.
+All methods use `world_size` global requests: one per EP worker or a batch of
+`world_size` in TP. Engine scheduling can distribute them differently; matching
+request counts does not make the manual probe an Engine-level endpoint.
 
-Worker timing uses CPU monotonic clocks with CUDA synchronization. The reported
+Worker timing uses CPU monotonic clocks with CUDA synchronization at the total
+measurement boundaries. Phase timers introduce no internal CUDA synchronization:
+they report host wall time, including production waits, not isolated GPU duration.
+For example, an asynchronous H2D enqueue phase is not its completed copy time.
+The reported
 switch and through-probe totals are the maximum rank durations. Raw per-rank
 phase measurements remain available; do not add independently maximized phase
 values and call the sum the measured critical path. Source initialization,
@@ -46,6 +56,13 @@ reference generation, host snapshot preparation, and warmup are untimed. There
 is one measured switch per fresh worker group. CUDA/NCCL JIT compilation and
 startup still occur during preparation; they are included for a fresh rebuild
 if the target initialization incurs them.
+
+`warmup_switches` defaults to one untimed execution of the actual measured
+transition, including host H2D or target recapture, followed by source restoration
+and a probe. Set it to zero to omit this extra warmup, but the initial reference
+and mode preparation still occur: zero does not mean a cold first-ever switch.
+Host source restoration uses NCCL because only the target has a CPU snapshot.
+Rebuild remains a fresh Engine initialization and does not use switch warmup.
 
 Checkpoint files are read normally. The benchmark does not clear OS file caches:
 initializing the source can warm the target checkpoint reads. Label row 1 as
@@ -67,7 +84,9 @@ implementation. Stable common runtime state is retained in both baselines.
 Attention QKV/O and expert w13/w2 weights get fresh destination allocations.
 Common auxiliary parameters (norms, embeddings, biases, sinks registered as
 parameters, etc.) remain at stable addresses; host reload also copies their CPU
-snapshots back in place. CPU target snapshots are prepared and pinned before the
+snapshots back in place. Only active target auxiliaries are copied: saved EP/TP
+representations are excluded and identical tensor views are deduplicated.
+CPU target snapshots are prepared and pinned before the
 measured transition by default. CPU snapshot bytes are reported per rank.
 
 Naive NCCL relies on PyTorch stream/lifetime tracking, with the production-style
@@ -100,6 +119,8 @@ methods explicitly use NCCL for empty-cache bookkeeping because their backend
 does not own a real UMM IPC arena; the worker records that difference. Static
 TP rebuild enables token-ID synchronization and clears stale DeepEP variables,
 matching the launcher. Remaining scope/configuration caveats are in the audit.
+Direct workers also apply production's optional GPU CPU-affinity and NUMA policy
+before model construction, and record their effective CPU affinity.
 Supported scope is a single node, PP=1, ordinary Qwen3-MoE/GPT-OSS decoding without
 quantization, speculation, LoRA, memory-saver, or torch.compile.
 
@@ -161,7 +182,11 @@ is restricted to process groups created by this driver.
 - `resolved_config.json`: configuration passed to every worker group.
 - Per-trial commands, normalized `server_args.json`, supervisor and rank logs.
 - `trials.jsonl`: successful and failed trials, per-rank timings and peak PyTorch
-  allocated/reserved memory. These peaks exclude non-PyTorch allocations.
+  allocated/reserved memory. Non-rebuild results separate switch-only and probe
+  peaks and record driver free memory at each boundary, allocator counter deltas,
+  allocator settings and EP/TP full/SWA capacities. PyTorch peaks exclude
+  non-PyTorch allocations; driver free memory is a boundary observation, not a
+  sampled peak. Legacy top-level peaks cover both switch and probe.
 - `summary.json`: median/range by method and direction; failed trials are excluded.
 
 CPU reference and orchestration tests, explicitly hiding all GPUs:
@@ -173,3 +198,41 @@ CUDA_VISIBLE_DEVICES='' python -m unittest discover -s benchmark/paras/tests -v
 These tests cover complete-tensor simulated NCCL routing, Qwen/GPT gate layouts,
 replicated KV heads, host snapshot independence, allocation/alias lifetime,
 configuration parity, graph operation ordering, and worker error propagation.
+
+## Memory pressure and Engine integration
+
+Keep the real planned KV allocation when comparing system methods. Increase
+`server_args.mem_fraction_static` in separate, explicitly labeled configurations
+to explore reduced headroom; never silently shrink graphs/cache after an OOM.
+Equal fractions do not guarantee equal KV capacity or physical footprints:
+independent storage allocates max(EP,TP) K/V buffers plus separate workspaces,
+whereas UMM overlaps regions. Report both endpoint capacities and observed
+headroom. Logical KV extents across modes must not be added as physical bytes.
+
+GPU allocation pressure is distinct from Python GC. The caching allocator can
+reuse cached blocks, reclaim them or retry a device allocation; Python's cycle
+collector is not driven directly by allocated GPU bytes. Do not force `gc` or
+`empty_cache` in the benchmark to amplify a baseline penalty. Capture retains
+SGLang's own GC policy. The new allocator counters expose retries and allocation
+calls where supported; missing counters remain null. A headroom sweep can OOM
+and does not guarantee more collections or a particular performance ordering.
+
+The next system integration can reuse these adapters under real Engine workers:
+
+1. Launch all methods through `Engine` and production `run_scheduler_process`,
+   including DataParallelController, tokenizer and scheduler event loops.
+2. Install benchmark-only storage/transport adapters in scheduler child processes;
+   wrap the normal ParaS configure handler with disposal/reload/recapture while
+   preserving its rejection handling and post-switch response routing.
+3. Issue normal tokenizer ParaS control requests and validate with the same
+   batched `Engine.generate` workload for every method. Record client switch
+   acknowledgment time separately from per-rank timing and post-switch decode.
+4. Use existing collective RPC for untimed snapshot preparation and result
+   collection. Keep the production switch methods unchanged.
+
+This is a moderate harness integration, not a new transfer implementation.
+Full/fixed need mostly the handler wrapper; host/NCCL reuse the independent
+manager. Live KV support is a larger, separate change: its request/page migration
+and IPC assumptions are not implemented by the independent backend. Current
+results remain worker-level and empty-state; this Engine integration is a design,
+not an implemented or validated serving benchmark.
