@@ -7,16 +7,97 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../python"))
 )
 
 from common.weight_bundle import ParaSMode
-from reconfigure.runtime import Runtime
+from reconfigure.runtime import Runtime, active_auxiliary_parameters
+from reconfigure.diagnostics import ALLOCATOR_COUNTERS, allocator_delta, kv_reservation
+
+
+class AccountingTest(unittest.TestCase):
+    def test_active_auxiliaries_exclude_saved_modes_and_deduplicate_views(self):
+        model = torch.nn.Module()
+        model.ep_experts = torch.nn.Linear(4, 4)
+        model.tp_experts = torch.nn.Linear(4, 2)
+        # Register the saved modes first, just as a real model can.
+        model.experts = model.tp_experts
+        model.ep_sinks = torch.nn.Parameter(torch.ones(4))
+        model.tp_sinks = torch.nn.Parameter(model.ep_sinks[1:3])
+        model.sinks = model.tp_sinks
+        model.tied_sinks = torch.nn.Parameter(model.sinks.data)
+        model.ep_qkv_bias = torch.nn.Parameter(torch.ones(4))
+        model.tp_qkv_bias = torch.nn.Parameter(torch.ones(2))
+        model.qkv_proj = torch.nn.Module()
+        model.qkv_proj.bias = model.tp_qkv_bias
+        bulk = {id(model.ep_experts.weight), id(model.tp_experts.weight)}
+        actual = list(active_auxiliary_parameters(model, bulk))
+        self.assertEqual(
+            {id(p) for p in actual},
+            {id(model.experts.bias), id(model.sinks), id(model.qkv_proj.bias)},
+        )
+        self.assertEqual(len(actual), 3)
+
+    def test_kv_report_excludes_aliases_and_does_not_add_mode_extents(self):
+        manager = SimpleNamespace(
+            ep_max_kv_tokens=64,
+            tp_max_kv_tokens=256,
+            ep_max_kv_tokens_swa=32,
+            tp_max_kv_tokens_swa=128,
+            _entries={
+                "layer.kv.ep.k": SimpleNamespace(size_bytes=128),
+                "layer.kv.tp.k": SimpleNamespace(size_bytes=256),
+                "layer.kv.k": SimpleNamespace(size_bytes=128),
+            },
+            _cache_buffers=[torch.empty(256, dtype=torch.uint8)],
+        )
+        result = kv_reservation(manager)
+        self.assertEqual(result["modes"]["ep"]["logical_kv_bytes"], 128)
+        self.assertEqual(result["modes"]["tp"]["logical_kv_bytes"], 256)
+        self.assertEqual(result["independent_kv_backing_bytes"], 256)
+        del manager._cache_buffers
+        self.assertIsNone(kv_reservation(manager)["independent_kv_backing_bytes"])
+
+    def test_allocator_missing_counters_are_not_reported_as_zero(self):
+        before = dict.fromkeys(ALLOCATOR_COUNTERS, None)
+        after = dict(before)
+        before["num_alloc_retries"], after["num_alloc_retries"] = 4, 7
+        delta = allocator_delta(before, after)
+        self.assertEqual(delta["num_alloc_retries"], 3)
+        self.assertIsNone(delta["num_device_alloc"])
 
 
 class RuntimeOrderingTest(unittest.TestCase):
+    def test_warmup_exercises_measured_path_then_restores_source(self):
+        runtime, events = self.runtime(ParaSMode.EP, "full")
+        reference = object()
+        runtime.probe = Mock(return_value=reference)
+        runtime.synchronize = Mock()
+
+        def execute(target, expected):
+            self.assertIs(expected, reference)
+            events.append("measured_path")
+            runtime.switch(target, measured=True)
+
+        runtime.execute = execute
+        self.assertIs(runtime.prepare(ParaSMode.EP, ParaSMode.TP), reference)
+        self.assertEqual(runtime.mode, ParaSMode.EP)
+        self.assertEqual(events.count("measured_path"), 1)
+        self.assertEqual(events.count("switch_ep"), 2)
+        self.assertEqual(events.count("switch_tp"), 2)
+        self.assertEqual(runtime.phases, {})
+
+    def test_phase_measurement_does_not_insert_device_synchronization(self):
+        runtime, _ = self.runtime(ParaSMode.EP, "full")
+        with patch("torch.cuda.synchronize", side_effect=AssertionError("extra sync")):
+            with Runtime.phase(runtime, "example_ms"):
+                pass
+        self.assertGreaterEqual(runtime.phases["example_ms"], 0)
+
     def test_disposal_drops_graph_references_without_explicit_gc(self):
         import weakref
 

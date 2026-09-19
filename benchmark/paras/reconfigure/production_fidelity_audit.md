@@ -50,11 +50,12 @@ was 2.237 s. These are different timing boundaries.
 
 A separate preallocated-staging NCCL weight microbenchmark measured 0.188 s,
 versus 0.130 s for direct v2. That component benchmark is not the fixed-buffer
-runtime row. Future manifests/results explicitly record each method's weight
+runtime row. Current manifests/results explicitly record each method's weight
 transport. The comparison naive_nccl → fixed_buffer_recapture changes both
 allocation and transport; it is not a clean allocation-only ablation. A real
-fixed-buffer NCCL runtime control is still missing. Adding it or holding
-transport fixed is required before attributing this gap solely to buffer reuse.
+fixed-buffer NCCL runtime control is still missing. The agreed five-row design
+keeps row 4 as fused UMM + recapture. Use the transport microbenchmarks for kernel
+ablations; do not attribute the row 3→4 gap solely to buffer reuse.
 
 ## 3. Other differences found
 
@@ -64,15 +65,15 @@ transport fixed is required before attributing this gap solely to buffer reuse.
 | Serving overlap | Forced `disable_overlap_schedule=True`, unlike launcher's enabled default. An empty boundary does not justify silently changing runtime configuration. | Presets now inherit enabled overlap. Manual probe still bypasses scheduling overlap; see probe scope below. |
 | KV transport | Forced NCCL even for production full/fixed methods. Even empty-cache NCCL can exchange placeholders; peer path has different empty-path work. | Full/fixed now use production launcher's peer-access setting. Independent allocation backend has only an IPC anchor, so it explicitly retains NCCL empty-cache bookkeeping and reports that choice. Not suitable for live KV. |
 | Static TP environment | Did not apply `SYNC_TOKEN_IDS_ACROSS_TP=1` or clear DeepEP environment as the launcher does. | Static TP rebuild now follows those launcher steps. Presets also set launcher's NVSHMEM_QP_DEPTH=2048. |
-| Warmup history | Reference generation executes the target before timing, then restores the source. Full/fixed initialize dual graphs; independent methods disable dual capture and warm through transfers/recaptures. Host H2D itself is not the setup transport. | Remains a warm reconfiguration experiment with different preparation histories. Must define first-use vs steady-state policy and control preparation before claiming causal allocation/capture differences. |
+| Warmup history | Reference generation executes the target before timing, then restores the source. Host H2D itself was not the setup transport. | Default one additional warmup exercises the actual measured method, including H2D/recapture, then restores source. `warmup_switches` is explicit. Mode initialization/allocator histories still differ; this is a warmed transition, not cold first use. |
 | Host reload scope | Snapshots already target-sharded tensors outside timing and retains model objects, request/KV pools, backends, scratch, communicators and precomputed auxiliaries. | Accurate name is **prepared host-weight reload + recapture**. It is not runtime reconstruction from a host checkpoint. CPU preparation/resharding/offload are excluded, as specified by this optimistic baseline. |
-| Auxiliary weights | Host snapshots all registered Parameters except bulk expert/QKV/O weights, including inactive-mode biases and overlapping sink views; reloads them in place. Naive NCCL retains precomputed biases/sinks. | Remaining asymmetry: audit active target auxiliaries, aliasing and bytes; avoid counting redundant/inactive copies. Registered buffers are retained, not reconstructed. |
-| Storage/capacities | Independent storage retains max(EP,TP) per-layer KV and separate workspaces for both modes, while production UMM overlaps regions. Equal mem_fraction_static does not imply equal footprint. | Report actual full/SWA token capacities and per-mode memory, including staging and graph pools; choose a common capacity/budget policy. No equality claim from the flag alone. |
+| Auxiliary weights | Host snapshots all registered Parameters except bulk expert/QKV/O weights, including inactive-mode biases and overlapping sink views; reloads them in place. Naive NCCL retains precomputed biases/sinks. | Now selects active target module aliases, excludes saved mode representations and deduplicates identical views. Registered buffers remain retained, not reconstructed. |
+| Storage/capacities | Independent storage retains max(EP,TP) per-layer KV and separate workspaces for both modes, while production UMM overlaps regions. Equal mem_fraction_static does not imply equal footprint. | Both already allocate real full planned KV. Results now record full/SWA capacities, logical mode extents, independent KV backing bytes, driver headroom, allocator configuration/counter deltas and separate peaks. Common memory fraction is the current policy; no equality claim about capacities/footprints. |
 | Static target placement | Native static TP may shard embedding/vocabulary weights, while ParaS retains EP-built replicated placement. Native allocation differs from UMM. Static TP launcher defaults memory fraction .8 vs .75 used in this comparison. | Rebuild is a whole-system alternative, not identical-runtime ablation. The common .75 budget is an explicit experimental choice, not exact reproduction of every launcher default. |
-| Process wrapper | Four methods construct Scheduler directly; rebuild uses Engine. Direct workers bypass optional production CPU/NUMA affinity in run_scheduler_process. | Scope differs and can affect host DMA. Need common rank affinity/NUMA policy and consistent timing endpoint; document worker-level vs Engine-level costs. |
-| Probe workload | Direct EP probe creates a request on each rank, while Engine probe submits one request. Direct probes manually build batches and run forwards outside Scheduler's loop. Rebuild validates repeated text; others compare same-mode logits. | through_probe_ms is a diagnostic, not a common serving-readiness endpoint or shared correctness oracle. Use matched workload and endpoint for a readiness comparison. |
-| Phase instrumentation | Adds CUDA synchronization around named phases and a final distributed barrier. Wall-clock phases include rank waits. | Report synchronized worker timing as such. Prefer trace instrumentation without added internal barriers for causal breakdown; never sum independent per-rank maxima. |
-| Peak memory | Counters reset before switching but are read after the validation probe. Non-PyTorch allocations are excluded. | Existing field is switch-plus-probe PyTorch peak. Record switch-only and post-probe peaks separately before making memory claims. |
+| Process wrapper | Four methods construct Scheduler directly; rebuild uses Engine. Direct workers bypassed optional production CPU/NUMA affinity. | Workers now apply production affinity/NUMA policy before allocation and record affinity. Engine messaging/event loops remain excluded; integration design is in README. |
+| Probe workload | Direct EP probe creates a request on each rank, while Engine probe submitted one request. Direct probes bypass Scheduler's loop. Rebuild validates repeated text; others compare same-mode logits. | All now use world_size global requests and matching token limits. Through-probe timing remains diagnostic: scheduling and correctness endpoints still differ until Engine integration. |
+| Phase instrumentation | Added CUDA synchronization around named phases and a final distributed barrier. | Removed benchmark-added internal CUDA waits. Phases are explicitly host wall time; async enqueue time is not device duration. Total boundary sync/barrier remains. |
+| Peak memory | Counters reset before switching but were read after the validation probe. Non-PyTorch allocations are excluded. | Now records switch-only and separately reset probe peaks, driver boundary headroom and switch allocator deltas. Legacy peaks cover both intervals. Diagnostics between intervals are excluded from through-probe total. |
 | Replication/statistics | One fresh-process runtime trial per method/direction; no randomized repeated comparison. | Functional smoke evidence only. Repeat matched trials before reporting distributions or assigning small timing differences to mechanisms. |
 
 Sources: `reconfigure/runtime.py`, `storage.py`, `transfers.py`, `worker.py`;
@@ -102,12 +103,13 @@ GPT-OSS specializations; only verified v2 results are reported.
    chosen production launch configuration; never reduce coverage silently.
 2. Validate pointer-only disposal and asynchronous source-release correctness
    with the updated independent baselines, including full round-trip checks.
-3. Settle whether row 4 is fused UMM recapture or fixed-buffer NCCL recapture;
-   preserve the transport label and use an allocation-only control if needed.
-4. Standardize warmup, active auxiliary handling, capacities and CPU placement;
-   distinguish first-use from warmed transitions.
+3. Retain agreed row 4 (fused UMM recapture) with explicit transport labels;
+   use microbenchmarks for transport ablations.
+4. Validate the corrected warmup, active auxiliary handling and CPU placement
+   on GPUs; inspect reported capacities and headroom before comparing methods.
 5. Collect repeated trials and traces separating allocation, staging, transfer,
    graph destruction and capture. Keep readiness/probe workload consistent.
 
-The current code addresses the explicit graph/GC bugs and selected concrete
-launch/sync differences; it is not claimed to resolve every item in this audit.
+The current code addresses graph/GC bugs, memory observability, warmup, active
+auxiliary selection and selected launch/sync/probe differences. It does not
+claim common Engine-level endpoints or live KV migration for independent storage.

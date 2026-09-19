@@ -66,6 +66,9 @@ def validate_config(config):
         raise ValueError("Benchmark weights must use BF16")
     if result.get("probe_decode_steps", 2) < 1:
         raise ValueError("probe_decode_steps must be positive")
+    warmups = result.setdefault("warmup_switches", 1)
+    if type(warmups) is not int or warmups < 0:
+        raise ValueError("warmup_switches must be a nonnegative integer")
     return result
 
 

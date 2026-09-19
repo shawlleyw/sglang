@@ -44,6 +44,11 @@ def _rank_worker(
             from sglang.srt.managers.scheduler import Scheduler
             from sglang.srt.server_args import ServerArgs, PortArgs
             from sglang.srt.utils import configure_logger
+            from sglang.srt.utils import (
+                get_bool_env_var,
+                numa_bind_to_node,
+                set_gpu_proc_affinity,
+            )
             from reconfigure.runtime import Runtime, install_independent_storage
             from sglang.srt.paras.mode import ParaSMode
 
@@ -54,6 +59,11 @@ def _rank_worker(
                 install_independent_storage()
             args = ServerArgs(**args_dict)
             configure_logger(args, prefix=f" benchmark-rank-{rank}")
+            # Follow run_scheduler_process before any model/host allocation.
+            if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+                set_gpu_proc_affinity(args.pp_size, args.tp_size, args.nnodes, rank)
+            if args.numa_node is not None:
+                numa_bind_to_node(args.numa_node[rank])
             scheduler = Scheduler(args, PortArgs(**ports), rank, rank, rank, 0, None)
             runtime = Runtime(scheduler, config, method)
             source, target = (ParaSMode(value) for value in DIRECTIONS[direction])
@@ -68,6 +78,8 @@ def _rank_worker(
                         for mode, sizes in runtime.graph_batches.items()
                     },
                     "kv_transfer_method": os.environ.get("PARAS_KV_TRANSFER_METHOD"),
+                    "cpu_affinity": sorted(os.sched_getaffinity(0)),
+                    "numa_node": args.numa_node[rank] if args.numa_node else None,
                 }
             )
             command = connection.recv()
@@ -208,10 +220,12 @@ def engine_worker(config, mode, directory):
             "max_new_tokens": config.get("probe_decode_steps", 2) + 1,
             "ignore_eos": True,
         }
-        output = engine.generate(prompt, sampling)
+        prompts = [prompt] * config["world_size"]
+        output = engine.generate(prompts, sampling)
         first_probe_done = time.perf_counter()
-        again = engine.generate(prompt, sampling)
-        if output["text"] != again["text"]:
+        again = engine.generate(prompts, sampling)
+        texts = [item["text"] for item in output]
+        if texts != [item["text"] for item in again]:
             raise RuntimeError(
                 "Repeated target-mode decode probe produced different output"
             )
@@ -221,7 +235,8 @@ def engine_worker(config, mode, directory):
             first_probe_done_at=first_probe_done,
             worker_start_at=started,
             validation="repeat_decode_passed",
-            probe_text=output["text"],
+            probe_text=texts,
+            probe_global_requests=config["world_size"],
         )
         sys.stdin.readline()
     finally:
