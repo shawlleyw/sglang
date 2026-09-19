@@ -58,7 +58,9 @@ All methods check coordinate-sensitive samples of every destination layer and
 component, then check the round trip before timing. Full small-tensor CPU tests
 check the NCCL layout transformations, gate ordering, actual overlapping UMM
 views, and reconstruction with poisoned duplicate attention K/V replicas.
-GPU peer kernels still require the GPU smoke test below.
+GPT-OSS-120B full bundles were validated on eight A100 GPUs on 2026-09-19;
+see `artifacts/20260919T070046Z_gptoss_120b_switch_eval` at the repository root.
+Other model/hardware combinations still require their own GPU smoke test below.
 
 ## KV kernels
 
@@ -137,6 +139,9 @@ torchrun --standalone --nproc_per_node=8 bench_cache.py \
 
 Use `--variant v3` for explicit optional kernel ablations; v2 is the runtime
 expert-kernel default. The sweep wrapper defaults to v2 and stops on failures.
+The current v3 expert extension only specializes Qwen shapes
+`(H,I)=(4096,1536)` and `(2048,768)` at TP=4/8 with separate gates. GPT-OSS
+expert transfers must use v2; requesting v3 fails before GPU initialization.
 `--help` documents the full CLI.
 
 ## Timing and reporting

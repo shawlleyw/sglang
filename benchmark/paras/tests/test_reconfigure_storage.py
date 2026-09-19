@@ -4,6 +4,8 @@ import os
 import sys
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -157,6 +159,113 @@ class IndependentStorageTest(unittest.TestCase):
             manager.replace_weight("model.layers.0.kv.ep.k", torch.empty(1))
         with self.assertRaisesRegex(ValueError, "shape/dtype"):
             manager.replace_weight(weight_name(0, ParaSMode.EP, "w13"), torch.empty(1))
+
+    def test_current_runtime_plan_preserves_hybrid_capacities_and_workspaces(self):
+        from sglang.srt.paras.paras_memory_manager import reserve_model_weights
+        from sglang.srt.paras.unified_layout import bf16_moe_workspace_sizes
+
+        for disable_hybrid in (False, True):
+            args = SimpleNamespace(
+                kv_cache_dtype="auto",
+                page_size=1,
+                swa_full_tokens_ratio=0.5,
+                disable_hybrid_swa_memory=disable_hybrid,
+                attention_backend="triton",
+                moe_runner_backend="triton",
+                enable_two_batch_overlap=False,
+                enable_pdmux=False,
+                speculative_algorithm=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                enable_deterministic_inference=False,
+                disable_cuda_graph=False,
+                cuda_graph_bs=[1, 4],
+                paras_tp_cuda_graph_bs=[1, 4],
+                max_running_requests=16,
+                max_prefill_tokens=32,
+                triton_attention_split_tile_size=None,
+                triton_attention_num_kv_splits=8,
+            )
+            config = SimpleNamespace(
+                num_hidden_layers=4,
+                num_key_value_heads=4,
+                num_attention_heads=8,
+                hidden_size=64,
+                head_dim=64,
+                sliding_window=128,
+                layer_types=["sliding_attention", "full_attention"] * 2,
+            )
+            manager = IndependentWeightMemoryManager(
+                device="cpu",
+                server_args=args,
+                context_len=1024,
+                world_size=4,
+            )
+            with patch(
+                "sglang.srt.layers.moe.utils.use_deep_gemm_bf16", return_value=False
+            ), patch.dict(
+                os.environ, {"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128"}
+            ):
+                reserve_model_weights(
+                    manager,
+                    num_layers=4,
+                    num_experts=8,
+                    hidden_size=64,
+                    intermediate_size=128,
+                    num_heads=8,
+                    num_kv_heads=4,
+                    head_dim=64,
+                    ep_size=4,
+                    tp_size=4,
+                    dp_size=1,
+                    moe_tp_size=1,
+                    top_k=2,
+                    with_bias=True,
+                )
+            plan = manager.plan_layout(config, budget=16 << 20)
+            manager.materialize(plan)
+            expected_tp_moe = bf16_moe_workspace_sizes(
+                hidden_size=64,
+                intermediate_size=128,
+                num_experts=8,
+                top_k=2,
+                tp_size=4,
+                dispatch_capacity=128,
+                tp_input_tokens=32,
+            )[1]
+            self.assertEqual(
+                manager.bind_moe_workspace(ParaSMode.TP).buffer.numel(), expected_tp_moe
+            )
+            for mode in (ParaSMode.EP, ParaSMode.TP):
+                full = (
+                    manager.get_ep_max_kv_tokens()
+                    if mode == ParaSMode.EP
+                    else manager.get_tp_max_kv_tokens()
+                )
+                swa = (
+                    manager.get_ep_max_kv_tokens("swa")
+                    if mode == ParaSMode.EP
+                    else manager.get_tp_max_kv_tokens("swa")
+                )
+                if disable_hybrid:
+                    self.assertEqual(full, swa)
+                else:
+                    self.assertLess(swa, full)
+                keys, values = manager.get_kv_views(4, mode)
+                for layer, (key, value) in enumerate(zip(keys, values)):
+                    capacity = swa if layer % 2 == 0 else full
+                    self.assertEqual(key.shape[0], capacity + args.page_size)
+                    self.assertEqual(key.shape, value.shape)
+                workspace = manager.get_attention_workspace_buffer("triton", mode)
+                self.assertGreater(workspace.numel(), 0)
+                manager.initialize_attention_workspace(mode)
+                self.assertTrue(torch.all(workspace == 0))
+            # The production checkpoint aliases still resolve to the active
+            # independent EP weights after the real planner has rebuilt entries.
+            self.assertIs(
+                manager.get_view("model.layers.0.mlp.experts.w13_weight"),
+                manager.get_view("model.layers.0.mlp.ep_experts.w13_weight"),
+            )
 
 
 if __name__ == "__main__":

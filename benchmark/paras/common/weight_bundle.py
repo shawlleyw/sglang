@@ -19,6 +19,16 @@ from sglang.srt.paras.workspace import ModeWorkspaces, WorkspaceRequirement
 COMPONENTS = ("w13", "w2", "qkv", "o")
 
 
+def verification_indices(numel, device, count=4096):
+    """Sample endpoints/interiors without FP32 rounding beyond large tensors."""
+    if numel <= 0 or count <= 0:
+        raise ValueError("Tensor size and sample count must be positive")
+    samples = min(count, numel)
+    positions = torch.arange(samples, device=device, dtype=torch.int64)
+    stratified = positions * (numel - 1) // max(samples - 1, 1)
+    return torch.cat((stratified, positions))
+
+
 def weight_name(layer, mode, component):
     prefix = f"model.layers.{layer}"
     if component in ("w13", "w2"):

@@ -1,9 +1,13 @@
 # Empty-state reconfiguration benchmarks
 
 `../bench_reconfigure.py` runs five reusable methods against the real SGLang
-runtime. **Implementation is CPU-tested; GPU smoke validation and performance
-measurements are pending.** Do not treat CPU tests or dry-run manifests as GPU
-results. No GPU workload is launched by importing the driver or using `--dry-run`.
+runtime. All five methods were GPU-validated in both directions with GPT-OSS-120B
+BF16 on eight A100-SXM4-80GB GPUs on 2026-09-19. The initial one-trial comparison,
+logs and exact source snapshots are in
+`artifacts/20260919T070046Z_gptoss_120b_switch_eval` at the repository root.
+These are preliminary timings; Qwen3/H200 validation and repeated runtime
+measurements remain separate work. No GPU workload is launched by importing the
+driver or using `--dry-run`.
 
 ## Methods and boundaries
 
@@ -131,7 +135,8 @@ is restricted to process groups created by this driver.
 - `manifest.json`: resolved experiment, versions, repository revision/branch,
   working-tree status, source hashes, and GPU inventory/topology for actual runs.
 - `benchmark_source.tar.gz` and `tracked_changes.patch`: exact benchmark sources
-  including uncommitted/new files, plus changes against the recorded revision.
+  including uncommitted/new files, plus all tracked working-tree changes against
+  the recorded revision (including serving/runtime changes outside the benchmark).
 - `resolved_config.json`: configuration passed to every worker group.
 - Per-trial commands, normalized `server_args.json`, supervisor and rank logs.
 - `trials.jsonl`: successful and failed trials, per-rank timings and peak PyTorch

@@ -320,7 +320,9 @@ def main():
             snapshot.add(ROOT / relative, arcname=relative)
 
     (directory / "tracked_changes.patch").write_text(
-        command_output(["git", "diff", "--", "benchmark/paras"])["stdout"]
+        # Runtime changes outside the benchmark affect layouts and measured
+        # behavior too. Include staged and unstaged tracked changes against HEAD.
+        command_output(["git", "diff", "--binary", "HEAD"])["stdout"]
     )
     if args.dry_run:
         print(
