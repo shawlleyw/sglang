@@ -68,7 +68,7 @@ def breakdown_trial(trial, *, reference=False):
     runtime = milliseconds(phases["runtime_switch_ms"])
     auxiliary = (
         milliseconds(phases["auxiliary_reload_ms"])
-        if trial["method"] == "host_reload"
+        if trial["method"] in ("host_reload", "host_model_to")
         else 0.0
     )
     if trial["method"] == "full":
@@ -148,7 +148,7 @@ def main():
         )
     lines += [
         "",
-        "Weights = weight_transfer_ms + auxiliary_reload_ms (host reload only). "
+        "Weights = weight_transfer_ms + auxiliary_reload_ms (both host methods). "
         "This includes expert and attention weight transfer, packing/unpacking, "
         "weight allocations/rebinding/source release performed inside the transfer "
         "adapter, layer fences and its completion wait. Auxiliary reload is "
@@ -176,7 +176,7 @@ def main():
         "H2D copies enqueued before graph disposal. The recorded data cannot "
         "separate those device costs exactly. Model initialization, host snapshot "
         "preparation, switch warmup and the validation probe are excluded from "
-        "the four switching-method totals.",
+        "the switching-method totals.",
         "",
         "Copied restart data remains total-only: its combined initialization "
         "timer does not isolate weight loading from graph capture and other "

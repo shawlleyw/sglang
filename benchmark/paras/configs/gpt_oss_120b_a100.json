@@ -1,5 +1,5 @@
 {
-  "name": "gpt-oss-120b-bf16-a100",
+  "name": "gpt-oss-120b-bf16-a100-v2-mem070",
   "model_path": "/data/shaoyuw/models/gpt-oss-120b-BF16-unsloth",
   "world_size": 8,
   "seed": 42,
@@ -11,7 +11,7 @@
   "server_args": {
     "dtype": "bfloat16",
     "trust_remote_code": true,
-    "mem_fraction_static": 0.75,
+    "mem_fraction_static": 0.70,
     "attention_backend": "triton",
     "moe_runner_backend": "triton",
     "max_running_requests": 2048,

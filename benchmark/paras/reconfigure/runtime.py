@@ -14,7 +14,7 @@ from common.model_configs import ModelConfig
 from common.weight_bundle import weight_name
 from sglang.srt.paras.mode import ParaSMode
 
-from .configuration import METHOD_TRANSPORT
+from .configuration import HOST_METHODS, METHOD_TRANSPORT
 from .diagnostics import (
     allocator_configuration,
     allocator_delta,
@@ -25,6 +25,7 @@ from .storage import IndependentWeightMemoryManager
 from .transfers import (
     naive_nccl_transfer_layer,
     reload_host_layer,
+    reload_host_model,
     snapshot_host_tensors,
 )
 
@@ -71,6 +72,21 @@ def active_auxiliary_parameters(model, bulk_ids):
             yield parameter
 
 
+def release_layer_weights(manager, layer, index, mode):
+    """Drop both module and manager references to a source layer's storage."""
+    for component, parameter in layer_parameters(layer, mode).items():
+        name = weight_name(index, mode, component)
+        placeholder = manager.placeholder(name)
+        parameter.data = placeholder
+        manager.replace_weight(name, placeholder)
+
+
+def bind_layer_weights(manager, layer, index, mode, target):
+    for component, parameter in layer_parameters(layer, mode).items():
+        parameter.data = target[component]
+        manager.replace_weight(weight_name(index, mode, component), target[component])
+
+
 def install_independent_storage():
     """Replace weight storage and transport only inside this worker process."""
     import sglang.srt.model_executor.model_runner as runner_module
@@ -92,10 +108,27 @@ def install_independent_storage():
         source_mode = body._unified_weights_mode
         model = manager.benchmark_dimensions
         direction = "ep_to_tp" if mode == ParaSMode.TP else "tp_to_ep"
+        method = getattr(manager, "benchmark_method", "naive_nccl")
+        if method == "host_model_to":
+            device = layer_parameters(body.layers[0], source_mode)["w13"].device
+            for index, layer in enumerate(body.layers):
+                release_layer_weights(manager, layer, index, source_mode)
+            target = reload_host_model(
+                manager.host_snapshots,
+                model,
+                manager.world_size,
+                rank,
+                direction,
+                device=device,
+            )
+            for index, layer in enumerate(body.layers):
+                bind_layer_weights(manager, layer, index, mode, target[index])
+            del target
+            torch.cuda.synchronize()
+            body._unified_weights_mode = mode
+            return
         group = get_paras_tp_group().device_group
-        host_reload = (
-            getattr(manager, "benchmark_method", "naive_nccl") == "host_reload"
-        )
+        host_reload = method == "host_reload"
         indices = (
             range(len(body.layers))
             if mode == ParaSMode.TP
@@ -118,11 +151,7 @@ def install_independent_storage():
                 target = naive_nccl_transfer_layer(
                     source, model, manager.world_size, rank, direction, group=group
                 )
-            for component, parameter in layer_parameters(layer, mode).items():
-                parameter.data = target[component]
-                manager.replace_weight(
-                    weight_name(index, mode, component), target[component]
-                )
+            bind_layer_weights(manager, layer, index, mode, target)
             if not host_reload:
                 dist.all_reduce(body._unified_fence, group=group)
             # PyTorch NCCL records tensor stream use and establishes current-
@@ -131,11 +160,7 @@ def install_independent_storage():
             # H2D reload has no remote source reads and needs no rank fence.
             # Keep this allocation-before-release order for both baselines:
             # target and source weights coexist for the layer being replaced.
-            for component, parameter in source.items():
-                name = weight_name(index, source_mode, component)
-                placeholder = manager.placeholder(name)
-                parameter.data = placeholder
-                manager.replace_weight(name, placeholder)
+            release_layer_weights(manager, layer, index, source_mode)
             del source, target
         torch.cuda.synchronize()
         body._unified_weights_mode = mode
@@ -367,7 +392,7 @@ class Runtime:
     def prepare(self, source, target):
         self.switch(target)
         reference = self.probe()
-        if self.method == "host_reload":
+        if self.method in HOST_METHODS:
             pin = self.config.get("host_pin_memory", True)
             self.manager.host_snapshots = {
                 index: snapshot_host_tensors(
@@ -396,7 +421,7 @@ class Runtime:
         # snapshot deliberately contains only the target representation.
         for _ in range(self.config.get("warmup_switches", 1)):
             self.execute(target, reference)
-            if self.method == "host_reload":
+            if self.method in HOST_METHODS:
                 self.manager.benchmark_method = "naive_nccl"
             self.switch(source, measured=True)
             self.probe()
@@ -411,8 +436,8 @@ class Runtime:
         torch.cuda.reset_peak_memory_stats()
         memory_before = memory_snapshot()
         start = time.perf_counter()
-        if self.method == "host_reload":
-            self.manager.benchmark_method = "host_reload"
+        if self.method in HOST_METHODS:
+            self.manager.benchmark_method = self.method
             with self.phase("auxiliary_reload_ms"):
                 for parameter, snapshot in self.auxiliary_snapshots:
                     parameter.data.copy_(snapshot, non_blocking=True)

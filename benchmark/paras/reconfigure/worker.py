@@ -21,6 +21,7 @@ sys.path[:0] = [str(BENCH), str(REPO / "python")]
 
 from reconfigure.configuration import (
     DIRECTIONS,
+    HOST_METHODS,
     METHODS,
     METHOD_TRANSPORT,
     server_arguments,
@@ -52,7 +53,7 @@ def _rank_worker(
             from reconfigure.runtime import Runtime, install_independent_storage
             from sglang.srt.paras.mode import ParaSMode
 
-            if method in ("host_reload", "naive_nccl"):
+            if method in (*HOST_METHODS, "naive_nccl"):
                 # Independent storage has no production IPC weight/KV arena.
                 # Empty-state baseline only: no live cache payload is moved.
                 os.environ["PARAS_KV_TRANSFER_METHOD"] = "nccl"

@@ -1,6 +1,6 @@
 # Empty-state reconfiguration benchmarks
 
-`../bench_reconfigure.py` runs five reusable methods against the real SGLang
+`../bench_reconfigure.py` runs six reusable methods against the real SGLang
 runtime. **V1 is archived at `artifacts/paras_switch_v1` and is not an accepted
 production-fidelity evaluation.** Its functional probes passed, but its sparse
 graph coverage, forced disposal GC and other confounds invalidate using those
@@ -18,12 +18,20 @@ This is one trial per method/direction; restart rows are copied v1 references,
 and Qwen still requires GPU validation. No GPU workload is launched by importing
 the driver or using `--dry-run`.
 
+On 2026-09-20, `host_model_to` and a fresh `host_reload` control passed both
+directions on the same eight A100s at memory fraction 0.70. All 32 rank results
+matched reference logits exactly; both methods captured the full graph sets.
+Their weight phases were nearly identical in these single-trial measurements.
+See the [host-method comparison](../../../artifacts/20260920T033755Z_gptoss_host_model_to/README.md)
+for the six-method table, origin labels, memory diagnostics and timing breakdown.
+
 ## Methods and boundaries
 
 | CLI method | Measured transition |
 |---|---|
 | `rebuild` | Shut down a source SGLang Engine, create a target Engine, load checkpoint weights and capture graphs |
 | `host_reload` | Reload prepared target CPU weight snapshots into fresh GPU tensors, bind them and capture target graphs |
+| `host_model_to` | Release all source bulk weights, move the prepared target weight module with one `Module.to(device, non_blocking=True)` call, bind and capture graphs |
 | `naive_nccl` | Allocate each target layer, pack/exchange/unpack experts and attention using NCCL, release the source layer, bind and capture graphs |
 | `fixed_buffer_recapture` | Production UMM **and fused peer-access transfer**, with graph discard and target recapture; this is not a fixed-buffer NCCL baseline |
 | `full` | Production Scheduler ParaS switch using its prepared UMM views and retained graphs |
@@ -101,14 +109,14 @@ the measured switch does not offload the old GPU weights. A persistent system
 using prepared host reload in both directions would need both representations
 or would have to prepare the destination on demand.
 
-Host reload allocates and enqueues copies for one layer's destination weights
+`host_reload` allocates and enqueues copies for one layer's destination weights
 before releasing that layer's source storage. EP→TP visits layers in forward
 order; TP→EP visits them in reverse. Source parameter storage and manager entries
 are replaced with expanded one-element placeholders. Once references and stream
 dependencies allow, the old storage becomes reusable by PyTorch's allocator;
 it need not return to the CUDA driver or reduce `nvidia-smi` usage. KV storage
 and runtime scratch remain allocated. Source-first release is a possible future
-host-reload optimization, not the ordering used by these measurements.
+host-reload optimization, not the ordering used by `host_reload`.
 
 The explicit `empty()` + asynchronous `copy_()` loop controls destination
 selection and storage rebinding. `Module.to()` also visits parameters and buffers
@@ -117,16 +125,52 @@ custom memory-manager references. Replacing the loop with that API is therefore
 not inherently a transfer optimization. The current implementation uses no
 per-tensor host synchronization during reload.
 
+`host_model_to` exercises PyTorch's actual `nn.Module.to` implementation once
+on a temporary module containing every destination expert and attention
+parameter. It releases all source bulk weights first, avoiding simultaneous
+full source and destination copies. CPU snapshots remain intact for warmup
+and measurement. Module construction, source release, conversion, runtime
+rebinding and transfer completion are timed. The existing runtime Parameter
+objects are preserved, along with their custom attributes and aliases.
+Auxiliary parameters use the same in-place asynchronous H2D reload as
+`host_reload`; KV, registered runtime buffers and scratch remain allocated.
+This is a target-weight-module conversion, not a `.to()` call on the serving
+model (already on CUDA, with both saved mode representations). It changes
+both the API and source-release schedule, so its difference from `host_reload`
+must not be attributed solely to Python call overhead. Both methods use pinned
+snapshots by default and recapture the same production graph lists.
+
+To compare both host methods in fresh workers with a matched configuration:
+
+```bash
+python benchmark/paras/bench_reconfigure.py \
+  --config path/to/matched-config.json \
+  --methods host_reload host_model_to --direction both --repetitions 1 \
+  --output artifacts/new-host-comparison
+```
+
 Naive NCCL relies on PyTorch stream/lifetime tracking, with the production-style
 per-layer GPU fence and a final device synchronization. It adds no per-layer
 host wait. Host reload needs no cross-rank fence for its H2D copies.
-Both directions include attention transfers:
+Naive NCCL includes attention transfers in both directions:
 EP→TP takes local QKV/O slices; TP→EP gathers and reconstructs full projections,
 discarding duplicate KV-head replicas. GPT-OSS gate/up interleaving is supported.
 All runtime patches exist only in the fresh benchmark workers, with no production
 server flags, global sitecustomize changes, or modifications to serving code.
 
 ## Configuration and dry runs
+
+The benchmark runs directly from a SGLang checkout; no artifact source restoration
+or archived patch is required. Install the serving dependencies and build/install
+the ParaS CUDA extension from `python/sglang/srt/paras/csrc` for the local
+Python/Torch/CUDA environment. If using an in-place extension build, prepend both
+`$PWD/python` and `$PWD/python/sglang/srt/paras/csrc` to `PYTHONPATH` from the
+repository root. The six methods, including `host_model_to`, are implemented in
+this directory; artifact launchers only select configurations and invoke the driver.
+
+The GPT-OSS/A100 config uses the validated memory fraction **0.70**. The earlier
+0.75 run failed preparation. New runs apply the same config to all six methods,
+including restart; they do not reproduce the older sparse-graph restart reference.
 
 Use the same serving environment as the model launchers. The configs specify
 BF16 weights, eight GPUs, Triton backends, disabled prefix caching and the

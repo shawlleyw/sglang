@@ -56,14 +56,16 @@ class BreakdownTest(unittest.TestCase):
         self.assertEqual(row, original)
 
     def test_host_auxiliary_enqueue_is_counted_once(self):
-        row = self.trial()
-        row["method"] = "host_reload"
-        for rank in row["rank_results"]:
-            rank["phases"]["auxiliary_reload_ms"] = 3
-        result = breakdown_trial(row)
-        self.assertEqual(result["weights_ms"], 23)
-        self.assertEqual(result["others_ms"], 27)
-        self.assertEqual(result["outside_phases_ms"], 17)
+        for method in ("host_reload", "host_model_to"):
+            with self.subTest(method=method):
+                row = self.trial()
+                row["method"] = method
+                for rank in row["rank_results"]:
+                    rank["phases"]["auxiliary_reload_ms"] = 3
+                result = breakdown_trial(row)
+                self.assertEqual(result["weights_ms"], 23)
+                self.assertEqual(result["others_ms"], 27)
+                self.assertEqual(result["outside_phases_ms"], 17)
 
     def test_full_retains_graphs_and_has_runtime_remainder(self):
         row = self.trial()

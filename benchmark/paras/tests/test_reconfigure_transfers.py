@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 import torch
 
@@ -16,6 +17,7 @@ from common.model_configs import ModelConfig
 from reconfigure.transfers import (
     naive_nccl_transfer_layer,
     reload_host_layer,
+    reload_host_model,
     reload_host_tensors,
     snapshot_host_tensors,
     target_shapes,
@@ -160,6 +162,42 @@ class SimulatedCollectives:
 
 
 class ReconfigurationTransfersTest(unittest.TestCase):
+    def test_model_to_moves_whole_target_without_mutating_host_snapshots(self):
+        model, world = self.model(True), 4
+        ep, tp = expected_modes(model, world)
+        for direction, layers in (("ep_to_tp", tp), ("tp_to_ep", ep)):
+            snapshot = {index: snapshot_host_tensors(layers[0]) for index in range(2)}
+            pointers = {
+                (index, name): tensor.data_ptr()
+                for index, layer in snapshot.items()
+                for name, tensor in layer.items()
+            }
+            # A real CPU→meta Module.to exercises parameter replacement without
+            # GPUs. The full runtime probe checks the CUDA copy's values later.
+            original_to = torch.nn.Module.to
+            with patch.object(
+                torch.nn.Module, "to", autospec=True, side_effect=original_to
+            ) as convert:
+                for _ in range(2):
+                    result = reload_host_model(
+                        snapshot, model, world, 0, direction, device="meta"
+                    )
+                    for index, layer in result.items():
+                        for name, tensor in layer.items():
+                            self.assertEqual(tensor.device.type, "meta")
+                            self.assertEqual(tensor.shape, snapshot[index][name].shape)
+                            self.assertEqual(tensor.dtype, torch.bfloat16)
+                            self.assertFalse(tensor.requires_grad)
+                            host = snapshot[index][name]
+                            self.assertEqual(host.device.type, "cpu")
+                            self.assertEqual(host.data_ptr(), pointers[index, name])
+                            torch.testing.assert_close(host, layers[0][name])
+                self.assertEqual(convert.call_count, 2)
+                for call in convert.call_args_list:
+                    self.assertTrue(call.kwargs["non_blocking"])
+            with self.assertRaisesRegex(ValueError, "non-CPU"):
+                reload_host_model(snapshot, model, world, 0, direction, device="cpu")
+
     def model(self, interleaved=False, kv_heads=1):
         return ModelConfig(
             "tiny",

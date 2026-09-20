@@ -1,4 +1,4 @@
-"""Run five real-runtime empty-state reconfiguration methods in fresh processes.
+"""Run real-runtime empty-state reconfiguration methods in fresh processes.
 
 Example (in the serving environment, when GPUs are available):
   python benchmark/paras/bench_reconfigure.py \

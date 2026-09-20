@@ -5,7 +5,7 @@ EP↔TP weight and KV redistribution. These measure transfer operations;
 server startup, request migration, graph capture, and graph activation are
 outside the measurements.
 
-For the five real-runtime empty-state reconfiguration baselines, see
+For the real-runtime empty-state reconfiguration baselines, see
 [reconfigure/README.md](reconfigure/README.md) and `bench_reconfigure.py`.
 
 ## Weight bundles with the current UMM

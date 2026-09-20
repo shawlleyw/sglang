@@ -2,11 +2,13 @@
 
 from copy import deepcopy
 
-METHODS = ("rebuild", "host_reload", "naive_nccl", "fixed_buffer_recapture", "full")
+HOST_METHODS = ("host_reload", "host_model_to")
+METHODS = ("rebuild", *HOST_METHODS, "naive_nccl", "fixed_buffer_recapture", "full")
 DIRECTIONS = {"ep_to_tp": ("ep", "tp"), "tp_to_ep": ("tp", "ep")}
 METHOD_TRANSPORT = {
     "rebuild": "checkpoint_load",
     "host_reload": "pinned_host_reload",
+    "host_model_to": "pinned_host_module_to_source_first",
     "naive_nccl": "nccl_fresh_layer_allocations",
     "fixed_buffer_recapture": "fused_peer_access_umm",
     "full": "fused_peer_access_umm",

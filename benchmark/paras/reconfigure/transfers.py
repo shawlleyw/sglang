@@ -162,6 +162,32 @@ def reload_host_layer(
 
 
 @torch.no_grad()
+def reload_host_model(snapshot, model, world, rank, direction, *, device):
+    """Move all prepared bulk weights with one real nn.Module.to() call.
+
+    The temporary module contains only target-mode expert/attention parameters.
+    Parameter wrappers share the pinned CPU snapshots until conversion; changing
+    their storage does not change the snapshots. The caller releases all source
+    GPU weights first and rebinds the result into the runtime's existing objects.
+    CPU destinations are rejected: Module.to(cpu) would be a no-op, not reload.
+    """
+    device = torch.device(device)
+    if device.type == "cpu":
+        raise ValueError("Module.to reload requires a non-CPU destination")
+    _validate_dimensions(model, world, rank)
+    shapes = target_shapes(model, world, direction)
+    target_model = torch.nn.ModuleDict()
+    for index, layer in snapshot.items():
+        _validate_layer(layer, shapes, cpu_only=True)
+        parameters = torch.nn.ParameterDict()
+        for name, tensor in layer.items():
+            parameters[name] = torch.nn.Parameter(tensor, requires_grad=False)
+        target_model[str(index)] = parameters
+    target_model.to(device=device, non_blocking=True)
+    return {index: dict(target_model[str(index)].items()) for index in snapshot}
+
+
+@torch.no_grad()
 def naive_nccl_transfer_layer(
     source, model, world, rank, direction, *, group=None, collectives=dist
 ):
