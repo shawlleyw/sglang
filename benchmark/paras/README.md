@@ -165,3 +165,54 @@ CPU reference checks (no GPU needed):
 python -m unittest discover -s benchmark/paras/tests -v
 python -m pytest -q benchmark/paras/tests
 ```
+
+## Expert-only and resident-cache kernel ablation
+
+`run_kernel_ablation.py` runs the expert weights (`--kernel experts`, w13+w2
+with one fence per layer, excluding attention) and uniform KV layers at total
+resident EP K+V volumes of 10/20/30 **GiB per GPU**. GPT-OSS uses all 36 layers,
+eight KV heads, head dimension 64 and BF16; SWA is disabled for this microbenchmark.
+The new `bench_cache.py --resident-cache-gib` allocates distinct source/destination
+buffers for every layer. It does not repeatedly transfer one small layer and
+label the result as a full resident allocation. It uses disjoint EP/TP buffers,
+not the production UMM's overlapping KV layout. At 30 GiB resident, GPT-OSS's
+source+destination arena is approximately 60 GiB per GPU; staging is additional.
+`--load` defaults to 1 in this mode; use a smaller fraction to model sparse slots.
+Actual resident bytes are rounded down to whole tokens/head-replica groups and
+recorded in the CSV. Attention weights are not transferred. Expert weights retain
+the production UMM placement but allocate no serving KV footprint in their run.
+
+```bash
+# Serving environment activated; build the reference without installing anything system-wide.
+bash benchmark/paras/build_nvbandwidth.sh /tmp/nvbandwidth-reference 80
+
+# CPU-only command/provenance preparation:
+python benchmark/paras/run_kernel_ablation.py --dry-run \
+  --output /tmp/kernel-ablation-plan \
+  --nvbandwidth /tmp/nvbandwidth-reference/build/nvbandwidth
+
+# GPU correctness smoke (all three methods, both directions):
+python benchmark/paras/run_kernel_ablation.py --smoke --warmup 1 --iters 2 \
+  --output results/kernel-smoke
+
+# Full sweep, with SM-only nvbandwidth references (no copy-engine tests):
+python benchmark/paras/run_kernel_ablation.py \
+  --output results/kernel-ablation \
+  --nvbandwidth /tmp/nvbandwidth-reference/build/nvbandwidth
+```
+
+The reference sweeps 256/512/1024 MiB per peer, five samples using the mean,
+for `device_to_device_memcpy_write_sm`, `one_to_all_write_sm`, and
+`all_to_one_write_sm`. All ParaS expert and KV kernels tested here use remote
+writes. The one-to-all and all-to-one results measure outbound and inbound
+bandwidth limits separately; they do not reproduce simultaneous all-to-all
+traffic and are not a proof of a mathematical optimum. Report efficiency against
+the **measured SM-copy reference**, including the selected denominator and its
+traffic-pattern limitation. Count remote payload once, excluding self transfers;
+do not sum send and receive bytes or compare against a duplex bandwidth number.
+
+`run_kernel_ablation.py` records each command, status, source hashes/archive, Git
+revision/diff, and GPU topology. Data initialization and destination verification
+are outside timing. CUDA events include staging, collectives, and layer fences;
+statistics use the slowest rank each iteration. Checksum data includes layer
+identity, so a transfer accidentally reusing the wrong layer can be detected.

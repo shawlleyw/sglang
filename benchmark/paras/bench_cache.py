@@ -11,8 +11,9 @@ Compares three transport methods per direction:
 Volume control:
     `--cache-size-gb` is the per-GPU EP cache capacity.
     `--load` is the resident fraction in (0, 1].
-    The preset layer count controls repeated transfers of ONE isolated layer.
-    This is not a full UMM migration or a heterogeneous GPT-OSS SWA trace.
+    Legacy mode repeats ONE isolated layer. --resident-cache-gib instead
+    allocates all uniform layers distinctly with that total resident EP K+V
+    GiB per GPU. Neither mode models overlapping UMM or hybrid SWA migration.
 
 Usage:
     torchrun --nproc_per_node=8 bench_cache.py \\
@@ -38,7 +39,12 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
 from common.ipc import CudaTimer, IPCContext, setup_ipc_arena
-from common.layouts import KVLayout, add_volume_args, make_kv_layout
+from common.layouts import (
+    KVLayout,
+    add_volume_args,
+    make_kv_layout,
+    make_resident_kv_layout,
+)
 from common.model_configs import add_model_args, resolve_model
 from common.slot_init import random_resident_slots
 from common.cache_reference import pack_gather, unpack_gather, unpack_scatter
@@ -181,17 +187,18 @@ def _views(ctx, layout, off):
     return result
 
 
-def _pattern(tokens, heads, dim, value_offset=0):
+def _pattern(tokens, heads, dim, value_offset=0, layer_index=0):
     # Head and dimension terms catch errors that a rank-only constant misses.
     values = (
         tokens[:, None, None] * 17
+        + layer_index * 11
         + heads[None, :, None] * 7
         + torch.arange(dim, device=tokens.device)[None, None, :] * 3
     ) % 127
     return (values + value_offset).to(torch.bfloat16)
 
 
-def _initialize(ctx, layout, views, direction, seed):
+def _initialize(ctx, layout, views, direction, seed, layer_index=0):
     n = layout.num_resident_tokens
     batch = 4096
     if direction == "ep_to_tp":
@@ -207,8 +214,12 @@ def _initialize(ctx, layout, views, direction, seed):
                 + ctx.rank * n
             )
             dst = slots[start : start + batch]
-            views["ep_k"][dst] = _pattern(tokens, heads, layout.head_dim)
-            views["ep_v"][dst] = _pattern(tokens, heads, layout.head_dim, 128)
+            views["ep_k"][dst] = _pattern(
+                tokens, heads, layout.head_dim, layer_index=layer_index
+            )
+            views["ep_v"][dst] = _pattern(
+                tokens, heads, layout.head_dim, 128, layer_index
+            )
     else:
         heads = (
             torch.arange(layout.heads_per_rank, device=ctx.device)
@@ -218,11 +229,15 @@ def _initialize(ctx, layout, views, direction, seed):
             tokens = torch.arange(
                 start, min(start + batch, n * ctx.world_size), device=ctx.device
             )
-            views["tp_k"][tokens + 1] = _pattern(tokens, heads, layout.head_dim)
-            views["tp_v"][tokens + 1] = _pattern(tokens, heads, layout.head_dim, 128)
+            views["tp_k"][tokens + 1] = _pattern(
+                tokens, heads, layout.head_dim, layer_index=layer_index
+            )
+            views["tp_v"][tokens + 1] = _pattern(
+                tokens, heads, layout.head_dim, 128, layer_index
+            )
 
 
-def _verify(ctx, layout, views, direction, seed):
+def _verify(ctx, layout, views, direction, seed, layer_index=0):
     n = layout.num_resident_tokens
     if direction == "ep_to_tp":
         count = n * ctx.world_size
@@ -250,7 +265,7 @@ def _verify(ctx, layout, views, direction, seed):
             ok.mul_(
                 (
                     views[f"{target}_{kind}"][dst]
-                    == _pattern(tokens, heads, layout.head_dim, offset)
+                    == _pattern(tokens, heads, layout.head_dim, offset, layer_index)
                 )
                 .all()
                 .int()
@@ -261,11 +276,34 @@ def _verify(ctx, layout, views, direction, seed):
 
 
 def run_direction(
-    ctx, layout, seed, method, direction, num_layers, warmup, iters, variant
+    ctx,
+    layout,
+    seed,
+    method,
+    direction,
+    num_layers,
+    warmup,
+    iters,
+    variant,
+    distinct_layers=False,
 ):
-    off = offsets_in_arena(layout)
-    views = _views(ctx, layout, off)
-    _initialize(ctx, layout, views, direction, seed)
+    base = offsets_in_arena(layout)
+    offsets = [
+        {
+            key: value + layer * base["total"]
+            for key, value in base.items()
+            if key != "total"
+        }
+        for layer in range(num_layers if distinct_layers else 1)
+    ]
+    layer_views = [_views(ctx, layout, off) for off in offsets]
+    for layer, views in enumerate(layer_views):
+        _initialize(ctx, layout, views, direction, seed, layer)
+
+    def select(layer):
+        index = layer if distinct_layers else 0
+        return offsets[index], layer_views[index]
+
     n, world, hpr, dim = (
         layout.num_resident_tokens,
         ctx.world_size,
@@ -278,15 +316,18 @@ def run_direction(
         )
         shape = (world, n, hpr, 2, dim)
 
-        def direct():
+        def direct(layer):
+            off, _ = select(layer)
             _peer_access_transfer_layer(
                 ctx, layout, off, slots, ctx.rank * n + 1, variant
             )
 
-        def pack(send):
+        def pack(send, layer):
+            _, views = select(layer)
             send.copy_(pack_gather(views["ep_k"], views["ep_v"], slots, world))
 
-        def unpack(recv):
+        def unpack(recv, layer):
+            _, views = select(layer)
             values = unpack_gather(recv)
             views["tp_k"][1 : world * n + 1].copy_(values[:, :, 0, :])
             views["tp_v"][1 : world * n + 1].copy_(values[:, :, 1, :])
@@ -309,17 +350,20 @@ def run_direction(
             .long()
         )
 
-        def direct():
+        def direct(layer):
+            off, _ = select(layer)
             _peer_access_scatter_layer(
                 ctx, layout, off, slots, owners, dst_slots, variant
             )
 
-        def pack(send):
+        def pack(send, layer):
+            _, views = select(layer)
             send_view = send.view(-1, hpr, 2, dim)
             send_view[:, :, 0, :] = views["tp_k"][src_long]
             send_view[:, :, 1, :] = views["tp_v"][src_long]
 
-        def unpack(recv):
+        def unpack(recv, layer):
+            _, views = select(layer)
             values = unpack_scatter(recv, layout.num_kv_heads)
             views["ep_k"][ep_positions] = values[:, :, 0, :]
             views["ep_v"][ep_positions] = values[:, :, 1, :]
@@ -345,29 +389,30 @@ def run_direction(
             prep_stream.wait_stream(main)
         for layer in range(layers):
             if method == "peer_access":
-                direct()
+                direct(layer)
                 ctx.barrier()
                 continue
             index = layer % len(buffers)
             send, recv = buffers[index]
             if prep_stream is None:
-                pack(send)
+                pack(send, layer)
             else:
                 with torch.cuda.stream(prep_stream):
                     if layer >= len(buffers):
                         prep_stream.wait_event(reusable[index])
-                    pack(send)
+                    pack(send, layer)
                     ready[index].record()
                 main.wait_event(ready[index])
             dist.all_to_all_single(recv.view(-1), send.view(-1), group=ctx.tp_group)
-            unpack(recv)
+            unpack(recv, layer)
             if prep_stream is not None:
                 reusable[index].record()
 
     ctx.barrier()
-    execute(1)
+    execute(num_layers if distinct_layers else 1)
     ctx.barrier()
-    _verify(ctx, layout, views, direction, seed)
+    for layer, views in enumerate(layer_views):
+        _verify(ctx, layout, views, direction, seed, layer)
     timer = CudaTimer(ctx.device, warmup=warmup, iters=iters)
     for _ in range(timer.total_iters):
         ctx.barrier()
@@ -376,7 +421,8 @@ def run_direction(
         timer.tock()
         ctx.barrier()
     # Also check the pipelined path after it has reused both staging slots.
-    _verify(ctx, layout, views, direction, seed)
+    for layer, views in enumerate(layer_views):
+        _verify(ctx, layout, views, direction, seed, layer)
     stats = timer.summary()
     stats["per_layer_mean_ms"] = stats["mean"] / num_layers
     stats["per_layer_p50_ms"] = stats["p50"] / num_layers
@@ -428,7 +474,21 @@ def main():
         )
     if model.num_kv_heads % args.tp_size and args.tp_size % model.num_kv_heads:
         parser.error("KV heads and TP size must divide one another")
-    layout = make_kv_layout(model, args.tp_size, args.cache_size_gb, args.load)
+    distinct_layers = args.resident_cache_gib is not None
+    if args.load is None:
+        args.load = 1.0 if distinct_layers else 0.5
+    if distinct_layers:
+        try:
+            layout = make_resident_kv_layout(
+                model, args.tp_size, args.resident_cache_gib, args.load
+            )
+        except ValueError as error:
+            parser.error(str(error))
+    else:
+        args.cache_size_gb = (
+            args.cache_size_gb if args.cache_size_gb is not None else 10.0
+        )
+        layout = make_kv_layout(model, args.tp_size, args.cache_size_gb, args.load)
     replication = layout.replication_factor
     n = layout.num_resident_tokens // replication * replication
     if n == 0:
@@ -441,7 +501,15 @@ def main():
 
         ppa3c = ppa
 
-    arena = 2 * layout.tp_buffer_bytes + 2 * layout.ep_buffer_bytes
+    arena = (2 * layout.tp_buffer_bytes + 2 * layout.ep_buffer_bytes) * (
+        num_layers if distinct_layers else 1
+    )
+    scope = (
+        "distinct_uniform_layers_no_swa"
+        if distinct_layers
+        else "isolated_homogeneous_layer_repeated"
+    )
+    layer_capacity_gib = 2 * layout.ep_buffer_bytes / 2**30
     ctx = setup_ipc_arena(arena, peer_access=args.method == "peer_access")
     if ctx.world_size != args.tp_size:
         raise SystemExit(
@@ -454,14 +522,12 @@ def main():
         )
         print(
             f"[rank 0] model={model.name} layers={num_layers} tp={args.tp_size} "
-            f"R={layout.replication_factor} cache={args.cache_size_gb:.1f}GiB "
-            f"load={args.load:.2f} resident={resident_gib:.2f}GiB "
+            f"R={layout.replication_factor} layer_capacity={layer_capacity_gib:.6f}GiB "
+            f"load={args.load:.2f} resident_all_layers={resident_gib * num_layers:.6f}GiB "
             f"num_resident_tokens={layout.num_resident_tokens}"
         )
         print(f"[rank 0] arena={arena/(1024**3):.2f}GiB method={args.method}")
-        print(
-            "[rank 0] scope=isolated_homogeneous_layer_repeated; not a full UMM or hybrid-SWA switch"
-        )
+        print(f"[rank 0] scope={scope}; cache transfer only; no serving or UMM overlap")
 
     results = []
 
@@ -478,6 +544,7 @@ def main():
             args.warmup,
             args.iters,
             args.variant,
+            distinct_layers=distinct_layers,
         )
         results.append({"direction": "tp_to_ep", **stats})
         if ctx.rank == 0:
@@ -500,6 +567,7 @@ def main():
             args.warmup,
             args.iters,
             args.variant,
+            distinct_layers=distinct_layers,
         )
         results.append({"direction": "ep_to_tp", **stats})
         if ctx.rank == 0:
@@ -528,6 +596,10 @@ def main():
                 "method",
                 "variant",
                 "scope",
+                "resident_cache_gib_requested",
+                "resident_bytes_per_rank_all_layers",
+                "arena_bytes",
+                "remote_bytes_per_rank_all_layers",
                 "remote_bytes_per_rank_per_layer",
                 "staging_bytes",
                 "total_mean_ms",
@@ -555,13 +627,23 @@ def main():
                         "num_layers": num_layers,
                         "tp_size": args.tp_size,
                         "replication": layout.replication_factor,
-                        "cache_size_gb": args.cache_size_gb,
+                        "cache_size_gb": layer_capacity_gib,
                         "load": args.load,
                         "num_resident_tokens": layout.num_resident_tokens,
                         "direction": r["direction"],
                         "method": args.method,
                         "variant": args.variant if args.method == "peer_access" else "",
-                        "scope": "isolated_homogeneous_layer_repeated",
+                        "scope": scope,
+                        "resident_cache_gib_requested": args.resident_cache_gib,
+                        "resident_bytes_per_rank_all_layers": n
+                        * layout.bytes_per_ep_slot
+                        * 2
+                        * num_layers,
+                        "arena_bytes": arena,
+                        "remote_bytes_per_rank_all_layers": r[
+                            "remote_bytes_per_rank_per_layer"
+                        ]
+                        * num_layers,
                         "remote_bytes_per_rank_per_layer": r[
                             "remote_bytes_per_rank_per_layer"
                         ],

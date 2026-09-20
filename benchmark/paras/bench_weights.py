@@ -349,9 +349,9 @@ def main():
     parser.add_argument("--tp-size", type=int, default=8)
     parser.add_argument(
         "--kernel",
-        choices=("w13", "w2", "both", "attention", "bundle", "all"),
+        choices=("w13", "w2", "both", "experts", "attention", "bundle", "all"),
         default="bundle",
-        help="both=separate expert measurements; bundle=experts+QKV/O; all=components and bundle",
+        help="both=separate experts; experts=w13+w2 together; bundle=experts+QKV/O; all=components and bundles",
     )
     parser.add_argument(
         "--direction", choices=("ep_to_tp", "tp_to_ep", "both"), default="both"
@@ -402,6 +402,7 @@ def main():
     selections = {
         "w13": ("w13",),
         "w2": ("w2",),
+        "experts": ("w13", "w2"),
         "attention": ("qkv", "o"),
         "bundle": COMPONENTS,
     }
@@ -461,6 +462,20 @@ def main():
                 interleaved_w13=model.interleaved_w13,
                 arena_bytes=plan.layout.budget,
                 staging_bytes=bench.scratch_bytes,
+                expert_payload_bytes_per_rank=sum(
+                    bench.views(0, component)[0].numel() * model.elem_size
+                    for component in selections[name]
+                    if component in ("w13", "w2")
+                )
+                * model.num_hidden_layers,
+                expert_remote_bytes_per_rank=sum(
+                    bench.views(0, component)[0].numel() * model.elem_size
+                    for component in selections[name]
+                    if component in ("w13", "w2")
+                )
+                * model.num_hidden_layers
+                * (world - 1)
+                // world,
                 overlap_scope=(
                     "within_layer_pack_collective"
                     if args.method == "nccl_overlap" and direction == "ep_to_tp"

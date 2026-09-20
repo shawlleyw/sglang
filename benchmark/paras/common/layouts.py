@@ -14,6 +14,7 @@ The routing helper rounds N down to a multiple of R.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from .model_configs import ModelConfig
 
@@ -175,17 +176,47 @@ def make_weight_layout(model: ModelConfig, tp_size: int) -> WeightLayout:
     )
 
 
+def make_resident_kv_layout(model, tp_size, resident_cache_gib, load=1.0):
+    """Uniform distinct layers: resident EP K+V volume summed across the model."""
+    if not math.isfinite(resident_cache_gib) or resident_cache_gib <= 0:
+        raise ValueError("resident cache GiB must be finite and positive")
+    if model.num_hidden_layers <= 0 or not 0 < load <= 1:
+        raise ValueError("layer count must be positive and load in (0, 1]")
+    replication = max(1, tp_size // model.num_kv_heads)
+    token_bytes = 2 * model.num_kv_heads * model.head_dim * model.elem_size
+    n = int(resident_cache_gib * 2**30) // (model.num_hidden_layers * token_bytes)
+    n = n // replication * replication
+    if n == 0:
+        raise ValueError(
+            "resident volume must hold at least one token per replica per layer"
+        )
+    return KVLayout(
+        tp_size=tp_size,
+        num_kv_heads=model.num_kv_heads,
+        head_dim=model.head_dim,
+        elem_size=model.elem_size,
+        ep_max_tokens=math.ceil(n / load) + 1,
+        tp_max_tokens=tp_size * n + 1,
+        num_resident_tokens=n,
+    )
+
+
 def add_volume_args(parser) -> None:
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--cache-size-gb",
         type=float,
-        default=10.0,
-        help="Per-GPU EP cache capacity in GiB (default 10)",
+        default=None,
+        help="Legacy isolated-layer EP capacity in GiB (default 10)",
+    )
+    group.add_argument(
+        "--resident-cache-gib",
+        type=float,
+        help="Total resident EP K+V GiB per GPU across distinct uniform model layers; no SWA",
     )
     parser.add_argument(
         "--load",
         type=float,
-        default=0.5,
-        help="Fraction of cache resident, in (0, 1]. "
-        "Cache size * load = resident bytes per GPU. (default 0.5)",
+        default=None,
+        help="Resident fraction; defaults to 1 for --resident-cache-gib, 0.5 for legacy mode",
     )
