@@ -958,10 +958,23 @@ class SchedulerParasMixin:
         self.profiler = None
 
     def paras_effective_max_prefill_tokens(self) -> int:
+        # The ramp is local to independent EP schedulers. Their counters can
+        # diverge, so carrying it into TP would produce different batch sizes
+        # across ranks and deadlock collective operations (including sampling).
+        if getattr(self, "paras_parallelism_config", None) == ParaSMode.TP:
+            self._paras_post_switch_iters_remaining = 0
+            return (
+                getattr(
+                    getattr(self, "server_args", None),
+                    "paras_tp_max_prefill_tokens",
+                    None,
+                )
+                or self.max_prefill_tokens
+            )
         if self._paras_post_switch_iters_remaining <= 0:
             return self.max_prefill_tokens
         ramp = max(1, self._paras_post_switch_ramp_iters)
-        cap = self._paras_post_switch_initial_cap
+        cap = min(self._paras_post_switch_initial_cap, self.max_prefill_tokens)
         remaining = self._paras_post_switch_iters_remaining
         progress = (ramp - remaining + 1) / ramp
         effective = cap + int((self.max_prefill_tokens - cap) * progress)

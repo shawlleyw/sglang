@@ -4,7 +4,9 @@
 > weights and backend workspace integration. The N+1 slots, removed planner
 > APIs, and overhead totals below describe that implementation only. For the
 > current mechanism and accounting, use the
-> [unified memory manager reference](unified_memory_manager.md).
+> [unified memory manager reference](unified_memory_manager.md) and
+> [current evaluation methodology](memory_evaluation.md). Do not use this
+> historical table for the final GPT-OSS EP8/TP8 presentation.
 
 Empirical accounting of the GPU memory overhead ParaS adds on top of baseline EP, with measured numbers, root-cause attributions, applied optimizations, and remaining reclaimable items.
 

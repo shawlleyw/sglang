@@ -57,7 +57,7 @@ Topology-aware setup sourced by every `launch_server_*.sh`. Provides two public 
 | DP/EP | `MAX_RUNNING_REQUESTS / NUM_GPUS` | each DP-attention rank captures graphs for its own ≤ N/8 slice |
 | TP/TP | `MAX_RUNNING_REQUESTS` | single global batch dispatched across TP ranks |
 
-Per-model launchers stay thin: they set `MODEL_PATH` and `MEM_FRACTION_STATIC` defaults (with optional `ENABLE_PARAS=1` branch), `HYBRID_SWA` default for gpt-oss, then call the right `paras_launch_setup_*` and splice the resulting arrays into the `python -m sglang.launch_server` invocation. All shared knobs (`MAX_RUNNING_REQUESTS=2048`, `MAX_PREFILL_TOKENS=8192`, `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=MAX_REQ_PER_RANK`, etc.) live in `launch_common.sh` — see the [Override Cheatsheet](#override-cheatsheet) below for the full list.
+Per-model launchers stay thin: they set `MODEL_PATH` and `MEM_FRACTION_STATIC` defaults (with optional `ENABLE_PARAS=1` branch), `HYBRID_SWA` default for gpt-oss, then call the right `paras_launch_setup_*` and splice the resulting arrays into the `python -m sglang.launch_server` invocation. Shared defaults live in `launch_common.sh`. The A100 GPT-OSS DP/EP server overrides the EP prefill budget to 2048 per rank and supplies a separate ParaS TP budget of 8192 — see the [Override Cheatsheet](#override-cheatsheet) below for the full list.
 
 ### `run_paras_tests.sh`
 
@@ -197,12 +197,14 @@ Every var below honors the standard `${VAR:-default}` pattern: `VAR=N bash launc
 | `CUDA_VISIBLE_DEVICES` | `0,1,...,NUM_GPUS-1` | both | physical GPUs (only set if unset) |
 | `ENABLE_CUDA_GRAPH` | `1` | both | `0` ⇒ pass `--disable-cuda-graph` |
 | `MAX_RUNNING_REQUESTS` | `2048` | both | sglang `--max-running-requests`; uniform across all models/servers |
-| `MAX_PREFILL_TOKENS` | `8192` | both | sglang `--max-prefill-tokens`; uniform across all models/servers |
+| `MAX_PREFILL_TOKENS` | `8192`; A100 GPT-OSS DP/EP: `2048` | both | `--max-prefill-tokens`; per DP rank in EP, shared batch in TP |
+| `PARAS_TP_MAX_PREFILL_TOKENS` | `8192` | A100 GPT-OSS ParaS server | TP-mode scheduler budget and MoE reservation; EP retains `MAX_PREFILL_TOKENS` |
 | `MAX_REQ_PER_RANK` | `MAX_RUNNING_REQUESTS / NUM_GPUS` | dp_ep | derived; feeds the three per-rank knobs below |
 | `CUDA_GRAPH_MAX_BS` | `MAX_REQ_PER_RANK` (dp_ep) / `MAX_RUNNING_REQUESTS` (tp_tp) | both | `--cuda-graph-max-bs` (only honored when graph enabled) |
 | `SGLANG_DEEPEP_BF16_DISPATCH` | `true` | dp_ep | BF16 in DeepEP dispatch |
 | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | `MAX_REQ_PER_RANK` | dp_ep | DeepEP buffer size per rank (NVSHMEM_QP_DEPTH constraint) |
 | `NVSHMEM_QP_DEPTH` | `2048` | dp_ep | NVSHMEM queue pair depth |
+| `NVSHMEM_DISABLE_NCCL` | `1` | A100 GPT-OSS dp_ep | Disable NVSHMEM internal NCCL collectives for static EP and ParaS; `0` restores them |
 | `DISABLE_OVERLAP` | `0` | both | `1` adds `--disable-overlap-schedule` |
 | `DISABLE_RADIX_CACHE` | `1` | both | `1` (default) adds `--disable-radix-cache` (paras parity) |
 | `HYBRID_SWA` | `auto` (dp_ep) / unset (tp_tp) | both | `auto` resolves to `1` under paras, `0` under static. `0` adds `--disable-hybrid-swa-memory`. Only meaningful for gpt-oss. |
@@ -289,3 +291,57 @@ python -m sglang.bench_serving --backend sglang \
 - [`.skills/paras-test-peer-access/SKILL.md`](../../../.skills/paras-test-peer-access/SKILL.md) — unit-test skill for KV transfer + weight transfer + request partition
 - `docs/paras/gpt_oss_support.md` — gpt-oss design doc + bug chronicle
 - `test/srt/paras/` — Python test sources driven by `run_paras_tests.sh`
+
+## Match native baseline workspace reservations to ParaS
+
+The [memory evaluation methodology](../../../docs/paras/memory_evaluation.md)
+defines the final EP8/TP8 baselines, complete configuration, workload order,
+metric definitions, and local reproduction bundle. This section describes the
+helper used to match native reservations; ordinary launchers do not install it.
+
+For the GPT-OSS BF16 Triton EP/TP memory comparison, use
+`matched_baseline_workspace.py` as the server entrypoint with the same server
+arguments and environment as the native launch script:
+
+```bash
+python scripts/paras/eval/matched_baseline_workspace.py <server arguments>
+```
+
+This opt-in wrapper allocates the active mode's ParaS-sized MoE and attention
+scratch after loading weights and **before native KV profiling**. All MoE layers
+reuse one scratch buffer; attention capture/eager execution reuse another.
+Larger runtime shapes retain dynamic fallback. Normal `sglang.launch_server`
+launches keep native allocation behavior. The helper requires GPT-OSS BF16,
+Triton, PP=1, disabled overlap, and no speculation/TBO/PDMux.
+
+For static TP set both `SGLANG_GPTOSS_REPLICATED_EMBEDDING=true` and
+`SGLANG_GPTOSS_REPLICATED_LM_HEAD=true`. These match ParaS's replicated
+vocabulary storage while keeping transformer attention and experts sharded.
+`--enable-dp-lm-head` instead requires DP attention. Match per-mode prefill
+budgets (EP 2048/rank; TP 8192), request limits, graphs, context, KV dtype, SWA
+storage, and DeepEP settings. ParaS uses `--paras-tp-max-prefill-tokens 8192`
+to preserve its TP reservation independently of the EP budget.
+
+The helper matches active-mode workspace, not ParaS-only transfer headroom,
+inactive mode state, or retained EP transport.
+
+Instrumentation can instead call `reserve_baseline_workspaces(model_runner)`
+after model loading and `bind_baseline_attention(model_runner)` after attention
+initialization, before graph capture. Use either these calls or `install()`,
+not both. Account the reserved buffers once, and verify reuse before comparing
+KV capacities or driver-resident bytes.
+
+The A100 GPT-OSS `launch_server_tp_tp.sh` and `bench_one_batch_tp_tp.sh`
+default both vocabulary replication switches to `true`; either can be
+overridden with `false` for an explicitly sharded vocabulary baseline.
+
+For DeepEP runtime-memory diagnostics, `NVSHMEM_DISABLE_NCCL=1` disables
+NVSHMEM's internal use of NCCL for collectives while preserving SGLang's normal
+TP collectives. On the measured eight-A100 BF16 GPT-OSS setup, this removed
+large internal communicator allocations and passed static EP, ParaS mode
+switching, and 2,048-request stress checks. The A100 GPT-OSS
+`launch_server_dp_ep.sh` (both static EP and `ENABLE_PARAS=1`) and
+`bench_one_batch_dp_ep.sh` default this setting to `1`. Set
+`NVSHMEM_DISABLE_NCCL=0` to restore NVSHMEM's internal NCCL collectives for a
+comparison, and record the same setting for static EP and ParaS. Current ParaS
+runtime VMM does not manage this memory.

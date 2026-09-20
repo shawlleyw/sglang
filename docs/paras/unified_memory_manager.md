@@ -129,14 +129,21 @@ complete overhead relative to an original single-mode server.
 For a matched total-memory budget, compare the endpoint against scratch the
 baseline actually allocates: `endpoint - baseline_scratch`, then account
 for alignment/page slack and external differences such as dual graphs and
-replicated auxiliary tensors. In particular, TP reserves for a full Triton
-64K-token chunk, while the native backend sizes temporaries to
-`min(actual_input_tokens, 65536)` and the selected kernel's padding. A
-smaller runtime batch can therefore leave unused space **inside** the TP
-scratch reservation even when endpoint padding is zero. Backend execution
-behavior is preserved, but worst-case reservation is not the same as the
-baseline's live allocation. Total overhead needs a matched runtime
-measurement; the diagrams alone cannot establish it.
+replicated auxiliary tensors. TP now reserves for the configured prefill,
+decode, and graph sizes, capped at the kernel's 64K-token chunk limit. The
+native backend sizes temporaries to `min(actual_input_tokens, 65536)` and
+the selected kernel's padding. A smaller runtime batch can still leave
+unused space **inside** the TP reservation even when endpoint padding is
+zero. Larger batches use the existing dynamic fallback. Total overhead
+needs a matched runtime measurement; the diagrams alone cannot establish it.
+The [evaluation protocol](memory_evaluation.md) specifies native scratch
+reservations, vocabulary layout, per-mode budgets, and reported metrics.
+
+The external request-to-token table reserves stable backing for the largest
+mode capacity, capped by `max_running_requests` when configured. EP scheduler
+admission divides that global limit across ranks, while TP uses the global
+limit. Capping scheduler admission alone would leave unreachable rows in the
+backing table; both the pool reservation and scheduler limits are capped.
 
 ## Backend workspace
 
@@ -148,19 +155,21 @@ the other's reservation or the unused padding.
 ### MoE
 
 Qwen EP selects BF16 DeepGEMM where the existing DeepEP backend supports
-it, otherwise Triton. TP uses fused Triton. GPT-OSS uses Triton for its
+it, otherwise Triton. TP uses Triton; the fused path is selected when its
+runner/dispatcher combination supports it. GPT-OSS uses Triton for its
 biases and activation. Reservations follow each backend's existing
 execution policy.
 
 For hidden size `H`, expert intermediate size `I`, expert count `E`, top-k
-`K`, TP size `P`, and DeepEP dispatch capacity `C`, BF16 scratch is:
+`K`, TP size `P`, DeepEP dispatch capacity `C`, and TP reservation target
+`R`, BF16 scratch is:
 
 ```text
 EP rows = E * C
 EP scratch = align(EP_rows * 2*I * 2) + align(EP_rows * I * 2)
 
 TP I = I / P
-TP rows = 65536*K + (E+1)*(256-1)
+TP rows = R*K + (E+1)*(256-1)
 TP scratch = align(TP_rows * max(2*TP_I, H) * 2)
            + align(TP_rows * TP_I * 2)
 ```
@@ -170,11 +179,25 @@ padded receive shape: `local_experts * (EP_size * C)`. Masked DeepGEMM
 consumes that shape directly; Triton EP flattens it. Normal dispatch uses
 actual received rows. EP has no 64K chunk limit or reservation floor.
 
-TP preserves `triton_moe_chunk_size = 64 * 1024` **input tokens per chunk**.
-It includes top-k expansion and the fused TMA padding bound
+The fused TP path preserves `triton_moe_chunk_size = 64 * 1024`
+**input tokens per chunk**; the generic Triton runner handles its full batch.
+Its reservation target `R` is the largest configured prefill, decode, or TP
+graph token count, capped at 65,536. TP prefill uses
+`paras_tp_max_prefill_tokens` when provided, otherwise `max_prefill_tokens`;
+the EP scheduler keeps its per-rank `max_prefill_tokens` budget. A positive
+chunked-prefill limit bounds
+the prefill target; decode/capture sizes include draft multiplicity when
+configured. Automatic request capacity uses the native 4,096-row ceiling.
+Planning without a prefill configuration retains the kernel ceiling.
+
+The reservation includes top-k expansion and the fused TMA padding bound
 `MOE_MAX_BLOCK_M = 256`. Gate/up and down share the first scratch tensor,
 so its width is `max(2*TP_I, H)`; activation occupies a separate tensor.
-This reservation does not shrink to the decode batch size.
+The reservation covers the fused scratch layout; the generic Triton path
+can need less, since its down-projection output is allocated externally.
+`R` is not a new runtime admission limit: a first unchunked prefill can exceed
+`max_prefill_tokens`, and its scratch falls back to native allocation if it
+does not fit. EP and TP kernel execution/chunking behavior is unchanged.
 
 `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` supplies `C` (dispatcher
 default 128). The [shared launch settings](../../scripts/paras/eval/launch_common.sh)
@@ -227,7 +250,9 @@ This is a **planner calculation**, not a measured H200 footprint. Assume
 page size 1, 94 layers, `H=4096`, `I=1536`, 128 experts, top-k 8, 64 query
 heads, four KV heads, and head dimension 128. Use the H200 launch request
 settings above (`C=256`) and, for Triton attention, eight KV splits and a
-maximum graph batch of 256 in EP and 2,048 in TP. All diagram sizes below
+maximum graph batch of 256 in EP and 2,048 in TP. For this example explicitly
+use `max_prefill_tokens=65536` with chunked prefill disabled, so `R=65536`;
+smaller configured targets produce smaller TP scratch. All diagram sizes below
 are **MiB per GPU**:
 
 ```text
@@ -339,6 +364,10 @@ transient communication buffers outside the UMM. The launch scripts select
 peer access for both.
 
 ## Validation references
+
+Use the [memory evaluation methodology](memory_evaluation.md) for the current
+GPT-OSS EP8/TP8 comparison and its reproducibility record. Runtime-state sizing
+and physical backing are described in [the VMM reference](runtime_state_vmm.md).
 
 Existing focused tests include `test_unified_workspace_layout.py`,
 `test_unified_attention_workspace.py`, `test_unified_workspace_views.py`,

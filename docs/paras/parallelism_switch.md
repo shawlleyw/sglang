@@ -65,6 +65,12 @@ sized and saved independently for EP and TP. The experimental
 [`--paras-vmm-runtime-states` option](runtime_state_vmm.md) releases inactive
 Triton KV-index/logits backing without destroying either mode's graphs.
 
+Prefill scheduling can use separate mode budgets: `--max-prefill-tokens` is
+the EP per-rank budget, and `--paras-tp-max-prefill-tokens` overrides the TP
+budget and TP MoE workspace reservation. Without the override, both use the
+base budget. Unchunked requests can exceed it. The [memory evaluation
+protocol](memory_evaluation.md) defines the matched static baselines and metrics.
+
 The canonical memory reference defines the
 [layout and endpoint sizing](unified_memory_manager.md#capacity-calculation).
 The required migration sequence is:
@@ -287,7 +293,9 @@ an up-to-date test inventory. Current layout tests are linked from the
 
 | Document | Contents |
 |----------|----------|
-| `unified_memory_manager.md` | Current asymmetric weights/KV/workspace layout, capacity, ownership, and migration safety |
+| [unified_memory_manager.md](unified_memory_manager.md) | Current asymmetric weights/KV/workspace layout, capacity, ownership, and migration safety |
+| [runtime_state_vmm.md](runtime_state_vmm.md) | Mode-local graph state, optional physical backing release, ownership and limits |
+| [memory_evaluation.md](memory_evaluation.md) | Reproducible EP8/TP8 memory comparison: baselines, configuration, workloads, metrics and artifact record |
 | `nvlink_peer_access_weight_transfer.md` | w13/w2 CUDA kernels (EP→TP + TP→EP reverse), data flow, performance comparison |
 | `nvlink_peer_access_kv_cache_transfer.md` | Fused K+V kernel (EP→TP + TP→EP scatter), head replication, NCCL fallback |
 | `nvlink_peer_access_guielines.md` | NVLink store optimization guidelines (grid config, vectorization, alignment) |

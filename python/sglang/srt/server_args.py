@@ -448,6 +448,7 @@ class ServerArgs:
     enable_paras_moe: bool = False
     paras_vmm_runtime_states: bool = False
     paras_tp_size: int = 4
+    paras_tp_max_prefill_tokens: Optional[int] = None
     paras_tp_cuda_graph_max_bs: Optional[int] = None
     paras_tp_cuda_graph_bs: Optional[List[int]] = None
     paras_auto_switch: bool = True
@@ -1584,6 +1585,13 @@ class ServerArgs:
             )
 
     def _check_paras_config(self):
+        if self.paras_tp_max_prefill_tokens is not None:
+            assert self.enable_paras_moe, (
+                "--paras-tp-max-prefill-tokens requires --enable-paras-moe"
+            )
+            assert self.paras_tp_max_prefill_tokens > 0, (
+                "--paras-tp-max-prefill-tokens must be positive"
+            )
         if self.paras_vmm_runtime_states:
             from sglang.srt.paras.runtime_memory import validate_runtime_vmm_config
 
@@ -3093,6 +3101,17 @@ class ServerArgs:
             type=int,
             default=ServerArgs.paras_tp_size,
             help="TP size for ParaS MoE layers.",
+        )
+        parser.add_argument(
+            "--paras-tp-max-prefill-tokens",
+            type=int,
+            default=ServerArgs.paras_tp_max_prefill_tokens,
+            help=(
+                "TP-mode prefill token budget for ParaS scheduling and MoE "
+                "workspace reservation. Defaults to --max-prefill-tokens, "
+                "which remains the per-DP-rank EP budget. Unchunked requests "
+                "can exceed this scheduling budget."
+            ),
         )
         parser.add_argument(
             "--paras-tp-cuda-graph-max-bs",

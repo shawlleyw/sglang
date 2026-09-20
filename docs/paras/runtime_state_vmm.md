@@ -1,9 +1,13 @@
 # Mode-local graph state and optional VMM backing
 
-This change has two parts. The sizing/isolation fix is always enabled for
-ParaS; physical backing suspension requires `--paras-vmm-runtime-states`.
-Only CPU tests have been run on this branch. CUDA capture/replay, actual HBM
-savings, and switch latency still need GPU validation.
+ParaS keeps graph and attention state separate for EP and TP. Mode-local sizing
+is always enabled; releasing inactive physical backing requires the opt-in
+`--paras-vmm-runtime-states` option.
+CUDA remapping and graph replay have also been validated on eight A100s with
+dummy GPT-OSS weights, including live-KV EP/TP roundtrips. Saved local artifacts
+record the tested configuration and memory results. The current comparison is
+documented in [the evaluation methodology](memory_evaluation.md); it does not
+establish latency or throughput performance for other settings.
 
 ## Mode-local state
 
@@ -31,7 +35,7 @@ Pass `--paras-vmm-runtime-states` with ParaS and explicit
 `--attention-backend triton`. The option requires CUDA graphs, PP=1, and no
 speculative decoding, two-batch overlap, PDMux, torch compile, or memory saver.
 It defaults off. It can be used with `--disable-hybrid-swa-memory` for the
-planned GPT-OSS comparison. That flag disables the separate SWA memory pool,
+GPT-OSS memory comparison. That flag disables the separate SWA memory pool,
 not the model's sliding-window attention semantics.
 
 The managed allocations are exactly:
@@ -62,12 +66,16 @@ There is no CPU backup or migration of live state in this allocator.
 
 ## Accounting and limits
 
-For the earlier example (`context=131072`, `vocab=201088`, EP capture 256,
-TP capture 2048), the two VMM-managed buffers require about **0.442 GiB in EP**
-or **3.534 GiB in TP**, before allocation-granularity rounding. Without VMM,
-the corrected separately sized buffers retain about **3.976 GiB** together.
-These are shape calculations per rank, not measured HBM results, and exclude
-all other memory. The removed verification masks are additional savings.
+For GPT-OSS (`context=131072`, `vocab=201088`, EP capture 256, TP capture
+2048), the measured VMM-backed regions are **0.443 GiB in EP** and
+**3.535 GiB in TP**, including mapping-granularity rounding. Only the active
+region is physically backed. VMM off retains both mode-local buffers. These
+figures cover KV-index/logits buffers only, not total HBM consumption.
+
+Releasing inactive VMM backing does not release cached PyTorch blocks. A switch
+can temporarily retain the previous workload's allocator cache while mapping the
+target mode's larger backing. Include activation snapshots when reporting the
+largest observed residency; one-second sampling can miss that transient.
 
 VMM-owned memory is outside PyTorch's caching allocator counters. Use device
 used/free memory plus the logged `ParaS runtime VMM` resident/virtual byte
@@ -77,11 +85,37 @@ attention backend, SWA setting, and total memory budget across static EP,
 static TP, and ParaS.
 
 The KV planner is not resized by a VMM mode switch. Reclaiming inactive backing
-provides headroom; it does not automatically create KV slots. Nor does this
-change port the earlier uncommitted TP MoE scratch sizing work from the other
-checkout: this branch's TP MoE planner still reserves its 64K-token chunk bound.
-Consequently, equal total overhead or equal KV capacity to static baselines is
-not yet established.
+provides headroom; it does not automatically create KV slots.
+
+The shared request-to-token backing table is capped by the configured
+`max_running_requests`, just like the native request pool. Scheduler admission
+still divides that limit across EP ranks. The table is outside UMM and is not
+managed by VMM.
+
+TP MoE scratch remains inside UMM, but its reservation follows the configured
+prefill/chunked-prefill, running-request, and TP graph sizes (including draft
+multiplicity when configured), up to the kernel's 64K input-token ceiling.
+With no explicit running-request cap, planning uses the native pool's 4096-row
+automatic ceiling. This is a reservation target, not a new admission limit:
+an unchunked first prefill may exceed `max_prefill_tokens`. The existing runner
+falls back to runtime scratch allocations when the requested views do not fit,
+without writing outside the UMM reservation or changing the kernel chunk loop.
+Reducing UMM scratch can increase KV capacity, although transfer headroom may
+still set the minimum front/tail size. VMM itself does not resize this layout.
+
+## Separate EP and TP prefill budgets
+
+For the matched A100 GPT-OSS memory evaluation, native EP uses
+`--max-prefill-tokens 2048` per DP rank, and native TP uses
+`--max-prefill-tokens 8192`. ParaS uses `--max-prefill-tokens 2048` plus
+`--paras-tp-max-prefill-tokens 8192`. The TP override controls both scheduler
+admission and TP MoE workspace sizing, including after EP/TP switches. Without
+the override, both modes retain the shared `--max-prefill-tokens` behavior.
+
+These are scheduling budgets, not strict per-forward limits: an unchunked
+request larger than the budget may run alone and use dynamic workspace fallback.
+ParaS currently requires unchunked prefill because migration does not preserve
+mid-chunk request state.
 
 ## CPU validation
 
@@ -91,6 +125,7 @@ Run with GPUs hidden and the clone first on `PYTHONPATH`:
 CUDA_VISIBLE_DEVICES='' PYTHONPATH="$PWD/python" python -m pytest -q \
   test/srt/paras/test_runtime_memory.py \
   test/srt/paras/test_runtime_states.py \
+  test/srt/paras/test_runtime_sizing.py \
   test/srt/paras/test_unified_attention_workspace.py \
   test/srt/paras/test_unified_workspace_layout.py \
   test/srt/paras/test_unified_workspace_views.py

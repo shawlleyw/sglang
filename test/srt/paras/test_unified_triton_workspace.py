@@ -11,16 +11,19 @@ from sglang.srt.paras.mode import ParaSMode
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("gpt_oss", [False, True])
 @pytest.mark.parametrize(
-    "mode,inplace,reserved_rows",
+    "mode,inplace,reserved_rows,core_runner",
     [
-        (ParaSMode.EP, False, None),
-        (ParaSMode.EP, False, 32),
-        (ParaSMode.TP, False, None),
-        (ParaSMode.TP, True, None),
+        (ParaSMode.EP, False, None, True),
+        (ParaSMode.EP, False, 32, True),
+        (ParaSMode.TP, False, None, False),
+        (ParaSMode.TP, False, 32, False),
+        (ParaSMode.TP, True, None, False),
+        (ParaSMode.TP, False, None, True),
+        (ParaSMode.TP, False, 32, True),
     ],
 )
 def test_managed_triton_matches_original_allocations(
-    monkeypatch, mode, inplace, reserved_rows, gpt_oss
+    monkeypatch, mode, inplace, reserved_rows, core_runner, gpt_oss
 ):
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
         fused_experts,
@@ -59,7 +62,7 @@ def test_managed_triton_matches_original_allocations(
         gemm1_alpha=1.702 if gpt_oss else None,
         gemm1_clamp_limit=7.0 if gpt_oss else None,
     )
-    if mode == ParaSMode.EP:
+    if core_runner:
         config = dict(
             BLOCK_SIZE_M=16,
             BLOCK_SIZE_N=32,
@@ -89,8 +92,8 @@ def test_managed_triton_matches_original_allocations(
 
     expected = run()
 
-    # TP keeps its original chunk loop; EP runs the whole batch even when
-    # the reserved scratch is smaller than that batch.
+    # TP keeps its original chunk loop. Both modes fall back to runtime
+    # allocations when a batch/chunk exceeds the configured reservation.
     monkeypatch.setattr(unified_layout, "triton_moe_chunk_size", 32)
     rows = m * k if reserved_rows is None else reserved_rows
     size = unified_layout.align_up(rows * 2 * inter * 2)
@@ -120,7 +123,7 @@ def test_managed_triton_matches_original_allocations(
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     if reserved_rows is not None:
         assert torch.all(mgr._buffer == 23)
-    if mode == ParaSMode.TP:
+    if mode == ParaSMode.TP and not core_runner:
         compiled = torch.compile(run, backend="eager", fullgraph=True)
         torch.testing.assert_close(compiled(), expected, rtol=0, atol=0)
     # Returned outputs must survive reuse by subsequent layers.

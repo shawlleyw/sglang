@@ -6,6 +6,7 @@
 #   MODEL_PATH HOST PORT NUM_GPUS CUDA_VISIBLE_DEVICES
 #   MEM_FRACTION_STATIC MAX_RUNNING_REQUESTS
 #   SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
+#   NVSHMEM_DISABLE_NCCL (default 1; set 0 to restore NVSHMEM NCCL collectives)
 #
 # Toggles (see ../../launch_common.sh for full semantics):
 #   ENABLE_PARAS=1       Bake in ParaS EP↔TP switching (--enable-paras-moe + canonical
@@ -30,12 +31,21 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 source "$SCRIPT_DIR/../../launch_common.sh"
 
 MODEL_PATH=${MODEL_PATH:-/data/shaoyuw/models/gpt-oss-120b-BF16-unsloth}
+
+# Avoid NVSHMEM internal NCCL buffers; SGLang TP collectives remain enabled.
+export NVSHMEM_DISABLE_NCCL=${NVSHMEM_DISABLE_NCCL:-1}
 ENABLE_PARAS=${ENABLE_PARAS:-0}
 
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.75}
 HYBRID_SWA=${HYBRID_SWA:-auto}
+# EP prefill budget is per DP rank; TP processes one shared token batch.
+MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-2048}
+PARAS_TP_MAX_PREFILL_TOKENS=${PARAS_TP_MAX_PREFILL_TOKENS:-8192}
 
 paras_launch_setup_dp_ep
+if [[ "$ENABLE_PARAS" == "1" ]]; then
+    PARAS_FLAGS+=(--paras-tp-max-prefill-tokens "$PARAS_TP_MAX_PREFILL_TOKENS")
+fi
 
 python -m sglang.launch_server \
     --model-path "$MODEL_PATH" \

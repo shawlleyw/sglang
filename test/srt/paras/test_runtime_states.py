@@ -251,3 +251,65 @@ def test_flashinfer_restores_backing_buffers_with_wrapper_metadata():
     b.paras_load_cuda_graph_state(tp)
     assert b.cuda_graph_kv_indices[0].numel() == 256
     assert set(b.decode_cuda_graph_metadata) == {8}
+
+
+def test_tp_prefill_ignores_divergent_ep_ramp_counters():
+    cls = load_nodes(
+        "paras/scheduler_paras_mixin.py",
+        {"paras_effective_max_prefill_tokens"},
+        "SchedulerParasMixin",
+    )
+    schedulers = []
+    for remaining in (0, 3, 4, 5, 10, 20):
+        scheduler = cls()
+        scheduler.paras_parallelism_config = ParaSMode.TP
+        scheduler.max_prefill_tokens = 8192
+        scheduler._paras_post_switch_initial_cap = 2048
+        scheduler._paras_post_switch_ramp_iters = 20
+        scheduler._paras_post_switch_iters_remaining = remaining
+        schedulers.append(scheduler)
+    assert {s.paras_effective_max_prefill_tokens() for s in schedulers} == {8192}
+    assert all(s._paras_post_switch_iters_remaining == 0 for s in schedulers)
+
+
+def test_ep_prefill_ramp_still_progresses():
+    cls = load_nodes(
+        "paras/scheduler_paras_mixin.py",
+        {"paras_effective_max_prefill_tokens"},
+        "SchedulerParasMixin",
+    )
+    scheduler = cls()
+    scheduler.paras_parallelism_config = ParaSMode.EP
+    scheduler.max_prefill_tokens = 8192
+    scheduler._paras_post_switch_initial_cap = 2048
+    scheduler._paras_post_switch_ramp_iters = 20
+    scheduler._paras_post_switch_iters_remaining = 20
+    caps = [scheduler.paras_effective_max_prefill_tokens() for _ in range(21)]
+    assert caps[0] == 2355
+    assert caps[-2:] == [8192, 8192]
+    assert caps == sorted(caps)
+
+
+@pytest.mark.parametrize("ramp_cap", [1024, 2048, 8192])
+def test_prefill_budget_roundtrip_honors_per_mode_limits(ramp_cap):
+    cls = load_nodes(
+        "paras/scheduler_paras_mixin.py",
+        {"paras_effective_max_prefill_tokens"},
+        "SchedulerParasMixin",
+    )
+    scheduler = cls()
+    scheduler.server_args = SimpleNamespace(paras_tp_max_prefill_tokens=8192)
+    scheduler.max_prefill_tokens = 2048
+    scheduler._paras_post_switch_initial_cap = ramp_cap
+    scheduler._paras_post_switch_ramp_iters = 20
+    for mode in [ParaSMode.EP, ParaSMode.TP, ParaSMode.EP]:
+        scheduler.paras_parallelism_config = mode
+        scheduler._paras_post_switch_iters_remaining = 20
+        caps = [scheduler.paras_effective_max_prefill_tokens() for _ in range(21)]
+        if mode == ParaSMode.TP:
+            assert caps == [8192] * 21
+            assert scheduler._paras_post_switch_iters_remaining == 0
+        else:
+            assert max(caps) == 2048
+            assert caps == sorted(caps)
+        assert scheduler.max_prefill_tokens == 2048

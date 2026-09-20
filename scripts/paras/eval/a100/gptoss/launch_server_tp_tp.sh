@@ -25,6 +25,10 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 source "$SCRIPT_DIR/../../launch_common.sh"
 
 MODEL_PATH=${MODEL_PATH:-/data/shaoyuw/models/gpt-oss-120b-BF16-unsloth}
+
+# Match ParaS vocabulary storage while attention and experts remain TP-sharded.
+export SGLANG_GPTOSS_REPLICATED_LM_HEAD=${SGLANG_GPTOSS_REPLICATED_LM_HEAD:-true}
+export SGLANG_GPTOSS_REPLICATED_EMBEDDING=${SGLANG_GPTOSS_REPLICATED_EMBEDDING:-true}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.8}
 HYBRID_SWA=${HYBRID_SWA:-1}
 
