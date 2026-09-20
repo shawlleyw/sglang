@@ -11,10 +11,9 @@ import torch
 import torch.distributed as dist
 
 from common.model_configs import ModelConfig
-from common.weight_bundle import COMPONENTS, weight_name
+from common.weight_bundle import weight_name
 from sglang.srt.paras.mode import ParaSMode
 
-from .storage import IndependentWeightMemoryManager
 from .configuration import METHOD_TRANSPORT
 from .diagnostics import (
     allocator_configuration,
@@ -22,27 +21,12 @@ from .diagnostics import (
     kv_reservation,
     memory_snapshot,
 )
+from .storage import IndependentWeightMemoryManager
 from .transfers import (
     naive_nccl_transfer_layer,
     reload_host_layer,
     snapshot_host_tensors,
 )
-
-
-def dimensions(config):
-    return ModelConfig(
-        name=config.model_type,
-        num_kv_heads=config.num_key_value_heads,
-        head_dim=getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        ),
-        num_experts=config.num_experts,
-        hidden_size=config.hidden_size,
-        moe_intermediate_size=config.moe_intermediate_size,
-        num_hidden_layers=config.num_hidden_layers,
-        num_attention_heads=config.num_attention_heads,
-        interleaved_w13=config.model_type == "gpt_oss",
-    )
 
 
 def layer_parameters(layer, mode):
@@ -109,6 +93,9 @@ def install_independent_storage():
         model = manager.benchmark_dimensions
         direction = "ep_to_tp" if mode == ParaSMode.TP else "tp_to_ep"
         group = get_paras_tp_group().device_group
+        host_reload = (
+            getattr(manager, "benchmark_method", "naive_nccl") == "host_reload"
+        )
         indices = (
             range(len(body.layers))
             if mode == ParaSMode.TP
@@ -117,7 +104,7 @@ def install_independent_storage():
         for index in indices:
             layer = body.layers[index]
             source = layer_parameters(layer, source_mode)
-            if getattr(manager, "benchmark_method", "naive_nccl") == "host_reload":
+            if host_reload:
                 target = reload_host_layer(
                     manager.host_snapshots[index],
                     model,
@@ -136,12 +123,14 @@ def install_independent_storage():
                 manager.replace_weight(
                     weight_name(index, mode, component), target[component]
                 )
-            if getattr(manager, "benchmark_method", "naive_nccl") != "host_reload":
+            if not host_reload:
                 dist.all_reduce(body._unified_fence, group=group)
             # PyTorch NCCL records tensor stream use and establishes current-
             # stream dependencies. Source/staging allocations can be released
             # after enqueueing without a device-wide host wait per layer.
             # H2D reload has no remote source reads and needs no rank fence.
+            # Keep this allocation-before-release order for both baselines:
+            # target and source weights coexist for the layer being replaced.
             for component, parameter in source.items():
                 name = weight_name(index, source_mode, component)
                 placeholder = manager.placeholder(name)

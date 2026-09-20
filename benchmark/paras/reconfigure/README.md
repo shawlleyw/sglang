@@ -95,6 +95,28 @@ representations are excluded and identical tensor views are deduplicated.
 CPU target snapshots are prepared and pinned before the
 measured transition by default. CPU snapshot bytes are reported per rank.
 
+Each fresh trial keeps only its destination-mode CPU snapshot: TP for EP→TP,
+or EP for TP→EP. Preparing that snapshot, including the D2H copy, is untimed;
+the measured switch does not offload the old GPU weights. A persistent system
+using prepared host reload in both directions would need both representations
+or would have to prepare the destination on demand.
+
+Host reload allocates and enqueues copies for one layer's destination weights
+before releasing that layer's source storage. EP→TP visits layers in forward
+order; TP→EP visits them in reverse. Source parameter storage and manager entries
+are replaced with expanded one-element placeholders. Once references and stream
+dependencies allow, the old storage becomes reusable by PyTorch's allocator;
+it need not return to the CUDA driver or reduce `nvidia-smi` usage. KV storage
+and runtime scratch remain allocated. Source-first release is a possible future
+host-reload optimization, not the ordering used by these measurements.
+
+The explicit `empty()` + asynchronous `copy_()` loop controls destination
+selection and storage rebinding. `Module.to()` also visits parameters and buffers
+individually; it does not combine model weights into one transfer or update our
+custom memory-manager references. Replacing the loop with that API is therefore
+not inherently a transfer optimization. The current implementation uses no
+per-tensor host synchronization during reload.
+
 Naive NCCL relies on PyTorch stream/lifetime tracking, with the production-style
 per-layer GPU fence and a final device synchronization. It adds no per-layer
 host wait. Host reload needs no cross-rank fence for its H2D copies.
