@@ -420,7 +420,11 @@ class ParaSMemoryManager:
         layer_types = (
             getattr(config, "layer_types", None) or ["full_attention"] * num_layers
         )
-        swa_ratio = self.server_args.swa_full_tokens_ratio
+        swa_ratio = (
+            1.0
+            if getattr(self.server_args, "disable_hybrid_swa_memory", False)
+            else self.server_args.swa_full_tokens_ratio
+        )
         ratios = tuple(
             swa_ratio if kind == "sliding_attention" else 1.0 for kind in layer_types
         )

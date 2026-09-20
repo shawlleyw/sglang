@@ -135,7 +135,10 @@ def test_unsupported_model_scope_rejected_before_reservation(
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_gpt_oss_hybrid_views_match_capacity_plan(monkeypatch, head_dim):
+@pytest.mark.parametrize("disable_hybrid_swa_memory", [False, True])
+def test_gpt_oss_hybrid_views_match_capacity_plan(
+    monkeypatch, head_dim, disable_hybrid_swa_memory
+):
     from types import SimpleNamespace
     from sglang.srt.layers.moe import utils as moe_utils
 
@@ -147,6 +150,7 @@ def test_gpt_oss_hybrid_views_match_capacity_plan(monkeypatch, head_dim):
         kv_cache_dtype="auto",
         page_size=1,
         swa_full_tokens_ratio=0.8,
+        disable_hybrid_swa_memory=disable_hybrid_swa_memory,
         attention_backend="fa3",
         moe_runner_backend="triton",
         enable_two_batch_overlap=False,
@@ -184,13 +188,19 @@ def test_gpt_oss_hybrid_views_match_capacity_plan(monkeypatch, head_dim):
     plan = mgr.plan_layout(config, budget=budget)
     mgr.materialize(plan)
     assert mgr.total_bytes == budget
-    assert mgr.ep_max_kv_tokens_swa < mgr.ep_max_kv_tokens
+    if disable_hybrid_swa_memory:
+        assert mgr.ep_max_kv_tokens_swa == mgr.ep_max_kv_tokens
+        assert mgr.tp_max_kv_tokens_swa == mgr.tp_max_kv_tokens
+    else:
+        assert mgr.ep_max_kv_tokens_swa < mgr.ep_max_kv_tokens
     for mode in (ParaSMode.EP, ParaSMode.TP):
         cache = getattr(mgr._unified_layout, f"{mode.value}_cache")
         for i in range(4):
             key = mgr.get_view(f"model.layers.{i}.kv.{mode.value}.k")
             value = mgr.get_view(f"model.layers.{i}.kv.{mode.value}.v")
             assert key.shape[0] == cache.layer_tokens[i] + 1
+            if disable_hybrid_swa_memory:
+                assert key.shape[0] == cache.full_tokens + 1
             assert (
                 unified_layout.align_up(key.numel() * key.element_size()) * 2
                 <= cache.layer_bytes[i]

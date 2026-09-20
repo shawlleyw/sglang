@@ -18,6 +18,8 @@ from sglang.srt.paras.mode import ParaSMode
         (ParaSMode.TP, False, None, False),
         (ParaSMode.TP, False, 32, False),
         (ParaSMode.TP, True, None, False),
+        (ParaSMode.TP, False, 1, False),
+        (ParaSMode.TP, True, 1, False),
         (ParaSMode.TP, False, None, True),
         (ParaSMode.TP, False, 32, True),
     ],
