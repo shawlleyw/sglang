@@ -104,6 +104,35 @@ Dimension flags override presets. For custom weight runs, supply
 
 Use an activated SGLang environment with the production `paras_peer_access_cuda`
 extension installed, on one NVLink server. No model checkpoint is loaded.
+After changing CUDA sources, rebuild the extension before running:
+
+```bash
+(cd python/sglang/srt/paras/csrc && python setup.py build_ext --inplace)
+export PYTHONPATH="$PWD/python/sglang/srt/paras/csrc:$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+torchrun --standalone --nproc_per_node=8 benchmark/paras/check_kv_scatter.py
+```
+
+`check_kv_scatter.py` also accepts 2 or 4 processes. It checks complete source
+and destination buffers against a CPU reference, including uneven/unsorted
+routes, replicated and multiple local heads, empty inputs, padding skips, and
+CUDA graph replay. The production v2 scatter kernel visits each routing entry
+once, distributing disjoint token ranges across warps. Grouped destinations
+improve peer concurrency, but sorted or equally sized routes are not required.
+
+The production `MHACacheTransfer` backend and overlapping UMM layer views have
+a separate regression test. Run each head count in fresh workers:
+
+```bash
+for heads in 8 4 16; do
+  PARAS_TEST_KV_HEADS="$heads" torchrun --standalone --nproc_per_node=8 \
+    -m pytest -q test/srt/paras/test_kv_scatter_single_pass.py
+done
+```
+
+These cover one local head, replicated heads, and multiple local heads, with
+uneven destination counts and scattered source slots. Live slots start at 1,
+matching the production allocator; slot 0 remains padding.
+
 Run a small GPU correctness/timing check first:
 
 ```bash
