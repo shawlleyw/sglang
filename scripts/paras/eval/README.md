@@ -292,27 +292,21 @@ python -m sglang.bench_serving --backend sglang \
 - `docs/paras/gpt_oss_support.md` — gpt-oss design doc + bug chronicle
 - `test/srt/paras/` — Python test sources driven by `run_paras_tests.sh`
 
-## Match native baseline workspace reservations to ParaS
+## Production static workspace and matched comparisons
 
 The [memory evaluation methodology](../../../docs/paras/memory_evaluation.md)
-defines the final EP8/TP8 baselines, complete configuration, workload order,
-metric definitions, and local reproduction bundle. This section describes the
-helper used to match native reservations; ordinary launchers do not install it.
+defines baselines, configuration, workload order, metrics and saved reproduction
+inputs. Native GPT-OSS BF16 Triton EP/TP now reserves reusable active-mode scratch
+in [production](../../../python/sglang/srt/model_executor/static_workspace.py),
+before KV profiling. Ordinary `sglang.launch_server` launches use it without an
+evaluation wrapper when the execution configuration is supported.
 
-For the GPT-OSS BF16 Triton EP/TP memory comparison, use
-`matched_baseline_workspace.py` as the server entrypoint with the same server
-arguments and environment as the native launch script:
-
-```bash
-python scripts/paras/eval/matched_baseline_workspace.py <server arguments>
-```
-
-This opt-in wrapper allocates the active mode's ParaS-sized MoE and attention
-scratch after loading weights and **before native KV profiling**. All MoE layers
-reuse one scratch buffer; attention capture/eager execution reuse another.
-Larger runtime shapes retain dynamic fallback. Normal `sglang.launch_server`
-launches keep native allocation behavior. The helper requires GPT-OSS BF16,
-Triton, PP=1, disabled overlap, and no speculation/TBO/PDMux.
+The path requires serial execution, PP=1 and an explicit request cap; unsupported
+concurrent, composite, speculative, quantized, compiled and memory-saver paths
+keep their original allocation policy. ParaS continues to reserve scratch in UMM.
+MoE sizing follows prefill/chunk, request and graph limits; EP padded scratch
+follows DeepEP dispatch capacity. Attention sizing uses the resolved runtime
+context and split settings. Oversized requests fall back to dynamic allocation.
 
 For static TP set both `SGLANG_GPTOSS_REPLICATED_EMBEDDING=true` and
 `SGLANG_GPTOSS_REPLICATED_LM_HEAD=true`. These match ParaS's replicated
@@ -322,14 +316,11 @@ budgets (EP 2048/rank; TP 8192), request limits, graphs, context, KV dtype, SWA
 storage, and DeepEP settings. ParaS uses `--paras-tp-max-prefill-tokens 8192`
 to preserve its TP reservation independently of the EP budget.
 
-The helper matches active-mode workspace, not ParaS-only transfer headroom,
-inactive mode state, or retained EP transport.
-
-Instrumentation can instead call `reserve_baseline_workspaces(model_runner)`
-after model loading and `bind_baseline_attention(model_runner)` after attention
-initialization, before graph capture. Use either these calls or `install()`,
-not both. Account the reserved buffers once, and verify reuse before comparing
-KV capacities or driver-resident bytes.
+The production reservation matches active-mode workspace, not ParaS-only transfer
+headroom, inactive state or retained EP transport. The old
+`matched_baseline_workspace.py` is retained as a small compatibility adapter for
+archived evaluation drivers: reservation is idempotent and attention binds the
+production buffers directly. It no longer installs initialization hooks.
 
 The A100 GPT-OSS `launch_server_tp_tp.sh` and `bench_one_batch_tp_tp.sh`
 default both vocabulary replication switches to `true`; either can be

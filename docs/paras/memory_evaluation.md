@@ -19,13 +19,21 @@ The implementation references are [UMM ownership and sizing](unified_memory_mana
 | ParaS, VMM off | Switches between the above | Separate EP and TP states remain resident | MoE and attention scratch stay in UMM; transfer headroom and both graph sets remain |
 | ParaS, VMM on | Same switching modes | Only active KV-index/logits backing is resident | Same UMM layout and KV capacity as VMM off |
 
-The static baselines use native single-mode execution with an **explicit matching
-workspace reservation**, not untouched native memory allocation. The
-[evaluation helper](../../scripts/paras/eval/matched_baseline_workspace.py)
-allocates scratch after weights load and before native KV profiling, then binds
-it for actual reuse. Instrumentation must verify both reservation order and
-reuse; allocating an unused matching buffer would double-count workspace.
-Larger shapes retain dynamic fallback.
+The saved reference run used an evaluation wrapper for its **matching workspace
+reservation**. That policy now lives in the [production static workspace
+module](../../python/sglang/srt/model_executor/static_workspace.py): ordinary
+supported GPT-OSS BF16 Triton launches reserve once before KV profiling and
+reuse those buffers. The old [evaluation entrypoint](../../scripts/paras/eval/matched_baseline_workspace.py)
+is a compatibility adapter for archived drivers; it installs no monkeypatches.
+The published matrix predates this integration and is not a new GPU validation
+of the production initialization path.
+
+The production path supports serial static TP or full DP-attention/DeepEP EP,
+PP=1, with explicit request limits. ParaS keeps scratch in UMM. Concurrent,
+composite, speculative, quantized, compiled and memory-saver paths retain their
+existing dynamic allocation policy. Instrumentation must verify reservation
+order and reuse, not allocate an unused matching buffer. Larger runtime shapes
+retain dynamic fallback.
 
 Both input embedding and LM head are fully replicated in static TP to match
 ParaS: set `SGLANG_GPTOSS_REPLICATED_EMBEDDING=true` and
@@ -61,6 +69,12 @@ Compare ParaS EP with static EP and ParaS TP with static TP.
 | NVSHMEM | `NVSHMEM_DISABLE_NCCL=1`; installed heap granularity 512 MiB, unchanged |
 | Instrumentation | Python phase snapshots plus approximately 1-second NVML samples; no CUPTI or LD_PRELOAD allocation interposer |
 
+Production attention sizing uses `model_config.context_len`, including the runtime
+context override and resolved RoPE scaling, when the split configuration depends
+on length. It does not blindly reserve for the checkpoint's architectural maximum.
+MoE uses the aggregate prefill/chunk budget and decode/graph limits; aggregate
+batch tokens can legitimately exceed one request's context length.
+
 The prefill override controls both ParaS TP scheduling and TP MoE reservation.
 Do not shrink its TP workspace to the EP 2K budget. The configured active-mode
 MoE/attention reservations are 540/32.5 MiB in EP and approximately
@@ -89,9 +103,10 @@ MAX_PREFILL_TOKENS=2048 PARAS_TP_MAX_PREFILL_TOKENS=8192 \
 
 This is a launch example, not the complete measurement harness. Omit VMM for
 the VMM-off case. Use `ENABLE_PARAS=0` for static EP, and the TP launcher with
-`MAX_PREFILL_TOKENS=8192` for static TP. **Static memory measurements additionally
-require the matched-workspace helper**, either as the entrypoint or through its
-instrumentation hooks. Plain launcher runs do not install those reservations.
+`MAX_PREFILL_TOKENS=8192` for static TP. The supported static production path now installs workspace reservations
+automatically; an evaluation wrapper is unnecessary. Use the saved source
+snapshot or commit `153175991` to reproduce the historical wrapper-based run
+exactly, and record the source revision for new production-path runs.
 Use the complete configuration table above and explicit graph batch lists for
 an exact comparison.
 

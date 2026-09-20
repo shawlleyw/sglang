@@ -139,6 +139,12 @@ needs a matched runtime measurement; the diagrams alone cannot establish it.
 The [evaluation protocol](memory_evaluation.md) specifies native scratch
 reservations, vocabulary layout, per-mode budgets, and reported metrics.
 
+Native static GPT-OSS BF16 Triton execution now uses the same configured scratch
+policy through [production static workspace](../../python/sglang/srt/model_executor/static_workspace.py),
+with reservation before KV profiling and direct backend reuse. It does not share
+the UMM allocation or reserve inactive-mode state. Unsupported execution paths
+keep dynamic scratch allocation; oversized supported batches also fall back.
+
 The external request-to-token table reserves stable backing for the largest
 mode capacity, capped by `max_running_requests` when configured. EP scheduler
 admission divides that global limit across ranks, while TP uses the global

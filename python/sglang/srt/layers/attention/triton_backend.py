@@ -111,6 +111,7 @@ class TritonAttnBackend(AttentionBackend):
         self.device = model_runner.device
         self._paras_workspace_mode = ParaSMode.EP
         self._paras_memory_manager = get_global_paras_memory_manager()
+        self._static_workspaces = getattr(model_runner, "static_workspaces", None)
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
@@ -266,6 +267,12 @@ class TritonAttnBackend(AttentionBackend):
             if mgr is not None
             else None
         )
+        if views is None and mgr is None:
+            workspace = getattr(self, "_static_workspaces", None)
+            if workspace is not None:
+                views = workspace.attention_views(
+                    shapes, torch.float32, self.device, zero=zero
+                )
         if views is None:
             allocate = torch.zeros if zero else torch.empty
             return [
