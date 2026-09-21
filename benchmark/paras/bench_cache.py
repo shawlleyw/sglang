@@ -3,7 +3,7 @@
 Compares three transport methods per direction:
     peer_access  - production CUDA peer-access kernel
                    (peer_access_kv_scatter / peer_access_kv_transfer).
-    nccl         - gather, NCCL all_to_all_single, and destination scatter.
+    nccl         - gather, NCCL all_to_all_single, and compact destination copy.
     nccl_overlap - same NCCL pattern, pipelined across 2 streams so a layer's
                    all_to_all overlaps with the next repetition's prep, using
                    separate staging slots and explicit reuse events.
@@ -14,6 +14,11 @@ Volume control:
     Legacy mode repeats ONE isolated layer. --resident-cache-gib instead
     allocates all uniform layers distinctly with that total resident EP K+V
     GiB per GPU. Neither mode models overlapping UMM or hybrid SWA migration.
+
+Slot policy:
+    Both directions read a scattered live source and write freshly allocated,
+    consecutive destination slots, matching the production allocator reset.
+    TP source slot assignments are shared across ranks; EP assignments are local.
 
 Usage:
     torchrun --nproc_per_node=8 bench_cache.py \\
@@ -47,9 +52,16 @@ from common.layouts import (
 )
 from common.model_configs import add_model_args, resolve_model
 from common.slot_init import random_resident_slots
-from common.cache_reference import pack_gather, unpack_gather, unpack_scatter
+from common.cache_reference import (
+    copy_compact_destination,
+    pack_gather,
+    pack_scatter,
+    unpack_gather,
+    unpack_scatter,
+)
 
 ppa = ppa3c = None  # Load the CUDA extension after CLI validation.
+SLOT_POLICY = "scattered_source_compact_destination_v1"
 
 
 def offsets_in_arena(layout: KVLayout) -> dict:
@@ -62,8 +74,19 @@ def offsets_in_arena(layout: KVLayout) -> dict:
     }
 
 
-def build_scatter_routing(ctx: IPCContext, layout: KVLayout, seed: int):
-    """Each replicated head sends a disjoint token chunk to every EP owner."""
+def build_source_slots(ctx: IPCContext, layout: KVLayout, direction: str, seed: int):
+    """Logical token order -> live physical slots, before allocator reset."""
+    n = layout.num_resident_tokens
+    if direction == "ep_to_tp":
+        count, capacity, slot_rank = n, layout.ep_max_tokens, ctx.rank
+    else:
+        # TP ranks share request/token mappings, even when they hold different heads.
+        count, capacity, slot_rank = n * ctx.world_size, layout.tp_max_tokens, 0
+    return random_resident_slots(count, capacity, slot_rank, seed).to(ctx.device)
+
+
+def build_scatter_routing(ctx: IPCContext, layout: KVLayout, source_slots):
+    """Send disjoint replica chunks from live TP slots to compact EP slots."""
     n, world, replication = (
         layout.num_resident_tokens,
         ctx.world_size,
@@ -73,18 +96,12 @@ def build_scatter_routing(ctx: IPCContext, layout: KVLayout, seed: int):
     local_tokens = (
         torch.arange(chunk, device=ctx.device) + (ctx.rank % replication) * chunk
     )
-    src_slots = (
-        torch.arange(world, device=ctx.device)[:, None] * n + local_tokens + 1
+    logical_tokens = (
+        torch.arange(world, device=ctx.device)[:, None] * n + local_tokens
     ).flatten()
+    src_slots = source_slots[logical_tokens]
     dst_ranks = torch.arange(world, device=ctx.device).repeat_interleave(chunk)
-    ep_slots = torch.cat(
-        [
-            random_resident_slots(n, layout.ep_max_tokens, owner, seed).to(ctx.device)[
-                local_tokens
-            ]
-            for owner in range(world)
-        ]
-    )
+    ep_slots = (local_tokens + 1).repeat(world)
     return src_slots.int(), dst_ranks.int(), ep_slots.int()
 
 
@@ -198,15 +215,11 @@ def _pattern(tokens, heads, dim, value_offset=0, layer_index=0):
     return (values + value_offset).to(torch.bfloat16)
 
 
-def _initialize(ctx, layout, views, direction, seed, layer_index=0):
+def _initialize(ctx, layout, views, direction, source_slots, layer_index=0):
     n = layout.num_resident_tokens
     batch = 4096
+    slots = source_slots.long()
     if direction == "ep_to_tp":
-        slots = (
-            random_resident_slots(n, layout.ep_max_tokens, ctx.rank, seed)
-            .to(ctx.device)
-            .long()
-        )
         heads = torch.arange(layout.num_kv_heads, device=ctx.device)
         for start in range(0, n, batch):
             tokens = (
@@ -229,15 +242,16 @@ def _initialize(ctx, layout, views, direction, seed, layer_index=0):
             tokens = torch.arange(
                 start, min(start + batch, n * ctx.world_size), device=ctx.device
             )
-            views["tp_k"][tokens + 1] = _pattern(
+            dst = slots[start : start + batch]
+            views["tp_k"][dst] = _pattern(
                 tokens, heads, layout.head_dim, layer_index=layer_index
             )
-            views["tp_v"][tokens + 1] = _pattern(
+            views["tp_v"][dst] = _pattern(
                 tokens, heads, layout.head_dim, 128, layer_index
             )
 
 
-def _verify(ctx, layout, views, direction, seed, layer_index=0):
+def _verify(ctx, layout, views, direction, layer_index=0):
     n = layout.num_resident_tokens
     if direction == "ep_to_tp":
         count = n * ctx.world_size
@@ -245,22 +259,16 @@ def _verify(ctx, layout, views, direction, seed, layer_index=0):
             torch.arange(layout.heads_per_rank, device=ctx.device)
             + ctx.rank * layout.num_kv_heads // ctx.world_size
         )
-        positions = None
         target = "tp"
     else:
         count = n
         heads = torch.arange(layout.num_kv_heads, device=ctx.device)
-        positions = (
-            random_resident_slots(n, layout.ep_max_tokens, ctx.rank, seed)
-            .to(ctx.device)
-            .long()
-        )
         target = "ep"
     ok = torch.ones((), dtype=torch.int32, device=ctx.device)
     for start in range(0, count, 4096):
         index = torch.arange(start, min(start + 4096, count), device=ctx.device)
         tokens = index if target == "tp" else index + ctx.rank * n
-        dst = index + 1 if positions is None else positions[start : start + 4096]
+        dst = index + 1
         for kind, offset in (("k", 0), ("v", 128)):
             ok.mul_(
                 (
@@ -297,8 +305,9 @@ def run_direction(
         for layer in range(num_layers if distinct_layers else 1)
     ]
     layer_views = [_views(ctx, layout, off) for off in offsets]
+    source_slots = build_source_slots(ctx, layout, direction, seed)
     for layer, views in enumerate(layer_views):
-        _initialize(ctx, layout, views, direction, seed, layer)
+        _initialize(ctx, layout, views, direction, source_slots, layer)
 
     def select(layer):
         index = layer if distinct_layers else 0
@@ -311,9 +320,7 @@ def run_direction(
         layout.head_dim,
     )
     if direction == "ep_to_tp":
-        slots = random_resident_slots(n, layout.ep_max_tokens, ctx.rank, seed).to(
-            ctx.device
-        )
+        slots = source_slots
         shape = (world, n, hpr, 2, dim)
 
         def direct(layer):
@@ -329,8 +336,7 @@ def run_direction(
         def unpack(recv, layer):
             _, views = select(layer)
             values = unpack_gather(recv)
-            views["tp_k"][1 : world * n + 1].copy_(values[:, :, 0, :])
-            views["tp_v"][1 : world * n + 1].copy_(values[:, :, 1, :])
+            copy_compact_destination(views["tp_k"], views["tp_v"], values)
 
         remote_bytes = (
             n
@@ -341,14 +347,9 @@ def run_direction(
             // world
         )
     else:
-        slots, owners, dst_slots = build_scatter_routing(ctx, layout, seed)
+        slots, owners, dst_slots = build_scatter_routing(ctx, layout, source_slots)
         src_long = slots.long()
         shape = (world, n // layout.replication_factor, hpr, 2, dim)
-        ep_positions = (
-            random_resident_slots(n, layout.ep_max_tokens, ctx.rank, seed)
-            .to(ctx.device)
-            .long()
-        )
 
         def direct(layer):
             off, _ = select(layer)
@@ -358,15 +359,12 @@ def run_direction(
 
         def pack(send, layer):
             _, views = select(layer)
-            send_view = send.view(-1, hpr, 2, dim)
-            send_view[:, :, 0, :] = views["tp_k"][src_long]
-            send_view[:, :, 1, :] = views["tp_v"][src_long]
+            pack_scatter(send, views["tp_k"], views["tp_v"], src_long)
 
         def unpack(recv, layer):
             _, views = select(layer)
             values = unpack_scatter(recv, layout.num_kv_heads)
-            views["ep_k"][ep_positions] = values[:, :, 0, :]
-            views["ep_v"][ep_positions] = values[:, :, 1, :]
+            copy_compact_destination(views["ep_k"], views["ep_v"], values)
 
         remote_bytes = n * layout.bytes_per_ep_slot * 2 * (world - 1) // world
 
@@ -412,7 +410,7 @@ def run_direction(
     execute(num_layers if distinct_layers else 1)
     ctx.barrier()
     for layer, views in enumerate(layer_views):
-        _verify(ctx, layout, views, direction, seed, layer)
+        _verify(ctx, layout, views, direction, layer)
     timer = CudaTimer(ctx.device, warmup=warmup, iters=iters)
     for _ in range(timer.total_iters):
         ctx.barrier()
@@ -422,7 +420,7 @@ def run_direction(
         ctx.barrier()
     # Also check the pipelined path after it has reused both staging slots.
     for layer, views in enumerate(layer_views):
-        _verify(ctx, layout, views, direction, seed, layer)
+        _verify(ctx, layout, views, direction, layer)
     stats = timer.summary()
     stats["per_layer_mean_ms"] = stats["mean"] / num_layers
     stats["per_layer_p50_ms"] = stats["p50"] / num_layers
@@ -528,6 +526,7 @@ def main():
         )
         print(f"[rank 0] arena={arena/(1024**3):.2f}GiB method={args.method}")
         print(f"[rank 0] scope={scope}; cache transfer only; no serving or UMM overlap")
+        print(f"[rank 0] slot_policy={SLOT_POLICY} seed={args.seed}")
 
     results = []
 
@@ -596,6 +595,8 @@ def main():
                 "method",
                 "variant",
                 "scope",
+                "slot_policy",
+                "seed",
                 "resident_cache_gib_requested",
                 "resident_bytes_per_rank_all_layers",
                 "arena_bytes",
@@ -634,6 +635,8 @@ def main():
                         "method": args.method,
                         "variant": args.variant if args.method == "peer_access" else "",
                         "scope": scope,
+                        "slot_policy": SLOT_POLICY,
+                        "seed": args.seed,
                         "resident_cache_gib_requested": args.resident_cache_gib,
                         "resident_bytes_per_rank_all_layers": n
                         * layout.bytes_per_ep_slot

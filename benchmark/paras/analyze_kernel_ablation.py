@@ -73,6 +73,7 @@ def analyze(raw):
     world = manifest["gpus"]
     reference = reference_bandwidth(sorted(raw.glob("nvbandwidth-*MiB.log")), world)
     results = []
+    cache_slot_policies = set()
     for kind, filename in (("weights", "weights.csv"), ("cache", "cache.csv")):
         with (raw / filename).open() as stream:
             source = list(csv.DictReader(stream))
@@ -93,6 +94,8 @@ def analyze(raw):
                 remote = int(r["remote_bytes_per_rank_all_layers"])
                 volume = float(r["resident_cache_gib_requested"])
                 workload = f"KV {volume:g} GiB"
+                slot_policy = r.get("slot_policy") or "legacy_random_ep_destination"
+                cache_slot_policies.add(slot_policy)
             ms = float(r["total_mean_ms"])
             if not math.isfinite(ms) or ms <= 0 or remote <= 0:
                 raise ValueError("Invalid latency or byte count")
@@ -105,6 +108,7 @@ def analyze(raw):
                     "resident_cache_gib": volume,
                     "method": r["method"],
                     "direction": r["direction"],
+                    "cache_slot_policy": slot_policy if kind == "cache" else "",
                     "layers": int(r["num_layers"]),
                     "iterations": int(r["n"]),
                     "total_mean_ms": ms,
@@ -120,6 +124,10 @@ def analyze(raw):
                     "staging_bytes_per_gpu": int(r["staging_bytes"]),
                 }
             )
+    if len(cache_slot_policies) > 1:
+        raise ValueError(
+            "Cannot compare cache measurements with different slot policies"
+        )
     expected = {
         (kind, volume, method, direction)
         for kind, volume in [("weights", 0.0)]
@@ -252,6 +260,10 @@ def main():
         "Efficiency = (remote bytes / measured SM-copy bandwidth) / measured transfer time. Remote bytes exclude self copies and are counted once. This is an empirical copy reference, not a proven optimal all-to-all kernel. Its fan-in/fan-out tests run separately; actual kernels have simultaneous all-to-all traffic, layout transformation, self copies, and layer fences.",
         "",
         "KV volumes are resident K+V GiB per EP GPU across distinct uniform layers, without SWA. Weights contain w13+w2 only. NCCL staging/packing/unpacking is timed. TP→EP weight overlap currently uses the sequential schedule. One fresh worker group per cell, with multiple timed iterations; not a multiple-run confidence interval.",
+        "",
+        "Cache slot policy: "
+        + next(r["cache_slot_policy"] for r in rows if r["kind"] == "cache")
+        + ".",
     ]
     (args.output / "TABLE.md").write_text("\n".join(lines) + "\n")
     inputs = {

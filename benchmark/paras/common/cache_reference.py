@@ -21,7 +21,7 @@ def unpack_gather(received):
 
 
 def scatter_token_positions(rank, world_size, replication, tokens_per_owner):
-    """Global TP token positions sent by one head replica, grouped by owner."""
+    """One-based logical TP token IDs sent by a head replica, grouped by owner."""
     if tokens_per_owner % replication:
         raise ValueError("tokens_per_owner must be divisible by replication")
     chunk = tokens_per_owner // replication
@@ -31,6 +31,21 @@ def scatter_token_positions(rank, world_size, replication, tokens_per_owner):
         for owner in range(world_size)
         for token in range(start, start + chunk)
     ]
+
+
+def pack_scatter(send, k, v, source_slots):
+    """Pack live TP slots in destination-owner order using only PyTorch ops."""
+    local_heads, dim = k.shape[1:]
+    send_view = send.view(-1, local_heads, 2, dim)
+    send_view[:, :, 0, :] = k[source_slots]
+    send_view[:, :, 1, :] = v[source_slots]
+
+
+def copy_compact_destination(k, v, values):
+    """Write newly allocated slots 1..N; slot zero remains reserved for padding."""
+    n = values.shape[0]
+    k[1 : n + 1].copy_(values[:, :, 0, :])
+    v[1 : n + 1].copy_(values[:, :, 1, :])
 
 
 def unpack_scatter(received, num_heads):

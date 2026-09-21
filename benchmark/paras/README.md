@@ -76,8 +76,15 @@ GPT-OSS's mix of full-attention and sliding-window live pages.
 - TP→EP routes W·N/R tokens per source rank, where R is the head replication
   factor. Replicas handle disjoint token subsets. N is rounded down to a
   multiple of R; the old reverse-volume cap has been removed.
+- Both directions read scattered live source slots and write fresh consecutive
+  destination slots starting at 1 (slot 0 is padding). EP source mappings are
+  rank-local; the TP source mapping is shared by all TP ranks. This matches the
+  production switch's allocator reset and request remapping. TP→EP does not
+  restore the old physical EP slots. Routing is built once, outside timing.
 - NCCL includes destination packing and unpacking using the same routes as the
-  direct kernels. All methods verify the destination, before and after timing.
+  direct kernels. After head reassembly, both directions use PyTorch `copy_`
+  into compact destination slices. NCCL baselines use no custom pack/unpack
+  kernels. All methods verify the destination, before and after timing.
 - NCCL overlap uses double staging buffers and explicit reuse events in this
   disjoint-buffer harness. It is not a demonstrated cross-layer UMM schedule.
 
@@ -206,7 +213,9 @@ buffers for every layer. It does not repeatedly transfer one small layer and
 label the result as a full resident allocation. It uses disjoint EP/TP buffers,
 not the production UMM's overlapping KV layout. At 30 GiB resident, GPT-OSS's
 source+destination arena is approximately 60 GiB per GPU; staging is additional.
-`--load` defaults to 1 in this mode; use a smaller fraction to model sparse slots.
+`--load` defaults to 1 in this mode; use a smaller fraction to model sparse EP
+source slots. The TP pool holds W·N live tokens plus padding; its source slots
+are a permutation of that resident span, without additional capacity slack.
 Actual resident bytes are rounded down to whole tokens/head-replica groups and
 recorded in the CSV. Attention weights are not transferred. Expert weights retain
 the production UMM placement but allocate no serving KV footprint in their run.
@@ -245,3 +254,10 @@ revision/diff, and GPU topology. Data initialization and destination verificatio
 are outside timing. CUDA events include staging, collectives, and layer fences;
 statistics use the slowest rank each iteration. Checksum data includes layer
 identity, so a transfer accidentally reusing the wrong layer can be detected.
+
+Cache logs/CSV record the seed and `slot_policy`:
+`scattered_source_compact_destination_v1`. Earlier results used compact TP
+sources and randomly indexed EP destinations in TP→EP; they describe a different
+workload. Use a fresh CSV for corrected runs and rerun all three cache methods
+together. The analyzer labels old data `legacy_random_ep_destination` and
+rejects mixed slot policies; existing measurements are not silently relabeled.
