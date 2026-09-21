@@ -1,6 +1,7 @@
 """CPU checks for production scratch sizing, ordering, reuse and fallback."""
 
 import ast
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -71,7 +72,7 @@ def runner(ep):
         dtype=torch.bfloat16,
         device="cpu",
         model=model,
-        model_config=SimpleNamespace(hf_config=config, context_len=128),
+        model_config=SimpleNamespace(hf_config=config, context_len=128, head_dim=8),
     )
 
 
@@ -193,7 +194,8 @@ def test_ep_moe_follows_dispatch_capacity(monkeypatch):
         dict(speculative_algorithm="EAGLE"),
         dict(pp_size=2),
         dict(quantization="fp8"),
-        dict(attention_backend="flashinfer"),
+        dict(attention_backend="fa3"),
+        dict(moe_runner_backend="triton_kernel"),
         dict(prefill_attention_backend="flashinfer"),
         dict(max_running_requests=None),
         dict(enable_torch_compile=True),
@@ -269,3 +271,160 @@ def test_auto_detected_quantization_keeps_native_allocation():
     r.model_config.quantization = "mxfp4"
     assert r.server_args.quantization is None
     assert reserve_static_workspaces(r) is None
+
+
+@pytest.mark.parametrize("ep", [True, False])
+@pytest.mark.parametrize("attention", ["triton", "flashinfer"])
+@pytest.mark.parametrize("moe", ["triton", "deep_gemm"])
+def test_qwen_reserves_supported_backend_combinations(monkeypatch, ep, attention, moe):
+    monkeypatch.setenv("SGLANG_FLASHINFER_WORKSPACE_SIZE", "4096")
+    r = runner(ep)
+    r.server_args.attention_backend = attention
+    r.server_args.moe_runner_backend = moe
+    config = r.model_config.hf_config
+    config.architectures = ["Qwen3MoeForCausalLM"]
+    config.moe_intermediate_size = config.intermediate_size
+    config.num_experts = config.num_local_experts
+    del config.intermediate_size, config.num_local_experts, config.head_dim
+    state = reserve_static_workspaces(r)
+    assert state is not None
+    assert state.moe.numel() > 0
+    if attention == "flashinfer":
+        assert state.attention.numel() == 4096
+    for layer in r.model:
+        assert layer.moe_runner_config.paras_workspace.buffer is state.moe
+
+
+@pytest.mark.parametrize("ep", [True, False])
+def test_flashinfer_reuses_preallocated_buffer_without_global_allocation(
+    monkeypatch, ep
+):
+    monkeypatch.setenv("SGLANG_FLASHINFER_WORKSPACE_SIZE", "4096")
+    r = runner(ep)
+    r.server_args.attention_backend = "flashinfer"
+    state = reserve_static_workspaces(r)
+    state.attention.fill_(23)
+    tree = ast.parse((ROOT / "layers/attention/flashinfer_backend.py").read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "FlashInferAttnBackend"
+    )
+    init = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+    )
+    # Run the real constructor's allocation block without importing CUDA wrappers.
+    start = next(
+        i
+        for i, n in enumerate(init.body)
+        if isinstance(n, ast.Assign)
+        and ast.unparse(n.targets[0]) == "self._paras_workspace_mode"
+    )
+    end = next(
+        i
+        for i, n in enumerate(init.body)
+        if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "max_bs"
+    )
+    b = SimpleNamespace(_paras_workspace=lambda: None)
+    namespace = dict(
+        self=b,
+        model_runner=r,
+        init_new_workspace=False,
+        ParaSMode=ParaSMode,
+        get_global_paras_memory_manager=lambda: None,
+        global_workspace_buffer=None,
+        torch=torch,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("FlashInfer allocated a second workspace")
+
+    monkeypatch.setattr(torch, "empty", forbidden)
+    exec(
+        compile(
+            ast.Module(body=init.body[start:end], type_ignores=[]), str(ROOT), "exec"
+        ),
+        namespace,
+    )
+    assert b.workspace_buffer is state.attention
+    assert torch.count_nonzero(b.workspace_buffer) == 0
+    assert namespace["global_workspace_buffer"] is None
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("fits", [False, True])
+def test_deepgemm_production_reservation_reuse_and_overflow(monkeypatch, masked, fits):
+    monkeypatch.setenv("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "4")
+    r = runner(True)
+    r.server_args.moe_runner_backend = "deep_gemm"
+    state = reserve_static_workspaces(r)
+    state.moe.fill_(23)
+    method_name = "_run_masked_gemm_bf16" if masked else "_run_contiguous_gemm_bf16"
+    tree = ast.parse((ROOT / "layers/moe/moe_runner/deep_gemm.py").read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "DeepGemmRunnerCore"
+    )
+    method = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == method_name
+    )
+    groups, rows, hidden, intermediate = 2, (16 if fits else 32), 64, 64
+    observed = []
+
+    def grouped(x, weight, out, *args):
+        observed.append(out.untyped_storage().data_ptr())
+        value = torch.bmm(x.reshape(groups, rows, -1), weight.transpose(1, 2))
+        out.copy_(value.reshape(out.shape))
+
+    def activate(x, out, *args):
+        gate, up = x.chunk(2, dim=-1)
+        out.copy_(torch.nn.functional.silu(gate) * up)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.layers.moe.ep_moe.kernels",
+        SimpleNamespace(silu_and_mul_masked_fwd=activate),
+    )
+    namespace = dict(
+        torch=torch,
+        DeepGemmRunnerInput=object,
+        DeepGemmMoeQuantInfo=object,
+        _is_npu=False,
+        _is_hip=False,
+        dispose_tensor=lambda x: None,
+        silu_and_mul=activate,
+        deep_gemm_wrapper=SimpleNamespace(
+            grouped_gemm_nt_bf16bf16bf16_contig=grouped,
+            grouped_gemm_nt_bf16bf16bf16_masked=grouped,
+        ),
+    )
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(ROOT), "exec"),
+        namespace,
+    )
+    x = torch.randn(groups, rows, hidden, dtype=torch.bfloat16) * 0.1
+    w13 = torch.randn(groups, 2 * intermediate, hidden, dtype=torch.bfloat16) * 0.1
+    w2 = torch.randn(groups, hidden, intermediate, dtype=torch.bfloat16) * 0.1
+    inputs = SimpleNamespace(
+        hidden_states=x if masked else x.flatten(0, 1),
+        hidden_states_scale=None,
+        masked_m=None,
+        expected_m=rows,
+        m_indices=None,
+    )
+    quant = SimpleNamespace(w13_weight=w13, w2_weight=w2)
+    runtime = dict(
+        all_tokens=groups * rows,
+        hidden_states_device="cpu",
+        hidden_states_shape=(groups * rows, hidden),
+    )
+    method_runner = SimpleNamespace(config=r.model[0].moe_runner_config)
+    actual = namespace[method_name](method_runner, inputs, quant, runtime)
+    assert (observed[0] == state.moe.data_ptr()) == fits
+    assert actual.untyped_storage().data_ptr() != state.moe.data_ptr()
+    if not fits:
+        assert torch.all(state.moe == 23)
+    method_runner.config.paras_workspace = None
+    expected = namespace[method_name](method_runner, inputs, quant, runtime)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -1,4 +1,4 @@
-"""Reusable scratch for native GPT-OSS BF16 Triton execution.
+"""Reusable scratch for native GPT-OSS and Qwen3 MoE BF16 execution.
 
 Reserve before KV profiling so cache capacity accounts for active-mode scratch.
 ParaS owns its workspace in UMM; concurrent/unsupported paths allocate normally.
@@ -66,8 +66,9 @@ def reserve_static_workspaces(runner):
         or runner.dtype != torch.bfloat16
         or args.quantization is not None
         or getattr(runner.model_config, "quantization", None) is not None
-        or args.attention_backend != "triton"
-        or args.moe_runner_backend != "triton"
+        or args.attention_backend not in ("triton", "flashinfer")
+        or args.moe_runner_backend not in ("triton", "deep_gemm")
+        or args.max_running_requests is None
         or not args.disable_overlap_schedule
         or args.enable_two_batch_overlap
         or args.enable_pdmux
@@ -80,7 +81,10 @@ def reserve_static_workspaces(runner):
     ):
         return None
     config = runner.model_config.hf_config
-    if config.architectures != ["GptOssForCausalLM"]:
+    if config.architectures not in (
+        ["GptOssForCausalLM"],
+        ["Qwen3MoeForCausalLM"],
+    ):
         return None
     ep = args.enable_dp_attention
     if ep:
@@ -95,7 +99,7 @@ def reserve_static_workspaces(runner):
         args,
         config,
         args.tp_size,
-        config.head_dim,
+        runner.model_config.head_dim,
         context_len=runner.model_config.context_len,
     )
     attention_bytes = requirements[0 if ep else 1].size_bytes
@@ -120,10 +124,14 @@ def reserve_static_workspaces(runner):
     )
     from sglang.srt.utils import get_int_env_var
 
+    # Qwen3 MoE uses different HF field names for the same expert geometry.
+    qwen = config.architectures == ["Qwen3MoeForCausalLM"]
     ep_bytes, tp_bytes = bf16_moe_workspace_sizes(
         hidden_size=config.hidden_size,
-        intermediate_size=config.intermediate_size,
-        num_experts=config.num_local_experts,
+        intermediate_size=(
+            config.moe_intermediate_size if qwen else config.intermediate_size
+        ),
+        num_experts=config.num_experts if qwen else config.num_local_experts,
         top_k=config.num_experts_per_tok,
         tp_size=args.tp_size,
         dispatch_capacity=get_int_env_var(

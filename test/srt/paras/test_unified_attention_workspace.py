@@ -12,6 +12,8 @@ from sglang.srt.paras.workspace import (
     WorkspaceRequirement,
     attention_workspace_requirements,
     triton_attention_split_config,
+    triton_attention_workspace_size,
+    workspace_views,
 )
 
 
@@ -81,6 +83,19 @@ def test_triton_uses_resolved_rope_context():
     )
     assert ep.size_bytes == 129 << 20
     assert tp.size_bytes == 129 << 20
+
+
+@pytest.mark.parametrize("requests", [1, 7])
+def test_eager_ep_reserves_scratch_for_minimum_request(requests):
+    ep, _ = requirements(
+        "triton", disable_cuda_graph=True, max_running_requests=requests
+    )
+    assert ep.size_bytes == triton_attention_workspace_size(1, 64, 8, 128)
+    buffer = torch.empty(ep.size_bytes, dtype=torch.uint8)
+    partial, lse = workspace_views(
+        buffer, ((1, 64, 8, 128), (1, 64, 8)), torch.float32, "cpu"
+    )
+    assert partial.numel() and lse.numel()
 
 
 def test_triton_deterministic_split_config(monkeypatch):

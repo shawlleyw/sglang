@@ -296,17 +296,21 @@ python -m sglang.bench_serving --backend sglang \
 
 The [memory evaluation methodology](../../../docs/paras/memory_evaluation.md)
 defines baselines, configuration, workload order, metrics and saved reproduction
-inputs. Native GPT-OSS BF16 Triton EP/TP now reserves reusable active-mode scratch
+inputs. Native GPT-OSS and Qwen3 MoE BF16 EP/TP reserve reusable active-mode scratch
 in [production](../../../python/sglang/srt/model_executor/static_workspace.py),
 before KV profiling. Ordinary `sglang.launch_server` launches use it without an
-evaluation wrapper when the execution configuration is supported.
+evaluation wrapper when the execution configuration is supported: Triton or
+FlashInfer attention, with Triton or DeepGEMM MoE. Kernel selection and hardware
+requirements stay unchanged; GPT-OSS's biased experts still use Triton.
 
 The path requires serial execution, PP=1 and an explicit request cap; unsupported
 concurrent, composite, speculative, quantized, compiled and memory-saver paths
 keep their original allocation policy. ParaS continues to reserve scratch in UMM.
 MoE sizing follows prefill/chunk, request and graph limits; EP padded scratch
-follows DeepEP dispatch capacity. Attention sizing uses the resolved runtime
-context and split settings. Oversized requests fall back to dynamic allocation.
+follows DeepEP dispatch capacity. Triton attention sizing uses the resolved runtime
+context and split settings, with at least one EP request per rank. FlashInfer
+reuses its configured workspace reservation instead of allocating a second global
+buffer. Oversized requests fall back to dynamic allocation.
 
 For static TP set both `SGLANG_GPTOSS_REPLICATED_EMBEDDING=true` and
 `SGLANG_GPTOSS_REPLICATED_LM_HEAD=true`. These match ParaS's replicated
@@ -317,10 +321,9 @@ storage, and DeepEP settings. ParaS uses `--paras-tp-max-prefill-tokens 8192`
 to preserve its TP reservation independently of the EP budget.
 
 The production reservation matches active-mode workspace, not ParaS-only transfer
-headroom, inactive state or retained EP transport. The old
-`matched_baseline_workspace.py` is retained as a small compatibility adapter for
-archived evaluation drivers: reservation is idempotent and attention binds the
-production buffers directly. It no longer installs initialization hooks.
+headroom, inactive state or retained EP transport. The obsolete evaluation helper
+has been removed. Use commit `153175991` for archived drivers that import it;
+new launches reserve and bind their workspace through production initialization.
 
 The A100 GPT-OSS `launch_server_tp_tp.sh` and `bench_one_batch_tp_tp.sh`
 default both vocabulary replication switches to `true`; either can be

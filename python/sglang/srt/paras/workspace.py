@@ -118,7 +118,7 @@ def attention_workspace_requirements(
         tp_graph_tokens = max(
             server_args.paras_tp_cuda_graph_bs or server_args.cuda_graph_bs
         )
-    ep_tokens = max(ep_graph_tokens, server_args.max_running_requests // tp_size)
+    ep_tokens = max(1, ep_graph_tokens, server_args.max_running_requests // tp_size)
     tp_tokens = max(tp_graph_tokens, server_args.max_running_requests)
     ep_heads = config.num_attention_heads
     tp_heads = ep_heads // tp_size

@@ -22,9 +22,11 @@ The implementation references are [UMM ownership and sizing](unified_memory_mana
 The saved reference run used an evaluation wrapper for its **matching workspace
 reservation**. That policy now lives in the [production static workspace
 module](../../python/sglang/srt/model_executor/static_workspace.py): ordinary
-supported GPT-OSS BF16 Triton launches reserve once before KV profiling and
-reuse those buffers. The old [evaluation entrypoint](../../scripts/paras/eval/matched_baseline_workspace.py)
-is a compatibility adapter for archived drivers; it installs no monkeypatches.
+supported GPT-OSS and Qwen3 MoE BF16 launches reserve once before KV profiling
+and reuse those buffers, with Triton or FlashInfer attention and Triton or
+DeepGEMM MoE. FlashInfer consumes the preallocated attention buffer directly;
+it does not allocate a second global workspace. The old evaluation entrypoint
+has been removed; archived drivers importing it require the historical revision.
 The published matrix predates this integration and is not a new GPU validation
 of the production initialization path.
 
@@ -33,7 +35,10 @@ PP=1, with explicit request limits. ParaS keeps scratch in UMM. Concurrent,
 composite, speculative, quantized, compiled and memory-saver paths retain their
 existing dynamic allocation policy. Instrumentation must verify reservation
 order and reuse, not allocate an unused matching buffer. Larger runtime shapes
-retain dynamic fallback.
+retain dynamic fallback. Backend eligibility does not change which BF16 MoE
+kernel the model selects: DeepGEMM requires a compatible device/model and
+DeepEP execution; GPT-OSS's biased experts retain Triton. VMM remains an
+independent opt-in restricted to Triton attention.
 
 Both input embedding and LM head are fully replicated in static TP to match
 ParaS: set `SGLANG_GPTOSS_REPLICATED_EMBEDDING=true` and
@@ -69,11 +74,15 @@ Compare ParaS EP with static EP and ParaS TP with static TP.
 | NVSHMEM | `NVSHMEM_DISABLE_NCCL=1`; installed heap granularity 512 MiB, unchanged |
 | Instrumentation | Python phase snapshots plus approximately 1-second NVML samples; no CUPTI or LD_PRELOAD allocation interposer |
 
-Production attention sizing uses `model_config.context_len`, including the runtime
+Production Triton attention sizing uses `model_config.context_len`, including the runtime
 context override and resolved RoPE scaling, when the split configuration depends
 on length. It does not blindly reserve for the checkpoint's architectural maximum.
 MoE uses the aggregate prefill/chunk budget and decode/graph limits; aggregate
-batch tokens can legitimately exceed one request's context length.
+batch tokens can legitimately exceed one request's context length. FlashInfer
+uses its configured workspace size and architecture/determinism overrides,
+matching the backend's allocation policy. EP scratch covers at least one
+request per rank even when graphs are disabled and the global request limit
+is smaller than the parallel group.
 
 The prefill override controls both ParaS TP scheduling and TP MoE reservation.
 Do not shrink its TP workspace to the EP 2K budget. The configured active-mode
@@ -118,9 +127,10 @@ from a fresh clone. Its `plan.json`, per-case `launch.json`/`launch.sh`,
 source. The base Git revision alone is insufficient because that run included
 uncommitted changes.
 
-The bundle contains a `drivers/reproduce.py` launcher that creates a **new**
+On the historical checkout (`153175991`), the bundle contains a
+`drivers/reproduce.py` launcher that creates a **new**
 artifact directory, copies the measurement hooks, resolves paths against the
-current checkout, records the current source/environment, and runs cases
+historical checkout, records the source/environment, and runs cases
 serially. From the checkout root, using the same Python/CUDA environment:
 
 ```bash
