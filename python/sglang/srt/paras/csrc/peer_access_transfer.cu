@@ -621,14 +621,16 @@ void launch_peer_access_kv_transfer(
 // EP layout: (ep_max_tokens, num_kv_heads, head_dim)
 //
 // Unlike peer_access_kv_transfer (EP→TP, where each token goes to ALL ranks),
-// each TP token goes to EXACTLY ONE EP rank (token_to_rank[t]). Warp-level peer
-// assignment ensures NVLink isolation: each warp only writes to its assigned
-// peer and skips tokens destined for other ranks.
+// each TP token goes to EXACTLY ONE EP rank (token_to_rank[t]). Divide the token
+// list into tp_size disjoint ranges and interleave their warps within each block.
+// Production groups routing entries by destination, so this exposes concurrent
+// peer writes without making every peer's warps scan and reject other tokens.
+// Resolve the actual peer per token: uneven and unsorted routes remain valid.
 //
 // NVLink optimizations (same as EP→TP kernel):
-//   - Warp-level peer assignment: peer = global_warp_id % tp_size
+//   - Warp-level token-range assignment (each entry is visited exactly once)
 //   - int4 vectorized stores (128-bit, 16 bytes per thread per store)
-//   - 8-store unrolling (4 KB contiguous per warp per iteration)
+//   - 8-store unrolling (4 KB of logical work per warp per iteration)
 //   - Self-write bypass when peer == tp_rank
 //   - __ldg() read-only cache for source reads
 //   - Fast uint32 integer division for index decomposition
@@ -657,17 +659,20 @@ __global__ void peer_access_kv_scatter(
     const int global_warp = blockIdx.x * warps_in_block + warp_in_block;
     const int total_warps = gridDim.x * warps_in_block;
 
-    // Warp-level peer assignment (NVLink guideline)
-    const int peer = global_warp % tp_size;
+    // Interleave disjoint token ranges, rather than scanning the whole list
+    // once per peer. Balanced, destination-grouped routes give each range one
+    // peer; this is only a scheduling hint, never a routing assumption.
+    const int chunk = global_warp % tp_size;
     const int warp_index = global_warp / tp_size;
-    const int warps_per_peer = total_warps / tp_size;
-
-    // Self-write bypass: avoid IPC pointer for local rank (no UVA overhead)
-    char* const dst_buf = (peer == tp_rank) ? const_cast<char*>(local_buffer) : peer_buffers[peer];
+    const int warps_per_chunk = total_warps / tp_size;
+    const int tokens_per_chunk = num_local_tokens / tp_size;
+    const int remainder = num_local_tokens % tp_size;
+    const int token_begin = chunk * tokens_per_chunk + min(chunk, remainder);
+    const int token_count = tokens_per_chunk + (chunk < remainder);
 
     // Work decomposition: fused K and V (kv_idx 0=K, 1=V)
     const int int4_per_head = (head_dim * elem_size) >> 4;  // / 16
-    const int64_t total_int4 = (int64_t)num_local_tokens * 2 * heads_per_rank * int4_per_head;
+    const int64_t total_int4 = (int64_t)token_count * 2 * heads_per_rank * int4_per_head;
 
     // Source stride (TP layout: heads_per_rank heads per token)
     const int src_token_stride = heads_per_rank * head_dim * elem_size;
@@ -687,7 +692,7 @@ __global__ void peer_access_kv_scatter(
 
     // 8 unrolled × 32 lanes = 256 int4 per warp per iteration = 4KB
     int64_t pos = (int64_t)warp_index * 256 + lane;
-    const int64_t stride = (int64_t)warps_per_peer * 256;
+    const int64_t stride = (int64_t)warps_per_chunk * 256;
 
     while (pos < total_int4) {
         #pragma unroll 8
@@ -696,46 +701,42 @@ __global__ void peer_access_kv_scatter(
             if (idx < total_int4) {
                 // Fast uint32 decomposition (hardware divider, ~20 cycles vs ~100 for int64)
                 const unsigned int idx_u = (unsigned int)idx;
-                const unsigned int token_idx = idx_u / per_token_u;
-                const unsigned int rem = idx_u - token_idx * per_token_u;
+                const unsigned int token_in_chunk = idx_u / per_token_u;
+                const unsigned int token_idx = token_begin + token_in_chunk;
+                const unsigned int rem = idx_u - token_in_chunk * per_token_u;
                 const unsigned int kv_idx = rem / per_kv_u;
                 const unsigned int rem2 = rem - kv_idx * per_kv_u;
                 const unsigned int head_local = rem2 / int4_per_head_u;
                 const unsigned int in_head = rem2 - head_local * int4_per_head_u;
 
-                // Route: only process tokens destined for this warp's peer
+                // Each token is visited by one range, irrespective of its peer.
+                const int src_token = tp_token_positions[token_idx];
+                const int ep_dst_token = ep_dst_positions[token_idx];
+
+                // Slot 0 is the reserved padding slot in both pools
+                // (TokenToKVPoolAllocator.clear seeds free_pages at index 1).
+                // SWA mappings also return 0 for already-evicted positions.
+                if (src_token == 0 || ep_dst_token == 0) continue;
+
                 const int dst_rank = token_to_rank[token_idx];
-                if (dst_rank == peer) {
-                    // Source: scattered read from local TP buffer.
-                    // Destination: scattered write to peer EP buffer via NVLink.
-                    const int src_token = tp_token_positions[token_idx];
-                    const int ep_dst_token = ep_dst_positions[token_idx];
+                char* const dst_buf = (dst_rank == tp_rank)
+                    ? const_cast<char*>(local_buffer) : peer_buffers[dst_rank];
 
-                    // Slot 0 is the reserved padding slot in both pools
-                    // (TokenToKVPoolAllocator.clear seeds free_pages at index 1)
-                    // and full_to_swa_index_mapping returns 0 for positions
-                    // whose SWA was already freed by ScheduleBatch._evict_swa
-                    // during the source-mode decode. Transferring such tokens
-                    // would shuffle padding bytes; skip them entirely to save
-                    // HBM bandwidth.
-                    if (src_token == 0 || ep_dst_token == 0) continue;
+                const int64_t src_base = (kv_idx == 0) ? src_k_offset : src_v_offset;
+                const int64_t src_off = src_base
+                    + (int64_t)src_token * src_token_stride
+                    + (int64_t)head_local * head_stride
+                    + (int64_t)in_head * 16;
 
-                    const int64_t src_base = (kv_idx == 0) ? src_k_offset : src_v_offset;
-                    const int64_t src_off = src_base
-                        + (int64_t)src_token * src_token_stride
-                        + (int64_t)head_local * head_stride
-                        + (int64_t)in_head * 16;
+                const int64_t dst_base = (kv_idx == 0) ? dst_k_offset : dst_v_offset;
+                const int64_t dst_off = dst_base
+                    + (int64_t)ep_dst_token * dst_token_stride
+                    + dst_head_base
+                    + (int64_t)head_local * head_stride
+                    + (int64_t)in_head * 16;
 
-                    const int64_t dst_base = (kv_idx == 0) ? dst_k_offset : dst_v_offset;
-                    const int64_t dst_off = dst_base
-                        + (int64_t)ep_dst_token * dst_token_stride
-                        + dst_head_base
-                        + (int64_t)head_local * head_stride
-                        + (int64_t)in_head * 16;
-
-                    *reinterpret_cast<int4*>(dst_buf + dst_off) =
-                        __ldg(reinterpret_cast<const int4*>(local_buffer + src_off));
-                }
+                *reinterpret_cast<int4*>(dst_buf + dst_off) =
+                    __ldg(reinterpret_cast<const int4*>(local_buffer + src_off));
             }
         }
         pos += stride;
@@ -786,5 +787,3 @@ void launch_peer_access_kv_scatter(
         printf("CUDA kv_scatter kernel error: %s\n", cudaGetErrorString(err));
     }
 }
-
-

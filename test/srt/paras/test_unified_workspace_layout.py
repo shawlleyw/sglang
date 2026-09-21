@@ -168,3 +168,36 @@ def test_gpt_oss_hybrid_cache_transfer_safety(page_size, swa_ratio, tp_row_bytes
         assert cache.layer_tokens[1] == cache.full_tokens
         assert cache.layer_bytes[0] <= cache.layer_bytes[1]
     assert_safe(layout)
+
+
+def test_configured_workspace_recovers_kv_without_changing_transfer_safety():
+    kwargs = dict(
+        hidden_size=2880,
+        intermediate_size=2880,
+        num_experts=128,
+        top_k=4,
+        tp_size=8,
+        dispatch_capacity=256,
+    )
+    ep, legacy_tp = bf16_moe_workspace_sizes(**kwargs)
+    same_ep, configured_tp = bf16_moe_workspace_sizes(**kwargs, tp_input_tokens=8192)
+    assert same_ep == ep
+    assert configured_tp < legacy_tp / 4
+    assert bf16_moe_workspace_sizes(**kwargs, tp_input_tokens=131072) == (ep, legacy_tp)
+    layouts = [
+        plan_unified_layout(
+            num_layers=36,
+            budget=57 << 30,
+            ep_weight_bytes=849346560,
+            tp_weight_bytes=802897920,
+            ep_workspace_bytes=ep + (260 << 20),
+            tp_workspace_bytes=tp + (int(32.5 * (1 << 20))),
+            ep_kv_row_bytes=2048,
+            tp_kv_row_bytes=256,
+        )
+        for tp in (legacy_tp, configured_tp)
+    ]
+    assert layouts[1].tp_cache.full_tokens > layouts[0].tp_cache.full_tokens
+    assert layouts[1].ep_cache.full_tokens >= layouts[0].ep_cache.full_tokens
+    for layout in layouts:
+        assert_safe(layout)

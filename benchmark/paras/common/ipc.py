@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 import torch
@@ -18,8 +18,6 @@ import torch.distributed as dist
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "python"))
-
-from sglang.srt.paras.peer_access import exchange_buffer_addresses_ipc  # noqa: E402
 
 
 @dataclass
@@ -31,10 +29,13 @@ class IPCContext:
     buf: torch.Tensor
     local_buffer_ptr: int
     peer_buffer_ptrs: torch.Tensor
+    _barrier_tensor: torch.Tensor = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self._barrier_tensor = torch.zeros(1, device=self.device)
 
     def barrier(self) -> None:
-        bar = torch.zeros(1, device=self.device)
-        dist.all_reduce(bar, group=self.tp_group)
+        dist.all_reduce(self._barrier_tensor, group=self.tp_group)
 
 
 def init_torchrun() -> Tuple[int, int]:
@@ -42,17 +43,28 @@ def init_torchrun() -> Tuple[int, int]:
         dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", rank)))
     return rank, world_size
 
 
-def setup_ipc_arena(buf_bytes: int) -> IPCContext:
+def setup_ipc_arena(buf_bytes: int, *, buffer=None, peer_access=True) -> IPCContext:
     rank, world_size = init_torchrun()
-    device = torch.device(f"cuda:{rank}")
-    buf = torch.zeros(buf_bytes, dtype=torch.uint8, device=device)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    buf = (
+        buffer
+        if buffer is not None
+        else torch.zeros(buf_bytes, dtype=torch.uint8, device=device)
+    )
     local_ptr = buf.data_ptr()
     tp_group = dist.group.WORLD
-    peer_addrs = exchange_buffer_addresses_ipc(local_ptr, tp_group, world_size, rank)
+    if peer_access:
+        from sglang.srt.paras.peer_access import exchange_buffer_addresses_ipc
+
+        peer_addrs = exchange_buffer_addresses_ipc(
+            local_ptr, tp_group, world_size, rank
+        )
+    else:
+        peer_addrs = [local_ptr] * world_size
     peer_ptrs = torch.tensor(peer_addrs, dtype=torch.int64, device=device)
     return IPCContext(
         rank=rank,
@@ -68,10 +80,10 @@ def setup_ipc_arena(buf_bytes: int) -> IPCContext:
 class CudaTimer:
     """Paired-CUDA-event timer. Usage:
 
-        timer = CudaTimer(device, warmup=5, iters=20)
-        for _ in range(timer.total_iters):
-            timer.tick(); <launch>; timer.tock()
-        timer.summary()  # {mean, p50, p90, min, max, n}
+    timer = CudaTimer(device, warmup=5, iters=20)
+    for _ in range(timer.total_iters):
+        timer.tick(); <launch>; timer.tock()
+    timer.summary()  # {mean, p50, p90, min, max, n}
     """
 
     def __init__(self, device: torch.device, warmup: int = 5, iters: int = 20):
@@ -93,11 +105,16 @@ class CudaTimer:
         self._ends.append(e)
 
     def summary(self) -> dict:
+        """Summarize the slowest rank per iteration; all ranks must participate."""
         torch.cuda.synchronize(self.device)
         all_times = [s.elapsed_time(e) for s, e in zip(self._starts, self._ends)]
-        kept = all_times[self.warmup:]
+        kept = all_times[self.warmup :]
         if not kept:
             return {"mean": 0.0, "p50": 0.0, "p90": 0.0, "p20": 0.0, "n": 0}
+        if dist.is_initialized():
+            rank_times = torch.tensor(kept, device=self.device)
+            dist.all_reduce(rank_times, op=dist.ReduceOp.MAX)
+            kept = rank_times.tolist()
         kept_sorted = sorted(kept)
         n = len(kept_sorted)
         return {

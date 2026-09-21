@@ -1,0 +1,30 @@
+{
+  "name": "qwen3-235b-bf16-h200",
+  "model_path": "/models/Qwen3-235B-A22B-Instruct-2507",
+  "world_size": 8,
+  "seed": 42,
+  "probe_prompt": "The capital of France is",
+  "probe_decode_steps": 2,
+  "logits_atol": 0.125,
+  "logits_rtol": 0.02,
+  "host_pin_memory": true,
+  "server_args": {
+    "dtype": "bfloat16",
+    "trust_remote_code": true,
+    "mem_fraction_static": 0.85,
+    "attention_backend": "triton",
+    "moe_runner_backend": "triton",
+    "max_running_requests": 2048,
+    "max_prefill_tokens": 8192,
+    "chunked_prefill_size": -1
+  },
+  "environment": {
+    "PARAS_CONFIGURE_METHOD": "peer_access",
+    "PARAS_KV_TRANSFER_METHOD": "peer_access",
+    "SGLANG_DEEPEP_BF16_DISPATCH": "true",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+    "SGLANG_ATTN_MAX_BS": "256",
+    "NVSHMEM_QP_DEPTH": "2048"
+  },
+  "experiment_version": 2
+}

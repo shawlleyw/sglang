@@ -1,170 +1,304 @@
-# ParaS Peer-Access Kernel Benchmarks
+# ParaS transfer microbenchmarks
 
-Microbench suite for the production ParaS KV cache and MoE weight transfer
-kernels in [`peer_access_transfer.cu`](file:///home/shaoyuw/sglang/python/sglang/srt/paras/csrc/peer_access_transfer.cu).
-Compares the **CUDA peer-access kernel** against the **NCCL all_to_all** and
-**NCCL all_to_all with 2-stream overlap** baselines, on both EP↔TP directions,
-for both cache and weights, across a configurable per-GPU volume.
+Compare BF16 direct peer-access kernels with NCCL staging/collectives for
+EP↔TP weight and KV redistribution. These measure transfer operations;
+server startup, request migration, graph capture, and graph activation are
+outside the measurements.
 
-## Coverage
+For the real-runtime empty-state reconfiguration baselines, see
+[reconfigure/README.md](reconfigure/README.md) and `bench_reconfigure.py`.
 
-| Surface | Direction | Kernel | Methods |
-|---|---|---|---|
-| KV cache | TP → EP (scatter) | `peer_access_kv_scatter` | peer_access \| nccl \| nccl_overlap |
-| KV cache | EP → TP (gather) | `peer_access_kv_transfer` | peer_access \| nccl \| nccl_overlap |
-| MoE w13 | EP → TP | `peer_access_fused_transfer_w13_v2` | peer_access \| nccl \| nccl_overlap |
-| MoE w13 | TP → EP | `peer_access_fused_transfer_w13_ep` | peer_access \| nccl \| nccl_overlap |
-| MoE w2 | EP → TP | `peer_access_fused_transfer_w2_v2` | peer_access \| nccl \| nccl_overlap |
-| MoE w2 | TP → EP | `peer_access_fused_transfer_w2_ep` | peer_access \| nccl \| nccl_overlap |
+## Weight bundles with the current UMM
 
-## Methods
+`bench_weights.py` uses the production `plan_unified_layout`,
+`ParaSMemoryManager` views, expert CUDA kernels, and attention reconstruction
+kernel. Each model layer has distinct planned EP/TP views in one allocation.
+EP→TP visits layers in order; TP→EP visits them in reverse. Every method fences
+after the complete layer bundle before overlapping source bytes can be reused.
+The benchmark restores the source mode outside each timed interval.
 
-- **`peer_access`** — production fused CUDA kernels with per-layer `dist.all_reduce` barrier (matches `paras_configure_tp_peer_access` / `peer_access_kv_scatter` per-layer pattern).
-- **`nccl`** — `dist.all_to_all_single` per layer, single stream (mirrors `paras_configure_tp_mlp_naive` / `do_scatter_one_layer_nccl`).
-- **`nccl_overlap`** — same `dist.all_to_all_single` pattern, pipelined across **two CUDA streams** so layer N's all_to_all overlaps with layer N+1's launch overhead (mirrors `paras_configure_tp_overlap`).
+The memory plan reserves **zero inference workspace and minimal unused KV**.
+This preserves the UMM's asymmetric weight placement and overwrite rules,
+without constructing attention/MoE backends or claiming a serving memory
+footprint. The benchmark allocates all selected model layers, including their
+attention weights. Reduce `--num-hidden-layers` for a smoke test; such a run is
+not a full-model timing. KV contents are not included in weight measurements.
 
-## Volume control
+| Selection (`--kernel`) | Measured work |
+|---|---|
+| `bundle` (default) | Expert w13 + w2 + attention QKV/O, one fence per layer |
+| `attention` | QKV/O transfer, one fence per layer |
+| `w13`, `w2` | One expert component, one fence per layer |
+| `both` | Separate w13 and w2 measurements (legacy CLI compatibility) |
+| `all` | w13, w2, attention, and combined bundle measurements |
 
-**Cache:**
+Component totals are not additive: the combined bundle shares its layer fence.
 
-```
---cache-size-gb N   # per-GPU EP buffer capacity (GiB)
---load f            # resident fraction in (0, 1]
-```
+| Method | Expert redistribution | Attention redistribution |
+|---|---|---|
+| `peer_access` | Production v2 kernels, or optional v3 | Local slices EP→TP; production Triton peer reads TP→EP |
+| `nccl` | EP→TP pack + all-to-all into target; TP→EP all-to-all + unpack | Same local slices EP→TP; rank-major all-gather + unpack TP→EP |
+| `nccl_overlap` | Independent within-layer packing stream overlaps w2 packing with w13 collective | Same as NCCL |
 
-Resident KV data per GPU = `cache_size_gb × load`. For example, `--cache-size-gb 20 --load 0.5` gives ~10 GiB resident KV per GPU.
+`nccl_overlap` deliberately keeps the UMM layer fence. It does **not** reproduce
+the old model-level cross-layer overlap path. Its overlap is useful for the
+EP→TP bundle; a single expert has no second pack to overlap, and TP→EP currently
+uses the sequential NCCL schedule. CSV `overlap_scope` records this distinction.
+Each expert has its own staging, avoiding cross-stream buffer reuse races.
 
-**EP→TP transfer** moves `num_resident_tokens` (= per-EP-partition cache budget) per source rank, broadcast to all W TP destinations (R replicas per head). This matches production EP→TP byte-for-byte.
+Qwen uses separate gate/up halves. GPT-OSS uses interleaved gate/up rows, so the
+w13 direct launch uses one gate and a doubled chunk extent. Attention handles
+replicated K/V heads: TP→EP reconstructs each K/V head from its representative
+rank. NCCL all-gather also communicates duplicate K/V replicas, then discards
+them when unpacking; that additional work is included in its measured time.
+Biases and attention sinks remain replicated outside the production UMM and
+are not transferred.
 
-**TP→EP scatter** mirrors the production `intra_rank // R` head-replica dedup: after EP→TP each TP rank holds the FULL global cache (W·N tokens of its 1 head), so production scatters W·N/R tokens per rank. The bench sets `M = min(W·N/R, ep_max_tokens-1)` to mirror this while keeping per-source EP slot ranges disjoint. To hit exact production volume, run at `load ≤ R/W` (e.g. `--load 0.25` for Qwen3 at tp=8); at higher loads the bench caps short of production volume to preserve disjoint slots and v2/v3 bytewise equality.
+All methods check coordinate-sensitive samples of every destination layer and
+component, then check the round trip before timing. Full small-tensor CPU tests
+check the NCCL layout transformations, gate ordering, actual overlapping UMM
+views, and reconstruction with poisoned duplicate attention K/V replicas.
+GPT-OSS-120B full bundles were validated on eight A100 GPUs on 2026-09-19;
+see `artifacts/20260919T070046Z_gptoss_120b_switch_eval` at the repository root.
+Other model/hardware combinations still require their own GPU smoke test below.
 
-**Weights:** volume is fixed by the model preset (`num_experts`, `hidden_size`, `moe_intermediate_size`).
+## KV kernels
 
-**Multi-layer timing:** every method's timed iteration runs **`num_hidden_layers`** back-to-back transfers (= one full EP↔TP switch). This is necessary for `nccl_overlap` to expose any pipelining benefit. Output reports both total time per iteration and per-layer mean (total / num_layers).
+`bench_cache.py` is a separate **isolated homogeneous layer** harness. It repeats
+one layer's buffers `num_hidden_layers` times to measure launch/transfer costs;
+it does not allocate a model's UMM layout, migrate request metadata, or reproduce
+GPT-OSS's mix of full-attention and sliding-window live pages.
 
-## Default model presets
+- `--cache-size-gb` sets the EP K+V capacity **for the one isolated layer** on
+  each GPU. `--load` sets its resident fraction.
+- EP→TP gathers N tokens per EP source into W·N token positions at each TP rank,
+  including required replicated heads.
+- TP→EP routes W·N/R tokens per source rank, where R is the head replication
+  factor. Replicas handle disjoint token subsets. N is rounded down to a
+  multiple of R; the old reverse-volume cap has been removed.
+- Both directions read scattered live source slots and write fresh consecutive
+  destination slots starting at 1 (slot 0 is padding). EP source mappings are
+  rank-local; the TP source mapping is shared by all TP ranks. This matches the
+  production switch's allocator reset and request remapping. TP→EP does not
+  restore the old physical EP slots. Routing is built once, outside timing.
+- NCCL includes destination packing and unpacking using the same routes as the
+  direct kernels. After head reassembly, both directions use PyTorch `copy_`
+  into compact destination slices. NCCL baselines use no custom pack/unpack
+  kernels. All methods verify the destination, before and after timing.
+- NCCL overlap uses double staging buffers and explicit reuse events in this
+  disjoint-buffer harness. It is not a demonstrated cross-layer UMM schedule.
 
-Values match upstream Hugging Face `config.json`. All bf16, `num_gates=2`.
+For GPT-OSS, run distinct volumes representing full-attention and sliding-window
+resident pages and label them as component measurements. A single cache run
+must not be described as the model's complete KV migration cost.
 
-| Preset | num_hidden_layers | num_kv_heads | head_dim | num_experts | hidden_size | moe_intermediate_size |
-|---|---:|---:|---:|---:|---:|---:|
-| `qwen3-30b` (Qwen3-30B-A3B) | 48 | 4 | 128 | 128 | 2048 | 768 |
-| `qwen3-235b` (Qwen3-235B-A22B) | 94 | 4 | 128 | 128 | 4096 | 1536 |
+## Presets
 
-Use `--model custom --num-kv-heads ... --head-dim ... --num-experts ... --hidden-size ... --moe-intermediate-size ... --num-hidden-layers ...` to override.
+All weights are BF16; GPT-OSS checkpoint quantization is not benchmarked.
 
-## Quick start
+| Preset | Layers | Q heads | KV heads | Head dim | Experts | Hidden | MoE intermediate | w13 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `qwen3-30b` | 48 | 32 | 4 | 128 | 128 | 2048 | 768 | Separate gates |
+| `qwen3-235b` | 94 | 64 | 4 | 128 | 128 | 4096 | 1536 | Separate gates |
+| `gpt-oss-120b` | 36 | 64 | 8 | 64 | 128 | 2880 | 2880 | Interleaved gates |
+
+Dimension flags override presets. For custom weight runs, supply
+`--model custom --num-attention-heads ... --num-kv-heads ... --head-dim ...
+--num-experts ... --hidden-size ... --moe-intermediate-size ...
+--num-hidden-layers ...`, optionally `--interleaved-w13`.
+
+## Running
+
+Use an activated SGLang environment with the production `paras_peer_access_cuda`
+extension installed, on one NVLink server. No model checkpoint is loaded.
+After changing CUDA sources, rebuild the extension before running:
 
 ```bash
-source /home/shaoyuw/miniconda3/etc/profile.d/conda.sh && conda activate sgl_paras
-export LD_LIBRARY_PATH=/home/shaoyuw/miniconda3/envs/sgl_paras/lib/python3.12/site-packages/torch/lib:$LD_LIBRARY_PATH
-cd /home/shaoyuw/sglang/benchmark/paras
-
-# Cache: both directions, 8 GPUs, 10 GiB cache @ 0.5 load, peer-access kernel
-torchrun --nproc_per_node=8 bench_cache.py \
-    --model qwen3-235b --tp-size 8 \
-    --cache-size-gb 10 --load 0.5 \
-    --direction both --method peer_access \
-    --warmup 3 --iters 10
-
-# Same workload via NCCL baseline
-torchrun --nproc_per_node=8 bench_cache.py \
-    --model qwen3-235b --tp-size 8 \
-    --cache-size-gb 10 --load 0.5 \
-    --direction both --method nccl \
-    --warmup 3 --iters 10
-
-# Same workload via NCCL 2-stream overlap baseline
-torchrun --nproc_per_node=8 bench_cache.py \
-    --model qwen3-235b --tp-size 8 \
-    --cache-size-gb 10 --load 0.5 \
-    --direction both --method nccl_overlap \
-    --warmup 3 --iters 10
-
-# Weights: all 4 kernels (w13/w2 × EP↔TP), default qwen3-235b
-torchrun --nproc_per_node=8 bench_weights.py \
-    --model qwen3-235b --tp-size 8 \
-    --kernel both --direction both --method peer_access \
-    --warmup 3 --iters 10
-
-# Full sweep wrapper across both models, all 3 methods, several cache configs
-NUM_GPUS=8 bash run_all.sh
+(cd python/sglang/srt/paras/csrc && python setup.py build_ext --inplace)
+export PYTHONPATH="$PWD/python/sglang/srt/paras/csrc:$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+torchrun --standalone --nproc_per_node=8 benchmark/paras/check_kv_scatter.py
 ```
 
-## CLI reference
+`check_kv_scatter.py` also accepts 2 or 4 processes. It checks complete source
+and destination buffers against a CPU reference, including uneven/unsorted
+routes, replicated and multiple local heads, empty inputs, padding skips, and
+CUDA graph replay. The production v2 scatter kernel visits each routing entry
+once, distributing disjoint token ranges across warps. Grouped destinations
+improve peer concurrency, but sorted or equally sized routes are not required.
 
-### `bench_cache.py`
+The production `MHACacheTransfer` backend and overlapping UMM layer views have
+a separate regression test. Run each head count in fresh workers:
 
-| Flag | Default | Purpose |
-|---|---|---|
-| `--model` | `qwen3-235b` | `qwen3-30b` \| `qwen3-235b` \| `custom` |
-| `--num-kv-heads`, `--head-dim`, `--num-hidden-layers` | — | Override preset (required if `custom`) |
-| `--tp-size` | `8` | Must equal `torchrun --nproc_per_node` |
-| `--cache-size-gb` | `10.0` | Per-GPU EP capacity (GiB) |
-| `--load` | `0.5` | Resident fraction in `(0, 1]` |
-| `--direction` | `both` | `tp_to_ep` (scatter) \| `ep_to_tp` (gather) \| `both` |
-| `--method` | `peer_access` | `peer_access` \| `nccl` \| `nccl_overlap` |
-| `--warmup` / `--iters` | `3` / `10` | Per-iteration timing (one iter = `num_hidden_layers` transfers) |
-| `--out-csv` | — | Append rows to this CSV |
-
-### `bench_weights.py`
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--model` | `qwen3-235b` | Preset |
-| `--num-experts`, `--hidden-size`, `--moe-intermediate-size`, `--num-hidden-layers` | — | Override preset |
-| `--tp-size` | `8` | torchrun nproc |
-| `--kernel` | `both` | `w13` \| `w2` \| `both` |
-| `--direction` | `both` | `ep_to_tp` \| `tp_to_ep` \| `both` |
-| `--method` | `peer_access` | `peer_access` \| `nccl` \| `nccl_overlap` |
-| `--warmup` / `--iters` | `3` / `10` | |
-| `--out-csv` | — | Append rows to this CSV |
-
-## Slot-based cache init
-
-To mirror production (active KV tokens sit at arbitrary slot positions in a fixed pool, not at slots `0..N`):
-
-1. Allocate `ep_max_tokens = cache_size_gb × 1024³ / bytes_per_ep_slot` slots per GPU.
-2. Each rank seeds `torch.Generator` with `seed + rank`, draws `num_resident = ep_max_tokens × load` distinct slot indices from `[1, ep_max_tokens)` (slot 0 reserved as kernel-side padding).
-3. Fills those slots with a bf16-EXACT pattern `v = rank*16 + (slot % 16) + kv_offset` (K uses 0, V uses 128; values in `[0, 256)` are bf16-exact step-1).
-
-The `peer_access` method additionally verifies bulk-GPU equality of the destination against ground truth before timing. `nccl` and `nccl_overlap` are timing-only (the production NCCL paths are upstream-verified).
-
-## Output schema
-
-Both bench scripts print one summary line per direction/kernel and (with `--out-csv`) append CSV rows with columns:
-
-```
-timestamp, model, num_layers, tp_size, ...,
-direction, method,
-total_mean_ms,        # mean across timed iterations (one iter = N layers)
-total_p50_ms,
-per_layer_mean_ms,    # total_mean_ms / num_layers
-per_layer_p50_ms,
-min_ms, max_ms, n
+```bash
+for heads in 8 4 16; do
+  PARAS_TEST_KV_HEADS="$heads" torchrun --standalone --nproc_per_node=8 \
+    -m pytest -q test/srt/paras/test_kv_scatter_single_pass.py
+done
 ```
 
-Use `per_layer_p50_ms` as the headline number; total time is reported so you can compare a full per-switch cost across methods.
+These cover one local head, replicated heads, and multiple local heads, with
+uneven destination counts and scattered source slots. Live slots start at 1,
+matching the production allocator; slot 0 remains padding.
 
-## Files
+Run a small GPU correctness/timing check first:
 
-```
-benchmark/paras/
-├── README.md
-├── run_all.sh                       # full sweep wrapper
-├── bench_cache.py                   # KV scatter + gather
-├── bench_weights.py                 # w13/w2 × EP↔TP
-├── common/
-│   ├── model_configs.py             # qwen3-30b, qwen3-235b, custom
-│   ├── ipc.py                       # IPC arena + CudaTimer
-│   ├── layouts.py                   # KVLayout / WeightLayout derivation
-│   └── slot_init.py                 # random-slot resident init
-└── results/                         # CSV output (timestamped subdirs)
+```bash
+cd benchmark/paras
+for method in peer_access nccl nccl_overlap; do
+  torchrun --standalone --nproc_per_node=8 bench_weights.py \
+    --model gpt-oss-120b --tp-size 8 --num-hidden-layers 2 \
+    --kernel all --direction both --method "$method" --warmup 1 --iters 2
+done
 ```
 
-## Notes
+Then run the full weight comparison on each corresponding server:
 
-- Default models: **Qwen3-30B-A3B** and **Qwen3-235B-A22B**.
-- The benchmark depends on the production `paras_peer_access_cuda` extension; build it once via `cd python/sglang/srt/paras/csrc && python setup.py build_ext --inplace`.
-- Outputs include `mean / p20 / p50 / p90 / min / max`. Report `p50` not `mean` when variance is bimodal; consider Mann-Whitney U for A/B significance.
-- This benchmark is **not committed** by default — files sit ready in `benchmark/paras/`.
+```bash
+# Qwen3-235B on H200
+MODELS=qwen3-235b COMPONENT=weights NUM_GPUS=8 bash run_all.sh
+# GPT-OSS-120B on A100
+MODELS=gpt-oss-120b COMPONENT=weights NUM_GPUS=8 bash run_all.sh
+```
+
+For selected kernel components or KV volumes:
+
+```bash
+torchrun --standalone --nproc_per_node=8 bench_weights.py \
+  --model qwen3-235b --tp-size 8 --kernel all --method nccl \
+  --direction both --warmup 3 --iters 10 --out-csv results/weights-nccl.csv
+
+torchrun --standalone --nproc_per_node=8 bench_cache.py \
+  --model qwen3-235b --tp-size 8 --cache-size-gb 1 --load 0.5 \
+  --direction both --method peer_access --variant v2 \
+  --warmup 3 --iters 10 --out-csv results/cache.csv
+```
+
+Use `--variant v3` for explicit optional kernel ablations; v2 is the runtime
+expert-kernel default. The sweep wrapper defaults to v2 and stops on failures.
+The current v3 expert extension only specializes Qwen shapes
+`(H,I)=(4096,1536)` and `(2048,768)` at TP=4/8 with separate gates. GPT-OSS
+expert transfers must use v2; requesting v3 fails before GPU initialization.
+`--help` documents the full CLI.
+
+## Timing and reporting
+
+CUDA events enclose transfers, staging copies, and the appropriate fences.
+All ranks contribute; statistics use the **maximum rank time per iteration**,
+then discard warmup and compute mean/median. Weight restoration is excluded.
+The weight total measures the full selected set of distinct layers; the KV
+total is a repeated-layer microbenchmark. Neither is end-to-end switch latency.
+
+CSV rows record model, layer count, direction, method, variant, total and
+per-layer timing. Weight rows also include UMM arena size, explicit NCCL staging
+allocation, gate layout, and overlap scope. KV rows include scope, actual remote
+bytes per rank per layer, and staging bytes. Staging sizes are **not peak GPU
+memory**: CUDA/NCCL state and temporary PyTorch packing allocations are excluded.
+Use a fresh output file if its schema differs from an earlier benchmark version.
+
+CPU reference checks (no GPU needed):
+
+```bash
+python -m unittest discover -s benchmark/paras/tests -v
+python -m pytest -q benchmark/paras/tests
+```
+
+## Expert-only and resident-cache kernel ablation
+
+### Model and hardware compatibility
+
+The default production `v2` kernels support both A100 (SM80) and H200 (SM90);
+`python/sglang/srt/paras/csrc/setup.py` builds both architectures. Kernel launch
+geometry uses the device's SM count. Rebuild the extension from the checkout on
+each server; changing Python source does not replace an older installed binary.
+`PARAS_KV_TRANSFER_METHOD=peer_access` selects the production path shared by MHA
+and SWA. No serving import depends on the benchmark adapters.
+
+| Model preset | BF16 KV shape | Expert gate layout | Reconfiguration config |
+|---|---|---|---|
+| `gpt-oss-120b` | 8 heads × 64 | Interleaved gate/up | `configs/gpt_oss_120b_a100.json` |
+| `qwen3-235b` | 4 heads × 128 | Separate gate/up | `configs/qwen3_235b_h200.json` |
+| `qwen3-30b` | 4 heads × 128 | Separate gate/up | Qwen config with `--model-path` pointing to 30B |
+
+The JSON filenames describe the intended experiments, not a hardware dispatch
+restriction. The reconfiguration worker reads actual checkpoint dimensions, and
+its `--model-path` override can select either Qwen size. Use BF16 checkpoints.
+Memory fractions and graph limits still need to fit each model/server pairing;
+old GPT-OSS/A100 measurements do not validate H200 or Qwen end-to-end execution.
+CPU reference tests cover both gate layouts, KV head dimensions and replication;
+production CUDA compilation is checked for both SM80 and SM90. Hardware smoke
+tests remain necessary before recording new results after the runtime rebase.
+
+For the reference build, pass architecture `80` on A100 or `90` on H200:
+
+```bash
+bash benchmark/paras/build_nvbandwidth.sh /tmp/nvbandwidth-h200 90
+python benchmark/paras/run_kernel_ablation.py --model qwen3-235b --dry-run \
+  --output /tmp/qwen3-kernel-plan
+```
+
+At TP8 and full occupancy, the cache arena alone is approximately **2×** the
+resident EP K+V volume for GPT-OSS, and **3×** for either Qwen preset because
+Qwen's four KV heads are replicated across eight TP ranks. Thus 10/20/30 GiB
+requires about 20/40/60 GiB per GPU for GPT-OSS, versus 30/60/90 GiB for Qwen,
+before NCCL staging, temporary tensors, and CUDA overhead. Qwen's 30 GiB case
+cannot fit an 80 GiB A100; select smaller volumes with `--cache-gib 10 20` there.
+The 30 GiB setting targets H200 capacity. Under Qwen replication, EP→TP also
+transfers twice the remote payload of TP→EP; the CSV accounts for this.
+
+`run_kernel_ablation.py` runs the expert weights (`--kernel experts`, w13+w2
+with one fence per layer, excluding attention) and uniform KV layers at total
+resident EP K+V volumes of 10/20/30 **GiB per GPU**. GPT-OSS uses all 36 layers,
+eight KV heads, head dimension 64 and BF16; SWA is disabled for this microbenchmark.
+The new `bench_cache.py --resident-cache-gib` allocates distinct source/destination
+buffers for every layer. It does not repeatedly transfer one small layer and
+label the result as a full resident allocation. It uses disjoint EP/TP buffers,
+not the production UMM's overlapping KV layout. At 30 GiB resident, GPT-OSS's
+source+destination arena is approximately 60 GiB per GPU; staging is additional.
+`--load` defaults to 1 in this mode; use a smaller fraction to model sparse EP
+source slots. The TP pool holds W·N live tokens plus padding; its source slots
+are a permutation of that resident span, without additional capacity slack.
+Actual resident bytes are rounded down to whole tokens/head-replica groups and
+recorded in the CSV. Attention weights are not transferred. Expert weights retain
+the production UMM placement but allocate no serving KV footprint in their run.
+
+```bash
+# Serving environment activated; build the reference without installing anything system-wide.
+bash benchmark/paras/build_nvbandwidth.sh /tmp/nvbandwidth-reference 80
+
+# CPU-only command/provenance preparation:
+python benchmark/paras/run_kernel_ablation.py --dry-run \
+  --output /tmp/kernel-ablation-plan \
+  --nvbandwidth /tmp/nvbandwidth-reference/build/nvbandwidth
+
+# GPU correctness smoke (all three methods, both directions):
+python benchmark/paras/run_kernel_ablation.py --smoke --warmup 1 --iters 2 \
+  --output results/kernel-smoke
+
+# Full sweep, with SM-only nvbandwidth references (no copy-engine tests):
+python benchmark/paras/run_kernel_ablation.py \
+  --output results/kernel-ablation \
+  --nvbandwidth /tmp/nvbandwidth-reference/build/nvbandwidth
+```
+
+The reference sweeps 256/512/1024 MiB per peer, five samples using the mean,
+for `device_to_device_memcpy_write_sm`, `one_to_all_write_sm`, and
+`all_to_one_write_sm`. All ParaS expert and KV kernels tested here use remote
+writes. The one-to-all and all-to-one results measure outbound and inbound
+bandwidth limits separately; they do not reproduce simultaneous all-to-all
+traffic and are not a proof of a mathematical optimum. Report efficiency against
+the **measured SM-copy reference**, including the selected denominator and its
+traffic-pattern limitation. Count remote payload once, excluding self transfers;
+do not sum send and receive bytes or compare against a duplex bandwidth number.
+
+`run_kernel_ablation.py` records each command, status, source hashes/archive, Git
+revision/diff, and GPU topology. Data initialization and destination verification
+are outside timing. CUDA events include staging, collectives, and layer fences;
+statistics use the slowest rank each iteration. Checksum data includes layer
+identity, so a transfer accidentally reusing the wrong layer can be detected.
+
+Cache logs/CSV record the seed and `slot_policy`:
+`scattered_source_compact_destination_v1`. Earlier results used compact TP
+sources and randomly indexed EP destinations in TP→EP; they describe a different
+workload. Use a fresh CSV for corrected runs and rerun all three cache methods
+together. The analyzer labels old data `legacy_random_ep_destination` and
+rejects mixed slot policies; existing measurements are not silently relabeled.

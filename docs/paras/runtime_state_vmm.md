@@ -119,6 +119,15 @@ mid-chunk request state.
 
 ## CPU validation
 
+The standalone [reconfiguration benchmark](../../benchmark/paras/reconfigure/README.md#compare-vmm-off-and-on)
+accepts `--vmm off|on|both` for comparisons of switch latency and boundary memory.
+It covers all five switching methods, preserves their Weights/Graph/Others
+breakdown, and records VMM resident/virtual bytes separately from PyTorch memory.
+Native engine restart is one shared reference labeled VMM not applicable.
+The full method follows production graph activation; recapture methods use a
+benchmark-only scratch-reuse adapter, with no changes to normal serving code.
+New recapture configurations need GPU validation before using their results.
+
 Run with GPUs hidden and the clone first on `PYTHONPATH`:
 
 ```sh
