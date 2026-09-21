@@ -62,7 +62,6 @@ def validate_config(config):
         "enable_memory_saver",
         "enable_two_batch_overlap",
         "enable_pdmux",
-        "paras_vmm_runtime_states",
     ):
         if options.get(field, False):
             raise ValueError(f"{field} is not supported by this benchmark")
@@ -71,12 +70,65 @@ def validate_config(config):
             raise ValueError(f"{field} is not supported by this BF16 decoder benchmark")
     if options.get("dtype", "bfloat16") not in ("bfloat16", "bf16"):
         raise ValueError("Benchmark weights must use BF16")
+    vmm = options.get("paras_vmm_runtime_states", False)
+    if type(vmm) is not bool:
+        raise ValueError("paras_vmm_runtime_states must be a boolean")
+    if vmm:
+        # Match production's opt-in restrictions without importing CUDA/SGLang
+        # in the dry-run driver. Other restrictions are checked above.
+        for field in (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        ):
+            allowed = ("triton",) if field == "attention_backend" else (None, "triton")
+            if options.get(field) not in allowed:
+                raise ValueError(f"paras_vmm_runtime_states requires Triton {field}")
     if result.get("probe_decode_steps", 2) < 1:
         raise ValueError("probe_decode_steps must be positive")
     warmups = result.setdefault("warmup_switches", 1)
     if type(warmups) is not int or warmups < 0:
         raise ValueError("warmup_switches must be a nonnegative integer")
     return result
+
+
+def vmm_configurations(config, selection=None):
+    """Resolve CLI overrides before validation; no flag preserves config policy."""
+    if selection not in (None, "off", "on", "both"):
+        raise ValueError(f"Unsupported VMM selection: {selection}")
+    if selection is None:
+        resolved = validate_config(config)
+        setting = (
+            "on"
+            if resolved.get("server_args", {}).get("paras_vmm_runtime_states", False)
+            else "off"
+        )
+        return {setting: resolved}
+    settings = ("off", "on") if selection == "both" else (selection,)
+    variants = {}
+    for setting in settings:
+        variant = deepcopy(config)
+        variant.setdefault("server_args", {})["paras_vmm_runtime_states"] = (
+            setting == "on"
+        )
+        variants[setting] = validate_config(variant)
+    return variants
+
+
+def trial_plan(methods, directions, repetitions, settings):
+    """Each VMM variant gets fresh workers; restart is one shared native reference."""
+    return [
+        {
+            "method": method,
+            "direction": direction,
+            "repetition": repetition,
+            "vmm": setting,
+        }
+        for repetition in range(1, repetitions + 1)
+        for method in methods
+        for direction in directions
+        for setting in (("not_applicable",) if method == "rebuild" else settings)
+    ]
 
 
 def server_arguments(config, mode="ep", paras=True):
@@ -90,6 +142,9 @@ def server_arguments(config, mode="ep", paras=True):
     world = config["world_size"]
     ep = mode == "ep"
     if not paras:
+        # Native restart has no dual-mode graph scratch. Record it as N/A in
+        # the trial plan and never pass an invalid ParaS-only opt-in to Engine.
+        args["paras_vmm_runtime_states"] = False
         # The native restart target has no ParaS settings. Translate its TP
         # prefill limit so scheduling and workspace reservation remain matched.
         tp_prefill = args.pop("paras_tp_max_prefill_tokens", None)

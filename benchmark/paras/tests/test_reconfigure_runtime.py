@@ -299,6 +299,43 @@ class RuntimeOrderingTest(unittest.TestCase):
             events, ["begin_runtime_switch_ms", "switch_tp", "end_runtime_switch_ms"]
         )
 
+    def test_recapture_activates_vmm_between_runtime_switch_and_capture(self):
+        for method in (
+            "host_reload",
+            "host_model_to",
+            "naive_nccl",
+            "fixed_buffer_recapture",
+        ):
+            for source, target in (
+                (ParaSMode.EP, ParaSMode.TP),
+                (ParaSMode.TP, ParaSMode.EP),
+            ):
+                runtime, events = self.runtime(
+                    source, method, independent=method != "fixed_buffer_recapture"
+                )
+                runtime.runner.graph_runner._paras_runtime_memory = SimpleNamespace(
+                    activate=lambda mode: events.append(f"activate_{mode.value}")
+                )
+                runtime.switch(target, measured=True)
+                self.assertLess(
+                    events.index(f"switch_{target.value}"),
+                    events.index(f"activate_{target.value}"),
+                )
+                self.assertLess(
+                    events.index(f"activate_{target.value}"),
+                    events.index("end_runtime_switch_ms"),
+                )
+                self.assertLess(
+                    events.index("end_runtime_switch_ms"), events.index("capture")
+                )
+
+    def test_full_vmm_activation_stays_in_production_graph_state_load(self):
+        runtime, _ = self.runtime(ParaSMode.EP, "full")
+        memory = SimpleNamespace(activate=Mock())
+        runtime.runner.graph_runner._paras_runtime_memory = memory
+        runtime.switch(ParaSMode.TP, measured=True)
+        memory.activate.assert_not_called()  # Adapter adds no second activation.
+
     def test_fixed_buffer_recaptures_only_measured_transition(self):
         runtime, events = self.runtime(ParaSMode.EP, "fixed_buffer_recapture")
         runtime.switch(ParaSMode.TP)

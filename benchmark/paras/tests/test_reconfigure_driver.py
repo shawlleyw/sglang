@@ -6,12 +6,20 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 BENCH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BENCH))
 
-from bench_reconfigure import Worker, summarize
-from reconfigure.configuration import server_arguments, validate_config
+from bench_reconfigure import Worker, main, summarize
+from reconfigure.configuration import (
+    METHODS,
+    DIRECTIONS,
+    server_arguments,
+    trial_plan,
+    validate_config,
+    vmm_configurations,
+)
 
 
 class ReconfigureDriverTest(unittest.TestCase):
@@ -57,11 +65,154 @@ class ReconfigureDriverTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "v1 override"):
             validate_config(config)
 
-    def test_vmm_is_not_silently_enabled_for_recapture_baselines(self):
+    def test_vmm_preserved_for_switching_but_disabled_for_native_restart(self):
         config = json.loads((BENCH / "configs/gpt_oss_120b_a100.json").read_text())
         config["server_args"]["paras_vmm_runtime_states"] = True
-        with self.assertRaisesRegex(ValueError, "paras_vmm_runtime_states"):
-            validate_config(config)
+        resolved = validate_config(config)
+        for mode in ("ep", "tp"):
+            self.assertTrue(
+                server_arguments(resolved, mode)["paras_vmm_runtime_states"]
+            )
+            self.assertFalse(
+                server_arguments(resolved, mode, paras=False)[
+                    "paras_vmm_runtime_states"
+                ]
+            )
+        self.assertTrue(config["server_args"]["paras_vmm_runtime_states"])
+
+    def test_vmm_backend_restrictions_apply_before_launch(self):
+        config = json.loads((BENCH / "configs/gpt_oss_120b_a100.json").read_text())
+        for field in (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        ):
+            for invalid in ("flashinfer", "fa3"):
+                with self.subTest(field=field, invalid=invalid):
+                    variant = json.loads(json.dumps(config))
+                    variant["server_args"][field] = invalid
+                    with self.assertRaisesRegex(ValueError, "requires Triton"):
+                        vmm_configurations(variant, "on")
+        config["server_args"]["paras_vmm_runtime_states"] = "false"
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            vmm_configurations(config)
+
+    def test_vmm_variants_are_independent_and_cli_overrides_config(self):
+        config = json.loads((BENCH / "configs/gpt_oss_120b_a100.json").read_text())
+        variants = vmm_configurations(config, "both")
+        self.assertEqual(list(variants), ["off", "on"])
+        variants["on"]["server_args"]["max_running_requests"] = 512
+        self.assertEqual(variants["off"]["server_args"]["max_running_requests"], 2048)
+        self.assertNotIn("paras_vmm_runtime_states", config["server_args"])
+        config["server_args"]["paras_vmm_runtime_states"] = True
+        self.assertEqual(list(vmm_configurations(config)), ["on"])
+        self.assertEqual(list(vmm_configurations(config, "off")), ["off"])
+
+    def test_both_variants_measure_restart_once_per_direction_and_repetition(self):
+        plan = trial_plan(METHODS, DIRECTIONS, 2, ("off", "on"))
+        self.assertEqual(len(plan), 44)
+        restart = [x for x in plan if x["method"] == "rebuild"]
+        self.assertEqual(len(restart), 4)
+        self.assertEqual({x["vmm"] for x in restart}, {"not_applicable"})
+        for method in METHODS[1:]:
+            cells = [x for x in plan if x["method"] == method]
+            self.assertEqual(len(cells), 8)
+            self.assertEqual({x["vmm"] for x in cells}, {"off", "on"})
+
+    def test_vmm_dry_runs_record_exact_plan_without_importing_runtime(self):
+        import subprocess
+
+        # A fresh interpreter rejects even importing torch; the real CLI must
+        # still generate both model plans and their separately resolved configs.
+        for preset in ("gpt_oss_120b_a100", "qwen3_235b_h200"):
+            with tempfile.TemporaryDirectory() as temp:
+                script = (
+                    "import runpy,sys\n"
+                    "class NoRuntime:\n"
+                    " def find_spec(self, fullname, *args):\n"
+                    "  if fullname.split('.')[0] in ('torch','sglang'):\n"
+                    "   raise AssertionError('dry run imported runtime: '+fullname)\n"
+                    "sys.meta_path.insert(0, NoRuntime())\n"
+                    f"sys.path.insert(0, {str(BENCH)!r})\n"
+                    f"runpy.run_path({str(BENCH / 'bench_reconfigure.py')!r}, run_name='__main__')\n"
+                )
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        script,
+                        "--config",
+                        str(BENCH / f"configs/{preset}.json"),
+                        "--vmm",
+                        "both",
+                        "--repetitions",
+                        "1",
+                        "--output",
+                        temp,
+                        "--dry-run",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                manifest = json.loads((Path(temp) / "manifest.json").read_text())
+                self.assertEqual(manifest["vmm_settings"], ["off", "on"])
+                self.assertEqual(len(manifest["trial_plan"]), 22)
+                self.assertNotIn("gpu_inventory", manifest)
+                for setting, name in manifest["resolved_configs"].items():
+                    variant = json.loads((Path(temp) / name).read_text())
+                    self.assertEqual(
+                        variant["server_args"]["paras_vmm_runtime_states"],
+                        setting == "on",
+                    )
+
+    def test_vmm_driver_passes_each_resolved_config_to_fresh_trial(self):
+        config = BENCH / "configs/gpt_oss_120b_a100.json"
+        seen = []
+
+        def run_trial(path, directory, method, direction, timeout):
+            resolved = json.loads(path.read_text())
+            args = server_arguments(resolved, paras=method != "rebuild")
+            setting = (
+                "not_applicable"
+                if method == "rebuild"
+                else ("on" if args["paras_vmm_runtime_states"] else "off")
+            )
+            seen.append((method, direction, setting, directory))
+            return dict(vmm=setting, switch_ms=1, through_probe_ms=2)
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "sys.argv",
+            [
+                "bench_reconfigure.py",
+                "--config",
+                str(config),
+                "--vmm",
+                "both",
+                "--methods",
+                "rebuild",
+                "full",
+                "--repetitions",
+                "1",
+                "--output",
+                temp,
+            ],
+        ), patch("bench_reconfigure.trial", side_effect=run_trial), patch(
+            "bench_reconfigure.command_output",
+            return_value={"stdout": "", "returncode": 0},
+        ):
+            main()
+            rows = [
+                json.loads(x)
+                for x in (Path(temp) / "trials.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(rows), 6)
+            self.assertEqual(len({x[3] for x in seen}), 6)
+            self.assertEqual(len([x for x in seen if x[2] == "on"]), 2)
+            self.assertEqual(
+                len(json.loads((Path(temp) / "summary.json").read_text())), 6
+            )
 
     def test_static_restart_translates_mode_specific_prefill_limits(self):
         config = json.loads((BENCH / "configs/gpt_oss_120b_a100.json").read_text())
@@ -147,6 +298,22 @@ class ReconfigureDriverTest(unittest.TestCase):
         summary = summarize(rows)
         self.assertEqual(summary[0]["n"], 3)
         self.assertEqual(summary[0]["switch_median_ms"], 5)
+
+    def test_summary_never_pools_vmm_on_and_off(self):
+        rows = [
+            dict(
+                method="full",
+                direction="ep_to_tp",
+                status="passed",
+                vmm=vmm,
+                switch_ms=value,
+                through_probe_ms=value + 3,
+            )
+            for vmm, value in (("off", 2), ("off", 4), ("on", 40), ("on", 60))
+        ]
+        summary = {x["vmm"]: x for x in summarize(rows)}
+        self.assertEqual(summary["off"]["switch_median_ms"], 3)
+        self.assertEqual(summary["on"]["switch_median_ms"], 50)
 
     def test_worker_protocol_and_owned_process_cleanup(self):
         with tempfile.TemporaryDirectory() as temp:

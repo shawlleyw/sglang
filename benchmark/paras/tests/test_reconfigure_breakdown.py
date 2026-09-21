@@ -77,6 +77,22 @@ class BreakdownTest(unittest.TestCase):
         self.assertEqual(result["graph_ms"], 0)
         self.assertEqual(result["others_ms"], 80)
 
+    def test_vmm_label_is_preserved_and_activation_stays_in_others(self):
+        row = self.trial()
+        row["vmm"] = "on"
+        before = breakdown_trial(row)
+        row["switch_ms"] += 7
+        row["rank_results"][1]["switch_ms"] += 7
+        row["rank_results"][1]["phases"]["runtime_switch_ms"] += 7
+        after = breakdown_trial(row)
+        self.assertEqual(after["vmm"], "on")
+        self.assertEqual(after["weights_ms"], before["weights_ms"])
+        self.assertEqual(after["graph_ms"], before["graph_ms"])
+        self.assertEqual(after["others_ms"], before["others_ms"] + 7)
+        self.assertEqual(
+            after["runtime_nonweight_ms"], before["runtime_nonweight_ms"] + 7
+        )
+
     def test_restart_split_is_unavailable_not_all_others(self):
         result = breakdown_trial(
             {

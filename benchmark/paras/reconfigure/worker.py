@@ -53,6 +53,10 @@ def _rank_worker(
             from reconfigure.runtime import Runtime, install_independent_storage
             from sglang.srt.paras.mode import ParaSMode
 
+            if args_dict.get("paras_vmm_runtime_states", False) and method != "full":
+                from reconfigure.runtime_memory import install_recapture_vmm
+
+                install_recapture_vmm()
             if method in (*HOST_METHODS, "naive_nccl"):
                 # Independent storage has no production IPC weight/KV arena.
                 # Empty-state baseline only: no live cache payload is moved.
@@ -84,6 +88,7 @@ def _rank_worker(
                     "graph_state": runtime.graph_state_report(),
                     "kv_reservation": kv_reservation(runtime.manager),
                     "memory": memory_snapshot(),
+                    "runtime_vmm": runtime.vmm_report(),
                     "independent_weight_storage": (
                         runtime.manager.weight_storage_report(runtime.mode)
                         if runtime.independent
@@ -180,11 +185,15 @@ def supervise(config, method, direction, directory, timeout):
             return
         messages = collect(connections, processes, "result", timeout)
         results = sorted((x["result"] for x in messages), key=lambda x: x["rank"])
+        vmm = "on" if args.paras_vmm_runtime_states else "off"
+        if any(x["vmm"] != vmm for x in results):
+            raise RuntimeError("Worker VMM setting differs from supervisor")
         # Wall-clock critical path; do not sum independently maximized phases.
         result = {
             "switch_ms": max(x["switch_ms"] for x in results),
             "through_probe_ms": max(x["through_probe_ms"] for x in results),
             "rank_results": results,
+            "vmm": vmm,
             "validation": "passed",
             "weight_transport": METHOD_TRANSPORT[method],
             "scope": "scheduler_worker_reconfiguration_empty_requests",

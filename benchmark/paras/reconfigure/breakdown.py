@@ -37,6 +37,9 @@ def breakdown_trial(trial, *, reference=False):
     result = {
         "method": trial["method"],
         "direction": trial["direction"],
+        "vmm": trial.get(
+            "vmm", "not_applicable" if trial["method"] == "rebuild" else "off"
+        ),
         "repetition": trial.get("repetition", 1),
         "origin": trial.get("result_origin", "reference" if reference else "measured"),
         "total_ms": total,
@@ -132,8 +135,8 @@ def main():
         "duration; components sum to that total before rounding. Rows remain "
         "individual trials, not independently aggregated phase statistics.",
         "",
-        "| Method | Direction | Origin | Rank | Weights | Graph | Others | Total |",
-        "|---|---|---|---:|---:|---:|---:|---:|",
+        "| Method | Direction | VMM | Origin | Rank | Weights | Graph | Others | Total |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         values = [
@@ -142,7 +145,7 @@ def main():
         ]
         rank = row["rank"] if row["rank"] is not None else "—"
         lines.append(
-            f"| {row['method']} | {row['direction']} | {row['origin']} | {rank} | "
+            f"| {row['method']} | {row['direction']} | {row['vmm']} | {row['origin']} | {rank} | "
             + " | ".join(values)
             + " |"
         )
@@ -162,7 +165,8 @@ def main():
         "Others = total - Weights - Graph. It includes parallel-mode/group and "
         "scheduler/sampler reconfiguration, empty-request/KV metadata bookkeeping "
         "and collectives, pool resizing/reset, attention/backend/workspace setup "
-        "and rebinding, saved graph activation, production waits outside the "
+        "and rebinding, saved graph activation (including VMM unmap/map, scratch "
+        "reset and synchronization when enabled), production waits outside the "
         "transfer phase, final device synchronization/barrier, and Python/timer "
         "overhead. No live KV payload is transferred in these empty-state trials.",
         "",

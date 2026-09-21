@@ -163,8 +163,8 @@ host wait. Host reload needs no cross-rank fence for its H2D copies.
 Naive NCCL includes attention transfers in both directions:
 EP→TP takes local QKV/O slices; TP→EP gathers and reconstructs full projections,
 discarding duplicate KV-head replicas. GPT-OSS gate/up interleaving is supported.
-All runtime patches exist only in the fresh benchmark workers, with no production
-server flags, global sitecustomize changes, or modifications to serving code.
+All runtime patches exist only in the fresh benchmark workers, with no new
+production flags, global sitecustomize changes, or modifications to serving code.
 
 ## Configuration and dry runs
 
@@ -206,8 +206,9 @@ Direct workers also apply production's optional GPU CPU-affinity and NUMA policy
 before model construction, and record their effective CPU affinity.
 Supported scope is a single node, PP=1, ordinary Qwen3-MoE/GPT-OSS decoding without
 quantization, speculation, LoRA, memory-saver, or torch.compile. The optional
-`paras_vmm_runtime_states` mode is excluded: these baselines recapture/reallocate
-ordinary graph state, while production VMM manages persistent per-mode addresses.
+`paras_vmm_runtime_states` mode is supported for the five switching methods with
+explicit Triton attention, prefill and decode backends (the latter two may inherit
+the main backend). Native restart is a shared reference without dual-mode VMM.
 
 From the repository root, validation without GPU access:
 
@@ -257,6 +258,71 @@ The driver defaults to a 30-minute timeout per worker stage; `--timeout` overrid
 it. Failures stop the sweep, retain logs, and create failed trial records. Cleanup
 is restricted to process groups created by this driver.
 
+### Compare VMM off and on
+
+`--vmm off`, `--vmm on`, and `--vmm both` override
+`server_args.paras_vmm_runtime_states`. Omitting the option preserves the config's
+value, which defaults to off. The same option works with the GPT-OSS/A100 and
+Qwen3/H200 configs; no model dimensions or GPU architecture are hardcoded in the
+adapter. The production CUDA driver checks device VMM support at initialization.
+
+```bash
+# CPU-only plan: 22 trials for six methods, both directions, one repetition.
+python benchmark/paras/bench_reconfigure.py \
+  --config benchmark/paras/configs/gpt_oss_120b_a100.json \
+  --vmm both --repetitions 1 \
+  --output /tmp/gptoss-vmm-plan --dry-run
+
+# Run only when all eight GPUs are available; start with a full-method smoke run.
+python benchmark/paras/bench_reconfigure.py \
+  --config benchmark/paras/configs/gpt_oss_120b_a100.json \
+  --vmm both --methods full --direction both --repetitions 1 \
+  --output results/gptoss-vmm-full-smoke
+
+# All switching methods plus one shared restart reference per direction/repetition.
+python benchmark/paras/bench_reconfigure.py \
+  --config benchmark/paras/configs/gpt_oss_120b_a100.json \
+  --vmm both --direction both --repetitions 3 \
+  --output results/gptoss-vmm-comparison
+```
+
+Both variants use identical graph limits, KV planning inputs, model and transport
+configuration in separate fresh workers. Restart constructs native single-mode
+engines, for which the ParaS VMM flag is invalid. It therefore runs once per
+direction/repetition and is labeled `vmm: "not_applicable"`, including when only
+`--vmm on` is requested. Its effective Engine arguments explicitly disable VMM.
+Do not count that shared reference twice when pooling repetitions.
+
+This compares the existing production
+[runtime-state VMM mechanism](../../../docs/paras/runtime_state_vmm.md): only the
+active mode's **logits and main Triton KV-index scratch** have physical backing.
+Weights, KV contents, SWA indices and graph-private pools are outside that scope.
+It is a memory/latency tradeoff, not an alternative weight-transfer kernel.
+
+`full` uses production graph-state activation without an adapter. Recapture
+methods retain only the two named scratch tensors per mode and reinitialize
+them during buffer setup; they still discard graph executables and saved graph
+metadata. A worker-local allocator subclass permits repeated requests for the
+same scratch name, rejecting changed shapes/dtypes. Physical mapping, unmapping,
+zero-on-map, synchronization and fail-closed behavior use production code.
+After graph disposal, the benchmark explicitly activates target VMM inside
+`runtime_switch_ms`, because the discarded saved graph no longer performs that
+activation. Recapture's buffer initialization is inside `graph_capture_ms`.
+
+VMM unmap/map, initialization during mapping and synchronization belong to
+**Others**. Recapture initialization (including resetting reused scratch) belongs
+to **Graph**, while Weights is unchanged. Boundary reports validate that the
+active mode is backed and inactive modes have zero resident VMM bytes. They
+record per-mode virtual/resident bytes before the switch, after the switch and
+after the validation probe, outside the measured interval. Use these counts
+alongside driver free memory: PyTorch allocator statistics exclude VMM pages.
+With VMM off, these VMM-specific byte counts are `null`, not an estimate of zero
+ordinary graph memory. The actual planned KV capacities are recorded separately.
+
+The new comparison has CPU lifecycle/ordering tests and dry-run coverage for both
+configs. GPU recapture/replay correctness, memory fit and timings still require
+fresh runs; the older measurements above did not exercise this adapter.
+
 ## Output and tests
 
 - `manifest.json`: resolved experiment, versions, repository revision/branch,
@@ -264,7 +330,9 @@ is restricted to process groups created by this driver.
 - `benchmark_source.tar.gz` and `tracked_changes.patch`: exact benchmark sources
   including uncommitted/new files, plus all tracked working-tree changes against
   the recorded revision (including serving/runtime changes outside the benchmark).
-- `resolved_config.json`: configuration passed to every worker group.
+- `resolved_config.json`: primary resolved configuration. With `--vmm both`,
+  `resolved_config_vmm_off.json` and `resolved_config_vmm_on.json` are the actual
+  variant configs; the manifest records their paths and every planned trial.
 - Per-trial commands, normalized `server_args.json`, supervisor and rank logs.
   `ready-ranks.json` records each worker's prepared source graph sets, active
   replay limits, KV reservation, memory and CPU placement before measurement.
@@ -274,12 +342,17 @@ is restricted to process groups created by this driver.
   allocator settings and EP/TP full/SWA capacities. PyTorch peaks exclude
   non-PyTorch allocations; driver free memory is a boundary observation, not a
   sampled peak. Legacy top-level peaks cover both switch and probe.
-- `summary.json`: median/range by method and direction; failed trials are excluded.
+- `summary.json`: median/range by method, direction and VMM setting; failed trials
+  are excluded and off/on measurements are never pooled together.
 
 CPU reference and orchestration tests, explicitly hiding all GPUs:
 
 ```bash
 CUDA_VISIBLE_DEVICES='' python -m unittest discover -s benchmark/paras/tests -v
+
+# Includes the VMM pytest fixtures and production allocator/state tests.
+CUDA_VISIBLE_DEVICES='' python -m pytest -q benchmark/paras/tests \
+  test/srt/paras/test_runtime_memory.py test/srt/paras/test_runtime_states.py
 ```
 
 These tests cover complete-tensor simulated NCCL routing, Qwen/GPT gate layouts,
@@ -329,7 +402,7 @@ SGLang's own GC policy. The new allocator counters expose retries and allocation
 calls where supported; missing counters remain null. A headroom sweep can OOM
 and does not guarantee more collections or a particular performance ordering.
 
-The chosen implementation remains standalone under `benchmark/paras`. The four
+The chosen implementation remains standalone under `benchmark/paras`. The five
 switching methods construct real Scheduler/ModelRunner state with production
 weights, KV pools, backends, workspaces and graphs; benchmark adapters select
 the weight-storage, transfer and recapture behavior. Normal SGLang serving has
@@ -339,7 +412,7 @@ and serving selectable strawmen are deferred.
 Untimed endpoint checks verify active graph coverage and replay limits, both
 saved mode sets for `full`, and absence of saved graphs after recapture. The
 recapture path updates `max_bs`/`max_num_token` just as production graph-state
-restoration does; the largest-mode input allocations remain intact. Fixed-buffer
+restoration does, allocating inputs for the target mode's dimensions. Fixed-buffer
 initialization may still own both graph sets before a zero-warmup measurement;
 they must be discarded during the measured transition.
 

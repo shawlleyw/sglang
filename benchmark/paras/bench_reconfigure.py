@@ -30,7 +30,8 @@ from reconfigure.configuration import (
     DIRECTIONS,
     METHODS,
     METHOD_TRANSPORT,
-    validate_config,
+    trial_plan,
+    vmm_configurations,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -51,7 +52,7 @@ def command_output(command):
         return {"error": str(error)}
 
 
-def manifest(config, args):
+def manifest(config, args, settings, plan):
     versions = {}
     for package in ("torch", "triton", "sglang", "transformers", "nvidia-nccl-cu12"):
         try:
@@ -82,6 +83,10 @@ def manifest(config, args):
             list(DIRECTIONS) if args.direction == "both" else [args.direction]
         ),
         "repetitions": args.repetitions,
+        "vmm_settings": list(settings),
+        "vmm_scope": "mode-local logits and Triton KV-index scratch; not model weights or KV contents",
+        "restart_vmm_policy": "shared native engine reference, VMM not applicable; measured once per direction/repetition",
+        "trial_plan": plan,
         "python": sys.executable,
         "platform": platform.platform(),
         "hostname": platform.node(),
@@ -250,6 +255,7 @@ def trial(config_path, directory, method, direction, timeout):
             "validation": ready["validation"],
             "probe_text": ready["probe_text"],
             "scope": "engine_rebuild_empty_requests",
+            "vmm": "not_applicable",
         }
         new.send("stop")
         new.finish()
@@ -259,33 +265,27 @@ def trial(config_path, directory, method, direction, timeout):
 
 
 def summarize(rows):
-    result = []
-    for method in METHODS:
-        for direction in DIRECTIONS:
-            matching = [
-                r
-                for r in rows
-                if r["method"] == method
-                and r["direction"] == direction
-                and r["status"] == "passed"
-            ]
-            if matching:
-                result.append(
-                    {
-                        "method": method,
-                        "direction": direction,
-                        "n": len(matching),
-                        "switch_median_ms": statistics.median(
-                            r["switch_ms"] for r in matching
-                        ),
-                        "through_probe_median_ms": statistics.median(
-                            r["through_probe_ms"] for r in matching
-                        ),
-                        "switch_min_ms": min(r["switch_ms"] for r in matching),
-                        "switch_max_ms": max(r["switch_ms"] for r in matching),
-                    }
-                )
-    return result
+    groups = {}
+    for row in rows:
+        if row["status"] != "passed":
+            continue
+        vmm = row.get("vmm", "not_applicable" if row["method"] == "rebuild" else "off")
+        groups.setdefault((row["method"], row["direction"], vmm), []).append(row)
+    return [
+        {
+            "method": method,
+            "direction": direction,
+            "vmm": vmm,
+            "n": len(matching),
+            "switch_median_ms": statistics.median(r["switch_ms"] for r in matching),
+            "through_probe_median_ms": statistics.median(
+                r["through_probe_ms"] for r in matching
+            ),
+            "switch_min_ms": min(r["switch_ms"] for r in matching),
+            "switch_max_ms": max(r["switch_ms"] for r in matching),
+        }
+        for (method, direction, vmm), matching in groups.items()
+    ]
 
 
 def main():
@@ -296,6 +296,11 @@ def main():
     parser.add_argument("--direction", choices=(*DIRECTIONS, "both"), default="both")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=1800)
+    parser.add_argument(
+        "--vmm",
+        choices=("off", "on", "both"),
+        help="Override paras_vmm_runtime_states; both runs matched off/on trials. Default: config value (off if absent).",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -304,14 +309,29 @@ def main():
     config = json.loads(args.config.read_text())
     if args.model_path:
         config["model_path"] = args.model_path
-    config = validate_config(config)
+    configs = vmm_configurations(config, args.vmm)
+    config = next(iter(configs.values()))
+    directions = list(DIRECTIONS) if args.direction == "both" else [args.direction]
+    plan = trial_plan(args.methods, directions, args.repetitions, configs)
     directory = args.output.resolve()
     directory.mkdir(parents=True, exist_ok=True)
     if (directory / "manifest.json").exists():
         parser.error("Output already contains a run; choose a new directory")
     resolved = directory / "resolved_config.json"
     resolved.write_text(json.dumps(config, indent=2) + "\n")
-    info = manifest(config, args)
+    config_paths = {}
+    for setting, variant in configs.items():
+        path = (
+            directory / f"resolved_config_vmm_{setting}.json"
+            if len(configs) > 1
+            else resolved
+        )
+        path.write_text(json.dumps(variant, indent=2) + "\n")
+        config_paths[setting] = path
+    info = manifest(config, args, configs, plan)
+    info["resolved_configs"] = {
+        setting: path.name for setting, path in config_paths.items()
+    }
     if not args.dry_run:
         info["gpu_inventory"] = command_output(
             [
@@ -333,43 +353,37 @@ def main():
     )
     if args.dry_run:
         print(
-            f"Validated {config['name']}; manifest written to {directory}; no GPU access"
+            f"Validated {config['name']}; {len(plan)} trials, VMM={','.join(configs)}; manifest written to {directory}; no GPU access"
         )
         return
     rows = []
-    directions = list(DIRECTIONS) if args.direction == "both" else [args.direction]
-    for repetition in range(args.repetitions):
-        for method in args.methods:
-            for direction in directions:
-                label = f"{method}-{direction}-rep{repetition + 1}"
-                print(f"Starting {label}", flush=True)
-                row = {
-                    "method": method,
-                    "direction": direction,
-                    "repetition": repetition + 1,
-                }
-                try:
-                    row.update(
-                        trial(
-                            resolved, directory / label, method, direction, args.timeout
-                        )
-                    )
-                    row["status"] = "passed"
-                except BaseException as error:
-                    row.update(status="failed", error=str(error))
-                    with open(directory / "trials.jsonl", "a") as output:
-                        output.write(json.dumps(row) + "\n")
-                    raise
-                rows.append(row)
-                with open(directory / "trials.jsonl", "a") as output:
-                    output.write(json.dumps(row) + "\n")
-                (directory / "summary.json").write_text(
-                    json.dumps(summarize(rows), indent=2) + "\n"
-                )
-                print(
-                    f"{label}: switch={row['switch_ms']:.3f}ms through_probe={row['through_probe_ms']:.3f}ms",
-                    flush=True,
-                )
+    for planned in plan:
+        row = dict(planned)
+        method, direction, setting = row["method"], row["direction"], row["vmm"]
+        suffix = f"-vmm-{setting}" if args.vmm is not None or "on" in configs else ""
+        label = f"{method}-{direction}{suffix}-rep{row['repetition']}"
+        path = config_paths.get(setting, resolved)  # Native rebuild disables VMM.
+        print(f"Starting {label}", flush=True)
+        try:
+            result = trial(path, directory / label, method, direction, args.timeout)
+            if result.get("vmm") != setting:
+                raise RuntimeError("Measured VMM setting differs from trial plan")
+            row.update(result, status="passed")
+        except BaseException as error:
+            row.update(status="failed", error=str(error))
+            with open(directory / "trials.jsonl", "a") as output:
+                output.write(json.dumps(row) + "\n")
+            raise
+        rows.append(row)
+        with open(directory / "trials.jsonl", "a") as output:
+            output.write(json.dumps(row) + "\n")
+        (directory / "summary.json").write_text(
+            json.dumps(summarize(rows), indent=2) + "\n"
+        )
+        print(
+            f"{label}: switch={row['switch_ms']:.3f}ms through_probe={row['through_probe_ms']:.3f}ms",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

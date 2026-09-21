@@ -22,6 +22,7 @@ from .diagnostics import (
     memory_snapshot,
 )
 from .storage import IndependentWeightMemoryManager
+from .runtime_memory import runtime_memory_report
 from .transfers import (
     naive_nccl_transfer_layer,
     reload_host_layer,
@@ -216,6 +217,15 @@ class Runtime:
         torch.cuda.synchronize()
         dist.barrier(group=self.scheduler.paras_tp_group.device_group)
 
+    def vmm_report(self):
+        return runtime_memory_report(
+            self.runner.graph_runner,
+            self.mode,
+            enabled=self.config.get("server_args", {}).get(
+                "paras_vmm_runtime_states", False
+            ),
+        )
+
     @contextmanager
     def phase(self, name):
         start = time.perf_counter()
@@ -332,8 +342,17 @@ class Runtime:
                 self.scheduler.paras_configure_tp()
             else:
                 self.scheduler.paras_configure_ep()
-        if self.mode != target:
-            raise RuntimeError("Requested switch was rejected")
+            if self.mode != target:
+                raise RuntimeError("Requested switch was rejected")
+            if recapture:
+                # Discarding saved graphs bypasses production's graph-state
+                # load (which normally activates VMM). Complete the same drained
+                # transition before allocating/capturing any target buffers.
+                memory = getattr(
+                    self.runner.graph_runner, "_paras_runtime_memory", None
+                )
+                if memory is not None:
+                    memory.activate(target)
         if recapture:
             with self.phase("graph_capture_ms"):
                 self.capture()
@@ -448,6 +467,7 @@ class Runtime:
         self.phases.clear()
         torch.cuda.reset_peak_memory_stats()
         memory_before = memory_snapshot()
+        vmm_before = self.vmm_report()
         start = time.perf_counter()
         if self.method in HOST_METHODS:
             self.manager.benchmark_method = self.method
@@ -470,6 +490,7 @@ class Runtime:
         self.synchronize()
         switch_ms = (time.perf_counter() - start) * 1000
         memory_after_switch = memory_snapshot()
+        vmm_after_switch = self.vmm_report()
         torch.cuda.reset_peak_memory_stats()
         probe_start = time.perf_counter()
         actual = self.probe()
@@ -477,6 +498,7 @@ class Runtime:
         # Exclude diagnostic memory queries between switch and probe.
         ready_ms = switch_ms + (time.perf_counter() - probe_start) * 1000
         memory_after_probe = memory_snapshot()
+        vmm_after_probe = self.vmm_report()
         graph_state = self.graph_state_report(require_discarded=True)
         if len(actual) != len(reference):
             raise RuntimeError("Probe and reference have different numbers of steps")
@@ -496,6 +518,7 @@ class Runtime:
             "phases": dict(self.phases),
             "max_logit_error": error,
             "phase_timing": "host_wall_time_no_added_internal_cuda_sync",
+            "vmm": "on" if vmm_after_switch["enabled"] else "off",
             "warmup_switches": self.config.get("warmup_switches", 1),
             "probe_global_requests": self.config["world_size"],
             "peak_allocated_bytes": max(
@@ -510,6 +533,11 @@ class Runtime:
                 "before_switch": memory_before,
                 "after_switch": memory_after_switch,
                 "after_probe": memory_after_probe,
+                "runtime_vmm": {
+                    "before_switch": vmm_before,
+                    "after_switch": vmm_after_switch,
+                    "after_probe": vmm_after_probe,
+                },
                 "switch_allocator_delta": allocator_delta(
                     memory_before["allocator_counters"],
                     memory_after_switch["allocator_counters"],
