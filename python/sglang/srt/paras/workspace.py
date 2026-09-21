@@ -85,8 +85,8 @@ def attention_workspace_requirements(
 ):
     """Resolve supported numerical scratch before constructing the backend.
 
-    Preserve the existing graph runner's max(EP, TP) allocation capacity in both
-    modes. Concurrent/composite backends remain external until they can declare
+    Size each mode from its own graph and runtime request limits.
+    Concurrent/composite backends remain external until they can declare
     independent workspace lifetimes. This does not change their allocation policy.
     """
     from sglang.srt.environ import envs
@@ -112,13 +112,14 @@ def attention_workspace_requirements(
         return external, external
 
     splits, _ = triton_attention_split_config(server_args, context_len)
-    graph_tokens = 0
+    ep_graph_tokens = tp_graph_tokens = 0
     if not server_args.disable_cuda_graph:
-        graph_tokens = max(
-            server_args.cuda_graph_bs + (server_args.paras_tp_cuda_graph_bs or [])
+        ep_graph_tokens = max(server_args.cuda_graph_bs)
+        tp_graph_tokens = max(
+            server_args.paras_tp_cuda_graph_bs or server_args.cuda_graph_bs
         )
-    ep_tokens = max(graph_tokens, server_args.max_running_requests // tp_size)
-    tp_tokens = max(graph_tokens, server_args.max_running_requests)
+    ep_tokens = max(1, ep_graph_tokens, server_args.max_running_requests // tp_size)
+    tp_tokens = max(tp_graph_tokens, server_args.max_running_requests)
     ep_heads = config.num_attention_heads
     tp_heads = ep_heads // tp_size
     ep = triton_attention_workspace_size(ep_tokens, ep_heads, splits, head_dim)

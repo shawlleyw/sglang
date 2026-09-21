@@ -172,6 +172,30 @@ def validate_triton_workspace_blocks(*block_sizes):
             )
 
 
+def tp_moe_workspace_token_capacity(
+    *,
+    max_prefill_tokens: int | None,
+    max_running_requests: int | None,
+    chunked_prefill_size: int | None = None,
+    cuda_graph_bs: tuple[int, ...] | list[int] = (),
+    speculative_num_draft_tokens: int | None = None,
+) -> int:
+    """Reserve for configured batches, not the kernel's largest possible chunk.
+
+    This is a reservation target, not an admission limit: unchunked prefill can
+    admit a first request larger than max_prefill_tokens. Such batches retain
+    the runner's existing dynamic-allocation fallback. Automatic request pools
+    are capped at 4096, matching ModelRunner's default capacity heuristic.
+    """
+    prefill = max_prefill_tokens or triton_moe_chunk_size
+    if chunked_prefill_size is not None and chunked_prefill_size > 0:
+        prefill = min(prefill, chunked_prefill_size)
+    tokens_per_request = max(1, speculative_num_draft_tokens or 1)
+    decode = (max_running_requests or 4096) * tokens_per_request
+    graph = max(cuda_graph_bs, default=0) * tokens_per_request
+    return min(triton_moe_chunk_size, max(prefill, decode, graph))
+
+
 def bf16_moe_workspace_sizes(
     *,
     hidden_size: int,
@@ -180,19 +204,25 @@ def bf16_moe_workspace_sizes(
     top_k: int,
     tp_size: int,
     dispatch_capacity: int,
+    tp_input_tokens: int | None = None,
 ) -> tuple[int, int]:
     """BF16 internal scratch; dispatcher inputs and escaped outputs are separate.
 
     EP follows DeepEP's low-latency receive shape: local_experts *
     (ep_size * dispatch_capacity). Both EP runners consume that same shape;
     normal dispatch uses its actual received rows and falls back to native
-    allocation when larger. TP follows Triton's existing input-token chunks.
+    allocation when larger. TP reserves its configured token target (up to the
+    kernel chunk limit) and likewise falls back for larger runtime batches.
     """
     ep_rows = num_experts * dispatch_capacity
     ep = align_up(ep_rows * 2 * intermediate_size * 2)
     ep += align_up(ep_rows * intermediate_size * 2)
     tp_inter = intermediate_size // tp_size
-    max_input_tokens_per_chunk = triton_moe_chunk_size
+    if tp_input_tokens is not None and tp_input_tokens <= 0:
+        raise ValueError("TP workspace token capacity must be positive")
+    max_input_tokens_per_chunk = min(
+        tp_input_tokens or triton_moe_chunk_size, triton_moe_chunk_size
+    )
     tp_rows = max_input_tokens_per_chunk * top_k + (num_experts + 1) * (
         MOE_MAX_BLOCK_M - 1
     )

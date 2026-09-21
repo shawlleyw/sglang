@@ -12,6 +12,8 @@ from sglang.srt.paras.workspace import (
     WorkspaceRequirement,
     attention_workspace_requirements,
     triton_attention_split_config,
+    triton_attention_workspace_size,
+    workspace_views,
 )
 
 
@@ -58,16 +60,16 @@ def test_flashinfer_configuration(monkeypatch):
     )
 
 
-def test_triton_preserves_existing_graph_capacity():
+def test_triton_sizes_each_mode_independently():
     ep, tp = requirements("triton")
-    assert ep.size_bytes == 516 << 20
+    assert ep.size_bytes == int(64.5 * (1 << 20))
     assert tp.size_bytes == int(64.5 * (1 << 20))
     ep, tp = requirements("triton", disable_cuda_graph=True)
     assert ep.size_bytes == tp.size_bytes == int(64.5 * (1 << 20))
     ep, tp = requirements(
         "triton", context_length=65536, triton_attention_split_tile_size=4096
     )
-    assert ep.size_bytes == 1032 << 20
+    assert ep.size_bytes == 129 << 20
     assert tp.size_bytes == 129 << 20
 
 
@@ -79,8 +81,21 @@ def test_triton_uses_resolved_rope_context():
         num_heads=32,
         triton_attention_split_tile_size=4096,
     )
-    assert ep.size_bytes == 1032 << 20
+    assert ep.size_bytes == 129 << 20
     assert tp.size_bytes == 129 << 20
+
+
+@pytest.mark.parametrize("requests", [1, 7])
+def test_eager_ep_reserves_scratch_for_minimum_request(requests):
+    ep, _ = requirements(
+        "triton", disable_cuda_graph=True, max_running_requests=requests
+    )
+    assert ep.size_bytes == triton_attention_workspace_size(1, 64, 8, 128)
+    buffer = torch.empty(ep.size_bytes, dtype=torch.uint8)
+    partial, lse = workspace_views(
+        buffer, ((1, 64, 8, 128), (1, 64, 8)), torch.float32, "cpu"
+    )
+    assert partial.numel() and lse.numel()
 
 
 def test_triton_deterministic_split_config(monkeypatch):

@@ -499,6 +499,11 @@ class ModelRunner:
 
             enable_batch_invariant_mode()
 
+        # Reserve reusable native scratch before KV sizing; ParaS uses UMM.
+        from sglang.srt.model_executor.static_workspace import reserve_static_workspaces
+
+        self.static_workspaces = reserve_static_workspaces(self)
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,

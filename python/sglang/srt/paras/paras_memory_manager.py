@@ -497,6 +497,12 @@ class ParaSMemoryManager:
             else _default_num_reqs(self.ep_max_kv_tokens)
         )
         tp_num_reqs = max(ep_num_reqs, _default_num_reqs(self.tp_max_kv_tokens))
+        if max_running_requests is not None:
+            # Match the native request pool's configured cap, including the
+            # shared backing allocation, not just scheduler admission. EP's
+            # per-rank admission limit is applied separately below.
+            ep_num_reqs = min(ep_num_reqs, max_running_requests)
+            tp_num_reqs = min(tp_num_reqs, max_running_requests)
 
         self.ep_max_num_reqs = ep_num_reqs
         self.tp_max_num_reqs = tp_num_reqs
@@ -734,7 +740,11 @@ def reserve_model_weights(
         ), "ParaS unified layout supports DeepGEMM/Triton EP and Triton TP"
     _validate_v1_scope(num_fused_shared_experts, quant_name)
 
-    from sglang.srt.paras.unified_layout import align_up, bf16_moe_workspace_sizes
+    from sglang.srt.paras.unified_layout import (
+        align_up,
+        bf16_moe_workspace_sizes,
+        tp_moe_workspace_token_capacity,
+    )
     from sglang.srt.utils import get_int_env_var
 
     if ep_size != tp_size or num_experts % ep_size or intermediate_size % tp_size:
@@ -751,6 +761,26 @@ def reserve_model_weights(
         "deep_gemm" if use_deep_gemm_bf16(ep_size, with_bias=with_bias) else "triton"
     )
     capacity = get_int_env_var("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128)
+    args = manager.server_args
+    graph_bs = ()
+    if args is not None and not getattr(args, "disable_cuda_graph", False):
+        graph_bs = (
+            getattr(args, "paras_tp_cuda_graph_bs", None)
+            or getattr(args, "cuda_graph_bs", None)
+            or ()
+        )
+    tp_tokens = tp_moe_workspace_token_capacity(
+        max_prefill_tokens=(
+            getattr(args, "paras_tp_max_prefill_tokens", None)
+            or getattr(args, "max_prefill_tokens", None)
+        ),
+        max_running_requests=getattr(args, "max_running_requests", None),
+        chunked_prefill_size=getattr(args, "chunked_prefill_size", None),
+        cuda_graph_bs=graph_bs,
+        speculative_num_draft_tokens=getattr(
+            args, "speculative_num_draft_tokens", None
+        ),
+    )
     ep_workspace_bytes, tp_workspace_bytes = bf16_moe_workspace_sizes(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -758,6 +788,7 @@ def reserve_model_weights(
         top_k=top_k,
         tp_size=tp_size,
         dispatch_capacity=capacity,
+        tp_input_tokens=tp_tokens,
     )
     spec = UnifiedLayoutSpec(
         num_layers=num_layers,

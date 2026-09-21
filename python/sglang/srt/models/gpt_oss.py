@@ -524,7 +524,11 @@ class GptOssModel(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                # Match ParaS vocabulary storage in opt-in static TP evaluations.
+                enable_tp=not (
+                    is_dp_attention_enabled()
+                    or get_bool_env_var("SGLANG_GPTOSS_REPLICATED_EMBEDDING")
+                ),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:

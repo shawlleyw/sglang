@@ -7,6 +7,7 @@
 #   BATCH_SIZE CUDA_GRAPH_BS INPUT_LEN OUTPUT_LEN MEM_FRACTION_STATIC
 #   DATASET_NAME DATASET_PATH RESULT_FILE RUN_NAME
 #   SGLANG_DEEPEP_BF16_DISPATCH SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK NVSHMEM_QP_DEPTH
+#   NVSHMEM_DISABLE_NCCL (default 1; set 0 to restore NVSHMEM NCCL collectives)
 #
 # Profile toggles (default disabled):
 #   ENABLE_NSYS=1          Wrap with `nsys profile --cuda-graph-trace=node -t cuda`. Output prefix: NSYS_OUTPUT.
@@ -18,6 +19,9 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 MODEL_PATH=${MODEL_PATH:-/data/shaoyuw/models/gpt-oss-120b-BF16-unsloth}
+
+# Avoid NVSHMEM internal NCCL buffers; SGLang TP collectives remain enabled.
+export NVSHMEM_DISABLE_NCCL=${NVSHMEM_DISABLE_NCCL:-1}
 NUM_GPUS=${NUM_GPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-"1 8 64 256 1 8 64 256"}
 CUDA_GRAPH_BS=${CUDA_GRAPH_BS:-"1 8 64 256"}
