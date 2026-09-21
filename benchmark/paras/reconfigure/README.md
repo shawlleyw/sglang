@@ -25,6 +25,14 @@ Their weight phases were nearly identical in these single-trial measurements.
 See the [host-method comparison](../../../artifacts/20260920T033755Z_gptoss_host_model_to/README.md)
 for the six-method table, origin labels, memory diagnostics and timing breakdown.
 
+After rebasing onto `paras_a100`'s runtime-state isolation, recapture allocates
+the target mode's graph inputs and attention metadata through the production
+`init_graph_buffers()` / `init_cuda_graph_state()` methods. EP's smaller buffers
+are no longer reused for TP capture. Disposal drops saved backend metadata as
+well as graph references, without explicit GC. These changes have CPU coverage
+using the production allocation methods; the historical GPU measurements above
+predate this rebase and do not validate its memory fit or capture latency.
+
 ## Methods and boundaries
 
 | CLI method | Measured transition |
@@ -185,6 +193,9 @@ and target sizes in results. Explicit maximum overrides remain supported via
 `server_args.cuda_graph_max_bs` and `server_args.paras_tp_cuda_graph_max_bs`;
 handwritten size lists are rejected. Runtime graph disposal only drops
 references and the pool handle. SGLang's own capture GC policy is unchanged.
+An explicit `paras_tp_max_prefill_tokens` is preserved for ParaS and translated
+to native TP's `max_prefill_tokens` for restart, while native EP keeps its own
+prefill limit. This also keeps the configured MoE workspace reservation aligned.
 
 Full/fixed methods use the launcher's peer-access KV path. Independent-storage
 methods explicitly use NCCL for empty-cache bookkeeping because their backend
@@ -194,7 +205,9 @@ matching the launcher. Remaining scope/configuration caveats are in the audit.
 Direct workers also apply production's optional GPU CPU-affinity and NUMA policy
 before model construction, and record their effective CPU affinity.
 Supported scope is a single node, PP=1, ordinary Qwen3-MoE/GPT-OSS decoding without
-quantization, speculation, LoRA, memory-saver, or torch.compile.
+quantization, speculation, LoRA, memory-saver, or torch.compile. The optional
+`paras_vmm_runtime_states` mode is excluded: these baselines recapture/reallocate
+ordinary graph state, while production VMM manages persistent per-mode addresses.
 
 From the repository root, validation without GPU access:
 
@@ -271,7 +284,8 @@ CUDA_VISIBLE_DEVICES='' python -m unittest discover -s benchmark/paras/tests -v
 
 These tests cover complete-tensor simulated NCCL routing, Qwen/GPT gate layouts,
 replicated KV heads, host snapshot independence, allocation/alias lifetime,
-configuration parity, graph operation ordering, and worker error propagation.
+configuration parity, target-mode graph-buffer allocation, graph operation
+ordering, and worker error propagation.
 
 ### Weights / Graph / Others breakdown
 

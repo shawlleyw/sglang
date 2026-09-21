@@ -49,6 +49,14 @@ entry/exit. That policy remains unchanged to match the serving code; capture
 phase timings can therefore include production GC. Discard timing no longer
 includes a benchmark-forced collection.
 
+The `paras_a100` runtime-state isolation rebase changes graph input ownership:
+EP and TP now have separately sized input/logit and attention metadata buffers.
+The benchmark's recapture adapter therefore calls the production backend
+`init_cuda_graph_state` and runner `init_graph_buffers` for the target mode before
+capture. It also drops the backend's saved graph metadata during disposal.
+CPU regressions execute those allocation methods through EP→TP→EP and verify
+the buffer capacities. Pre-rebase v2 GPU results require a fresh validation run.
+
 ## 2. The 0.142 s result was not NCCL
 
 `fixed_buffer_recapture` calls the production UMM transfer implementation,

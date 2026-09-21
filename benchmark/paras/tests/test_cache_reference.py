@@ -64,10 +64,16 @@ class CacheReferenceTest(unittest.TestCase):
     def test_paged_roundtrip(self):
         from bench_cache import build_scatter_routing, build_source_slots
 
-        for world, heads in ((2, 4), (4, 4), (8, 8), (8, 4), (4, 1)):
+        for world, heads, dim in (
+            (2, 4, 128),
+            (4, 4, 128),
+            (8, 8, 64),
+            (8, 4, 128),
+            (4, 1, 128),
+        ):
             with self.subTest(world=world, heads=heads):
                 replication = max(1, world // heads)
-                n, dim = 3 * replication, 5
+                n = 3 * replication
                 ep_k, ep_v, slots = [], [], []
                 for rank in range(world):
                     # Distinct values across ranks, tokens, heads, and dimensions.

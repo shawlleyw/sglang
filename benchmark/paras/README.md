@@ -204,6 +204,47 @@ python -m pytest -q benchmark/paras/tests
 
 ## Expert-only and resident-cache kernel ablation
 
+### Model and hardware compatibility
+
+The default production `v2` kernels support both A100 (SM80) and H200 (SM90);
+`python/sglang/srt/paras/csrc/setup.py` builds both architectures. Kernel launch
+geometry uses the device's SM count. Rebuild the extension from the checkout on
+each server; changing Python source does not replace an older installed binary.
+`PARAS_KV_TRANSFER_METHOD=peer_access` selects the production path shared by MHA
+and SWA. No serving import depends on the benchmark adapters.
+
+| Model preset | BF16 KV shape | Expert gate layout | Reconfiguration config |
+|---|---|---|---|
+| `gpt-oss-120b` | 8 heads × 64 | Interleaved gate/up | `configs/gpt_oss_120b_a100.json` |
+| `qwen3-235b` | 4 heads × 128 | Separate gate/up | `configs/qwen3_235b_h200.json` |
+| `qwen3-30b` | 4 heads × 128 | Separate gate/up | Qwen config with `--model-path` pointing to 30B |
+
+The JSON filenames describe the intended experiments, not a hardware dispatch
+restriction. The reconfiguration worker reads actual checkpoint dimensions, and
+its `--model-path` override can select either Qwen size. Use BF16 checkpoints.
+Memory fractions and graph limits still need to fit each model/server pairing;
+old GPT-OSS/A100 measurements do not validate H200 or Qwen end-to-end execution.
+CPU reference tests cover both gate layouts, KV head dimensions and replication;
+production CUDA compilation is checked for both SM80 and SM90. Hardware smoke
+tests remain necessary before recording new results after the runtime rebase.
+
+For the reference build, pass architecture `80` on A100 or `90` on H200:
+
+```bash
+bash benchmark/paras/build_nvbandwidth.sh /tmp/nvbandwidth-h200 90
+python benchmark/paras/run_kernel_ablation.py --model qwen3-235b --dry-run \
+  --output /tmp/qwen3-kernel-plan
+```
+
+At TP8 and full occupancy, the cache arena alone is approximately **2×** the
+resident EP K+V volume for GPT-OSS, and **3×** for either Qwen preset because
+Qwen's four KV heads are replicated across eight TP ranks. Thus 10/20/30 GiB
+requires about 20/40/60 GiB per GPU for GPT-OSS, versus 30/60/90 GiB for Qwen,
+before NCCL staging, temporary tensors, and CUDA overhead. Qwen's 30 GiB case
+cannot fit an 80 GiB A100; select smaller volumes with `--cache-gib 10 20` there.
+The 30 GiB setting targets H200 capacity. Under Qwen replication, EP→TP also
+transfers twice the remote payload of TP→EP; the CSV accounts for this.
+
 `run_kernel_ablation.py` runs the expert weights (`--kernel experts`, w13+w2
 with one fence per layer, excluding attention) and uniform KV layers at total
 resident EP K+V volumes of 10/20/30 **GiB per GPU**. GPT-OSS uses all 36 layers,

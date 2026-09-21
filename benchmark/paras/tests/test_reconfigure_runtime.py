@@ -111,6 +111,10 @@ class RuntimeOrderingTest(unittest.TestCase):
         gr.graphs = {1: graph}
         gr.output_buffers = {1: graph}
         gr._paras_saved = {ParaSMode.EP: {"graphs": {1: graph}}}
+        runtime.runner.attn_backend._paras_graph_states = {
+            ParaSMode.EP: {"metadata": graph}
+        }
+        runtime.runner.attn_backend.decode_cuda_graph_metadata = {1: graph}
         del graph
         pool_reset = Mock()
         module = SimpleNamespace(set_global_graph_memory_pool=pool_reset)
@@ -122,11 +126,40 @@ class RuntimeOrderingTest(unittest.TestCase):
         pool_reset.assert_called_once_with(None)
 
     def test_recapture_uses_resolved_mode_specific_lists(self):
+        from test.srt.paras.test_runtime_states import backend, load_nodes
+
         runtime, _ = self.runtime(ParaSMode.EP, "fixed_buffer_recapture")
         gr = runtime.runner.graph_runner
         seen = []
+        # Execute the production allocation methods with CPU tensors. This catches
+        # API/shape changes that a capture-order-only mock cannot detect.
+        cls = load_nodes(
+            "model_executor/cuda_graph_runner.py",
+            {"init_graph_buffers", "_cache_loc_dtype"},
+            "CudaGraphRunner",
+            TboCudaGraphRunnerPlugin=object,
+        )
+        gr.init_graph_buffers = cls.init_graph_buffers.__get__(gr)
+        gr._cache_loc_dtype = cls._cache_loc_dtype.__get__(gr)
+        gr.device = "cpu"
+        gr.seq_len_fill_value = 1
+        gr.pp_size = 1
+        gr.is_encoder_decoder = False
+        gr._paras_runtime_memory = None
+        gr.require_gathered_buffer = False
+        gr.model_runner = runtime.runner
+        runtime.runner.model_config = SimpleNamespace(vocab_size=16)
+        runtime.runner.spec_algorithm = SimpleNamespace(is_eagle3=lambda: False)
+        runtime.runner.attn_backend = backend()
 
         def capture():
+            self.assertEqual(gr.input_ids.shape, (gr.max_num_token,))
+            self.assertEqual(gr.req_pool_indices.shape, (gr.max_bs,))
+            self.assertEqual(gr.next_token_logits_buffer.shape, (gr.max_num_token, 16))
+            self.assertEqual(
+                runtime.runner.attn_backend.cuda_graph_kv_indices.numel(),
+                gr.max_num_token * 32,
+            )
             seen.append((list(gr.capture_bs), gr.max_bs, gr.max_num_token))
             gr.graphs = dict.fromkeys(gr.capture_bs)
 
@@ -139,11 +172,15 @@ class RuntimeOrderingTest(unittest.TestCase):
                 paras_refresh_cuda_graph_settings=lambda gr: None
             ),
         }
-        with patch.dict(sys.modules, modules):
+        with patch.dict(sys.modules, modules), patch(
+            "torch.cuda._lazy_init", side_effect=AssertionError("CPU test used CUDA")
+        ):
             Runtime.capture(runtime)
             runtime.scheduler.paras_parallelism_config = ParaSMode.TP
             Runtime.capture(runtime)
-        self.assertEqual(seen, [([1, 2], 2, 2), ([1, 2, 4, 8], 8, 8)])
+            runtime.scheduler.paras_parallelism_config = ParaSMode.EP
+            Runtime.capture(runtime)
+        self.assertEqual(seen, [([1, 2], 2, 2), ([1, 2, 4, 8], 8, 8), ([1, 2], 2, 2)])
 
     def test_full_graph_report_requires_both_sets_and_correct_replay_limits(self):
         runtime, _ = self.runtime(ParaSMode.EP, "full")
@@ -186,6 +223,7 @@ class RuntimeOrderingTest(unittest.TestCase):
         events = []
         manager = SimpleNamespace()
         runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(),
             graph_runner=SimpleNamespace(
                 capture_bs=[1, 2],
                 _paras_tp_capture_bs=[1, 2, 4, 8],

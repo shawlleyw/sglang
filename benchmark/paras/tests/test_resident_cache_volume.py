@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 class ResidentCacheVolumeTest(unittest.TestCase):
     def test_requested_total_is_not_multiplied_by_layers(self):
-        for preset in ("gpt-oss-120b", "qwen3-235b"):
+        for preset in ("gpt-oss-120b", "qwen3-235b", "qwen3-30b"):
             model = PRESETS[preset]
             for gib in (10, 20, 30):
                 layout = make_resident_kv_layout(model, 8, gib)
@@ -37,6 +37,19 @@ class ResidentCacheVolumeTest(unittest.TestCase):
                     layout.num_resident_tokens % layout.replication_factor, 0
                 )
                 self.assertEqual(layout.ep_max_tokens, layout.num_resident_tokens + 1)
+
+    def test_replicated_tp_cache_requires_more_than_a100_capacity_at_30gib(self):
+        # Qwen TP8 replicates four KV heads across eight ranks. Even though
+        # redundant network sends are removed, both TP replicas remain resident.
+        for preset in ("gpt-oss-120b", "qwen3-235b", "qwen3-30b"):
+            model = PRESETS[preset]
+            layout = make_resident_kv_layout(model, 8, 30)
+            arena = offsets_in_arena(layout)["total"] * model.num_hidden_layers
+            expected_gib = 60 if preset == "gpt-oss-120b" else 90
+            # Whole-token/replica rounding and per-layer padding are sub-MiB
+            # for these settings; they do not change the hardware fit boundary.
+            self.assertAlmostEqual(arena / 2**30, expected_gib, delta=2 / 1024)
+            self.assertEqual(arena > 80 * 2**30, preset != "gpt-oss-120b")
 
     def test_distinct_layer_views_and_patterns(self):
         model = PRESETS["gpt-oss-120b"]

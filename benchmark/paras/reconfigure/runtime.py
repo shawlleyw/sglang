@@ -254,6 +254,17 @@ class Runtime:
         gr.output_buffers.clear()
         if hasattr(gr, "_paras_saved"):
             gr._paras_saved.clear()
+        # Backends also own graph metadata outside the graph runner. Drop saved
+        # references so recapture cannot retain old mode buffers/wrappers.
+        backend = self.runner.attn_backend
+        for name in (
+            "_paras_graph_states",  # Triton
+            "decode_cuda_graph_metadata",  # FlashInfer
+            "prefill_cuda_graph_metadata",
+            "draft_extend_cuda_graph_metadata",
+        ):
+            if hasattr(backend, name):
+                getattr(backend, name).clear()
         set_global_graph_memory_pool(None)
 
     def capture(self):
@@ -262,12 +273,14 @@ class Runtime:
 
         gr = self.runner.graph_runner
         gr.capture_bs = list(self.graph_batches[self.mode])
-        # The shared input/backend buffers were allocated for the largest
-        # mode during production initialization. These are active replay
-        # limits, matching paras_load_cuda_graph_state, not new allocations.
+        # Production now allocates graph inputs and backend metadata per mode.
+        # EP buffers cannot capture TP's larger batch range. Follow dual-capture
+        # initialization, with all target buffer allocation inside this phase.
         gr.max_bs = max(gr.capture_bs)
         gr.max_num_token = gr.max_bs * gr.num_tokens_per_bs
         paras_refresh_cuda_graph_settings(gr)
+        self.runner.attn_backend.init_cuda_graph_state(gr.max_bs, gr.max_num_token)
+        gr.init_graph_buffers()
         with model_capture_mode():
             gr.capture()
         if sorted(gr.graphs) != sorted(gr.capture_bs):

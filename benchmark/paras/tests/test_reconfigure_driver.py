@@ -57,6 +57,28 @@ class ReconfigureDriverTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "v1 override"):
             validate_config(config)
 
+    def test_vmm_is_not_silently_enabled_for_recapture_baselines(self):
+        config = json.loads((BENCH / "configs/gpt_oss_120b_a100.json").read_text())
+        config["server_args"]["paras_vmm_runtime_states"] = True
+        with self.assertRaisesRegex(ValueError, "paras_vmm_runtime_states"):
+            validate_config(config)
+
+    def test_static_restart_translates_mode_specific_prefill_limits(self):
+        config = json.loads((BENCH / "configs/gpt_oss_120b_a100.json").read_text())
+        config["server_args"].update(
+            max_prefill_tokens=2048, paras_tp_max_prefill_tokens=8192
+        )
+        for mode, expected in (("ep", 2048), ("tp", 8192)):
+            native = server_arguments(config, mode, paras=False)
+            self.assertEqual(native["max_prefill_tokens"], expected)
+            self.assertNotIn("paras_tp_max_prefill_tokens", native)
+        paras = server_arguments(config, "ep", paras=True)
+        self.assertEqual(paras["max_prefill_tokens"], 2048)
+        self.assertEqual(paras["paras_tp_max_prefill_tokens"], 8192)
+        config["server_args"]["paras_tp_max_prefill_tokens"] = 0
+        with self.assertRaisesRegex(ValueError, "paras_tp_max_prefill_tokens"):
+            validate_config(config)
+
     def test_production_graph_generator_and_explicit_maxima(self):
         # Execute the actual ServerArgs method without importing CUDA/runtime.
         from types import SimpleNamespace

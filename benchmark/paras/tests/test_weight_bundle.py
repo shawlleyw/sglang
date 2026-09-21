@@ -151,7 +151,7 @@ class WeightBundleTest(unittest.TestCase):
         self.run_roundtrip(True, 2)
 
     def test_real_presets_plan_without_allocating_model(self):
-        for preset in ("qwen3-235b", "gpt-oss-120b"):
+        for preset in ("qwen3-235b", "qwen3-30b", "gpt-oss-120b"):
             model = PRESETS[preset]
             manager, plan = make_manager(model, 8, "cpu", materialize=False)
             for mode in (ParaSMode.EP, ParaSMode.TP):

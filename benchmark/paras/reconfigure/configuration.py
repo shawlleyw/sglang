@@ -41,7 +41,11 @@ def validate_config(config):
     if forbidden.intersection(result.get("server_args", {})):
         raise ValueError("layout and graph enablement are controlled by the benchmark")
     options = result.get("server_args", {})
-    for field in ("cuda_graph_max_bs", "paras_tp_cuda_graph_max_bs"):
+    for field in (
+        "cuda_graph_max_bs",
+        "paras_tp_cuda_graph_max_bs",
+        "paras_tp_max_prefill_tokens",
+    ):
         if options.get(field) is not None and options[field] <= 0:
             raise ValueError(f"{field} must be positive")
     if options.get("max_running_requests", 2048) < result["world_size"]:
@@ -58,6 +62,7 @@ def validate_config(config):
         "enable_memory_saver",
         "enable_two_batch_overlap",
         "enable_pdmux",
+        "paras_vmm_runtime_states",
     ):
         if options.get(field, False):
             raise ValueError(f"{field} is not supported by this benchmark")
@@ -84,6 +89,12 @@ def server_arguments(config, mode="ep", paras=True):
     args = deepcopy(config.get("server_args", {}))
     world = config["world_size"]
     ep = mode == "ep"
+    if not paras:
+        # The native restart target has no ParaS settings. Translate its TP
+        # prefill limit so scheduling and workspace reservation remain matched.
+        tp_prefill = args.pop("paras_tp_max_prefill_tokens", None)
+        if not ep and tp_prefill is not None:
+            args["max_prefill_tokens"] = tp_prefill
     ep_max = args.pop("cuda_graph_max_bs", None) or (
         args.get("max_running_requests", 2048) // world
     )
