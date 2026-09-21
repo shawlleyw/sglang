@@ -849,7 +849,9 @@ class SchedulerParasMixin:
             self.tp_worker.paras_configure_ep()
 
         sampler = self.tp_worker.model_runner.sampler
-        sampler.tp_sync_group = self.paras_tp_attn_tp_group.device_group
+        # EP schedulers sample independent batches, including empty ones.
+        # Token synchronization (explicit or grammar-triggered) must stay local.
+        sampler.tp_sync_group = self.paras_ep_attn_tp_group.device_group
         sampler.force_sync_token_ids = False
 
         end_time = time.time()

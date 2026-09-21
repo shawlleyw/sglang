@@ -313,3 +313,86 @@ def test_prefill_budget_roundtrip_honors_per_mode_limits(ramp_cap):
             assert max(caps) == 2048
             assert caps == sorted(caps)
         assert scheduler.max_prefill_tokens == 2048
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_ep_return_restores_independent_sampling_group(monkeypatch, rank):
+    """Uneven EP batches must not sample collectively across DP ranks."""
+    import logging
+    import time
+    from contextlib import nullcontext
+    from unittest.mock import Mock
+
+    noop = lambda *args, **kwargs: None
+    monkeypatch.setattr(torch.cuda, "synchronize", noop)
+    scatter = Mock()
+    scatter.precheck_ep_capacity.return_value = (True, "", {})
+    scatter.get_new_running_batch.return_value = None
+    scatter.get_new_waiting_queue.return_value = []
+    cls = load_nodes(
+        "paras/scheduler_paras_mixin.py",
+        {"paras_configure_ep"},
+        "SchedulerParasMixin",
+        paras_func=lambda f: f,
+        ParaSReqScatterManager=lambda **kwargs: scatter,
+        TimeReporter=lambda *args: nullcontext(),
+        time=time,
+        logger=logging.getLogger(__name__),
+        MoeA2ABackend=SimpleNamespace(DEEPEP=SimpleNamespace(value="deepep")),
+        moe_utils=SimpleNamespace(),
+        compute_dp_attention_world_info=lambda *args: (0, 1, rank),
+    )
+    scheduler = cls()
+    tp_group = SimpleNamespace(device_group=object())
+    ep_attn_group = SimpleNamespace(device_group=object())
+    sampler = SimpleNamespace(
+        tp_sync_group=tp_group.device_group, force_sync_token_ids=True
+    )
+    scheduler.__dict__.update(
+        paras_parallelism_config=ParaSMode.TP,
+        paras_check=lambda: True,
+        server_args=SimpleNamespace(
+            enable_paras_moe=True, enable_custom_logit_processor=False
+        ),
+        paras_dp_size=1,
+        paras_tp_size=4,
+        paras_tp_rank=rank,
+        paras_ep_size=4,
+        paras_ep_rank=rank,
+        dp_size=4,
+        paras_tp_group=tp_group,
+        paras_tp_attn_tp_group=tp_group,
+        paras_ep_group=tp_group,
+        paras_ep_cpu_group=object(),
+        paras_ep_attn_tp_group=ep_attn_group,
+        paras_ep_attn_tp_cpu_group=object(),
+        _paras_drain_overlap_pipeline=noop,
+        _paras_auto_policy=None,
+        _paras_post_switch_ramp_iters=0,
+        paras_start_profile=noop,
+        paras_stop_profile=noop,
+        tree_cache=SimpleNamespace(reset=noop),
+        merge_last_batch=noop,
+        running_batch=None,
+        waiting_queue=[],
+        req_to_token_pool=object(),
+        token_to_kv_pool_allocator=object(),
+        tp_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(model=object(), sampler=sampler),
+            paras_configure_ep=noop,
+        ),
+        tokenizer=None,
+        model_config=None,
+        enable_overlap=False,
+        spec_algorithm=None,
+        ep_recv_from_tokenizer=object(),
+        ep_send_to_tokenizer=object(),
+        ep_send_to_detokenizer=object(),
+        ep_recv_from_rpc=object(),
+        last_batch=object(),
+    )
+    scheduler.paras_configure_ep()
+    assert sampler.tp_sync_group is ep_attn_group.device_group
+    assert sampler.tp_sync_group is scheduler.attn_tp_group.device_group
+    assert not sampler.force_sync_token_ids
+    assert scheduler.paras_parallelism_config == ParaSMode.EP
