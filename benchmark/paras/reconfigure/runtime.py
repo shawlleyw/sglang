@@ -15,6 +15,7 @@ from common.weight_bundle import weight_name
 from sglang.srt.paras.mode import ParaSMode
 
 from .configuration import HOST_METHODS, METHOD_TRANSPORT
+from .restart_audit import host_rss_peak_bytes
 from .diagnostics import (
     allocator_configuration,
     allocator_delta,
@@ -201,6 +202,7 @@ class Runtime:
         self.independent = isinstance(self.manager, IndependentWeightMemoryManager)
         self.phases = {}
         self.auxiliary_snapshots = []
+        self.host_memory_stages = {}
         gr = self.runner.graph_runner
         # Preserve the lists actually resolved by production initialization,
         # including EP request-pool/alignment filtering and ParaS TP scaling.
@@ -264,17 +266,36 @@ class Runtime:
         gr.output_buffers.clear()
         if hasattr(gr, "_paras_saved"):
             gr._paras_saved.clear()
-        # Backends also own graph metadata outside the graph runner. Drop saved
-        # references so recapture cannot retain old mode buffers/wrappers.
+        # Current production keeps separate EP/TP input tensors. Dropping
+        # graphs alone leaves source-sized inputs and FlashInfer wrappers alive.
+        # All of these belong to discarded graphs; weights/KV/workspaces stay.
+        from sglang.srt.paras.paras_cuda_graph import _BUFFER_KEYS
+
+        for name in _BUFFER_KEYS:
+            if hasattr(gr, name):
+                delattr(gr, name)
         backend = self.runner.attn_backend
         for name in (
-            "_paras_graph_states",  # Triton
-            "decode_cuda_graph_metadata",  # FlashInfer
+            "decode_cuda_graph_metadata",
             "prefill_cuda_graph_metadata",
             "draft_extend_cuda_graph_metadata",
+            "_paras_graph_states",
+        ):
+            metadata = getattr(backend, name, None)
+            if metadata is not None:
+                metadata.clear()
+        # forward_metadata can retain the last captured FlashInfer wrapper even
+        # after its per-batch dictionary is cleared.
+        if hasattr(backend, "forward_metadata"):
+            backend.forward_metadata = None
+        for name in (
+            "cuda_graph_kv_indices",
+            "cuda_graph_custom_mask",
+            "cuda_graph_qk_indptr",
+            "cuda_graph_qo_indptr",
         ):
             if hasattr(backend, name):
-                getattr(backend, name).clear()
+                delattr(backend, name)
         set_global_graph_memory_pool(None)
 
     def capture(self):
@@ -421,6 +442,31 @@ class Runtime:
             raise RuntimeError("Probe produced nonfinite logits")
         return outputs
 
+    def layout_report(self):
+        return {
+            "mode": self.mode.value,
+            "attention_backend": self.runner.server_args.attention_backend,
+            "moe_workspace_backend": self.manager._unified_spec.for_mode(self.mode).workspaces.moe.backend,
+            "effective_max_prefill_tokens": self.scheduler.paras_effective_max_prefill_tokens(),
+            "embedding_shape": list(self.runner.model.model.embed_tokens.weight.shape),
+            "lm_head_shape": list(self.runner.model.lm_head.weight.shape),
+        }
+
+    def host_snapshot_report(self):
+        tensors = [
+            tensor
+            for layer in getattr(self.manager, "host_snapshots", {}).values()
+            for tensor in layer.values()
+        ] + [tensor for _, tensor in self.auxiliary_snapshots]
+        return {
+            "tensor_count": len(tensors),
+            "bytes": sum(t.numel() * t.element_size() for t in tensors),
+            "pinned_bytes": sum(t.numel() * t.element_size() for t in tensors if t.is_pinned()),
+            "all_pinned": all(t.is_pinned() for t in tensors) if tensors else None,
+            "host_rss_peak_bytes": host_rss_peak_bytes(),
+            "rss_semantics": "Linux process lifetime high-water mark; not concurrent across ranks",
+        }
+
     def prepare(self, source, target):
         self.switch(target)
         reference = self.probe()
@@ -446,6 +492,7 @@ class Runtime:
                     "tensor"
                 ]
                 self.auxiliary_snapshots.append((parameter, snapshot))
+            self.host_memory_stages["snapshot_prepared"] = self.host_snapshot_report()
         self.switch(source)
         self.probe()
         # Exercise the actual measured transport/recapture path, including H2D
@@ -550,6 +597,9 @@ class Runtime:
                     else None
                 ),
             },
+            "runtime_layout": self.layout_report(),
+            "host_memory_stages": dict(self.host_memory_stages),
+            "host_snapshot_report": self.host_snapshot_report(),
             "host_snapshot_bytes": sum(
                 t.numel() * t.element_size()
                 for layer in getattr(self.manager, "host_snapshots", {}).values()

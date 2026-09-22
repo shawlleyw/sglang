@@ -185,7 +185,7 @@ class IndependentStorageTest(unittest.TestCase):
             args = SimpleNamespace(
                 kv_cache_dtype="auto",
                 page_size=1,
-                swa_full_tokens_ratio=0.5,
+                swa_full_tokens_ratio=1.0 if disable_hybrid else 0.5,
                 disable_hybrid_swa_memory=disable_hybrid,
                 attention_backend="triton",
                 moe_runner_backend="triton",

@@ -87,11 +87,11 @@ class ReconfigureDriverTest(unittest.TestCase):
             "prefill_attention_backend",
             "decode_attention_backend",
         ):
-            for invalid in ("flashinfer", "fa3"):
+            for invalid in (("fa3",) if field == "attention_backend" else ("flashinfer", "fa3")):
                 with self.subTest(field=field, invalid=invalid):
                     variant = json.loads(json.dumps(config))
                     variant["server_args"][field] = invalid
-                    with self.assertRaisesRegex(ValueError, "requires Triton"):
+                    with self.assertRaisesRegex(ValueError, "requires matching Triton/FlashInfer"):
                         vmm_configurations(variant, "on")
         config["server_args"]["paras_vmm_runtime_states"] = "false"
         with self.assertRaisesRegex(ValueError, "boolean"):

@@ -182,6 +182,83 @@ class RuntimeOrderingTest(unittest.TestCase):
             Runtime.capture(runtime)
         self.assertEqual(seen, [([1, 2], 2, 2), ([1, 2, 4, 8], 8, 8), ([1, 2], 2, 2)])
 
+    def test_flashinfer_recapture_recreates_input_and_backend_capacity_both_directions(self):
+        runtime, _ = self.runtime(ParaSMode.EP, "fixed_buffer_recapture")
+        runtime.graph_batches = {
+            ParaSMode.EP: [1, 2, 4, 8, 256],
+            ParaSMode.TP: [1, 2, 4, 8, 256, 2048],
+        }
+        gr = runtime.runner.graph_runner
+        backend = runtime.runner.attn_backend
+        gr.seq_lens = [0] * 256  # Source EP buffers reproduce the smoke failure.
+        events = []
+        def init_backend(max_bs, max_tokens):
+            backend.capacity = max_tokens
+            events.append(("backend", max_bs, max_tokens))
+        def init_inputs():
+            gr.seq_lens = [0] * gr.max_bs
+            gr.input_ids = [0] * gr.max_num_token
+            events.append(("inputs", gr.max_bs))
+        def capture():
+            for bs in reversed(gr.capture_bs):
+                # FlashInfer wrappers fix their batch at construction; updater
+                # derives runtime batch from sliced seq_lens. These must match.
+                self.assertEqual(len(gr.seq_lens[:bs]), bs)
+                self.assertEqual(len(gr.input_ids[:bs]), bs)
+                self.assertGreaterEqual(backend.capacity, bs)
+            events.append(("capture", gr.max_bs))
+            gr.graphs = dict.fromkeys(gr.capture_bs)
+        backend.init_cuda_graph_state = init_backend
+        gr.init_graph_buffers = init_inputs
+        gr.capture = capture
+        modules = {
+            "sglang.srt.model_executor.cuda_graph_runner": SimpleNamespace(model_capture_mode=nullcontext),
+            "sglang.srt.paras.paras_cuda_graph": SimpleNamespace(paras_refresh_cuda_graph_settings=lambda gr: None),
+        }
+        with patch.dict(sys.modules, modules):
+            for mode in (ParaSMode.TP, ParaSMode.EP):
+                runtime.scheduler.paras_parallelism_config = mode
+                Runtime.capture(runtime)
+        self.assertEqual(events, [
+            ("backend", 2048, 2048), ("inputs", 2048), ("capture", 2048),
+            ("backend", 256, 256), ("inputs", 256), ("capture", 256),
+        ])
+
+    def test_discard_releases_flashinfer_wrappers_and_graph_inputs_without_gc(self):
+        import weakref
+        class Owned:
+            pass
+        runtime, _ = self.runtime(ParaSMode.EP, "fixed_buffer_recapture")
+        gr, backend = runtime.runner.graph_runner, runtime.runner.attn_backend
+        wrapper, buffer = Owned(), Owned()
+        wrapper_ref, buffer_ref = weakref.ref(wrapper), weakref.ref(buffer)
+        gr.graphs, gr.output_buffers = {}, {}
+        gr._paras_saved = {ParaSMode.EP: {"buffer": buffer, "wrapper": wrapper}}
+        gr.seq_lens = buffer
+        backend.decode_cuda_graph_metadata = {256: [wrapper]}
+        backend.prefill_cuda_graph_metadata = {256: [wrapper]}
+        backend.draft_extend_cuda_graph_metadata = {256: [wrapper]}
+        backend.forward_metadata = SimpleNamespace(decode_wrappers=[wrapper])
+        backend.cuda_graph_kv_indices = [buffer]
+        backend.cuda_graph_custom_mask = buffer
+        backend.cuda_graph_qk_indptr = [buffer]
+        backend.cuda_graph_qo_indptr = [buffer]
+        workspace = Owned()
+        backend.workspace_buffer = workspace
+        del wrapper, buffer
+        modules = {
+            "sglang.srt.model_executor.cuda_graph_runner": SimpleNamespace(set_global_graph_memory_pool=Mock()),
+            "sglang.srt.paras.paras_cuda_graph": SimpleNamespace(_BUFFER_KEYS=("seq_lens",)),
+        }
+        with patch.dict(sys.modules, modules), patch("gc.collect", side_effect=AssertionError("explicit GC")):
+            Runtime.discard_graphs(runtime)
+        self.assertIsNone(wrapper_ref())
+        self.assertIsNone(buffer_ref())
+        self.assertIsNone(backend.forward_metadata)
+        self.assertFalse(hasattr(gr, "seq_lens"))
+        self.assertFalse(hasattr(backend, "cuda_graph_kv_indices"))
+        self.assertIs(backend.workspace_buffer, workspace)
+
     def test_full_graph_report_requires_both_sets_and_correct_replay_limits(self):
         runtime, _ = self.runtime(ParaSMode.EP, "full")
         gr = runtime.runner.graph_runner

@@ -14,7 +14,8 @@ import sys
 import tarfile
 import time
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = next(p for p in Path(__file__).resolve().parents
+            if (p / "python/sglang").is_dir() and (p / "benchmark/paras").is_dir())
 HERE = Path(__file__).resolve().parent
 
 
@@ -23,7 +24,6 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model", default="gpt-oss-120b")
     parser.add_argument("--gpus", type=int, default=8)
-    parser.add_argument("--cache-layout", choices=["overlapping", "separate"], default="overlapping")
     parser.add_argument("--cache-gib", nargs="+", type=float, default=[10, 20, 30])
     parser.add_argument(
         "--methods",
@@ -106,8 +106,6 @@ def main():
                     + [
                         "--resident-cache-gib",
                         str(size),
-                        "--cache-layout",
-                        args.cache_layout,
                         "--load",
                         "1",
                         "--method",
@@ -144,7 +142,6 @@ def main():
         if p.is_file()
         and p.suffix in (".py", ".sh", ".md", ".json")
         and "results" not in p.parts
-        and "legacy" not in p.relative_to(HERE).parts
     )
     manifest = {
         "created_at": time.time(),
@@ -152,7 +149,6 @@ def main():
         "gpus": args.gpus,
         "smoke": args.smoke,
         "cache_gib": args.cache_gib,
-        "cache_layout": args.cache_layout,
         "warmup": args.warmup,
         "iters": args.iters,
         "dry_run": args.dry_run,

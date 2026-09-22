@@ -13,8 +13,7 @@ Volume control:
     `--load` is the resident fraction in (0, 1].
     Legacy mode repeats ONE isolated layer. --resident-cache-gib instead
     allocates all uniform layers distinctly with that total resident EP K+V
-    GiB per GPU. Resident mode defaults to overlapping EP/TP storage;
-    --cache-layout separate retains the historical disjoint layout. No hybrid SWA.
+    GiB per GPU. Neither mode models overlapping UMM or hybrid SWA migration.
 
 Slot policy:
     Both directions read a scattered live source and write freshly allocated,
@@ -39,8 +38,6 @@ import sys
 import time
 
 import torch
-import triton
-import triton.language as tl
 import torch.distributed as dist
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,7 +48,6 @@ from common.layouts import (
     KVLayout,
     add_volume_args,
     make_kv_layout,
-    make_overlapping_cache_layout,
     make_resident_kv_layout,
 )
 from common.model_configs import add_model_args, resolve_model
@@ -63,52 +59,6 @@ from common.cache_reference import (
     unpack_gather,
     unpack_scatter,
 )
-
-@triton.jit
-def _initialize_sources(
-    arena, offsets, slots, N: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
-    TOKEN_START: tl.constexpr, HEAD_START: tl.constexpr, BLOCK: tl.constexpr,
-):
-    layer = tl.program_id(1)
-    kind = tl.program_id(2)
-    x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    valid = x < N * H * D
-    token = x // (H * D)
-    slot = tl.load(slots + token, valid, other=0).to(tl.int64)
-    destination = slot * (H * D) + x % (H * D)
-    offset = tl.load(offsets + layer * 2 + kind)
-    ptr = (arena + offset).to(tl.pointer_type(tl.bfloat16))
-    value = ((token + TOKEN_START) * 17 + layer * 11
-             + (x // D % H + HEAD_START) * 7 + (x % D) * 3) % 127
-    tl.store(ptr + destination, value + kind * 128, valid)
-
-
-def prepare_source_initializer(ctx, layout, offsets, direction, source_slots):
-    """Return a capture-safe source reset; caller excludes it from timing.
-
-    Every source layer is distinct. Sources may alias other layers' previous
-    destinations, so resetting them is required before each measured switch.
-    Destination values are verified independently with the Torch reference.
-    """
-    ep = direction == "ep_to_tp"
-    mode = "ep" if ep else "tp"
-    source_offsets = torch.tensor(
-        [[off[f"{mode}_k"], off[f"{mode}_v"]] for off in offsets],
-        dtype=torch.int64, device=ctx.device,
-    )
-    n = layout.num_resident_tokens * (1 if ep else ctx.world_size)
-    heads = layout.num_kv_heads if ep else layout.heads_per_rank
-    token_start = ctx.rank * layout.num_resident_tokens if ep else 0
-    head_start = 0 if ep else ctx.rank * layout.num_kv_heads // ctx.world_size
-
-    def initialize():
-        _initialize_sources[(triton.cdiv(n * heads * layout.head_dim, 4096), len(offsets), 2)](
-            ctx.buf, source_offsets, source_slots, n, heads, layout.head_dim,
-            token_start, head_start, 4096,
-        )
-
-    return initialize
-
 
 ppa = ppa3c = None  # Load the CUDA extension after CLI validation.
 SLOT_POLICY = "scattered_source_compact_destination_v1"
@@ -344,7 +294,6 @@ def run_direction(
     iters,
     variant,
     distinct_layers=False,
-    cache_layout="separate",
 ):
     base = offsets_in_arena(layout)
     offsets = [
@@ -355,23 +304,10 @@ def run_direction(
         }
         for layer in range(num_layers if distinct_layers else 1)
     ]
-    layer_views = []
-    overlapping = distinct_layers and cache_layout == "overlapping"
-    if overlapping:
-        storage = make_overlapping_cache_layout(layout, num_layers)
-        offsets = [storage.offsets(layer) for layer in range(num_layers)]
-        layer_views = [_views(ctx, layout, off) for off in offsets]
-    else:
-        layer_views = [_views(ctx, layout, off) for off in offsets]
+    layer_views = [_views(ctx, layout, off) for off in offsets]
     source_slots = build_source_slots(ctx, layout, direction, seed)
-    if overlapping:
-        initialize_sources = prepare_source_initializer(
-            ctx, layout, offsets, direction, source_slots
-        )
-        initialize_sources()
-    else:
-        for layer, views in enumerate(layer_views):
-            _initialize(ctx, layout, views, direction, source_slots, layer)
+    for layer, views in enumerate(layer_views):
+        _initialize(ctx, layout, views, direction, source_slots, layer)
 
     def select(layer):
         index = layer if distinct_layers else 0
@@ -449,19 +385,18 @@ def run_direction(
         main = torch.cuda.current_stream()
         if prep_stream is not None:
             prep_stream.wait_stream(main)
-        order = storage.layer_order(direction) if overlapping else range(layers)
-        for ordinal, layer in enumerate(order):
+        for layer in range(layers):
             if method == "peer_access":
                 direct(layer)
                 ctx.barrier()
                 continue
-            index = ordinal % len(buffers)
+            index = layer % len(buffers)
             send, recv = buffers[index]
             if prep_stream is None:
                 pack(send, layer)
             else:
                 with torch.cuda.stream(prep_stream):
-                    if ordinal >= len(buffers):
+                    if layer >= len(buffers):
                         prep_stream.wait_event(reusable[index])
                     pack(send, layer)
                     ready[index].record()
@@ -478,8 +413,6 @@ def run_direction(
         _verify(ctx, layout, views, direction, layer)
     timer = CudaTimer(ctx.device, warmup=warmup, iters=iters)
     for _ in range(timer.total_iters):
-        if overlapping:
-            initialize_sources()
         ctx.barrier()
         timer.tick()
         execute(num_layers)
@@ -523,10 +456,6 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
-    parser.add_argument(
-        "--cache-layout", choices=("overlapping", "separate"), default="overlapping",
-        help="Resident-layer EP/TP layout; source regeneration is outside timing",
-    )
     parser.add_argument("--seed", type=int, default=0xCAFE)
     parser.add_argument("--out-csv", type=str, default=None)
     args = parser.parse_args()
@@ -578,9 +507,6 @@ def main():
         if distinct_layers
         else "isolated_homogeneous_layer_repeated"
     )
-    if distinct_layers and args.cache_layout == "overlapping":
-        arena = make_overlapping_cache_layout(layout, num_layers).arena_bytes
-        scope = "distinct_uniform_layers_overlapping_no_swa"
     layer_capacity_gib = 2 * layout.ep_buffer_bytes / 2**30
     ctx = setup_ipc_arena(arena, peer_access=args.method == "peer_access")
     if ctx.world_size != args.tp_size:
@@ -599,7 +525,7 @@ def main():
             f"num_resident_tokens={layout.num_resident_tokens}"
         )
         print(f"[rank 0] arena={arena/(1024**3):.2f}GiB method={args.method}")
-        print(f"[rank 0] scope={scope}; cache transfer only; no serving workload or hybrid SWA")
+        print(f"[rank 0] scope={scope}; cache transfer only; no serving or UMM overlap")
         print(f"[rank 0] slot_policy={SLOT_POLICY} seed={args.seed}")
 
     results = []
@@ -618,7 +544,6 @@ def main():
             args.iters,
             args.variant,
             distinct_layers=distinct_layers,
-            cache_layout=args.cache_layout,
         )
         results.append({"direction": "tp_to_ep", **stats})
         if ctx.rank == 0:
@@ -642,7 +567,6 @@ def main():
             args.iters,
             args.variant,
             distinct_layers=distinct_layers,
-            cache_layout=args.cache_layout,
         )
         results.append({"direction": "ep_to_tp", **stats})
         if ctx.rank == 0:

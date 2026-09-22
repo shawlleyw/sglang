@@ -7,7 +7,10 @@ import unittest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common.layouts import make_resident_kv_layout
+from common.layouts import (
+    KVLayout, OverlappingCacheLayout, make_overlapping_cache_layout,
+    make_resident_kv_layout,
+)
 from common.model_configs import PRESETS
 from bench_cache import _pattern, _views, offsets_in_arena
 from types import SimpleNamespace
@@ -75,6 +78,79 @@ class ResidentCacheVolumeTest(unittest.TestCase):
         for volume in (0, -1, float("nan"), float("inf"), 1e-10):
             with self.assertRaises(ValueError):
                 make_resident_kv_layout(PRESETS["gpt-oss-120b"], 8, volume)
+
+
+class OverlappingCacheTest(unittest.TestCase):
+    def test_real_layouts_slot_zero_and_ninety_four_layers(self):
+        for heads in (8, 4, 1):  # TP8 gives R1, R2, R8.
+            for tokens in (8, 128, 8192):
+                base = KVLayout(8, heads, 128, 2, tokens + 1, 8 * tokens + 1, tokens)
+                plan = make_overlapping_cache_layout(base, 94)
+                self.assertEqual(plan.offsets(93)["ep_v"], 187 * base.ep_buffer_bytes)
+                self.assertEqual(plan.offsets(93)["tp_v"],
+                                 2 * base.ep_buffer_bytes + 93 * plan.tp_layer_stride + base.tp_buffer_bytes)
+                self.assertEqual(plan.layer_order("ep_to_tp"), tuple(range(93, -1, -1)))
+                self.assertEqual(plan.layer_order("tp_to_ep"), tuple(range(94)))
+                self.assertEqual(plan.arena_bytes, plan.ep_layer_bytes + 94 * plan.tp_layer_stride)
+                if heads == 8:
+                    self.assertLess(plan.tp_layer_bytes, plan.ep_layer_bytes)
+                    self.assertEqual(plan.tp_layer_stride, plan.ep_layer_bytes)
+                else:
+                    self.assertEqual(plan.tp_layer_stride, plan.tp_layer_bytes)
+
+    def test_byte_array_migration_preserves_unread_sources(self):
+        # Simulate real writes into one shared allocation, not just inequalities.
+        for layers in (1, 2, 5, 12):
+            for replication in (1, 2, 8):
+                plan = OverlappingCacheLayout(8, 8 * replication, layers)
+                for direction in ("ep_to_tp", "tp_to_ep"):
+                    arena = bytearray([255]) * plan.arena_bytes
+                    for layer in range(layers):
+                        source, _ = plan._regions(layer, direction)
+                        arena[source[0]:source[1]] = bytes([layer + 1]) * (source[1] - source[0])
+                    for layer in plan.layer_order(direction):
+                        source, destination = plan._regions(layer, direction)
+                        self.assertEqual(set(arena[source[0]:source[1]]), {layer + 1})
+                        arena[destination[0]:destination[1]] = bytes([layer + 1]) * (destination[1] - destination[0])
+                    for layer in range(layers):
+                        _, destination = plan._regions(layer, direction)
+                        self.assertEqual(set(arena[destination[0]:destination[1]]), {layer + 1})
+
+    def test_wrong_order_and_incomplete_order_rejected(self):
+        plan = OverlappingCacheLayout(64, 128, 94)
+        for direction in ("ep_to_tp", "tp_to_ep"):
+            with self.assertRaisesRegex(ValueError, "destroys unread"):
+                plan.validate_order(direction, reversed(plan.layer_order(direction)))
+            with self.assertRaisesRegex(ValueError, "exactly once"):
+                plan.validate_order(direction, [0] * 94)
+
+    def test_next_destination_must_not_race_current_source_read(self):
+        # With R1 adjacent layouts shift by exactly one layer. Eager destination
+        # commits would destroy every preceding in-flight read in both directions.
+        plan = OverlappingCacheLayout(8, 8, 4)
+        self.assertEqual(plan.prefetch_hazards("ep_to_tp"), ((3, 2), (2, 1), (1, 0)))
+        self.assertEqual(plan.prefetch_hazards("tp_to_ep"), ((0, 1), (1, 2), (2, 3)))
+
+    def test_real_qwen_residency_allocation(self):
+        # R2 physical TP volume is approximately twice EP; one extra EP layer
+        # replaces the previous full additional EP arena, including slot zero.
+        for gib in (10, 20, 30, 40, 50, 60):
+            tokens = (gib * 2**30) // (94 * 2 * 4 * 128 * 2)
+            layout = KVLayout(8, 4, 128, 2, tokens + 1, tokens * 8 + 1, tokens)
+            plan = make_overlapping_cache_layout(layout, 94)
+            old = 94 * (plan.ep_layer_bytes + plan.tp_layer_bytes)
+            self.assertEqual(old - plan.arena_bytes, 93 * plan.ep_layer_bytes)
+            self.assertLess(plan.arena_bytes / (94 * plan.ep_layer_bytes), 2.02)
+
+    def test_invalid_arguments(self):
+        for args in ((0, 1, 1), (1, -1, 1), (1, 1, 0), (True, 1, 1)):
+            with self.assertRaises(ValueError):
+                OverlappingCacheLayout(*args)
+        plan = OverlappingCacheLayout(1, 1, 1)
+        with self.assertRaises(ValueError):
+            plan.offsets(1)
+        with self.assertRaises(ValueError):
+            plan.layer_order("bad")
 
 
 if __name__ == "__main__":

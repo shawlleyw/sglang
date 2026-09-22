@@ -1,6 +1,7 @@
 """Configuration validation shared by the driver, workers, and CPU tests."""
 
 from copy import deepcopy
+from pathlib import Path
 
 HOST_METHODS = ("host_reload", "host_model_to")
 METHODS = ("rebuild", *HOST_METHODS, "naive_nccl", "fixed_buffer_recapture", "full")
@@ -21,6 +22,7 @@ def validate_config(config):
         raise ValueError("world_size must be at least 2")
     if not result.get("model_path"):
         raise ValueError("model_path is required")
+    result["model_path"] = str(Path(result["model_path"]).expanduser())
     if "graph_batch_sizes" in result:
         raise ValueError(
             "graph_batch_sizes is a v1 override; use production-generated graph "
@@ -81,9 +83,10 @@ def validate_config(config):
             "prefill_attention_backend",
             "decode_attention_backend",
         ):
-            allowed = ("triton",) if field == "attention_backend" else (None, "triton")
+            backend = options.get("attention_backend")
+            allowed = ("triton", "flashinfer") if field == "attention_backend" else (None, backend)
             if options.get(field) not in allowed:
-                raise ValueError(f"paras_vmm_runtime_states requires Triton {field}")
+                raise ValueError(f"paras_vmm_runtime_states requires matching Triton/FlashInfer {field}")
     if result.get("probe_decode_steps", 2) < 1:
         raise ValueError("probe_decode_steps must be positive")
     warmups = result.setdefault("warmup_switches", 1)
@@ -173,4 +176,32 @@ def server_arguments(config, mode="ep", paras=True):
         disable_radix_cache=True,
         random_seed=config.get("seed", 42),
     )
+    if not ep:
+        args["moe_runner_backend"] = config.get(
+            "tp_moe_runner_backend", args.get("moe_runner_backend", "triton")
+        )
     return args
+
+
+def configure_vocabulary_environment(mode, *, paras, environ):
+    """Scope the static TP parity opt-in; do not leak it into DP constructors."""
+    replicated = mode == "tp" and not paras
+    for field in ("EMBEDDING", "LM_HEAD"):
+        environ[f"SGLANG_QWEN3_REPLICATED_{field}"] = str(replicated).lower()
+    if mode == "tp":
+        environ["SYNC_TOKEN_IDS_ACROSS_TP"] = "1"
+
+
+def verify_ep_provider(config, importer=None):
+    """Check the real EP implementation before allocating/loading model weights."""
+    if config.get("ep_provider") != "uccl":
+        return None
+    if importer is None:
+        from importlib import import_module
+        importer = import_module
+    importer("torch")  # UCCL extension requires libtorch loaded first.
+    deep_ep = importer("deep_ep")
+    uccl_ep = importer("uccl.ep")
+    if deep_ep.Config is not uccl_ep.Config:
+        raise RuntimeError("This experiment requires UCCL's deep_ep compatibility wrapper")
+    return {"provider": "uccl", "deep_ep_path": deep_ep.__file__, "uccl_ep_path": uccl_ep.__file__}

@@ -421,3 +421,27 @@ and only scalar placeholders for inactive entries. They report backing bytes by
 mode; this verifies manager ownership, not all possible external references or
 the allocator returning cached memory to CUDA. These checks run outside switch
 timing. Live KV request/page migration remains outside this benchmark's scope.
+
+## Qwen3-235B on H200
+
+The Qwen H200 preset uses FlashInfer attention, DeepGEMM MoE/UCCL EP and Triton
+MoE in native TP. Prefill budgets are 2048 per EP rank and 8192 in TP. Native TP
+replicates the Qwen vocabulary embedding/head to match ParaS storage without
+turning on DP attention. UCCL's compatibility-wrapper identity is checked before
+loading weights. Override `--model-path` if the default `~/models` path differs.
+
+For the single-measurement campaign, pass `--repetitions 1`. One warmup remains
+outside timing. Six methods × both directions gives twelve baseline cells.
+To add the seventh plotted variant without duplicating Full-off observations,
+run only `--methods full --vmm on --repetitions 1` in a separate directory and
+pair it with the baseline Full-off cells. Preserve source/configuration identity,
+logical KV capacities and full graph coverage across the pair. Native `--vmm both`
+is still available for independent matched studies.
+
+VMM validation follows current production support for matching Triton or
+FlashInfer backends; native Engine restart always disables this ParaS-only option.
+Fresh manifests hash/archive runtime Python sources as well as benchmark files.
+Host methods record actual destination snapshot and pinned bytes, and Linux
+process-lifetime peak RSS. Restart's child hooks record actual captured graph
+keys and first replay per rank; the initial audit write is part of Engine setup.
+These observations do not replace numerical validation or device testing.

@@ -64,10 +64,11 @@ Other model/hardware combinations still require their own GPU smoke test below.
 
 ## KV kernels
 
-`bench_cache.py` is a separate **isolated homogeneous layer** harness. It repeats
-one layer's buffers `num_hidden_layers` times to measure launch/transfer costs;
-it does not allocate a model's UMM layout, migrate request metadata, or reproduce
-GPT-OSS's mix of full-attention and sliding-window live pages.
+`bench_cache.py` supports a legacy isolated-layer mode and a resident mode
+(`--resident-cache-gib`) with distinct storage for every uniform layer. Resident
+mode defaults to overlapping EP/TP layouts; `--cache-layout separate` reproduces
+the historical disjoint-buffer experiment. Neither mode migrates request metadata
+or reproduces GPT-OSS's mix of full-attention and sliding-window live pages.
 
 - `--cache-size-gb` sets the EP K+V capacity **for the one isolated layer** on
   each GPU. `--load` sets its resident fraction.
@@ -85,8 +86,10 @@ GPT-OSS's mix of full-attention and sliding-window live pages.
   direct kernels. After head reassembly, both directions use PyTorch `copy_`
   into compact destination slices. NCCL baselines use no custom pack/unpack
   kernels. All methods verify the destination, before and after timing.
-- NCCL overlap uses double staging buffers and explicit reuse events in this
-  disjoint-buffer harness. It is not a demonstrated cross-layer UMM schedule.
+- NCCL overlap uses double staging buffers and explicit reuse events. With
+  overlapping storage, safe layer order protects unread sources, preparation
+  reads the next source into independent staging, and destination commits remain
+  ordered on the main stream. This is an isolated kernel benchmark.
 
 For GPT-OSS, run distinct volumes representing full-attention and sliding-window
 resident pages and label them as component measurements. A single cache run
@@ -236,24 +239,68 @@ python benchmark/paras/run_kernel_ablation.py --model qwen3-235b --dry-run \
   --output /tmp/qwen3-kernel-plan
 ```
 
-At TP8 and full occupancy, the cache arena alone is approximately **2×** the
-resident EP K+V volume for GPT-OSS, and **3×** for either Qwen preset because
-Qwen's four KV heads are replicated across eight TP ranks. Thus 10/20/30 GiB
-requires about 20/40/60 GiB per GPU for GPT-OSS, versus 30/60/90 GiB for Qwen,
-before NCCL staging, temporary tensors, and CUDA overhead. Qwen's 30 GiB case
-cannot fit an 80 GiB A100; select smaller volumes with `--cache-gib 10 20` there.
-The 30 GiB setting targets H200 capacity. Under Qwen replication, EP→TP also
-transfers twice the remote payload of TP→EP; the CSV accounts for this.
+### Model and GPU portability
 
-`run_kernel_ablation.py` runs the expert weights (`--kernel experts`, w13+w2
-with one fence per layer, excluding attention) and uniform KV layers at total
-resident EP K+V volumes of 10/20/30 **GiB per GPU**. GPT-OSS uses all 36 layers,
-eight KV heads, head dimension 64 and BF16; SWA is disabled for this microbenchmark.
-The new `bench_cache.py --resident-cache-gib` allocates distinct source/destination
-buffers for every layer. It does not repeatedly transfer one small layer and
-label the result as a full resident allocation. It uses disjoint EP/TP buffers,
-not the production UMM's overlapping KV layout. At 30 GiB resident, GPT-OSS's
-source+destination arena is approximately 60 GiB per GPU; staging is additional.
+The same kernel benchmark supports `gpt-oss-120b`, `qwen3-235b`, and
+`qwen3-30b`. Dimensions, layer counts, GPT-OSS gate/up interleaving, and
+TP KV-head replication are derived from the model preset. It uses patterned
+BF16 tensors; no model checkpoint or DeepGEMM/UCCL serving backend is required.
+The production peer-access extension builds SM80 and SM90 code for A100 and
+H100/H200 respectively. Direct transfer requires working peer access between
+all participating GPUs; use a single NVLink-connected node for comparable results.
+Build the extension for the target environment before running.
+
+Run this smoke command for each model on each target machine before collecting
+results (use a fresh output directory each time):
+
+```bash
+python benchmark/paras/run_kernel_ablation.py --model gpt-oss-120b --smoke \
+  --output /tmp/gptoss-kernel-smoke
+python benchmark/paras/run_kernel_ablation.py --model qwen3-235b --smoke \
+  --output /tmp/qwen3-kernel-smoke
+```
+
+The smoke run exercises both directions and all three transports with two
+layers and 64 MiB of resident EP KV. CPU tests and `--dry-run` validate layout
+and command construction; they do not establish execution on a GPU model.
+Full Qwen3 measurements have been collected on H200; A100/H100 execution of
+this revision still requires target-machine validation.
+
+Choose cache volumes for the actual device capacity. In Qwen3 TP8, 30 GiB
+resident EP KV needs about 60.32 GiB of arena before staging/runtime overhead;
+40 GiB needs about 80.43 GiB and therefore cannot fit an 80-GiB GPU. Smaller
+GPU variants need smaller volumes. GPT-OSS has a different replication factor
+and footprint; its uniform-layer benchmark explicitly disables hybrid SWA.
+
+The existing `bench_cache.py` and `run_kernel_ablation.py` entry points and
+arguments remain supported; no replacement script is required. Legacy isolated-layer
+mode is unchanged. For resident-cache runs, add `--cache-layout separate` to
+reproduce the previous storage layout.
+
+Resident mode defaults to `--cache-layout overlapping`. Each layer has disjoint
+source/destination views, but the EP and TP layouts share storage across layers.
+An EP-layer gap separates their starts. The TP stride is the larger of one EP
+layer and one TP layer (including slot-zero padding). EP→TP visits layers in
+reverse; TP→EP visits them forward, protecting every unread source. The default
+Qwen TP8/R2 arena is approximately **2V + V/L**, where V is resident EP K+V
+per GPU and L is the layer count, instead of 3V with separate buffers. Thus
+Qwen3-235B's 40/50/60 GiB points need approximately 80.43/100.53/120.64 GiB
+arenas, before NCCL staging and runtime overhead. These are cache-only runs;
+no model weights are allocated. The arena is a compact benchmark layout,
+not a claim about an entire serving process's memory footprint.
+
+Patterned sources are regenerated in place before **every** warmup/measured
+iteration, outside the timed region. No full-cache backup is retained.
+The timed operation includes transfer, NCCL packing/unpacking and required
+synchronization. All destination elements in every distinct layer are checked
+against a separate Torch reference before and after timing. Remote bytes count
+EP→TP replication (2V × 7/8 at Qwen TP8) and unique reverse traffic (V × 7/8).
+
+`run_kernel_ablation.py` runs expert-only weights (w13+w2, excluding attention)
+and distinct uniform KV layers. Use `--cache-gib 10 20 30 40 50 60` for the H200
+Qwen sweep. `--cache-layout separate` remains available for historical comparison;
+never mix the two storage layouts in one curve. GPT-OSS uses all 36 uniform
+layers here, with SWA disabled; this is not a full model's hybrid-cache switch.
 `--load` defaults to 1 in this mode; use a smaller fraction to model sparse EP
 source slots. The TP pool holds W·N live tokens plus padding; its source slots
 are a permutation of that resident span, without additional capacity slack.
@@ -302,3 +349,10 @@ sources and randomly indexed EP destinations in TP→EP; they describe a differe
 workload. Use a fresh CSV for corrected runs and rerun all three cache methods
 together. The analyzer labels old data `legacy_random_ep_destination` and
 rejects mixed slot policies; existing measurements are not silently relabeled.
+
+### Archived kernel benchmark
+
+The [previous kernel benchmark](legacy/kernel_benchmark/README.md) is retained
+with its own measurement scripts, helpers, reproduction commands, and provenance.
+Use the current entry points above for new GPT-OSS/Qwen3 measurements. Current
+run archives exclude `legacy/` to avoid duplicating historical sources.
