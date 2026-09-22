@@ -14,6 +14,7 @@ set -uo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 source "$SCRIPT_DIR/lib.sh"
+export ENABLE_PARAS=1
 
 FAIL_COUNT=0
 FAILED_STEPS=()
@@ -29,6 +30,7 @@ run_step() {
         echo "step ${n} FAILED (rc=$rc)"
         FAIL_COUNT=$((FAIL_COUNT + 1))
         FAILED_STEPS+=("${n}")
+        exit "$rc"
     fi
     return $rc
 }

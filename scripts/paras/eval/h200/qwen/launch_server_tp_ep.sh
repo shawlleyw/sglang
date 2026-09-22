@@ -23,7 +23,9 @@ set -uo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 source "$SCRIPT_DIR/../../launch_common.sh"
 
-MODEL_PATH=${MODEL_PATH:-/models/Qwen3-235B-A22B-Instruct-2507}
+MODEL_PATH=${MODEL_PATH:-$HOME/models/Qwen3-235B-A22B-Instruct-2507}
+ATTENTION_BACKEND=${ATTENTION_BACKEND:-flashinfer}
+MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-triton}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
 
 paras_launch_setup_tp_ep
@@ -31,6 +33,8 @@ paras_launch_setup_tp_ep
 python -m sglang.launch_server \
     --model-path "$MODEL_PATH" \
     --trust-remote-code \
+    --attention-backend "$ATTENTION_BACKEND" \
+    --moe-runner-backend "$MOE_RUNNER_BACKEND" \
     --host "$HOST" --port "$PORT" \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --tp-size "$NUM_GPUS" --ep-size "$NUM_GPUS" \
