@@ -173,7 +173,7 @@ def test_supported_configuration():
     [
         ("enable_paras_moe", False),
         ("disable_cuda_graph", True),
-        ("attention_backend", "flashinfer"),
+        ("attention_backend", "fa3"),
         ("device", "cpu"),
         ("speculative_algorithm", "EAGLE"),
         ("pp_size", 2),
@@ -270,3 +270,32 @@ def test_cuda_manager_pins_the_device_ordinal_without_using_cuda(monkeypatch):
     memory = rm.CudaModeRuntimeMemory("cuda")
     assert memory.device == rm.torch.device("cuda:3")
     assert requested_devices == [3]
+
+
+@pytest.mark.parametrize("backend", ["triton", "flashinfer"])
+def test_matching_prefill_decode_backends_supported(backend):
+    args = valid_config()
+    args.attention_backend = backend
+    args.prefill_attention_backend = backend
+    args.decode_attention_backend = backend
+    validate_runtime_vmm_config(args)
+
+
+def test_mixed_attention_backends_rejected():
+    args = valid_config()
+    args.attention_backend = "flashinfer"
+    args.decode_attention_backend = "triton"
+    with pytest.raises(ValueError, match="matching"):
+        validate_runtime_vmm_config(args)
+
+
+@pytest.mark.parametrize("dtype,typestr", [("int32", "<i4"), ("uint8", "|u1")])
+def test_flashinfer_cuda_array_interface_dtypes(dtype, typestr):
+    from sglang.srt.paras import runtime_memory as rm
+
+    allocation = VmmAllocation(FakeDriver(), 128)
+    owner = rm._CudaArray(allocation, (32,), getattr(rm.torch, dtype))
+    interface = owner.__cuda_array_interface__
+    assert interface["typestr"] == typestr
+    assert interface["data"] == (allocation.address, False)
+    assert owner.allocation is allocation

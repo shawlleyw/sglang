@@ -155,7 +155,12 @@ class _CudaArray:
         self.__cuda_array_interface__ = {
             "shape": tuple(shape),
             "strides": None,
-            "typestr": {torch.int64: "<i8", torch.float32: "<f4"}[dtype],
+            "typestr": {
+                torch.int64: "<i8",
+                torch.int32: "<i4",
+                torch.uint8: "|u1",
+                torch.float32: "<f4",
+            }[dtype],
             "data": (allocation.address, False),
             "version": 3,
         }
@@ -261,7 +266,10 @@ def validate_runtime_vmm_config(args):
     required = (
         (args.enable_paras_moe, "--enable-paras-moe"),
         (not args.disable_cuda_graph, "CUDA graphs"),
-        (args.attention_backend == "triton", "--attention-backend triton"),
+        (
+            args.attention_backend in ("triton", "flashinfer"),
+            "--attention-backend triton or flashinfer",
+        ),
         (args.device in (None, "cuda"), "CUDA"),
         (args.speculative_algorithm is None, "no speculative decoding"),
         (args.pp_size == 1, "pipeline parallel size 1"),
@@ -269,8 +277,14 @@ def validate_runtime_vmm_config(args):
         (not args.enable_pdmux, "pdmux disabled"),
         (not args.enable_torch_compile, "torch compile disabled"),
         (not args.enable_memory_saver, "memory saver disabled"),
-        (args.prefill_attention_backend in (None, "triton"), "Triton prefill"),
-        (args.decode_attention_backend in (None, "triton"), "Triton decode"),
+        (
+            args.prefill_attention_backend in (None, args.attention_backend),
+            "prefill backend matching the attention backend",
+        ),
+        (
+            args.decode_attention_backend in (None, args.attention_backend),
+            "decode backend matching the attention backend",
+        ),
     )
     for supported, requirement in required:
         if not supported:

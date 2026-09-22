@@ -3091,9 +3091,10 @@ class ServerArgs:
             "--paras-vmm-runtime-states",
             action="store_true",
             help=(
-                "Experimental: unmap inactive ParaS Triton graph KV indices and "
-                "logits while retaining their virtual addresses. Requires CUDA "
-                "graphs, explicit triton attention, and no speculative decoding."
+                "Experimental: unmap inactive ParaS graph KV indices, logits, "
+                "and FlashInfer custom masks while retaining virtual addresses. "
+                "Requires CUDA graphs, explicit triton or flashinfer attention, "
+                "and no speculative decoding."
             ),
         )
         parser.add_argument(

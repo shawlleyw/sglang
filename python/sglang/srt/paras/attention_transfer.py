@@ -11,39 +11,50 @@ def _restore_attention(
     peer_bases,
     output,
     source_offset: tl.constexpr,
-    count: tl.constexpr,
     H: tl.constexpr,
     Q: tl.constexpr,
     KV: tl.constexpr,
     HEAD: tl.constexpr,
     T: tl.constexpr,
+    RANK: tl.constexpr,
     IS_QKV: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    valid = x < count
+    # Interleave source peers instead of exhausting one peer's shard first.
+    # A scalar peer base also preserves contiguous/vectorized remote loads.
+    program = tl.program_id(0)
+    # Rotate each destination's starting peer to avoid synchronized hotspots.
+    peer = (program % T + RANK) % T
+    x = (program // T) * BLOCK + tl.arange(0, BLOCK)
     q = Q // T
     kv = tl.maximum(HEAD, KV // T)
+    replica = tl.maximum(1, T // (KV // HEAD))
     if IS_QKV:
         row, col = x // H, x % H
-        is_q = row < Q
-        kv_row = (row - Q) % KV
-        replica = tl.maximum(1, T // (KV // HEAD))
-        rank = tl.where(is_q, row // q, kv_row // kv * replica)
-        local_row = tl.where(is_q, row % q, q + (row - Q) // KV * kv + kv_row % kv)
-        index = local_row * H + col
+        is_q = row < q
+        # Q uses every shard; duplicated K/V uses only its canonical replica.
+        valid = (x < (q + 2 * kv) * H) & (is_q | (peer % replica == 0))
+        destination_row = tl.where(
+            is_q,
+            peer * q + row,
+            Q + ((row - q) // kv) * KV + (peer // replica) * kv + (row - q) % kv,
+        )
+        destination = destination_row * H + col
     else:
-        row, col = x // Q, x % Q
-        rank = col // q
-        index = row * q + col % q
-    base = tl.load(peer_bases + rank, valid, other=0) + source_offset
+        valid = x < H * q
+        destination = (x // q) * Q + peer * q + x % q
+    base = tl.load(peer_bases + peer) + source_offset
     source = base.to(tl.pointer_type(tl.bfloat16))
-    value = tl.load(source + index, valid, other=0)
-    tl.store(output + x, value, valid)
+    value = tl.load(source + x, valid, other=0)
+    tl.store(output + destination, value, valid)
 
 
 def transfer_attention(manager, layer_id, mode: ParaSMode, rank, peer_bases):
-    """Caller fences all ranks after the complete layer, including MoE."""
+    """Transfer disjoint layer views; caller fences every rank after the layer.
+
+    The CUDA restore pushes each canonical shard to all peers. No rank may
+    consume the reconstructed weights until the collective fence completes.
+    """
     spec = manager._unified_spec
     lp = f"{spec.prefix}.layers.{layer_id}.self_attn"
     h, d, t = spec.hidden_size, spec.head_dim, spec.tp_size
@@ -53,6 +64,37 @@ def transfer_attention(manager, layer_id, mode: ParaSMode, rank, peer_bases):
     for proj in ("qkv_proj", "o_proj"):
         ep_name, tp_name = f"{lp}.{proj}.weight", f"{lp}.{proj}.tp_weight"
         ep, tp = manager.get_view(ep_name), manager.get_view(tp_name)
+        ep_offset = manager._entries[ep_name].offset_bytes
+        tp_offset = manager._entries[tp_name].offset_bytes
+        # The vectorized CUDA path copies eight BF16 elements per instruction.
+        # Retain the existing path for shapes without this alignment.
+        if (
+            ep.element_size() == 2
+            and tp.element_size() == 2
+            and h % 8 == 0
+            and qs % 8 == 0
+            and d % 8 == 0
+            and ep.data_ptr() % 16 == 0
+            and tp.data_ptr() % 16 == 0
+            and ep_offset % 16 == 0
+            and tp_offset % 16 == 0
+        ):
+            import paras_peer_access_cuda as cuda
+
+            base = tp.data_ptr() - tp_offset
+            if mode == ParaSMode.EP:
+                cuda.launch_attention_restore(
+                    base, peer_bases, tp_offset, ep_offset, h, q, kv, d, t,
+                    rank, proj == "qkv_proj", "push", 16384, 256, 1,
+                )
+            elif mode == ParaSMode.TP:
+                cuda.launch_attention_slice(
+                    base, ep_offset, tp_offset, h, q, kv, d, t, rank,
+                    proj == "qkv_proj", 16384, 256,
+                )
+            else:
+                raise ValueError(mode)
+            continue
         if mode == ParaSMode.TP:
             if proj == "qkv_proj":
                 tp[:qs].copy_(ep[rank * qs : (rank + 1) * qs])
@@ -63,18 +105,18 @@ def transfer_attention(manager, layer_id, mode: ParaSMode, rank, peer_bases):
             else:
                 tp.copy_(ep[:, rank * qs : (rank + 1) * qs])
         elif mode == ParaSMode.EP:
-            _restore_attention[(triton.cdiv(ep.numel(), 1024),)](
+            _restore_attention[(triton.cdiv(tp.numel(), 4096) * t,)](
                 peer_bases,
                 ep,
                 manager._entries[tp_name].offset_bytes,
-                ep.numel(),
                 h,
                 q,
                 kv,
                 d,
                 t,
+                rank,
                 proj == "qkv_proj",
-                1024,
+                4096,
             )
         else:
             raise ValueError(mode)

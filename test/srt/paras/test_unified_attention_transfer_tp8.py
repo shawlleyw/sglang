@@ -24,8 +24,8 @@ def test_tp8_attention_ipc_uses_four_distinct_kv_shards():
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl")
     try:
-        # Actual Qwen3-30B attention dimensions.
-        h, heads, kv_heads, d, t = 2048, 32, 4, 128, 8
+        # Actual Qwen3-235B attention dimensions, including replicated KV.
+        h, heads, kv_heads, d, t = 4096, 64, 4, 128, 8
         q, kv = heads * d, kv_heads * d
         qs, ks = q // t, d
         shapes = {
@@ -98,21 +98,57 @@ def test_tp8_attention_ipc_uses_four_distinct_kv_shards():
         # Destroy every full copy and poison the duplicate KV replicas.
         # Reconstruction must read K/V only from ranks 0,2,4,6, yet still
         # read distinct Q/O shards from all eight ranks.
-        for proj in reference:
-            view(f"model.layers.0.self_attn.{proj}.weight").fill_(float("nan"))
         if rank % 2:
             qkv[qs:].fill_(float("nan"))
-        torch.cuda.synchronize()
-        dist.barrier()
+        sources = {
+            proj: view(f"model.layers.0.self_attn.{proj}.tp_weight")
+            for proj in reference
+        }
+
+        def clear_destination():
+            for proj in reference:
+                view(f"model.layers.0.self_attn.{proj}.weight").fill_(float("nan"))
+
+        def fence():
+            torch.cuda.synchronize()
+            dist.barrier()
+
+        # Compile before CUDA graph capture. Fences remain outside the graph:
+        # every rank must finish reading peer shards before source updates.
+        before_warmup = {proj: tensor.view(torch.int16).clone() for proj, tensor in sources.items()}
+        clear_destination()
+        fence()
         transfer_attention(manager, 0, ParaSMode.EP, rank, bases)
-        for proj, expected in reference.items():
-            torch.testing.assert_close(
-                view(f"model.layers.0.self_attn.{proj}.weight"),
-                expected,
-                rtol=0,
-                atol=0,
-            )
-        torch.cuda.synchronize()
-        dist.barrier()
+        fence()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            transfer_attention(manager, 0, ParaSMode.EP, rank, bases)
+        fence()
+
+        for proj, tensor in sources.items():
+            assert torch.equal(tensor.view(torch.int16), before_warmup[proj])
+
+        for execution in ("eager", "cuda_graph", "cuda_graph_changed_source"):
+            if execution == "cuda_graph_changed_source":
+                for tensor in reference.values():
+                    tensor.neg_()
+                for tensor in sources.values():
+                    tensor.neg_()
+            snapshots = {proj: tensor.view(torch.int16).clone() for proj, tensor in sources.items()}
+            clear_destination()
+            fence()
+            if execution == "eager":
+                transfer_attention(manager, 0, ParaSMode.EP, rank, bases)
+            else:
+                graph.replay()
+            fence()
+            for proj, expected in reference.items():
+                torch.testing.assert_close(
+                    view(f"model.layers.0.self_attn.{proj}.weight"),
+                    expected, rtol=0, atol=0,
+                )
+                # Exact bit equality also checks the poisoned replica NaNs.
+                assert torch.equal(sources[proj].view(torch.int16), snapshots[proj])
+            fence()
     finally:
         dist.destroy_process_group()

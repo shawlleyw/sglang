@@ -630,18 +630,36 @@ class FlashInferAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        if kv_indices_buf is None:
+        memory = getattr(self, "_paras_runtime_memory", None)
+        shape = (max_num_tokens * self.max_context_len,)
+        if memory is not None:
+            if kv_indices_buf is not None:
+                raise ValueError("ParaS runtime VMM requires owned FlashInfer indices")
+            # Wrappers retain these exact pointers in captured kernels. Reclaim
+            # physical pages only; replay's indices updater rewrites all used
+            # indices after the mode manager remaps the same virtual addresses.
+            self.cuda_graph_kv_indices = [
+                memory.zeros(
+                    self._paras_workspace_mode,
+                    f"flashinfer_kv_indices_{i}",
+                    shape,
+                    torch.int32,
+                )
+                for i in range(self.num_wrappers)
+            ]
+        elif kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len,),
+                shape,
                 dtype=torch.int32,
                 device="cuda",
             )
         else:
             cuda_graph_kv_indices = kv_indices_buf
 
-        self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
-            cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
-        ]
+        if memory is None:
+            self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
+                cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
+            ]
 
         # Ensure tensors are properly allocated
         for i in range(self.num_wrappers):
@@ -650,11 +668,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_kv_indices[i][0] = 0
 
         if not self.skip_prefill:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device="cuda",
-            )
+            if memory is None:
+                self.cuda_graph_custom_mask = torch.zeros(
+                    shape, dtype=torch.uint8, device="cuda"
+                )
+            else:
+                # Speculative decoding (the consumer of this mask) is rejected
+                # by VMM validation. Keep the usual state layout and size while
+                # allowing its inactive-mode pages to be reclaimed as well.
+                self.cuda_graph_custom_mask = memory.zeros(
+                    self._paras_workspace_mode,
+                    "flashinfer_custom_mask",
+                    shape,
+                    torch.uint8,
+                )
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
