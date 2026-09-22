@@ -74,6 +74,14 @@ def analyze(raw):
     reference = reference_bandwidth(sorted(raw.glob("nvbandwidth-*MiB.log")), world)
     results = []
     cache_slot_policies = set()
+    cache_layouts = set()
+    manifest_layout = manifest.get("cache_layout", "separate")
+    if manifest_layout not in ("separate", "overlapping"):
+        raise ValueError("Unknown manifest cache_layout")
+    scope_layouts = {
+        "distinct_uniform_layers_no_swa": "separate",
+        "distinct_uniform_layers_overlapping_no_swa": "overlapping",
+    }
     for kind, filename in (("weights", "weights.csv"), ("cache", "cache.csv")):
         with (raw / filename).open() as stream:
             source = list(csv.DictReader(stream))
@@ -88,8 +96,16 @@ def analyze(raw):
                 workload = "Experts"
                 volume = 0.0
             else:
-                if r["scope"] != "distinct_uniform_layers_no_swa":
+                layout = scope_layouts.get(r["scope"])
+                if layout is None:
                     raise ValueError("Expected distinct-layer uniform cache data")
+                if r.get("cache_layout") and r["cache_layout"] != layout:
+                    raise ValueError("Cache layout column disagrees with scope")
+                cache_layouts.add(layout)
+                if len(cache_layouts) > 1:
+                    raise ValueError("Cannot compare mixed separate/overlapping cache layouts")
+                if layout != manifest_layout:
+                    raise ValueError("Cache layout disagrees with manifest cache_layout")
                 payload = int(r["resident_bytes_per_rank_all_layers"])
                 remote = int(r["remote_bytes_per_rank_all_layers"])
                 volume = float(r["resident_cache_gib_requested"])
@@ -109,6 +125,7 @@ def analyze(raw):
                     "method": r["method"],
                     "direction": r["direction"],
                     "cache_slot_policy": slot_policy if kind == "cache" else "",
+                    "cache_layout": layout if kind == "cache" else "",
                     "layers": int(r["num_layers"]),
                     "iterations": int(r["n"]),
                     "total_mean_ms": ms,
@@ -239,8 +256,8 @@ def main():
         "",
         "Mean of maximum-rank CUDA-event times; initialization/checking excluded.",
         "",
-        "| Workload | Direction | NCCL (ms) | NCCL overlap (ms) | Direct (ms) | Direct GB/s | % SM reference |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "| Workload | Cache layout | Direction | NCCL (ms) | NCCL overlap (ms) | Direct (ms) | Direct GB/s | % SM reference |",
+        "|---|---|---|---:|---:|---:|---:|---:|",
     ]
     for workload in dict.fromkeys(r["workload"] for r in rows):
         for direction in ("ep_to_tp", "tp_to_ep"):
@@ -251,7 +268,7 @@ def main():
             }
             direct = subset["peer_access"]
             lines.append(
-                f"| {workload} | {direction} | {subset['nccl']['total_mean_ms']:.3f} | {subset['nccl_overlap']['total_mean_ms']:.3f} | {direct['total_mean_ms']:.3f} | {direct['effective_remote_GBps_per_gpu']:.2f} | {direct['sm_reference_efficiency_percent']:.1f}% |"
+                f"| {workload} | {direct['cache_layout'] or 'N/A'} | {direction} | {subset['nccl']['total_mean_ms']:.3f} | {subset['nccl_overlap']['total_mean_ms']:.3f} | {direct['total_mean_ms']:.3f} | {direct['effective_remote_GBps_per_gpu']:.2f} | {direct['sm_reference_efficiency_percent']:.1f}% |"
             )
     lines += [
         "",
@@ -259,7 +276,13 @@ def main():
         "",
         "Efficiency = (remote bytes / measured SM-copy bandwidth) / measured transfer time. Remote bytes exclude self copies and are counted once. This is an empirical copy reference, not a proven optimal all-to-all kernel. Its fan-in/fan-out tests run separately; actual kernels have simultaneous all-to-all traffic, layout transformation, self copies, and layer fences.",
         "",
-        "KV volumes are resident K+V GiB per EP GPU across distinct uniform layers, without SWA. Weights contain w13+w2 only. NCCL staging/packing/unpacking is timed. TP→EP weight overlap currently uses the sequential schedule. One fresh worker group per cell, with multiple timed iterations; not a multiple-run confidence interval.",
+        "KV volumes are resident K+V GiB per EP GPU across distinct uniform layers, without SWA. Weights contain w13+w2 only. NCCL staging/packing/unpacking is timed. TP→EP weight overlap currently uses the sequential schedule. One fresh worker group per method/workload job, measuring both directions with multiple timed iterations; not a multiple-run confidence interval.",
+        "",
+        "Cache layout: "
+        + next(r["cache_layout"] for r in rows if r["kind"] == "cache")
+        + ". Distinct cache storage is used for every layer ("
+        + ", ".join(str(n) for n in sorted({r["layers"] for r in rows if r["kind"] == "cache"}))
+        + " layers). Overlapping layout uses ordered layer transfers through overlapping EP/TP views, with source reinitialization outside every timed iteration; separate layout retains disjoint EP/TP allocations. These layouts must not be mixed in one comparison.",
         "",
         "Cache slot policy: "
         + next(r["cache_slot_policy"] for r in rows if r["kind"] == "cache")

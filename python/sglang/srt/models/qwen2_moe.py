@@ -518,6 +518,7 @@ class Qwen2MoeModel(nn.Module):
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = Qwen2MoeDecoderLayer,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        replicated_embedding: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -530,7 +531,7 @@ class Qwen2MoeModel(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                enable_tp=not (is_dp_attention_enabled() or replicated_embedding),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:

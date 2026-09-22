@@ -61,6 +61,7 @@ def manifest(config, args, settings, plan):
             versions[package] = None
     files = sorted(
         {
+            *(ROOT / "python/sglang/srt").rglob("*.py"),
             *HERE.glob("*.py"),
             *HERE.glob("*.sh"),
             *HERE.glob("*.md"),
@@ -73,6 +74,7 @@ def manifest(config, args, settings, plan):
         }
     )
     return {
+        "runtime_checkout": str(ROOT),
         "schema_version": 1,
         "experiment_version": 2,
         "created_at": time.time(),
@@ -84,7 +86,7 @@ def manifest(config, args, settings, plan):
         ),
         "repetitions": args.repetitions,
         "vmm_settings": list(settings),
-        "vmm_scope": "mode-local logits and Triton KV-index scratch; not model weights or KV contents",
+        "vmm_scope": "mode-local logits and attention KV-index scratch; not model weights or KV contents",
         "restart_vmm_policy": "shared native engine reference, VMM not applicable; measured once per direction/repetition",
         "trial_plan": plan,
         "python": sys.executable,

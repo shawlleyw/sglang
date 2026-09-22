@@ -21,6 +21,40 @@ PRINT_CHARS=${PRINT_CHARS:-300}
 BURST_SIZE=${BURST_SIZE:-32}
 MAX_TOKENS=${MAX_TOKENS:-200}
 
+# Require the endpoint's exact success message, not merely HTTP 200.
+paras_cmd_verify_switch() {
+    local mode=$1 response=$2 elapsed_ms=$3
+    if [ "$response" != "ParaS ${mode^^} parallelism configured." ]; then
+        echo "FAIL: unexpected configure_${mode} response: $response" >&2
+        return 1
+    fi
+    python3 - "$elapsed_ms" "${CONFIGURE_MAX_MS:-2500}" "$LOG_FILE" "${4:-}" "$mode" <<'PY'
+import math, re, sys
+elapsed, limit = map(float, sys.argv[1:3])
+if not math.isfinite(elapsed) or not 0 <= elapsed < limit:
+    sys.exit(f'FAIL: configure took {elapsed} ms; threshold is {limit} ms')
+if sys.argv[4]:
+    with open(sys.argv[3], 'rb') as stream:
+        stream.seek(int(sys.argv[4]))
+        recent = stream.read().decode(errors='replace')
+    if 'switch rejected by precheck' in recent:
+        sys.exit('FAIL: scheduler rejected the requested switch')
+    timings = re.findall(r'Time taken to configure ' + sys.argv[5].upper() + r': ([\d.eE+-]+) ms', recent)
+    if not timings:
+        sys.exit('FAIL: no fresh successful switch in server log')
+    if any(not math.isfinite(float(ms)) or not 0 <= float(ms) < limit for ms in timings):
+        sys.exit(f'FAIL: scheduler switch timing exceeds {limit} ms')
+PY
+}
+
+paras_cmd_burst_wait() {
+    local pid status=0
+    for pid in "$@"; do
+        wait "$pid" || status=1
+    done
+    return "$status"
+}
+
 # Send a /v1/chat/completions request and print "[label] <text>" with the response.
 # gpt-oss requires the harmony chat template (auto-applied by /v1/chat/completions);
 # raw /v1/completions skips it and the model never emits <|return|> EOS, so use
@@ -147,7 +181,7 @@ paras_cmd_burst_send() {
     for _i in "${!_prompts_ref[@]}"; do
         _payload=$(paras_cmd_build_payload "${_prompts_ref[$_i]}" "$_max_tokens")
         _n=$((_i + 1))
-        curl -s --max-time "$_timeout" "http://${HOST}:${PORT}/v1/chat/completions" \
+        curl --fail-with-body -sS --max-time "$_timeout" "http://${HOST}:${PORT}/v1/chat/completions" \
             -H "Content-Type: application/json" -d "$_payload" \
             > "$_tmpdir/burst_${_n}.json" &
         _pids_ref+=("$!")
@@ -157,30 +191,40 @@ paras_cmd_burst_send() {
 # Scan $tmpdir/burst_*.json for the canonical "(\b\w+\b)(\s+\1){5,}" attractor
 # (5+ consecutive identical word repetitions). Print degenerate file indices
 # inline. Returns 0 if all clean, 1 if any degenerate.
-# Usage: paras_cmd_burst_verify <tmpdir> <label>
+# Usage: paras_cmd_burst_verify <tmpdir> <label> [expected-count]
 paras_cmd_burst_verify() {
     local _tmpdir=$1
     local _label=$2
     local _total=0 _degen=0 _f _idx
     for _f in "$_tmpdir"/burst_*.json; do
         _total=$((_total + 1))
-        if python3 -c "
+        if ! python3 - "$_f" <<'PYVERIFY'
 import json, re, sys
 try:
-    d = json.load(open('$_f'))
-    msg = d['choices'][0].get('message', {})
-    text = (msg.get('reasoning_content') or '') + (msg.get('content') or '')
-    sys.exit(0 if re.search(r'(\b\w+\b)(\s+\1){5,}', text) else 1)
-except Exception:
-    sys.exit(2)
-" 2>/dev/null; then
+    with open(sys.argv[1]) as f:
+        response = json.load(f)
+    message = response['choices'][0]['message']
+    text = (message.get('reasoning_content') or '') + (message.get('content') or '')
+    if len(text.strip()) < 10:
+        raise ValueError('response shorter than 10 characters')
+    if re.search(r'(\b\w+\b)(\s+\1){5,}', text):
+        raise ValueError('degenerate repeated words')
+except Exception as error:
+    print(f'{sys.argv[1]}: {error}', file=sys.stderr)
+    sys.exit(1)
+PYVERIFY
+        then
             _degen=$((_degen + 1))
             _idx=$(basename "$_f" .json | sed 's/burst_//')
-            echo "  [${_label}] burst_${_idx}: DEGENERATE"
+            echo "  [${_label}] burst_${_idx}: INVALID OR DEGENERATE"
         fi
     done
+    if [ -n "${3:-}" ] && [ "$_total" -ne "$3" ]; then
+        echo "[${_label}] FAIL: expected $3 responses, found $_total"
+        return 1
+    fi
     if [ "$_degen" -gt 0 ]; then
-        echo "[${_label}] FAIL: ${_degen} / ${_total} degenerate"
+        echo "[${_label}] FAIL: ${_degen} / ${_total} invalid or degenerate"
         return 1
     fi
     echo "[${_label}] PASS: 0 / ${_total} degenerate"

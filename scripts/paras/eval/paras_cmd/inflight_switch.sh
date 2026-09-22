@@ -45,15 +45,27 @@ paras_cmd_burst_send prompts pids "$TMPDIR" "$INFLIGHT_MAX_TOKENS"
 
 sleep "$INFLIGHT_DELAY"
 
+active=0
+for pid in "${pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then active=$((active + 1)); fi
+done
+if [ "$active" -eq 0 ]; then
+    echo "FAIL: all requests finished before the in-flight switch; reduce INFLIGHT_DELAY" >&2
+    exit 1
+fi
+echo "[${TAG}] $active requests still outstanding at switch time"
+
+log_offset=$(wc -c < "$LOG_FILE") || exit $?
 t0=$(date +%s.%N)
-switch_resp=$(curl -s --max-time 60 "http://${HOST}:${PORT}/paras_configure_${TARGET}")
+switch_resp=$(curl --fail-with-body -sS --max-time 60 "http://${HOST}:${PORT}/paras_configure_${TARGET}") || exit $?
 t1=$(date +%s.%N)
 elapsed_ms=$(python3 -c "print(round(($t1 - $t0) * 1000, 1))")
 echo "[${TAG}] configure_${TARGET}: ${elapsed_ms}ms; resp: ${switch_resp}"
+paras_cmd_verify_switch "$TARGET" "$switch_resp" "$elapsed_ms" "$log_offset" || exit $?
 
-wait "${pids[@]}"
+paras_cmd_burst_wait "${pids[@]}" || { echo "FAIL: completion request failed" >&2; exit 1; }
 
-if ! paras_cmd_burst_verify "$TMPDIR" "$TAG"; then
+if ! paras_cmd_burst_verify "$TMPDIR" "$TAG" "${#prompts[@]}"; then
     paras_cmd_print_completion_file "${TAG} P1 (sample)" "$TMPDIR/burst_1.json"
     echo "[${TAG}] preserving response files at ${TMPDIR} for inspection"
     trap '' EXIT

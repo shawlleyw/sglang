@@ -11,10 +11,24 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 source "$SCRIPT_DIR/lib.sh"
 
 WHAT=${1:-all}
+if [ ! -r "$LOG_FILE" ]; then
+    echo "FAIL: server log is not readable: $LOG_FILE" >&2
+    exit 1
+fi
 
 check_timing() {
     echo "=== timing ==="
-    grep -E "Time taken to configure (TP|EP)|transfer_weights" "$LOG_FILE" || echo "(no timing lines)"
+    grep -E "Time taken to configure (TP|EP)|transfer_weights" "$LOG_FILE" || return 1
+    python3 - "$LOG_FILE" "${CONFIGURE_MAX_MS:-2500}" <<'PY'
+import math, re, sys
+with open(sys.argv[1]) as stream:
+    matches = re.findall(r'Time taken to configure (?:TP|EP): ([\d.eE+-]+) ms', stream.read())
+if not matches:
+    sys.exit('FAIL: no completed ParaS switch timing found')
+limit = float(sys.argv[2])
+if any(not math.isfinite(float(ms)) or not 0 <= float(ms) < limit for ms in matches):
+    sys.exit(f'FAIL: configure timing exceeds {limit} ms')
+PY
 }
 
 check_errors() {
@@ -41,7 +55,7 @@ case "$WHAT" in
     errors)     check_errors ;;
     cuda_graph) check_cuda_graph ;;
     all)
-        check_timing
+        check_timing || exit $?
         echo
         check_cuda_graph
         echo

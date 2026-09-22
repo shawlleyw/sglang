@@ -262,6 +262,8 @@ def use_deep_gemm_bf16(
 
     return (
         moe_ep_size > 1
+        and get_moe_runner_backend()
+        in (MoeRunnerBackend.AUTO, MoeRunnerBackend.DEEP_GEMM)
         and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         and get_moe_a2a_backend().is_deepep()
         and not with_bias

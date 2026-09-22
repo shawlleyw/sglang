@@ -17,7 +17,9 @@ set -uo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
-MODEL_PATH=${MODEL_PATH:-/models/Qwen3-235B-A22B-Instruct-2507}
+MODEL_PATH=${MODEL_PATH:-$HOME/models/Qwen3-235B-A22B-Instruct-2507}
+ATTENTION_BACKEND=${ATTENTION_BACKEND:-flashinfer}
+MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-triton}
 NUM_GPUS=${NUM_GPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-"1 8 64 256 1 8 64 256"}
 CUDA_GRAPH_BS=${CUDA_GRAPH_BS:-"1 8 64 256"}
@@ -38,6 +40,8 @@ paras_init_profile
 "${LAUNCHER[@]}" python -m sglang.bench_one_batch \
     --model-path "$MODEL_PATH" \
     --trust-remote-code \
+    --attention-backend "$ATTENTION_BACKEND" \
+    --moe-runner-backend "$MOE_RUNNER_BACKEND" \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --tp-size "$NUM_GPUS" --dp-size "$NUM_GPUS" \
     --enable-dp-attention --enable-dp-lm-head \

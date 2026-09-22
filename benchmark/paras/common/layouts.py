@@ -14,6 +14,7 @@ The routing helper rounds N down to a multiple of R.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterable
 import math
 
 from .model_configs import ModelConfig
@@ -220,3 +221,107 @@ def add_volume_args(parser) -> None:
         default=None,
         help="Resident fraction; defaults to 1 for --resident-cache-gib, 0.5 for legacy mode",
     )
+
+
+def _overlaps(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return max(a[0], b[0]) < min(a[1], b[1])
+
+
+@dataclass(frozen=True)
+class OverlappingCacheLayout:
+    """Layer-wise EP/TP aliases with an EP-sized gap and safe migration order.
+
+    TP stride is padded to at least the EP layer size. Callers must fence
+    each layer before committing the next destination; prefetching into
+    independent staging alone does not satisfy that dependency.
+    """
+
+    ep_buffer_bytes: int
+    tp_buffer_bytes: int
+    num_layers: int
+
+    def __post_init__(self):
+        for name in ("ep_buffer_bytes", "tp_buffer_bytes", "num_layers"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        self.validate_order("ep_to_tp")
+        self.validate_order("tp_to_ep")
+
+    @property
+    def ep_layer_bytes(self) -> int:
+        return 2 * self.ep_buffer_bytes
+
+    @property
+    def tp_layer_bytes(self) -> int:
+        return 2 * self.tp_buffer_bytes
+
+    @property
+    def tp_layer_stride(self) -> int:
+        return max(self.ep_layer_bytes, self.tp_layer_bytes)
+
+    @property
+    def arena_bytes(self) -> int:
+        return self.ep_layer_bytes + self.num_layers * self.tp_layer_stride
+
+    def offsets(self, layer: int) -> dict[str, int]:
+        if not isinstance(layer, int) or not 0 <= layer < self.num_layers:
+            raise ValueError("layer index out of bounds")
+        ep = layer * self.ep_layer_bytes
+        tp = self.ep_layer_bytes + layer * self.tp_layer_stride
+        return {"ep_k": ep, "ep_v": ep + self.ep_buffer_bytes,
+                "tp_k": tp, "tp_v": tp + self.tp_buffer_bytes}
+
+    def _regions(self, layer: int, direction: str):
+        offsets = self.offsets(layer)
+        ep = (offsets["ep_k"], offsets["ep_k"] + self.ep_layer_bytes)
+        tp = (offsets["tp_k"], offsets["tp_k"] + self.tp_layer_bytes)
+        if direction == "ep_to_tp":
+            return ep, tp
+        if direction == "tp_to_ep":
+            return tp, ep
+        raise ValueError(f"unknown direction: {direction}")
+
+    def layer_order(self, direction: str) -> tuple[int, ...]:
+        if direction == "ep_to_tp":
+            return tuple(range(self.num_layers - 1, -1, -1))
+        if direction == "tp_to_ep":
+            return tuple(range(self.num_layers))
+        raise ValueError(f"unknown direction: {direction}")
+
+    def validate_order(self, direction: str, order: Iterable[int] | None = None):
+        """Reject out-of-bounds views or writes that destroy an unread source."""
+        expected = self.layer_order(direction)
+        order = expected if order is None else tuple(order)
+        if sorted(order) != list(range(self.num_layers)):
+            raise ValueError("order must visit every layer exactly once")
+        regions = [self._regions(layer, direction) for layer in range(self.num_layers)]
+        for layer, (source, destination) in enumerate(regions):
+            for start, end in (source, destination):
+                if not 0 <= start < end <= self.arena_bytes:
+                    raise ValueError(f"layer {layer} view outside arena")
+            if _overlaps(source, destination):
+                raise ValueError(f"layer {layer} source and destination overlap")
+        unread = set(range(self.num_layers))
+        for layer in order:
+            unread.remove(layer)
+            destination = regions[layer][1]
+            for other in unread:
+                if _overlaps(destination, regions[other][0]):
+                    raise ValueError(f"layer {layer} write destroys unread layer {other}")
+
+    def prefetch_hazards(self, direction: str) -> tuple[tuple[int, int], ...]:
+        """Return (current, next) pairs needing read-before-next-write fences.
+
+        Pure next-source prefetch into disjoint staging is safe. These hazards
+        concern the next destination commit racing a still-active current read.
+        """
+        order = self.layer_order(direction)
+        return tuple((current, nxt) for current, nxt in zip(order, order[1:])
+                     if _overlaps(self._regions(current, direction)[0],
+                                  self._regions(nxt, direction)[1]))
+
+
+def make_overlapping_cache_layout(layout, num_layers: int) -> OverlappingCacheLayout:
+    """Derive geometry from KVLayout, including its already-reserved slot zero."""
+    return OverlappingCacheLayout(layout.ep_buffer_bytes, layout.tp_buffer_bytes, num_layers)

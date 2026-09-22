@@ -20,6 +20,7 @@ from reconfigure.runtime_memory import (
     runtime_memory_report,
 )
 from sglang.srt.paras.mode import ParaSMode
+from sglang.srt.paras.paras_cuda_graph import _BUFFER_KEYS
 from sglang.srt.paras.runtime_memory import CudaModeRuntimeMemory, ModeRuntimeMemory
 from test.srt.paras.test_runtime_memory import FakeDriver
 from test.srt.paras.test_runtime_states import backend, load_nodes
@@ -163,6 +164,7 @@ def test_repeated_capture_uses_production_graph_buffers_and_vmm_names(
         "sglang.srt.paras.paras_cuda_graph",
         SimpleNamespace(
             paras_refresh_cuda_graph_settings=lambda gr: None,
+            _BUFFER_KEYS=_BUFFER_KEYS,
         ),
     )
     monkeypatch.setattr("gc.collect", lambda: pytest.fail("explicit disposal GC"))

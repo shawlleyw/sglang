@@ -9,11 +9,13 @@ from sglang.srt.paras.mode import ParaSMode
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("tp_size,kv_heads", [(4, 8), (8, 4)])
-def test_attention_roundtrip_without_full_backup(tp_size, kv_heads):
+@pytest.mark.parametrize("tp_size,kv_heads", [(4, 8), (8, 4), (8, 1)])
+@pytest.mark.parametrize("execution", ["eager", "cuda_graph"])
+@pytest.mark.parametrize("h", [64, 65], ids=["cuda_aligned", "unaligned_fallback"])
+def test_attention_roundtrip_without_full_backup(tp_size, kv_heads, execution, h):
     from sglang.srt.paras.attention_transfer import transfer_attention
 
-    h, heads, d = 64, 16, 128
+    heads, d = 16, 128
     q, kv = heads * d, kv_heads * d
     q_tp, kv_tp = q // tp_size, max(d, kv // tp_size)
     shapes = {"qkv_proj": (q + 2 * kv, h), "o_proj": (h, q)}
@@ -62,15 +64,64 @@ def test_attention_roundtrip_without_full_backup(tp_size, kv_heads):
     )
     for rank, manager in enumerate(managers):
         transfer_attention(manager, 0, ParaSMode.TP, rank, bases)
-    for manager in managers:
-        for p in shapes:
-            manager.get_view(f"model.layers.0.self_attn.{p}.weight").fill_(float("nan"))
+    # Noncanonical KV replicas must never supply reconstructed K/V. Q and O
+    # remain rank-distinct and must still be read from every participating rank.
+    replication = max(1, tp_size // kv_heads)
     for rank, manager in enumerate(managers):
-        transfer_attention(manager, 0, ParaSMode.EP, rank, bases)
-        for p in shapes:
-            torch.testing.assert_close(
-                manager.get_view(f"model.layers.0.self_attn.{p}.weight"),
-                reference[p],
-                rtol=0,
-                atol=0,
-            )
+        if rank % replication:
+            manager.get_view("model.layers.0.self_attn.qkv_proj.tp_weight")[q_tp:].fill_(float("nan"))
+
+    def clear_destinations():
+        for manager in managers:
+            for p in shapes:
+                manager.get_view(f"model.layers.0.self_attn.{p}.weight").fill_(float("nan"))
+
+    def restore():
+        for rank, manager in enumerate(managers):
+            transfer_attention(manager, 0, ParaSMode.EP, rank, bases)
+
+    original_sources = [
+        manager.get_view(f"model.layers.0.self_attn.{p}.tp_weight")
+        for manager in managers for p in shapes
+    ]
+    before_warmup = [tensor.view(torch.int16).clone() for tensor in original_sources]
+    clear_destinations()
+    # Compile before graph capture; this warmup does not satisfy verification.
+    restore()
+    graph = None
+    if execution == "cuda_graph":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            restore()
+
+    for tensor, before in zip(original_sources, before_warmup):
+        assert torch.equal(tensor.view(torch.int16), before)
+
+    for iteration in range(2):
+        if iteration:
+            # Reuse captured pointers with different source values, so a graph
+            # accidentally retaining old output cannot pass the second replay.
+            for tensor in reference.values():
+                tensor.neg_()
+            for manager in managers:
+                for p in shapes:
+                    manager.get_view(f"model.layers.0.self_attn.{p}.tp_weight").neg_()
+        sources = [
+            manager.get_view(f"model.layers.0.self_attn.{p}.tp_weight")
+            for manager in managers for p in shapes
+        ]
+        snapshots = [tensor.view(torch.int16).clone() for tensor in sources]
+        clear_destinations()
+        if graph is None:
+            restore()
+        else:
+            graph.replay()
+        for manager in managers:
+            for p in shapes:
+                torch.testing.assert_close(
+                    manager.get_view(f"model.layers.0.self_attn.{p}.weight"),
+                    reference[p], rtol=0, atol=0,
+                )
+        for tensor, before in zip(sources, snapshots):
+            # Compare bits, including poisoned NaN replicas.
+            assert torch.equal(tensor.view(torch.int16), before)

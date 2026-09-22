@@ -2,6 +2,20 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <vector>
+#include <string>
+
+namespace paras_attention {
+void launch_attention_restore(
+    uint64_t local_buffer_ptr, torch::Tensor peer_bases, int64_t src_offset,
+    int64_t dst_offset, int H, int Q, int KV, int head_dim, int tp_size, int rank,
+    bool is_qkv, const std::string& method, int tile_bytes, int threads,
+    int rotation);
+void launch_attention_slice(
+    uint64_t local_buffer_ptr, int64_t src_offset, int64_t dst_offset, int H,
+    int Q, int KV, int head_dim, int tp_size, int rank, bool is_qkv,
+    int tile_bytes, int threads);
+}
+
 
 // Forward declarations from .cu (v2 kernels only)
 void launch_peer_access_fused_transfer_w13_v2(
@@ -499,4 +513,19 @@ PYBIND11_MODULE(paras_peer_access_cuda, m) {
           "v3 KV cache EP->TP transfer (R-broadcast, half-warp K/V)");
     m.def("launch_peer_access_kv_scatter_v3", &launch_kv_scatter_v3_py,
           "v3 KV cache TP->EP scatter (contiguous-tile, half-warp K/V)");
+
+  m.def("launch_attention_restore", &paras_attention::launch_attention_restore,
+        pybind11::arg("local_buffer_ptr"), pybind11::arg("peer_bases"),
+        pybind11::arg("src_offset"), pybind11::arg("dst_offset"),
+        pybind11::arg("H"), pybind11::arg("Q"), pybind11::arg("KV"),
+        pybind11::arg("head_dim"), pybind11::arg("tp_size"), pybind11::arg("rank"),
+        pybind11::arg("is_qkv"), pybind11::arg("method") = "pull",
+        pybind11::arg("tile_bytes") = 16384, pybind11::arg("threads") = 256,
+        pybind11::arg("rotation") = 1);
+  m.def("launch_attention_slice", &paras_attention::launch_attention_slice,
+        pybind11::arg("local_buffer_ptr"), pybind11::arg("src_offset"),pybind11::arg("dst_offset"),
+        pybind11::arg("H"),pybind11::arg("Q"),pybind11::arg("KV"),pybind11::arg("head_dim"),
+        pybind11::arg("tp_size"),pybind11::arg("rank"),pybind11::arg("is_qkv"),
+        pybind11::arg("tile_bytes")=16384,pybind11::arg("threads")=256);
+
 }

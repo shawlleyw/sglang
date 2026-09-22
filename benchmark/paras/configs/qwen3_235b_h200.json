@@ -1,6 +1,6 @@
 {
-  "name": "qwen3-235b-bf16-h200",
-  "model_path": "/models/Qwen3-235B-A22B-Instruct-2507",
+  "name": "qwen3-235b-bf16-h200-fi-deepgemm-uccl-ep2k-tp8k-mem070",
+  "model_path": "~/models/Qwen3-235B-A22B-Instruct-2507",
   "world_size": 8,
   "seed": 42,
   "probe_prompt": "The capital of France is",
@@ -11,12 +11,17 @@
   "server_args": {
     "dtype": "bfloat16",
     "trust_remote_code": true,
-    "mem_fraction_static": 0.85,
-    "attention_backend": "triton",
-    "moe_runner_backend": "triton",
+    "mem_fraction_static": 0.7,
+    "attention_backend": "flashinfer",
+    "moe_runner_backend": "deep_gemm",
     "max_running_requests": 2048,
-    "max_prefill_tokens": 8192,
-    "chunked_prefill_size": -1
+    "max_prefill_tokens": 2048,
+    "chunked_prefill_size": -1,
+    "paras_tp_max_prefill_tokens": 8192,
+    "disable_overlap_schedule": true,
+    "paras_vmm_runtime_states": false,
+    "cuda_graph_max_bs": 256,
+    "paras_tp_cuda_graph_max_bs": 2048
   },
   "environment": {
     "PARAS_CONFIGURE_METHOD": "peer_access",
@@ -24,7 +29,12 @@
     "SGLANG_DEEPEP_BF16_DISPATCH": "true",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
     "SGLANG_ATTN_MAX_BS": "256",
-    "NVSHMEM_QP_DEPTH": "2048"
+    "NVSHMEM_QP_DEPTH": "2048",
+    "NVSHMEM_DISABLE_NCCL": "1",
+    "PARAS_POST_SWITCH_RAMP_ITERS": "0"
   },
-  "experiment_version": 2
+  "experiment_version": 2,
+  "warmup_switches": 1,
+  "ep_provider": "uccl",
+  "tp_moe_runner_backend": "triton"
 }

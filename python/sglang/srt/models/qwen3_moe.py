@@ -69,6 +69,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
+    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
@@ -667,6 +668,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
             prefix=prefix,
             decoder_layer_type=decoder_layer_type,
             alt_stream=alt_stream,
+            replicated_embedding=get_bool_env_var("SGLANG_QWEN3_REPLICATED_EMBEDDING"),
         )
 
 
@@ -683,6 +685,18 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        server_args = get_global_server_args()
+        replicated_lm_head = get_bool_env_var("SGLANG_QWEN3_REPLICATED_LM_HEAD")
+        if replicated_lm_head:
+            if server_args.enable_dp_attention or server_args.enable_dp_lm_head:
+                raise ValueError(
+                    "SGLANG_QWEN3_REPLICATED_LM_HEAD requires TP attention. "
+                    "For DP attention, use --enable-dp-lm-head instead."
+                )
+            if quant_config is not None:
+                raise ValueError(
+                    "SGLANG_QWEN3_REPLICATED_LM_HEAD requires unquantized weights."
+                )
         self.model = Qwen3MoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -691,9 +705,18 @@ class Qwen3MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            enable_tp=not replicated_lm_head,
+            use_attn_tp_group=server_args.enable_dp_lm_head,
         )
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(config, skip_all_gather=replicated_lm_head)
+        if replicated_lm_head:
+            logger.info(
+                "QWEN3_LM_HEAD_LAYOUT replicated=True head_tp_size=%s "
+                "weight_shape=%s logits_all_gather=%s",
+                self.lm_head.tp_size,
+                tuple(self.lm_head.weight.shape),
+                self.logits_processor.do_tensor_parallel_all_gather,
+            )
         self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self) -> nn.Embedding:

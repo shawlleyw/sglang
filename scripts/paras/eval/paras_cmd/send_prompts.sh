@@ -32,9 +32,9 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "[${LABEL}] sending ${#prompts[@]} parallel completions (max_tokens=${MAX_TOKENS})..."
 paras_cmd_burst_send prompts pids "$TMPDIR" "$MAX_TOKENS"
-wait "${pids[@]}"
+paras_cmd_burst_wait "${pids[@]}" || { echo "FAIL: completion request failed" >&2; exit 1; }
 
-if ! paras_cmd_burst_verify "$TMPDIR" "$LABEL"; then
+if ! paras_cmd_burst_verify "$TMPDIR" "$LABEL" "${#prompts[@]}"; then
     paras_cmd_print_completion_file "${LABEL} P1 (sample)" "$TMPDIR/burst_1.json"
     echo "[${LABEL}] preserving response files at ${TMPDIR} for inspection"
     trap '' EXIT

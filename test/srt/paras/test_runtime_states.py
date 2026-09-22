@@ -396,3 +396,51 @@ def test_ep_return_restores_independent_sampling_group(monkeypatch, rank):
     assert sampler.tp_sync_group is scheduler.attn_tp_group.device_group
     assert not sampler.force_sync_token_ids
     assert scheduler.paras_parallelism_config == ParaSMode.EP
+
+
+@pytest.mark.parametrize("num_wrappers", [1, 2])
+def test_flashinfer_vmm_state_owns_all_large_buffers_and_restores_aliases(num_wrappers):
+    cls = load_nodes(
+        "layers/attention/flashinfer_backend.py",
+        {"init_cuda_graph_state", "paras_save_cuda_graph_state", "paras_load_cuda_graph_state"},
+        "FlashInferAttnBackend",
+    )
+    allocations = {}
+
+    def zeros(mode, name, shape, dtype):
+        assert (mode, name) not in allocations
+        value = torch.zeros(shape, dtype=dtype)
+        allocations[mode, name] = value
+        return value
+
+    b = cls()
+    b._paras_runtime_memory = SimpleNamespace(zeros=zeros)
+    b.max_context_len = 16
+    b.num_wrappers = num_wrappers
+    b.skip_prefill = False
+    b.kv_indptr = [torch.zeros(9, dtype=torch.int32) for _ in range(num_wrappers)]
+    b.decode_cuda_graph_metadata = {}
+    b.prefill_cuda_graph_metadata = {}
+    b.draft_extend_cuda_graph_metadata = {}
+    states = {}
+    for mode, bs in [(ParaSMode.EP, 2), (ParaSMode.TP, 8)]:
+        b._paras_workspace_mode = mode
+        b.init_cuda_graph_state(bs, bs)
+        # Represent the captured wrappers' retained aliases without loading CUDA.
+        b.decode_cuda_graph_metadata = {bs: list(b.cuda_graph_kv_indices)}
+        states[mode] = b.paras_save_cuda_graph_state()
+        assert b.cuda_graph_custom_mask.numel() == bs * 16
+        assert b.cuda_graph_custom_mask.dtype == torch.uint8
+        for i, tensor in enumerate(b.cuda_graph_kv_indices):
+            assert tensor is allocations[mode, f"flashinfer_kv_indices_{i}"]
+            assert tensor.numel() == bs * 16
+            assert tensor.dtype == torch.int32
+    assert len(allocations) == 2 * (num_wrappers + 1)
+    for mode in [ParaSMode.EP, ParaSMode.TP, ParaSMode.EP]:
+        b.paras_load_cuda_graph_state(states[mode])
+        for i, tensor in enumerate(b.cuda_graph_kv_indices):
+            assert tensor is allocations[mode, f"flashinfer_kv_indices_{i}"]
+            assert next(iter(b.decode_cuda_graph_metadata.values()))[i] is tensor
+        assert b.cuda_graph_custom_mask is allocations[mode, "flashinfer_custom_mask"]
+    with pytest.raises(ValueError, match="owned FlashInfer indices"):
+        b.init_cuda_graph_state(2, 2, kv_indices_buf=torch.zeros(32))

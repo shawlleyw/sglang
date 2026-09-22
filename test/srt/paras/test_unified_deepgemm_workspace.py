@@ -85,16 +85,22 @@ def test_deepgemm_bf16_workspace_matches_dynamic_allocations(monkeypatch, masked
         (4, False, "gelu", False),
     ],
 )
-def test_bf16_backend_selection(monkeypatch, ep_size, with_bias, activation, expected):
+@pytest.mark.parametrize("backend", ["auto", "deep_gemm", "triton", "triton_kernel"])
+def test_bf16_backend_selection(
+    monkeypatch, ep_size, with_bias, activation, expected, backend
+):
     from types import SimpleNamespace
     from sglang.srt.layers import deep_gemm_wrapper
     from sglang.srt.layers.moe import utils
 
     monkeypatch.setattr(deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", True)
     monkeypatch.setattr(
+        utils, "get_moe_runner_backend", lambda: utils.MoeRunnerBackend(backend)
+    )
+    monkeypatch.setattr(
         utils, "get_moe_a2a_backend", lambda: SimpleNamespace(is_deepep=lambda: True)
     )
     assert (
         utils.use_deep_gemm_bf16(ep_size, with_bias=with_bias, activation=activation)
-        == expected
+        == (expected and backend in ("auto", "deep_gemm"))
     )

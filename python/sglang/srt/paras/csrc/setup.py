@@ -21,6 +21,7 @@ def get_extensions():
                 "peer_access_transfer.cu",
                 "kernels_v3.cu",
                 "kernels_v3_cache.cu",
+                "attention_transfer.cu",
                 "binding.cpp",
             ],
             extra_compile_args={

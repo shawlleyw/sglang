@@ -25,6 +25,8 @@ from reconfigure.configuration import (
     METHODS,
     METHOD_TRANSPORT,
     server_arguments,
+    configure_vocabulary_environment,
+    verify_ep_provider,
 )
 
 
@@ -78,6 +80,8 @@ def _rank_worker(
             connection.send(
                 {
                     "stage": "ready",
+                    "runtime_layout": runtime.layout_report(),
+                    "host_snapshot_report": runtime.host_snapshot_report(),
                     "rank": rank,
                     "graph_batch_sizes": list(runtime.runner.graph_runner.capture_bs),
                     "graph_batches_by_mode": {
@@ -143,6 +147,7 @@ def supervise(config, method, direction, directory, timeout):
     from sglang.srt.entrypoints.engine import _set_envs_and_config
     from sglang.srt.server_args import ServerArgs, PortArgs
 
+    configure_vocabulary_environment("ep", paras=True, environ=os.environ)
     raw = server_arguments(config, "ep", paras=True)
     args = ServerArgs(**raw)
     args.check_server_args()
@@ -220,6 +225,9 @@ def engine_worker(config, mode, directory):
     """Actual SGLang Engine initialization/release for the rebuild baseline."""
     from sglang.srt.entrypoints.engine import Engine
 
+    configure_vocabulary_environment(mode, paras=False, environ=os.environ)
+    from reconfigure.restart_audit import install_engine_audit
+    install_engine_audit(directory / "graph-audit")
     args = server_arguments(config, mode, paras=False)
     if mode == "tp":
         # Match launch_common.sh's static TP sampler safety and environment.
@@ -281,6 +289,8 @@ def main():
     os.environ.update(config.get("environment", {}))
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     try:
+        provider = verify_ep_provider(config)
+        (directory / "ep_provider.json").write_text(json.dumps(provider, indent=2))
         if args.engine_mode:
             engine_worker(config, args.engine_mode, directory)
         else:

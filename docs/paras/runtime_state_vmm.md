@@ -32,7 +32,8 @@ static runs so that the comparison stays consistent.
 ## Optional physical backing suspension
 
 Pass `--paras-vmm-runtime-states` with ParaS and explicit
-`--attention-backend triton`. The option requires CUDA graphs, PP=1, and no
+`--attention-backend triton` or `--attention-backend flashinfer`. Explicit prefill
+and decode backend overrides must match that backend. The option requires CUDA graphs, PP=1, and no
 speculative decoding, two-batch overlap, PDMux, torch compile, or memory saver.
 It defaults off. It can be used with `--disable-hybrid-swa-memory` for the
 GPT-OSS memory comparison. That flag disables the separate SWA memory pool,
@@ -41,6 +42,10 @@ not the model's sliding-window attention semantics.
 The managed allocations are exactly:
 
 - Triton's main `cuda_graph_kv_indices` (`int64`).
+- FlashInfer's per-wrapper `cuda_graph_kv_indices` (`int32`) and
+  `cuda_graph_custom_mask` (`uint8`, when prefill is enabled). The mask is retained
+  for parity with the VMM-off allocation layout; its speculative decoding
+  consumer is disabled by the VMM configuration guard.
 - The graph runner's `next_token_logits_buffer` (`float32`).
 
 They are allocated with CUDA VMM from the beginning; existing PyTorch allocator
@@ -62,6 +67,9 @@ blocks replay; the worker must restart rather than use an unmapped pointer.
 This does not suspend weights, live KV, request-to-token mappings, numerical
 scratch inside the UMM, DeepEP/NCCL buffers, or graph-private intermediates.
 The optional SWA index array and small graph inputs also remain resident.
+FlashInfer's wrapper integer plans and small shared indptr/last-page-length
+buffers remain resident. Its captured wrappers retain the original index tensor
+aliases; replay metadata generation writes indices into the remapped addresses.
 There is no CPU backup or migration of live state in this allocator.
 
 ## Accounting and limits

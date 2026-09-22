@@ -1,5 +1,5 @@
 #!/bin/bash
-# bench_one_batch — Qwen3-235B-A22B-Instruct-2507, DP/EP (DP attention + DeepEP experts), H200.
+# bench_one_batch — Qwen3-235B-A22B-Instruct-2507, DP/EP (DP attention + UCCL EP experts), H200.
 # Note: --batch-size is per-DP-rank. Equivalent global batch = batch_size * dp_size (= NUM_GPUS).
 #
 # Common overrides (env vars):
@@ -17,7 +17,12 @@ set -uo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
-MODEL_PATH=${MODEL_PATH:-/models/Qwen3-235B-A22B-Instruct-2507}
+source "$SCRIPT_DIR/backend_common.sh"
+paras_h200_check_ep_provider || exit 1
+
+MODEL_PATH=${MODEL_PATH:-$HOME/models/Qwen3-235B-A22B-Instruct-2507}
+ATTENTION_BACKEND=${ATTENTION_BACKEND:-flashinfer}
+MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-deep_gemm}
 NUM_GPUS=${NUM_GPUS:-8}
 MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-2048}
 MAX_REQ_PER_RANK=$((MAX_RUNNING_REQUESTS / NUM_GPUS))
@@ -44,10 +49,12 @@ paras_init_profile
 "${LAUNCHER[@]}" python -m sglang.bench_one_batch \
     --model-path "$MODEL_PATH" \
     --trust-remote-code \
+    --attention-backend "$ATTENTION_BACKEND" \
+    --moe-runner-backend "$MOE_RUNNER_BACKEND" \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --tp-size "$NUM_GPUS" --dp-size "$NUM_GPUS" --ep-size "$NUM_GPUS" \
     --enable-dp-attention --enable-dp-lm-head \
-    --moe-a2a-backend deepep --deepep-mode auto \
+    --moe-a2a-backend deepep --deepep-mode "${DEEPEP_MODE:-auto}" \
     --batch-size $BATCH_SIZE \
     --cuda-graph-bs $CUDA_GRAPH_BS \
     --input-len "$INPUT_LEN" \
