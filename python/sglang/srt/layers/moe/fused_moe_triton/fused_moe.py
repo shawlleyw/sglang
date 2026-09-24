@@ -10,6 +10,7 @@ import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -83,6 +84,7 @@ def inplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -112,6 +114,7 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
+        workspace_buffer=workspace_buffer,
     )
 
 
@@ -141,6 +144,7 @@ def inplace_fused_experts_fake(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> None:
     pass
 
@@ -148,7 +152,7 @@ def inplace_fused_experts_fake(
 direct_register_custom_op(
     op_name="inplace_fused_experts",
     op_func=inplace_fused_experts,
-    mutates_args=["hidden_states"],
+    mutates_args=["hidden_states", "workspace_buffer"],
     fake_impl=inplace_fused_experts_fake,
 )
 
@@ -180,6 +184,7 @@ def outplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -209,6 +214,7 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
+        workspace_buffer=workspace_buffer,
     )
 
 
@@ -239,6 +245,7 @@ def outplace_fused_experts_fake(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -246,7 +253,7 @@ def outplace_fused_experts_fake(
 direct_register_custom_op(
     op_name="outplace_fused_experts",
     op_func=outplace_fused_experts,
-    mutates_args=[],
+    mutates_args=["workspace_buffer"],
     fake_impl=outplace_fused_experts_fake,
 )
 
@@ -272,6 +279,8 @@ def fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
 ):
+    binding = moe_runner_config.paras_workspace
+    workspace_buffer = binding.buffer if binding is not None else None
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
         moe_runner_config.num_experts is None
@@ -305,6 +314,7 @@ def fused_experts(
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
+            workspace_buffer=workspace_buffer,
         )
         return hidden_states
     else:
@@ -335,6 +345,7 @@ def fused_experts(
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
+            workspace_buffer=workspace_buffer,
         )
 
 
@@ -344,12 +355,142 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     out.mul_(routed_scaling_factor)
 
 
-@torch.compile
-def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
-    gate, up = x[..., ::2], x[..., 1::2]
-    gate = gate.clamp(min=None, max=gemm1_limit)
-    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
-    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+@triton.jit
+def _swiglu_with_alpha_and_limit_unmasked_kernel(
+    output_ptr,
+    input_ptr,
+    n_dim,
+    gemm1_alpha,
+    gemm1_limit,
+    BLOCK_N: tl.constexpr,
+):
+    m_id = tl.program_id(axis=0)
+    n_id = tl.program_id(axis=1)
+    n_offs = n_id * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = n_offs < n_dim
+    in_base = m_id * (n_dim * 2)
+    out_base = m_id * n_dim
+    gate = tl.load(input_ptr + in_base + 2 * n_offs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(input_ptr + in_base + 2 * n_offs + 1, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.minimum(gate, gemm1_limit)
+    up = tl.minimum(tl.maximum(up, -gemm1_limit), gemm1_limit)
+    out = gate * tl.sigmoid(gate * gemm1_alpha) * (up + 1.0)
+    tl.store(output_ptr + out_base + n_offs, out.to(input_ptr.dtype.element_ty), mask=mask)
+
+
+def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit, output=None):
+    assert x.is_contiguous()
+    leading = x.shape[:-1]
+    n_dim_2 = x.shape[-1]
+    assert n_dim_2 % 2 == 0
+    n_dim = n_dim_2 // 2
+    x_flat = x.reshape(-1, n_dim_2)
+    m = x_flat.shape[0]
+    if output is None:
+        output = torch.empty((m, n_dim), dtype=x.dtype, device=x.device)
+    BLOCK_N = 512
+    grid = (m, triton.cdiv(n_dim, BLOCK_N))
+    _swiglu_with_alpha_and_limit_unmasked_kernel[grid](
+        output,
+        x_flat,
+        n_dim,
+        float(gemm1_alpha),
+        float(gemm1_limit),
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+    )
+    return output.reshape(*leading, n_dim)
+
+
+@triton.jit
+def _swiglu_with_alpha_and_limit_masked_kernel(
+    input_ptr,
+    stride_input_0,
+    stride_input_1,
+    stride_input_2,
+    output_ptr,
+    stride_output_0,
+    stride_output_1,
+    stride_output_2,
+    masked_m_ptr,
+    size_n,
+    gemm1_alpha,
+    gemm1_limit,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    expert_id = tl.program_id(2)
+    token_id = tl.program_id(1)
+    hidden_dim_block_index = tl.program_id(0)
+    block_num_per_expert = tl.num_programs(1)
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+
+    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
+    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+    stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
+    stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
+
+    offs_n = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < size_n
+    input_base = input_ptr + expert_id * stride_input_0
+    output_base = output_ptr + expert_id * stride_output_0
+
+    for token_index in tl.range(
+        token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
+    ):
+        gate = tl.load(
+            input_base + token_index * stride_input_1 + 2 * offs_n,
+            mask=n_mask,
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            input_base + token_index * stride_input_1 + 2 * offs_n + 1,
+            mask=n_mask,
+            other=0.0,
+        ).to(tl.float32)
+        gate = tl.minimum(gate, gemm1_limit)
+        up = tl.minimum(tl.maximum(up, -gemm1_limit), gemm1_limit)
+        out = gate * tl.sigmoid(gate * gemm1_alpha) * (up + 1.0)
+        tl.store(
+            output_base + token_index * stride_output_1 + offs_n,
+            out.to(input_ptr.dtype.element_ty),
+            mask=n_mask,
+        )
+
+
+def swiglu_with_alpha_and_limit_masked(
+    input_3d, masked_m, gemm1_alpha, gemm1_limit, output=None
+):
+    assert input_3d.is_contiguous()
+    assert input_3d.dim() == 3
+    expert_num, token_num_padded, n_doubled = input_3d.shape
+    assert n_doubled % 2 == 0
+    size_n = n_doubled // 2
+    if output is None:
+        output = torch.empty(
+            (expert_num, token_num_padded, size_n),
+            dtype=input_3d.dtype,
+            device=input_3d.device,
+        )
+    BLOCK_N = 128
+    BLOCK_NUM_PER_EXPERT = 32 if expert_num >= 4 else 64
+    NUM_STAGES = 6
+    hidden_dim_split_block_num = triton.cdiv(size_n, BLOCK_N)
+    grid = (hidden_dim_split_block_num, BLOCK_NUM_PER_EXPERT, expert_num)
+    _swiglu_with_alpha_and_limit_masked_kernel[grid](
+        input_3d,
+        *input_3d.stride(),
+        output,
+        *output.stride(),
+        masked_m,
+        size_n,
+        float(gemm1_alpha),
+        float(gemm1_limit),
+        BLOCK_N=BLOCK_N,
+        NUM_STAGE=NUM_STAGES,
+        num_warps=1,
+    )
+    return output
 
 
 @functools.lru_cache()
@@ -385,6 +526,7 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -407,8 +549,12 @@ def fused_experts_impl(
     E, N, _ = w1.shape
     # We execute the fused_moe kernel in chunks to circumvent this issue:
     # https://github.com/vllm-project/vllm/issues/5938
-    CHUNK_SIZE = 64 * 1024
-    M = min(num_tokens, CHUNK_SIZE)
+    from sglang.srt.paras.unified_layout import (
+        triton_moe_chunk_size as max_input_tokens_per_chunk,
+        validate_triton_workspace_blocks,
+    )
+
+    M = min(num_tokens, max_input_tokens_per_chunk)
     config_dtype = get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
@@ -438,8 +584,26 @@ def fused_experts_impl(
         min(M * topk, E + 1) * (max_block_m - 1) if down_moe_use_tma else 0
     )
     total_tokens = M * topk + max_padded_tokens
-    cache = torch.empty(
-        total_tokens * max(N, w2.shape[1]),
+    from sglang.srt.paras.workspace import moe_workspace_views, workspace_or_empty
+
+    intermediate_shape = (total_tokens * max(N, w2.shape[1]),)
+    activation_shape = (total_tokens, N // 2)
+    intermediate_workspace, activation_workspace = moe_workspace_views(
+        workspace_buffer,
+        intermediate_shape,
+        activation_shape,
+        hidden_states.dtype,
+        hidden_states.device,
+    )
+    if intermediate_workspace is not None and down_moe_use_tma:
+        validate_triton_workspace_blocks(
+            config["BLOCK_SIZE_M"],
+            down_config["BLOCK_SIZE_M"],
+            max_block_m,
+        )
+    cache = workspace_or_empty(
+        intermediate_workspace,
+        intermediate_shape,
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
@@ -461,10 +625,10 @@ def fused_experts_impl(
     else:
         out_hidden_states = torch.empty_like(hidden_states)
 
-    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
+    for chunk in range((num_tokens // max_input_tokens_per_chunk) + 1):
         begin_chunk_idx, end_chunk_idx = (
-            chunk * CHUNK_SIZE,
-            min((chunk + 1) * CHUNK_SIZE, num_tokens),
+            chunk * max_input_tokens_per_chunk,
+            min((chunk + 1) * max_input_tokens_per_chunk, num_tokens),
         )
         curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
         tokens_in_chunk, _ = curr_hidden_states.shape
@@ -472,7 +636,7 @@ def fused_experts_impl(
         if tokens_in_chunk == 0:
             break
 
-        if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
+        if tokens_in_chunk < max_input_tokens_per_chunk and chunk > 0:
             # Adjust the intermediate cache size and config for the last
             # chunk. Note that in most cases we only have one chunk
             # so the cache size and config are already set correctly and
@@ -483,6 +647,10 @@ def fused_experts_impl(
                 and down_config is not None
                 and down_config.pop("USE_TMA", False)
             )
+            if intermediate_workspace is not None and down_moe_use_tma:
+                validate_triton_workspace_blocks(
+                    config["BLOCK_SIZE_M"], down_config["BLOCK_SIZE_M"]
+                )
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
 
         padded_tokens = (
@@ -494,7 +662,12 @@ def fused_experts_impl(
         intermediate_cache1 = cache[: total_tokens * N].view(
             (total_tokens, N),
         )
-        intermediate_cache2 = torch.empty(
+        intermediate_cache2 = workspace_or_empty(
+            (
+                activation_workspace[:total_tokens]
+                if activation_workspace is not None
+                else None
+            ),
             (total_tokens, N // 2),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
@@ -540,6 +713,7 @@ def fused_experts_impl(
                     intermediate_cache1.view(-1, N),
                     gemm1_alpha,
                     gemm1_limit,
+                    output=intermediate_cache2,
                 )
             elif _is_cuda or _is_hip:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)

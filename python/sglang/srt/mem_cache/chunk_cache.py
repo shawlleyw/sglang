@@ -42,7 +42,7 @@ class ChunkCache(BasePrefixCache):
         return True
 
     def reset(self):
-        pass
+        self.protected_size_ = 0
 
     def match_prefix(self, **unused_kwargs) -> MatchResult:
         return MatchResult(
@@ -94,9 +94,11 @@ class SWAChunkCache(ChunkCache):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: SWATokenToKVPoolAllocator,
         page_size: int,
+        sliding_window_size: Optional[int] = None,
     ):
         super().__init__(req_to_token_pool, token_to_kv_pool_allocator, page_size)
         assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+        self.sliding_window_size = sliding_window_size
 
     def evict_swa(
         self,

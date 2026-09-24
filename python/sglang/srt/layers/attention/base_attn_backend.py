@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
@@ -14,6 +14,10 @@ if TYPE_CHECKING:
 
 class AttentionBackend(ABC):
     """The base class of attention backends"""
+
+    def paras_initialize_workspace(self):
+        """Initialize managed scratch after all live weight/KV transfers finish."""
+        pass
 
     @abstractmethod
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -143,3 +147,18 @@ class AttentionBackend(ABC):
     ) -> Optional[BaseIndexerMetadata]:
         """Get the indexer metadata. None means don't support indexer."""
         return None
+
+    def paras_save_cuda_graph_state(self) -> Dict[str, Any]:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement "
+            "paras_save_cuda_graph_state. Override it to snapshot any "
+            "tensor whose data_ptr() is baked into a captured graph "
+            "kernel arg (e.g. kv_indptr family, cuda_graph_* buffers)."
+        )
+
+    def paras_load_cuda_graph_state(self, state: Dict[str, Any]) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement "
+            "paras_load_cuda_graph_state. Override it to restore the "
+            "tensor refs snapshotted by paras_save_cuda_graph_state."
+        )

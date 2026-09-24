@@ -60,6 +60,8 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqInput,
     HealthCheckOutput,
     OpenSessionReqOutput,
+    ParaSAutoSwitchReq,
+    ParaSConfigureReqType,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -145,6 +147,9 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
+    last_text_offset: int = 0
+    response_queue: Optional[asyncio.Queue] = None
+    response_index: int = 0
 
     # For incremental state update.
     # TODO(lianmin): do not initialize some lists if not needed.
@@ -162,6 +167,14 @@ class ReqState:
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+
+    def set_output(self, output):
+        # Text, token IDs and logprobs are accumulated in ReqState. Only the
+        # latest metadata needs to wait for delivery; keep the pending slot bounded.
+        self.out_list[:] = [output]
+        if self.response_queue is not None and not self.event.is_set():
+            self.response_queue.put_nowait(self.response_index)
+        self.event.set()
 
 
 class TokenizerManager(TokenizerCommunicatorMixin):
@@ -398,6 +411,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
+                (ParaSAutoSwitchReq, self._handle_paras_auto_switch_req),
             ]
         )
         self.init_communicators(server_args)
@@ -957,7 +971,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """Wait for the response of one request."""
         while True:
             try:
-                await asyncio.wait_for(state.event.wait(), timeout=4)
+                if not state.event.is_set():
+                    await asyncio.wait_for(state.event.wait(), timeout=4)
             except asyncio.TimeoutError:
                 if (
                     request is not None
@@ -975,6 +990,19 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             out = state.out_list[-1]
 
             state.out_list = []
+            state.event.clear()
+            # Advance delivery offsets here, not when detokenizer updates arrive.
+            # Multiple updates may coalesce while this consumer is backpressured.
+            if getattr(obj, "stream", False):
+                if "text" in out:
+                    out["text"] = state.text[state.last_text_offset :]
+                    state.last_text_offset = len(state.text)
+                if "output_ids" in out:
+                    if "text" in out or self.server_args.stream_output:
+                        out["output_ids"] = state.output_ids[state.last_output_offset :]
+                        state.last_output_offset = len(state.output_ids)
+                    else:
+                        out["output_ids"] = state.output_ids.copy()
             if state.finished:
                 # For non-streaming cases, response has not been sent yet (`response_sent_ts` has not been set yet).
                 # Record response sent time right before we log finished results and metrics.
@@ -1021,8 +1049,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 yield out
                 break
 
-            state.event.clear()
-
             if obj.stream:
                 # Record response sent time right before we send response.
                 if not state.response_sent_ts:
@@ -1051,6 +1077,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         batch_size = obj.batch_size
 
         generators = []
+        states = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
@@ -1060,6 +1087,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
                     tmp_obj = obj[i]
+                    states.append(self.rid_to_state[tmp_obj.rid])
                     generators.append(
                         self._wait_one_response(
                             tmp_obj, self.rid_to_state[tmp_obj.rid], request
@@ -1079,6 +1107,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         state = self._send_one_request(
                             tmp_obj, tokenized_obj, created_time
                         )
+                        states.append(state)
                         generators.append(
                             self._wait_one_response(tmp_obj, state, request)
                         )
@@ -1116,6 +1145,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    states.append(state)
                     generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
 
@@ -1125,23 +1155,52 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
             yield outputs
         else:
-            rid_to_index = {rid: i for i, rid in enumerate(rids)}
-            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
-            while task_map:
-                done, _ = await asyncio.wait(
-                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
-                )
-
-                for task in done:
-                    gen = task_map.pop(task)
+            # A ready queue avoids creating one Task per token and scanning all
+            # batch members with FIRST_COMPLETED on every update.
+            ready = asyncio.Queue()
+            for index, state in enumerate(states):
+                state.response_queue = ready
+                state.response_index = index
+                if state.event.is_set():
+                    ready.put_nowait(index)
+            remaining = len(states)
+            delivered = 0
+            try:
+                while remaining:
                     try:
-                        result = task.result()
-                        result["index"] = rid_to_index[result["meta_info"]["id"]]
-                        yield result
-                        new_task = asyncio.create_task(gen.__anext__())
-                        task_map[new_task] = gen
-                    except StopAsyncIteration:
-                        pass
+                        if ready.empty():
+                            index = await asyncio.wait_for(ready.get(), timeout=4)
+                        else:
+                            index = ready.get_nowait()
+                    except asyncio.TimeoutError:
+                        if (
+                            request is not None
+                            and not obj.background
+                            and await request.is_disconnected()
+                        ):
+                            for rid in rids:
+                                self.abort_request(rid)
+                            raise ValueError(
+                                "Request is disconnected from the client side (batched stream)."
+                            )
+                        continue
+                    state = states[index]
+                    result = await generators[index].__anext__()
+                    result["index"] = index
+                    if state.finished:
+                        remaining -= 1
+                        state.response_queue = None
+                    yield result
+                    delivered += 1
+                    if delivered % 128 == 0:
+                        # ASGI sends can complete without yielding. Let the input
+                        # handler run even while a large batch remains ready.
+                        await asyncio.sleep(0)
+            finally:
+                for state in states:
+                    state.response_queue = None
+                for gen in generators:
+                    await gen.aclose()
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
@@ -1408,6 +1467,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
+            # Ready ZMQ receives may not suspend; do not starve HTTP consumers.
+            await asyncio.sleep(0)
 
     def _handle_batch_output(
         self,
@@ -1480,25 +1541,29 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
             if isinstance(recv_obj, BatchStrOutput):
-                state.text += recv_obj.output_strs[i]
                 if state.obj.stream:
+                    # Preserve the full response in state. The waiter computes
+                    # the undelivered delta when it consumes the latest metadata.
+                    delta_text = recv_obj.output_strs[i]
+                    state.text += delta_text
                     state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset :]
-                    state.last_output_offset = len(state.output_ids)
+                    output_token_ids = recv_obj.output_ids[i]
+                    text_to_send = delta_text
                 else:
+                    state.text += recv_obj.output_strs[i]
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids.copy()
+                    text_to_send = state.text
 
                 out_dict = {
-                    "text": state.text,
+                    "text": text_to_send,
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset :]
-                    state.last_output_offset = len(state.output_ids)
+                    output_token_ids = recv_obj.output_ids[i]
                 else:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids.copy()
@@ -1535,8 +1600,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 if self.server_args.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
-            state.out_list.append(out_dict)
-            state.event.set()
+            state.set_output(out_dict)
 
             # Log metrics and dump
             if self.enable_metrics and state.obj.log_metrics:
@@ -1914,14 +1978,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         output_ids = state.output_ids
         meta_info["completion_tokens"] = len(output_ids)
         if is_stream:
-            output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
+            output_ids = []
         out = {
-            "text": state.text,
+            # The waiter flushes any undelivered text and IDs from request
+            # state, including when an abort overtakes pending updates.
+            "text": "" if is_stream else state.text,
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
-        state.out_list.append(out)
-        state.event.set()
+        if self.server_args.skip_tokenizer_init:
+            out.pop("text")
+        state.set_output(out)
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(

@@ -239,8 +239,21 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             N % 2 == 0
         ), f"w13 output dimension must be even for silu_and_mul, got {N}"
 
-        gateup_output = torch.empty(
-            (all_tokens, N),
+        from sglang.srt.paras.workspace import moe_workspace_views, workspace_or_empty
+
+        moe_workspace = self.config.paras_workspace
+        gateup_shape = (all_tokens, N)
+        down_input_shape = (all_tokens, N // 2)
+        gateup_output, down_input = moe_workspace_views(
+            moe_workspace.buffer if moe_workspace is not None else None,
+            gateup_shape,
+            down_input_shape,
+            torch.bfloat16,
+            hidden_states_device,
+        )
+        gateup_output = workspace_or_empty(
+            gateup_output,
+            gateup_shape,
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
@@ -255,8 +268,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if hidden_states_scale is not None:
             dispose_tensor(hidden_states_scale)
 
-        down_input = torch.empty(
-            (all_tokens, N // 2),
+        down_input = workspace_or_empty(
+            down_input,
+            down_input_shape,
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
@@ -419,6 +433,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
 
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            silu_and_mul_masked_fwd,
+        )
+
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
         masked_m = runner_input.masked_m
@@ -435,8 +453,23 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             n % 2 == 0
         ), f"w13 output dimension must be even for silu_and_mul, got {n}"
 
-        gateup_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+        from sglang.srt.paras.workspace import moe_workspace_views, workspace_or_empty
+
+        moe_workspace = self.config.paras_workspace
+        gateup_shape = (num_groups, m, n)
+        down_input_shape = (num_groups, m, n // 2)
+        gateup_output, down_input = moe_workspace_views(
+            moe_workspace.buffer if moe_workspace is not None else None,
+            gateup_shape,
+            down_input_shape,
+            torch.bfloat16,
+            hidden_states_device,
+        )
+        gateup_output = workspace_or_empty(
+            gateup_output,
+            gateup_shape,
+            device=hidden_states_device,
+            dtype=torch.bfloat16,
         )
         deep_gemm_wrapper.grouped_gemm_nt_bf16bf16bf16_masked(
             hidden_states,
@@ -449,8 +482,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if hidden_states_scale is not None:
             dispose_tensor(hidden_states_scale)
 
-        down_input = torch.empty(
-            (num_groups, m, n // 2),
+        down_input = workspace_or_empty(
+            down_input,
+            down_input_shape,
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
@@ -458,9 +492,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gate, up = torch.split(gateup_output, n // 2, dim=-1)
             down_input.copy_(torch.silu(gate) * up)
         else:
-            silu_and_mul(
-                gateup_output.view(-1, n),
-                down_input.view(-1, n // 2),
+            silu_and_mul_masked_fwd(
+                gateup_output,
+                down_input,
+                masked_m,
             )
         del gateup_output
 

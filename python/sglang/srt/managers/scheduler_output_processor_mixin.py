@@ -47,6 +47,8 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        self.total_prefill_tokens_lifetime += batch.extend_num_tokens or 0
+
         skip_stream_req = None
 
         if self.is_generation:
@@ -303,6 +305,7 @@ class SchedulerOutputProcessorMixin:
             accept_lens_list = result.accept_lens.tolist()
 
         self.num_generated_tokens += len(batch.reqs)
+        self.total_decode_tokens_lifetime += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
@@ -825,11 +828,7 @@ class SchedulerOutputProcessorMixin:
                         # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                         should_output &= not req.check_match_stop_str_prefix()
                 else:
-                    should_output = (
-                        len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
-                        if not self.model_config.is_multimodal_gen
-                        else False
-                    )
+                    should_output = False
 
             if should_output:
                 send_token_offset = req.send_token_offset

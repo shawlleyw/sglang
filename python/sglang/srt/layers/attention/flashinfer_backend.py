@@ -23,6 +23,9 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.paras.mode import ParaSMode
+from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
+from sglang.srt.paras.workspace import flashinfer_workspace_size
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
@@ -126,7 +129,10 @@ class FlashInferAttnBackend(AttentionBackend):
             model_runner.server_args.multi_item_scoring_delimiter
         )
 
-        # Parse constants
+        # Parse constants (stored for ParaS recomputation in paras_configure_helper)
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.total_num_attention_heads = model_runner.model_config.num_attention_heads
+        self._get_num_kv_heads = model_runner.model_config.get_num_kv_heads
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
@@ -154,13 +160,14 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
-        # Qwen2/Qwen3 models require higher flashinfer workspace size
-        if (
-            "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
-        ):
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
+        # Use the same allocation-free sizing policy as the UMM planner.
+        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(
+            flashinfer_workspace_size(
+                model_runner.model_config.hf_config.architectures,
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                model_runner.server_args.enable_deterministic_inference,
+            )
+        )
 
         # When deterministic inference is enabled, tensor cores should be used for decode
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
@@ -180,27 +187,49 @@ class FlashInferAttnBackend(AttentionBackend):
                 "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
             )
             self.disable_cuda_graph_kv_split = True
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
-        # Allocate buffers
+        self._paras_workspace_mode = ParaSMode.EP
+        self._paras_memory_manager = get_global_paras_memory_manager()
+        self._static_workspaces = getattr(model_runner, "static_workspaces", None)
+        managed_workspace = self._paras_workspace()
+
+        # Allocate buffers. Managed attention scratch is disjoint from MoE;
+        # never create the external global allocation when using its UMM view.
         global global_workspace_buffer
-        if global_workspace_buffer is None:
-            # different from flashinfer zero_init_global_workspace_buffer
-            global_workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
-            global_workspace_buffer = torch.empty(
-                global_workspace_size,
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
-        if init_new_workspace:
-            self.workspace_buffer = torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
+        if managed_workspace is not None:
+            self.workspace_buffer = managed_workspace.zero_()
+        elif self._static_workspaces is not None and not init_new_workspace:
+            self.workspace_buffer = self._static_workspaces.attention.zero_()
         else:
-            self.workspace_buffer = global_workspace_buffer
+            if global_workspace_buffer is None:
+                global_workspace_buffer = torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+            self.workspace_buffer = (
+                torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+                if init_new_workspace
+                else global_workspace_buffer
+            )
         max_bs = model_runner.req_to_token_pool.size
+        # ParaS: when EP↔TP switching is enabled, ``req_to_token_pool`` can
+        # grow to the UMM-planned TP request capacity. Pre-size these
+        # runtime metadata buffers (``kv_indptr``, ``kv_last_page_len``,
+        # ``qo_indptr``) to the larger TP capacity so the eager metadata-setup
+        # path does not overflow after the switch. Without this,
+        # ``kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)`` raises a
+        # shape mismatch (or illegal memory access) when the TP-mode
+        # ``forward_batch.batch_size`` exceeds the original EP-local pool size.
+        # See ``docs/paras/runs/2026-04-26-flashinfer-paras-buffer-capacity.md``.
+        server_args = model_runner.server_args
+        if server_args.enable_paras_moe:
+            mgr = get_global_paras_memory_manager()
+            max_bs = max(max_bs, mgr.get_tp_max_num_reqs())
         if kv_indptr_buf is None:
             self.kv_indptr = [
                 torch.zeros(
@@ -285,6 +314,106 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+
+    # ------------------------------------------------------------------
+    # ParaS: EP↔TP attention backend reconfiguration
+    # ------------------------------------------------------------------
+
+    def _paras_workspace(self):
+        mgr = self._paras_memory_manager
+        if mgr is None:
+            return None
+        return mgr.get_attention_workspace_buffer(
+            "flashinfer", self._paras_workspace_mode
+        )
+
+    def _paras_bind_workspace(self, mode: ParaSMode):
+        self._paras_workspace_mode = mode
+        workspace = self._paras_workspace()
+        if workspace is None:
+            return
+        # Only rebind here: the target scratch can still contain source weights.
+        self.workspace_buffer = workspace
+        wrappers = (
+            [self.prefill_wrapper_ragged]
+            + self.prefill_wrappers_paged
+            + self.prefill_wrappers_verify
+            + self.decode_wrappers
+        )
+        for wrapper in wrappers:
+            # Keep each wrapper's integer plan and pinned staging allocation.
+            # reset_workspace_buffer would reallocate the latter on every switch.
+            wrapper._float_workspace_buffer = workspace
+
+    def paras_initialize_workspace(self):
+        mgr = self._paras_memory_manager
+        if mgr is not None:
+            mgr.initialize_attention_workspace(self._paras_workspace_mode)
+
+    def paras_configure_helper(self):
+        """Recompute derived state after head counts change."""
+        # Recompute whether to use tensor cores (depends on GQA group size)
+        if hasattr(self, 'indices_updater_decode'):
+            self.decode_use_tensor_cores = should_use_tensor_core(
+                kv_cache_dtype=self.kv_cache_dtype,
+                num_attention_heads=self.indices_updater_decode.num_qo_heads,
+                num_kv_heads=self.indices_updater_decode.num_kv_heads,
+            )
+
+    def paras_configure_tp(self, paras_tp_size: int, req_to_token: "torch.Tensor"):
+        """Update cached state for TP mode after ParaS switch."""
+        self._paras_bind_workspace(ParaSMode.TP)
+        num_qo_heads = self.total_num_attention_heads // paras_tp_size
+        num_kv_heads = self._get_num_kv_heads(paras_tp_size)
+        for updater_attr in ('indices_updater_decode', 'indices_updater_prefill'):
+            updater = getattr(self, updater_attr, None)
+            if updater is not None:
+                updater.num_qo_heads = num_qo_heads
+                updater.num_kv_heads = num_kv_heads
+                updater.req_to_token = req_to_token
+        self.paras_configure_helper()
+
+    def paras_configure_ep(self, req_to_token: "torch.Tensor"):
+        """Revert cached state for EP mode after ParaS switch."""
+        self._paras_bind_workspace(ParaSMode.EP)
+        # EP mode uses DP attention: each rank has all heads, tp_size=1
+        num_qo_heads = self.total_num_attention_heads
+        num_kv_heads = self._get_num_kv_heads(1)
+        for updater_attr in ('indices_updater_decode', 'indices_updater_prefill'):
+            updater = getattr(self, updater_attr, None)
+            if updater is not None:
+                updater.num_qo_heads = num_qo_heads
+                updater.num_kv_heads = num_kv_heads
+                updater.req_to_token = req_to_token
+        self.paras_configure_helper()
+
+    def paras_save_cuda_graph_state(self):
+        return {
+            "graph_buffers": {
+                name: getattr(self, name)
+                for name in (
+                    "cuda_graph_kv_indices",
+                    "cuda_graph_custom_mask",
+                    "cuda_graph_qk_indptr",
+                    "cuda_graph_qo_indptr",
+                )
+                if hasattr(self, name)
+            },
+            "decode_cuda_graph_metadata": dict(self.decode_cuda_graph_metadata),
+            "prefill_cuda_graph_metadata": dict(self.prefill_cuda_graph_metadata),
+            "draft_extend_cuda_graph_metadata": dict(
+                self.draft_extend_cuda_graph_metadata
+            ),
+        }
+
+    def paras_load_cuda_graph_state(self, state):
+        for name, value in state["graph_buffers"].items():
+            setattr(self, name, value)
+        self.decode_cuda_graph_metadata = state["decode_cuda_graph_metadata"]
+        self.prefill_cuda_graph_metadata = state["prefill_cuda_graph_metadata"]
+        self.draft_extend_cuda_graph_metadata = state[
+            "draft_extend_cuda_graph_metadata"
+        ]
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -501,18 +630,36 @@ class FlashInferAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        if kv_indices_buf is None:
+        memory = getattr(self, "_paras_runtime_memory", None)
+        shape = (max_num_tokens * self.max_context_len,)
+        if memory is not None:
+            if kv_indices_buf is not None:
+                raise ValueError("ParaS runtime VMM requires owned FlashInfer indices")
+            # Wrappers retain these exact pointers in captured kernels. Reclaim
+            # physical pages only; replay's indices updater rewrites all used
+            # indices after the mode manager remaps the same virtual addresses.
+            self.cuda_graph_kv_indices = [
+                memory.zeros(
+                    self._paras_workspace_mode,
+                    f"flashinfer_kv_indices_{i}",
+                    shape,
+                    torch.int32,
+                )
+                for i in range(self.num_wrappers)
+            ]
+        elif kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len,),
+                shape,
                 dtype=torch.int32,
                 device="cuda",
             )
         else:
             cuda_graph_kv_indices = kv_indices_buf
 
-        self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
-            cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
-        ]
+        if memory is None:
+            self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
+                cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
+            ]
 
         # Ensure tensors are properly allocated
         for i in range(self.num_wrappers):
@@ -521,11 +668,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_kv_indices[i][0] = 0
 
         if not self.skip_prefill:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device="cuda",
-            )
+            if memory is None:
+                self.cuda_graph_custom_mask = torch.zeros(
+                    shape, dtype=torch.uint8, device="cuda"
+                )
+            else:
+                # Speculative decoding (the consumer of this mask) is rejected
+                # by VMM validation. Keep the usual state layout and size while
+                # allowing its inactive-mode pages to be reclaimed as well.
+                self.cuda_graph_custom_mask = memory.zeros(
+                    self._paras_workspace_mode,
+                    "flashinfer_custom_mask",
+                    shape,
+                    torch.uint8,
+                )
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 

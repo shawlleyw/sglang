@@ -1,0 +1,62 @@
+{
+  "source_commit": "f2900de32aab6bef96e1e81b6c86e7b4bbb736fb",
+  "scope": "Pre-overlapping-cache kernel benchmark from HEAD; runtime/CUDA extensions are supplied by the active checkout.",
+  "files": {
+    "bench_cache.py": {
+      "original_sha256": "aa73b43e1108be986b72f92aeaeb0fdd0c2e9340edd71598985cf4683dafa6e6",
+      "archived_sha256": "aa73b43e1108be986b72f92aeaeb0fdd0c2e9340edd71598985cf4683dafa6e6"
+    },
+    "bench_weights.py": {
+      "original_sha256": "a00e8de035df79901c4c69e32741a9ae434f77981e494397bb2591fc2c9a0013",
+      "archived_sha256": "a00e8de035df79901c4c69e32741a9ae434f77981e494397bb2591fc2c9a0013"
+    },
+    "run_kernel_ablation.py": {
+      "original_sha256": "c3ff15757896905116347e67fb8938456b3255b6a7b360812c38d268e37af7c8",
+      "archived_sha256": "70ef823a8e462ee74fdfb9495faa85801f744ecf14d718f79513bbd0b4432c23"
+    },
+    "analyze_kernel_ablation.py": {
+      "original_sha256": "c87f2bd62c0b80d941816167d16ec66568a9d2b30ac63c80b465821eac52f10e",
+      "archived_sha256": "c87f2bd62c0b80d941816167d16ec66568a9d2b30ac63c80b465821eac52f10e"
+    },
+    "run_all.sh": {
+      "original_sha256": "e7b304c27e3d417b577516082ae54dbee1ee55e05dc2f655c3cefdd82d8a5474",
+      "archived_sha256": "e7b304c27e3d417b577516082ae54dbee1ee55e05dc2f655c3cefdd82d8a5474"
+    },
+    "build_nvbandwidth.sh": {
+      "original_sha256": "8ec2994010827617d3f9b57a54245e41aafc20dcd0d5ea351200ba3f6b05e0ad",
+      "archived_sha256": "8ec2994010827617d3f9b57a54245e41aafc20dcd0d5ea351200ba3f6b05e0ad"
+    },
+    "common/__init__.py": {
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "archived_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "common/cache_reference.py": {
+      "original_sha256": "47931ca85e74cd180e3a6ee4a07543fba3ca902f8a4f774a19c78ad6560282fb",
+      "archived_sha256": "47931ca85e74cd180e3a6ee4a07543fba3ca902f8a4f774a19c78ad6560282fb"
+    },
+    "common/ipc.py": {
+      "original_sha256": "f87ae8af35930368962fd3e163b675c392466044dabae07389e359342c2eceda",
+      "archived_sha256": "421c4b4926271a586f55d0d558642f0b011738a495429d595b57773309ac964e"
+    },
+    "common/layouts.py": {
+      "original_sha256": "555d61ac59aab891de2aa8cda0b9c631e7d75ef36c0ef6d942983908549e1591",
+      "archived_sha256": "555d61ac59aab891de2aa8cda0b9c631e7d75ef36c0ef6d942983908549e1591"
+    },
+    "common/model_configs.py": {
+      "original_sha256": "3015029c3343a79d85afd0d047ab6024348c0449f7352f9fd1bdd259ede3c222",
+      "archived_sha256": "3015029c3343a79d85afd0d047ab6024348c0449f7352f9fd1bdd259ede3c222"
+    },
+    "common/slot_init.py": {
+      "original_sha256": "396f4b507d2e0b7fcc2f8b690133696562f66fe9e5bf66fb8d2e2ce65a501e5b",
+      "archived_sha256": "396f4b507d2e0b7fcc2f8b690133696562f66fe9e5bf66fb8d2e2ce65a501e5b"
+    },
+    "common/weight_bundle.py": {
+      "original_sha256": "2716ab129048e3025ebc5003ad75258fa9d09ad897ba044f9d715d77457454b6",
+      "archived_sha256": "2716ab129048e3025ebc5003ad75258fa9d09ad897ba044f9d715d77457454b6"
+    }
+  },
+  "relocation_changes": [
+    "run_kernel_ablation.py: locate active source checkout by ancestor markers",
+    "common/ipc.py: locate active source checkout by ancestor markers"
+  ]
+}

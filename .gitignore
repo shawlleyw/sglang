@@ -1,3 +1,8 @@
+# Sisyphus orchestration state (local only)
+.sisyphus/
+.omc/
+paras_configure_tp/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -241,3 +246,5 @@ lmms-eval
 
 **/.claude/
 **/.serena/
+docs/paras/runs/
+docs/paras/bugs/

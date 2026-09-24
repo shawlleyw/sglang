@@ -528,7 +528,7 @@ def get_available_gpu_memory(
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
 
     if distributed:
-        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
+        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32, device="cpu")
         torch.distributed.all_reduce(
             tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
         )

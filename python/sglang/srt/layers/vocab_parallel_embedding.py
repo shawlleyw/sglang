@@ -471,7 +471,13 @@ class VocabParallelEmbedding(torch.nn.Module):
                 self.shard_indices.added_vocab_end_index,
             )
         else:
-            masked_input = input_
+            # tp_size==1 takes the no-mask path. Clamp into [0, num_embeddings)
+            # to survive a malformed input_ids tensor (NaN-induced OOB ids
+            # propagated from the sampler under DP-attention long-tail BF16
+            # decode). Without this, F.embedding asserts at IndexKernel.cu:113
+            # and the scheduler watchdog kills the rank. Pairs with Fix A in
+            # layers/sampler.py.
+            masked_input = input_.clamp(0, self.num_embeddings - 1)
         # Get the embeddings.
         with use_symmetric_memory(get_tp_group(), disabled=not self.enable_tp):
             output_parallel = self.quant_method.embedding(self, masked_input.long())
@@ -508,6 +514,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         params_dtype: type of the parameters.
         org_num_embeddings: original vocabulary size (without LoRA).
         padding_size: padding size for the vocabulary.
+        enable_tp: shard the vocabulary across TP ranks. If False, each rank
+            stores a full head; the caller must also disable logits all-gather.
     """
 
     def __init__(
@@ -521,6 +529,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        enable_tp: bool = True,
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
     ):
@@ -532,6 +541,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             padding_size=padding_size,
             quant_config=quant_config,
             prefix=prefix,
+            enable_tp=enable_tp,
             use_attn_tp_group=use_attn_tp_group,
             use_presharded_weights=use_presharded_weights,
         )

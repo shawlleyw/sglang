@@ -50,25 +50,33 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        cur_stream = torch.cuda.current_stream()
+
         if return_logprob:
             if self.logits_output.next_token_logits is not None:
+                self.logits_output.next_token_logits.record_stream(cur_stream)
                 self.logits_output.next_token_logits = (
                     self.logits_output.next_token_logits.to("cpu", non_blocking=True)
                 )
             if self.logits_output.input_token_logprobs is not None:
+                self.logits_output.input_token_logprobs.record_stream(cur_stream)
                 self.logits_output.input_token_logprobs = (
                     self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
                 )
         if self.logits_output.hidden_states is not None:
+            self.logits_output.hidden_states.record_stream(cur_stream)
             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True
             )
+        self.next_token_ids.record_stream(cur_stream)
         self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
 
         if self.accept_lens is not None:
+            self.accept_lens.record_stream(cur_stream)
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
 
         if self.allocate_lens is not None:
+            self.allocate_lens.record_stream(cur_stream)
             self.allocate_lens = self.allocate_lens.to("cpu", non_blocking=True)
 
         self.copy_done.record()
