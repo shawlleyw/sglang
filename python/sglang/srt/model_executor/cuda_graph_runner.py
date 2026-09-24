@@ -416,7 +416,12 @@ class CudaGraphRunner:
                 )
             else:
                 self.next_token_logits_buffer = memory.zeros(
-                    memory.active, "logits", logits_shape, torch.float32
+                    memory.active,
+                    "logits",
+                    logits_shape,
+                    torch.float32,
+                    # LogitsProcessor overwrites the consumed slice before use.
+                    zero_on_resume=False,
                 )
 
     def _cache_loc_dtype(self):

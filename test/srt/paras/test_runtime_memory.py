@@ -25,6 +25,7 @@ class FakeDriver:
         self.fail_map = False
         self.fail_unmap = False
         self.peak = 0
+        self.clears = []
 
     def reserve(self, size):
         address = self.next_address
@@ -36,7 +37,7 @@ class FakeDriver:
         assert address not in self.resident
         assert self.reserved.pop(address) == size
 
-    def map(self, address, size):
+    def map(self, address, size, *, zero=True):
         self.events.append(("map", address))
         if self.fail_map:
             raise RuntimeError("injected allocation failure")
@@ -44,6 +45,8 @@ class FakeDriver:
         assert self.reserved[address] == size
         self.resident[address] = size
         self.peak = max(self.peak, sum(self.resident.values()))
+        if zero:
+            self.clears.append(address)
 
     def unmap(self, address, size):
         self.events.append(("unmap", address))
@@ -91,6 +94,36 @@ def test_switch_to_active_mode_is_a_noop():
     assert driver.events == before
 
 
+def test_disposable_scratch_is_zeroed_once_and_still_waits_before_unmap():
+    memory, driver = manager()
+    ep = memory.allocate(EP, "logits", 128, zero_on_resume=False)
+    memory.activate(TP)
+    tp = memory.allocate(TP, "indices", 512, zero_on_resume=False)
+    assert driver.clears == [ep.address, tp.address]
+    for mode, old, target in ((EP, tp, ep), (TP, ep, tp)):
+        driver.events.clear()
+        memory.activate(mode)
+        assert driver.events == [
+            ("sync",),
+            ("unmap", old.address),
+            ("map", target.address),
+        ]
+    assert driver.clears == [ep.address, tp.address]
+    assert driver.peak == 512
+
+
+def test_mixed_resume_policies_keep_initialization_barrier():
+    memory, driver = manager()
+    scratch = memory.allocate(EP, "disposable", 128, zero_on_resume=False)
+    cleared = memory.allocate(EP, "cleared", 64)
+    memory.activate(TP)
+    driver.events.clear()
+    memory.activate(EP)
+    assert driver.events[0] == driver.events[-1] == ("sync",)
+    assert driver.clears.count(scratch.address) == 1
+    assert driver.clears.count(cleared.address) == 2
+
+
 def test_multiple_buffers_are_all_suspended():
     memory, driver = manager()
     memory.allocate(EP, "indices", 128)
@@ -102,11 +135,12 @@ def test_multiple_buffers_are_all_suspended():
 
 
 @pytest.mark.parametrize("failure", ["fail_map", "fail_unmap"])
-def test_failed_switch_blocks_replay_and_later_activation(failure):
+@pytest.mark.parametrize("zero_on_resume", [True, False])
+def test_failed_switch_blocks_replay_and_later_activation(failure, zero_on_resume):
     memory, driver = manager()
-    memory.allocate(EP, "indices", 64)
+    memory.allocate(EP, "indices", 64, zero_on_resume=zero_on_resume)
     memory.activate(TP)
-    memory.allocate(TP, "indices", 512)
+    memory.allocate(TP, "indices", 512, zero_on_resume=zero_on_resume)
     setattr(driver, failure, True)
     with pytest.raises(RuntimeError, match="injected"):
         memory.activate(EP)
@@ -247,6 +281,11 @@ def test_driver_releases_allocation_handles_and_cleans_failed_mappings(
     else:
         allocation.resume()
         assert mappings == {allocation.address}
+        allocation.zero_on_resume = False
+        allocation.suspend()
+        allocation.resume()
+        assert events.count("cuMemsetD8_v2") == 1
+        assert events.count("cuMemCreate") == 2
     # The mapped allocation must not retain a handle pinning physical pages.
     assert not live_handles
     allocation.close()

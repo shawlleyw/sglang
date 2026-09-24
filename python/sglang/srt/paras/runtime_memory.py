@@ -89,7 +89,7 @@ class CudaVmmDriver:
     def free_address(self, address, size):
         self._call("cuMemAddressFree", address, size)
 
-    def map(self, address, size):
+    def map(self, address, size, *, zero=True):
         handle = C.c_uint64()
         self._call("cuMemCreate", C.byref(handle), size, C.byref(self.prop), 0)
         mapped = False
@@ -97,8 +97,8 @@ class CudaVmmDriver:
             self._call("cuMemMap", address, size, 0, handle, 0)
             mapped = True
             self._call("cuMemSetAccess", address, size, C.byref(self.access), 1)
-            # Scratch contents are disposable. Reset them before reusing a graph.
-            self._call("cuMemsetD8_v2", address, 0, size)
+            if zero:
+                self._call("cuMemsetD8_v2", address, 0, size)
         except BaseException:
             if mapped:
                 self.unmap(address, size)
@@ -113,7 +113,7 @@ class CudaVmmDriver:
 
 
 class VmmAllocation:
-    def __init__(self, driver, size):
+    def __init__(self, driver, size, *, zero_on_resume=True):
         self.driver = driver
         self.size = (
             (size + driver.granularity - 1) // driver.granularity
@@ -122,11 +122,22 @@ class VmmAllocation:
             raise ValueError("VMM allocations must be nonempty")
         self.address = driver.reserve(self.size)
         self.mapped = False
+        self.zero_on_resume = zero_on_resume
+        self.initialized = False
 
     def resume(self):
+        """Map backing and return whether initialization was submitted.
+
+        First allocation is always zeroed for graph capture. Skipping later
+        initialization requires every element read to be overwritten first.
+        """
         if not self.mapped:
-            self.driver.map(self.address, self.size)
+            zero = not self.initialized or self.zero_on_resume
+            self.driver.map(self.address, self.size, zero=zero)
             self.mapped = True
+            self.initialized = True
+            return zero
+        return False
 
     def suspend(self):
         if self.mapped:
@@ -181,12 +192,12 @@ class ModeRuntimeMemory:
         self.allocations = {mode: {} for mode in (ParaSMode.EP, ParaSMode.TP)}
         self.failed = False
 
-    def allocate(self, mode, name, size):
+    def allocate(self, mode, name, size, *, zero_on_resume=True):
         if self.failed or mode != self.active:
             raise RuntimeError("Cannot allocate scratch for an inactive/failed mode")
         if name in self.allocations[mode]:
             raise RuntimeError(f"Duplicate ParaS scratch allocation: {mode}/{name}")
-        allocation = VmmAllocation(self.driver, size)
+        allocation = VmmAllocation(self.driver, size, zero_on_resume=zero_on_resume)
         try:
             allocation.resume()
         except BaseException:
@@ -206,10 +217,13 @@ class ModeRuntimeMemory:
         try:
             for allocation in self.allocations[self.active].values():
                 allocation.suspend()
+            initialized = False
             for allocation in self.allocations[mode].values():
-                allocation.resume()
-            # Complete scratch initialization before replay on another stream.
-            self.synchronize()
+                initialized |= allocation.resume()
+            # Mapping itself submits no scratch writes. Wait only when clearing
+            # was requested; graph replay's producers initialize disposable data.
+            if initialized:
+                self.synchronize()
         except BaseException:
             self.failed = True
             raise
@@ -238,13 +252,15 @@ class CudaModeRuntimeMemory(ModeRuntimeMemory):
             driver = CudaVmmDriver(self.device.index)
         super().__init__(driver, lambda: torch.cuda.synchronize(self.device))
 
-    def zeros(self, mode, name, shape, dtype):
+    def zeros(self, mode, name, shape, dtype, *, zero_on_resume=True):
+        """Initially zeroed storage with explicit initialization policy on remap."""
         with torch.cuda.device(self.device):
             allocation = self.allocate(
                 mode,
                 name,
                 math.prod(shape)
                 * torch.empty((), dtype=dtype, device="cpu").element_size(),
+                zero_on_resume=zero_on_resume,
             )
             self.synchronize()
             owner = _CudaArray(allocation, shape, dtype)

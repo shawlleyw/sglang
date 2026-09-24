@@ -566,7 +566,13 @@ class TritonAttnBackend(AttentionBackend):
                 )
             else:
                 self.cuda_graph_kv_indices = memory.zeros(
-                    self._paras_workspace_mode, "kv_indices", shape, torch.int64
+                    self._paras_workspace_mode,
+                    "kv_indices",
+                    shape,
+                    torch.int64,
+                    # Replay metadata rebuilds [0, kv_indptr[bs]); attention
+                    # masks accesses outside each request's index range.
+                    zero_on_resume=False,
                 )
         else:
             self.cuda_graph_kv_indices = kv_indices_buf

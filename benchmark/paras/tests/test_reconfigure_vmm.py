@@ -35,9 +35,14 @@ def memory(monkeypatch):
     )
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
 
-    def cpu_zeros(self, mode, name, shape, dtype):
+    def cpu_zeros(self, mode, name, shape, dtype, *, zero_on_resume=True):
         tensor = torch.zeros(shape, dtype=dtype, device="cpu")
-        self.allocate(mode, name, tensor.numel() * tensor.element_size())
+        self.allocate(
+            mode,
+            name,
+            tensor.numel() * tensor.element_size(),
+            zero_on_resume=zero_on_resume,
+        )
         return tensor
 
     monkeypatch.setattr(CudaModeRuntimeMemory, "zeros", cpu_zeros)

@@ -356,3 +356,51 @@ The [previous kernel benchmark](legacy/kernel_benchmark/README.md) is retained
 with its own measurement scripts, helpers, reproduction commands, and provenance.
 Use the current entry points above for new GPT-OSS/Qwen3 measurements. Current
 run archives exclude `legacy/` to avoid duplicating historical sources.
+
+## Single-GPU VMM activation
+
+`bench_runtime_vmm.py` measures the production runtime VMM allocator with no
+checkpoint or distributed process group. Expose exactly one idle GPU. Defaults
+match the GPT-OSS-120B experiment's EP/TP logits and KV-index shapes (256/2048
+tokens, context 131072, vocabulary 201088); `--ep-max-tokens`, `--tp-max-tokens`,
+`--context-length` and `--vocab-size` allow other settings.
+
+```bash
+# CPU-only provenance/shape preparation; requires a fresh output directory.
+python benchmark/paras/bench_runtime_vmm.py --dry-run --output /tmp/vmm-plan
+
+# Select an idle GPU UUID first; only this device is exposed to the process.
+CUDA_VISIBLE_DEVICES=GPU_UUID python benchmark/paras/bench_runtime_vmm.py \
+  --output results/vmm-idle --rounds 3 --iterations 20
+
+# Same scratch sizes under synthetic HBM pressure (not real serving KV).
+CUDA_VISIBLE_DEVICES=GPU_UUID python benchmark/paras/bench_runtime_vmm.py \
+  --output results/vmm-resident60 --resident-gib 60 --rounds 3 --iterations 20
+```
+
+Three variants isolate the changes: `zero_two_sync` recreates the original
+activation policy, `no_zero_two_sync` removes clearing only, and
+`no_zero_one_sync` uses the optimized production policy for disposable buffers.
+All variants release inactive physical backing and preserve virtual addresses;
+all wait for outgoing users before unmapping. Initial allocation always clears
+storage. Each timed sample is one activation, and both directions are reported.
+Variant order rotates across rounds. A separate diagnostic pass reports host
+time in each driver call and synchronization, without adding internal fences;
+these timings can include waiting, not just execution of the named operation.
+Use `--interval-ms 100` to leave an idle interval before each activation, outside
+timing. The default tight loop stresses repeated physical allocation; driver
+allocation latency under this churn can differ substantially from occasional
+switches. Report the interval alongside memory residency and sample statistics.
+
+Before timing, the optimized path captures both modes once and checks repeated
+remapping/replay with invalid old indices and NaN logits. The checks use the
+production KV-index builder and Triton decode attention, compare valid output
+rows with a PyTorch reference, and exercise changing lengths, padding, tails,
+empty metadata and a different replay stream. They validate scratch consumers,
+not full model inference or multi-GPU scheduler behavior.
+
+Outputs include exact command/configuration, source snapshots/hashes/patch,
+GPU identity, all raw samples, correctness records, API profiles and a Markdown
+table. Initial allocation, correctness checks, resident ballast and diagnostic
+profiling are outside headline timing. This ablation does not replace the
+eight-GPU full-model switch results or establish their end-to-end speedup.

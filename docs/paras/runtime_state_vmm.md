@@ -3,11 +3,14 @@
 ParaS keeps graph and attention state separate for EP and TP. Mode-local sizing
 is always enabled; releasing inactive physical backing requires the opt-in
 `--paras-vmm-runtime-states` option.
-CUDA remapping and graph replay have also been validated on eight A100s with
+The initial remapping/clearing path was validated on eight A100s with
 dummy GPT-OSS weights, including live-KV EP/TP roundtrips. Saved local artifacts
 record the tested configuration and memory results. The current comparison is
 documented in [the evaluation methodology](memory_evaluation.md); it does not
 establish latency or throughput performance for other settings.
+The subsequent skip-clearing optimization has single-GPU scratch/operator
+replay validation; the full multi-GPU model switch has not yet been retested
+with that optimization.
 
 ## Mode-local state
 
@@ -56,8 +59,16 @@ PyTorch tensors alias those addresses through the CUDA array interface, whose
 owner retains the allocation object.
 
 At a switch, the scheduler first drains its overlap pipeline. The VMM manager
-also synchronizes the device, unmaps the outgoing mode, maps and clears the
-target mode's ranges, and synchronizes initialization before graph replay.
+also synchronizes the device and unmaps the outgoing mode before mapping the
+target mode's ranges. Initial allocation is zeroed for graph capture. Logits
+and Triton's main KV indices explicitly skip clearing on subsequent remaps:
+logits are overwritten before consumption, and replay metadata rebuilds the
+valid index range before attention reads it. Attention masks indices outside
+that range.
+These remaps submit no initialization writes, so they omit the final device
+synchronization when all target buffers skip clearing. FlashInfer indices and
+masks retain the default clear-on-resume policy, which keeps both clearing and
+the final initialization barrier.
 It does not hold both modes' physical backing simultaneously. Virtual
 reservations, tensors, and graph executables survive. Indices are regenerated
 by attention metadata preparation and logits by each forward pass. Old scratch
@@ -71,6 +82,12 @@ FlashInfer's wrapper integer plans and small shared indptr/last-page-length
 buffers remain resident. Its captured wrappers retain the original index tensor
 aliases; replay metadata generation writes indices into the remapped addresses.
 There is no CPU backup or migration of live state in this allocator.
+
+The single-GPU [activation benchmark](../../benchmark/paras/bench_runtime_vmm.py)
+compares the original clear/two-wait path, skipped clearing with two waits,
+and skipped clearing with only the mandatory pre-unmap wait. It profiles CUDA
+driver calls in a separate diagnostic pass and verifies retained graph replay
+after poisoning remapped scratch. See the [benchmark instructions](../../benchmark/paras/README.md#single-gpu-vmm-activation).
 
 ## Accounting and limits
 

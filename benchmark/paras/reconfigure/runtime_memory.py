@@ -16,16 +16,22 @@ class RecaptureRuntimeMemory(CudaModeRuntimeMemory):
         super().__init__(device)
         self._scratch_tensors = {}
 
-    def zeros(self, mode, name, shape, dtype):
+    def zeros(self, mode, name, shape, dtype, *, zero_on_resume=True):
         self.check_ready()
         if mode != self.active:
             raise RuntimeError("Cannot initialize scratch for an inactive mode")
         key = (mode, name)
         tensor = self._scratch_tensors.get(key)
         if tensor is None:
-            tensor = super().zeros(mode, name, shape, dtype)
+            tensor = super().zeros(
+                mode, name, shape, dtype, zero_on_resume=zero_on_resume
+            )
             self._scratch_tensors[key] = tensor
         else:
+            if self.allocations[mode][name].zero_on_resume != zero_on_resume:
+                raise RuntimeError(
+                    f"Recaptured scratch changed resume policy: {mode}/{name}"
+                )
             if tuple(tensor.shape) != tuple(shape) or tensor.dtype != dtype:
                 raise RuntimeError(
                     f"Recaptured scratch changed shape/dtype: {mode}/{name}"

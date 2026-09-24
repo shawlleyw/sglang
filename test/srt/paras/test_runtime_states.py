@@ -147,13 +147,13 @@ def test_backend_routes_only_owned_indices_to_vmm():
     b = backend()
     calls = []
 
-    def zeros(mode, name, shape, dtype):
-        calls.append((mode, name, shape))
+    def zeros(mode, name, shape, dtype, *, zero_on_resume=True):
+        calls.append((mode, name, shape, zero_on_resume))
         return torch.zeros(shape, dtype=dtype)
 
     b._paras_runtime_memory = SimpleNamespace(zeros=zeros)
     b.init_cuda_graph_state(2, 2)
-    assert calls == [(ParaSMode.EP, "kv_indices", (64,))]
+    assert calls == [(ParaSMode.EP, "kv_indices", (64,), False)]
 
 
 def test_graph_inputs_and_output_views_follow_the_saved_mode(monkeypatch):
