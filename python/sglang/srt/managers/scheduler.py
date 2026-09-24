@@ -150,6 +150,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.paras.scheduler_paras_mixin import SchedulerParasMixin
+from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
@@ -1164,6 +1165,49 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
+        if (
+            self.server_args.enable_paras_moe
+            and self.paras_parallelism_config == ParaSMode.TP
+        ):
+            # recv_requests() has already broadcast this whole list to every
+            # TP rank. If a TP->EP control request appears before work in the
+            # same list, switching immediately makes every rank admit the
+            # remaining work independently as EP. The next EP->TP gather then
+            # sees eight copies of a RID and the detokenizer receives eight
+            # outputs for it. Admit the already-broadcast work in TP first;
+            # the switch will partition its waiting queue across EP ranks.
+            configure_ep_index = next(
+                (
+                    i
+                    for i, req in enumerate(recv_reqs)
+                    if isinstance(req, ParaSConfigureReqInput)
+                    and req.type == ParaSConfigureReqType.CONFIGURE_EP
+                ),
+                None,
+            )
+            if configure_ep_index is not None:
+                work_types = (
+                    TokenizedGenerateReqInput,
+                    TokenizedEmbeddingReqInput,
+                    BatchTokenizedGenerateReqInput,
+                    BatchTokenizedEmbeddingReqInput,
+                )
+                trailing = recv_reqs[configure_ep_index + 1 :]
+                trailing_work = [req for req in trailing if isinstance(req, work_types)]
+                if trailing_work:
+                    recv_reqs = (
+                        recv_reqs[:configure_ep_index]
+                        + trailing_work
+                        + [recv_reqs[configure_ep_index]]
+                        + [req for req in trailing if not isinstance(req, work_types)]
+                    )
+                    if self.tp_rank == 0:
+                        logger.info(
+                            "ParaS TP->EP admitted %d already-broadcast work "
+                            "messages before configuration",
+                            len(trailing_work),
+                        )
+
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
