@@ -647,6 +647,16 @@ class SchedulerParasMixin:
             self._paras_restore_ep_state_after_aborted_tp_switch()
             return True
 
+        # EP ranks adapt their admission ratios independently after retractions.
+        # In TP every rank must choose the same prefill or decode batch.
+        admission_ratio = torch.tensor(self.new_token_ratio, dtype=torch.float64)
+        torch.distributed.all_reduce(
+            admission_ratio,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.paras_tp_cpu_group,
+        )
+        self.new_token_ratio = admission_ratio.item()
+
         with TimeReporter("reorchestrate_cache"):
             paras_gather_manager.reorchestrate_cache()
 
