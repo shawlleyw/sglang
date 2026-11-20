@@ -1,8 +1,10 @@
-from typing import List, Optional, Tuple, Any
+import copy
 import gc
 import os
-import torch
 import pickle
+from typing import Any, List, Optional, Tuple
+
+import torch
 import numpy as np
 import torch.distributed as dist
 
@@ -26,6 +28,7 @@ from sglang.srt.paras.cache_transfer.utils import (
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 from sglang.srt.paras.layers.utils import LayerCacheSpec
 from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
+from sglang.srt.paras.cache_transfer.prefix import LiveKVRows, gather_live_rows
 from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 
 def prune_request(req: Req):
@@ -46,11 +49,14 @@ def recover_request(
         req.last_host_node = tree_cache.root_node
         req.last_node = tree_cache.root_node
     req.prefix_indices = []
+    req.last_matched_prefix_len = 0
     req.tokenizer = tokenizer
 
 def paras_tp_group_all_gather_reqs(
     reqs: List[Req],
     group: GroupCoordinator,
+    *,
+    preserve_source: bool = False,
 ) -> Tuple[Optional[List[Req]], Optional[List[int]]]:
     # The 8 x pickle.loads loop below allocates ~2,048 fresh Req objects
     # (256 reqs x 8 ranks, each with nested fields). That allocation rate
@@ -68,7 +74,10 @@ def paras_tp_group_all_gather_reqs(
 
         num_ranks = group.world_size
 
-        # Clean up tensor members to avoid pickle triggering torch device copy, mostly radix cache related stuff
+        # Avoid serializing device tensors. Preserve source ownership until
+        # the destination has accepted the live radix cache.
+        if preserve_source:
+            reqs = [copy.copy(req) for req in reqs]
         for req in reqs:
             prune_request(req)
 
@@ -138,6 +147,7 @@ class ParaSReqGatherManager:
         method: Optional[str] = None,
         layer_specs: Optional[list] = None,
         local_waiting_reqs: Optional[List[Req]] = None,
+        preserve_prefixes: bool = False,
     ):
         self.local_reqs = local_reqs
         self.local_waiting_reqs = local_waiting_reqs or []
@@ -148,6 +158,8 @@ class ParaSReqGatherManager:
         self.peer_ctx = peer_ctx
         self.method = method or os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl")
         self.layer_specs = layer_specs
+        self.preserve_prefixes = preserve_prefixes
+        self.live_rows: Optional[LiveKVRows] = None
         
         self.local_no_reqs = len(local_reqs) == 0
         self.local_seqlens_list = [req.seqlen for req in local_reqs]
@@ -168,7 +180,9 @@ class ParaSReqGatherManager:
                 f"local tokens {self.num_local_tokens}, local token indices {self.local_token_indices.shape}"
     
     def gather_global_reqs(self):
-        self.global_reqs, self.global_reqs_split_sizes = paras_tp_group_all_gather_reqs(self.local_reqs, self.gather_group)
+        self.global_reqs, self.global_reqs_split_sizes = paras_tp_group_all_gather_reqs(
+            self.local_reqs, self.gather_group, preserve_source=self.preserve_prefixes
+        )
         self.global_seqlens_list = [req.seqlen for req in self.global_reqs]
         
         start_index = 0
@@ -178,13 +192,36 @@ class ParaSReqGatherManager:
             self.global_num_tokens.append(sum(self.global_seqlens_list[start_index:end_index]) - split_size)
             start_index = end_index
             
+        if self.preserve_prefixes and sum(self.global_num_tokens):
+            flat_slots = self.local_token_indices
+            if flat_slots is None:
+                flat_slots = torch.empty(
+                    0, dtype=torch.int32, device=self.req_to_token_pool.device
+                )
+            unique, local_rows = LiveKVRows.compact(self.local_reqs, flat_slots)
+            self.num_local_tokens = unique.numel()
+            self.local_token_indices = unique if self.num_local_tokens else None
+            counts, prefixes, inverse = gather_live_rows(
+                local_rows,
+                self.num_local_tokens,
+                self.global_reqs_split_sizes,
+                self.global_num_tokens,
+                self.gather_group,
+            )
+            self.global_num_tokens = counts
+            self.live_rows = LiveKVRows(
+                inverse, [n - 1 for n in self.global_seqlens_list], prefixes
+            )
+
         self.num_global_tokens = sum(self.global_num_tokens)
 
         # Gather waiting-queue requests too. They have no KV cache yet — just
         # plain Python objects — so the same all-gather mechanism preserves
         # them across the EP->TP switch without any GPU memory transfer.
         gathered_waiting, _ = paras_tp_group_all_gather_reqs(
-            self.local_waiting_reqs, self.gather_group
+            self.local_waiting_reqs,
+            self.gather_group,
+            preserve_source=self.preserve_prefixes,
         )
         self.global_waiting_reqs = gathered_waiting or []
 
@@ -317,14 +354,22 @@ class ParaSReqGatherManager:
 
         if self.num_global_tokens > 0:        
             global_token_indices: torch.Tensor = self.token_to_kv_pool_allocator.alloc(self.num_global_tokens)
-            start_index = 0
-            # TODO: optimize writing to req_to_token_pool and token_to_kv_pool_allocator
-            for req, req_pool_idx in zip(self.global_reqs, req_pool_indices):
-                end_index = start_index + req.seqlen - 1
-                req.req_pool_idx = req_pool_idx
-                token_indices = global_token_indices[start_index:end_index]
-                self.req_to_token_pool.write((req_pool_idx, slice(0, req.seqlen - 1)), token_indices)
-                start_index = end_index
+            if self.live_rows is not None:
+                self.live_rows.install(
+                    self.global_reqs,
+                    req_pool_indices,
+                    global_token_indices,
+                    self.req_to_token_pool,
+                )
+            else:
+                start_index = 0
+                # TODO: optimize writing to req_to_token_pool and token_to_kv_pool_allocator
+                for req, req_pool_idx in zip(self.global_reqs, req_pool_indices):
+                    end_index = start_index + req.seqlen - 1
+                    req.req_pool_idx = req_pool_idx
+                    token_indices = global_token_indices[start_index:end_index]
+                    self.req_to_token_pool.write((req_pool_idx, slice(0, req.seqlen - 1)), token_indices)
+                    start_index = end_index
                 
             self.global_token_indices = global_token_indices
             assert self.global_token_indices.shape[0] == self.num_global_tokens, "The number of global tokens is not equal to the number of tokens in the global requests."
@@ -523,6 +568,10 @@ class ParaSReqGatherManager:
         
         for req in self.global_reqs:
             recover_request(req, tree_cache, tokenizer)
+        if self.live_rows is not None:
+            self.live_rows.restore_prefixes(
+                self.global_reqs, self.req_to_token_pool, tree_cache
+            )
 
         batch = ScheduleBatch.init_new(
             self.global_reqs,

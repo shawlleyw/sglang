@@ -25,6 +25,7 @@ from sglang.srt.paras.mode import ParaSMode
 from sglang.srt.server_args import get_global_server_args
 
 from sglang.srt.paras.utils import paras_func, paras_profile_func
+from sglang.srt.paras.prefix_cache import ParaSPrefixCache
 from sglang.srt.paras.gather_manager import ParaSReqGatherManager, recover_request
 from sglang.srt.paras.scatter_manager import ParaSReqScatterManager
 from sglang.srt.layers.moe import utils as moe_utils
@@ -503,57 +504,21 @@ class SchedulerParasMixin:
             policy.cooldown_until, time.time() + policy.cooldown_sec
         )
 
-    def _paras_restore_tp_state_after_aborted_ep_switch(self) -> None:
-        # Roll back the TP->EP preamble in paras_configure_ep when the
-        # capacity precheck aborts the switch. Asymmetric vs the EP->TP
-        # restore: paras_configure_ep defers all server_args /
-        # parallelism_config / MOE_A2A_BACKEND mutations until AFTER
-        # reorchestrate_cache succeeds, so the preamble has only two
-        # things to undo (in reverse order):
-        #   1. prune_request mutations applied by the ParaSReqScatterManager
-        #      constructor on local_waiting_reqs (via
-        #      paras_tp_group_all_gather_reqs). Rank 0's waiting_queue items
-        #      are pruned in place; other ranks pass an empty list so are
-        #      no-ops. running_batch.reqs are NOT pruned by the scatter
-        #      ctor, but tree_cache.reset() ran earlier so their stale
-        #      last_host_node / last_node references must be re-linked to
-        #      the new (empty) root via recover_request -- defensively
-        #      iterating over them too costs nothing and matches the EP->TP
-        #      restore's symmetry.
-        #   2. profiler started by paras_start_profile.
-        # tree_cache.reset() and merge_last_batch() are NOT reverted: the
-        # radix tree rebuilds on subsequent prefills, and the merged
-        # running_batch is the correct TP-mode resume state.
+    def _paras_restore_pruned_requests(self) -> None:
+        if isinstance(self.tree_cache, ParaSPrefixCache):
+            return
         if self.running_batch is not None:
             for req in self.running_batch.reqs:
                 recover_request(req, self.tree_cache, self.tokenizer)
         for req in self.waiting_queue:
             recover_request(req, self.tree_cache, self.tokenizer)
 
+    def _paras_restore_tp_state_after_aborted_ep_switch(self) -> None:
+        self._paras_restore_pruned_requests()
         self.paras_stop_profile()
 
     def _paras_restore_ep_state_after_aborted_tp_switch(self) -> None:
-        # Roll back the EP->TP preamble in paras_configure_tp when the
-        # capacity precheck aborts the switch. Undoes (in reverse order):
-        #   1. prune_request mutations on running_batch.reqs and waiting_queue
-        #      applied by paras_tp_group_all_gather_reqs (it nulls
-        #      tokenizer / radix-tree linkage on every local req to keep
-        #      pickle off GPU tensors). Without this restore the scheduler
-        #      would dereference None on the next prefill/decode iteration.
-        #   2. profiler started by paras_start_profile (no destructive side
-        #      effect, but leaving it running leaks a profiler context).
-        #   3. server_args + global moe_a2a_backend mutations -- mirrors the
-        #      EP epilogue in paras_configure_ep so subsequent EP iterations
-        #      see a coherent config.
-        # tree_cache.reset() and merge_last_batch() are NOT reverted: the
-        # radix tree rebuilds naturally on subsequent prefills, and the
-        # merged running_batch is already the correct EP-mode state.
-        if self.running_batch is not None:
-            for req in self.running_batch.reqs:
-                recover_request(req, self.tree_cache, self.tokenizer)
-        for req in self.waiting_queue:
-            recover_request(req, self.tree_cache, self.tokenizer)
-
+        self._paras_restore_pruned_requests()
         self.paras_stop_profile()
 
         self.paras_parallelism_config = ParaSMode.EP
@@ -622,7 +587,9 @@ class SchedulerParasMixin:
         moe_utils.MOE_A2A_BACKEND = MoeA2ABackend.NONE
 
         self.paras_start_profile("/tmp/paras_configure_profile")
-        self.tree_cache.reset()
+        preserve_prefixes = isinstance(self.tree_cache, ParaSPrefixCache)
+        if not preserve_prefixes:
+            self.tree_cache.reset()
         local_reqs = self.paras_get_local_reqs()
         local_waiting_reqs = list(self.waiting_queue)
 
@@ -638,6 +605,7 @@ class SchedulerParasMixin:
             ),
             method=os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl"),
             local_waiting_reqs=local_waiting_reqs,
+            preserve_prefixes=preserve_prefixes,
             layer_specs=getattr(
                 self.tp_worker.model_runner.model,
                 'paras_layer_specs',
@@ -693,6 +661,8 @@ class SchedulerParasMixin:
         with TimeReporter("gather_cache"):
             paras_gather_manager.gather_cache()
 
+        if preserve_prefixes:
+            self.tree_cache.reset()
         self.running_batch = paras_gather_manager.get_new_running_batch(
             self.tokenizer,
             self.tree_cache,
@@ -702,6 +672,9 @@ class SchedulerParasMixin:
             self.server_args.enable_custom_logit_processor
         )
         self.waiting_queue = paras_gather_manager.get_new_waiting_queue()
+        if preserve_prefixes:
+            for req in self.waiting_queue:
+                recover_request(req, self.tree_cache, self.tokenizer)
         # paras_gather_manager.update_running_batch_inplace(self.running_batch)
 
         with TimeReporter("transfer_weights"):
@@ -764,8 +737,10 @@ class SchedulerParasMixin:
 
         self.paras_start_profile("/tmp/paras_configure_profile")
 
-        # Phase 1: Prepare — reset tree cache, merge batches, build global req list
-        self.tree_cache.reset()
+        # Phase 1: Prepare — merge batches and build the global request list.
+        preserve_prefixes = isinstance(self.tree_cache, ParaSPrefixCache)
+        if not preserve_prefixes:
+            self.tree_cache.reset()
         self.merge_last_batch()
         global_reqs = list(self.running_batch.reqs) if self.running_batch else []
         local_waiting_reqs = (
@@ -786,6 +761,7 @@ class SchedulerParasMixin:
             paras_tp_rank=self.paras_tp_rank,
             paras_tp_size=self.paras_tp_size,
             local_waiting_reqs=local_waiting_reqs,
+            preserve_prefixes=preserve_prefixes,
             layer_specs=getattr(
                 self.tp_worker.model_runner.model,
                 'paras_layer_specs',
@@ -834,6 +810,8 @@ class SchedulerParasMixin:
         with TimeReporter("scatter_cache"):
             paras_scatter_manager.scatter_cache()
 
+        if preserve_prefixes:
+            self.tree_cache.reset()
         self.running_batch = paras_scatter_manager.get_new_running_batch(
             self.tokenizer,
             self.tree_cache,
@@ -843,6 +821,9 @@ class SchedulerParasMixin:
             self.server_args.enable_custom_logit_processor,
         )
         self.waiting_queue = paras_scatter_manager.get_new_waiting_queue()
+        if preserve_prefixes:
+            for req in self.waiting_queue:
+                recover_request(req, self.tree_cache, self.tokenizer)
 
         # Phase 3: Model switch (weights + attention)
         with TimeReporter("transfer_weights"):
@@ -919,14 +900,14 @@ class SchedulerParasMixin:
             rejected = self.paras_configure_tp()
             if rejected:
                 self.tp_send_to_tokenizer.send_output(
-                    ParaSConfigureReqOutput(), recv_req
+                    ParaSConfigureReqOutput(success=False), recv_req
                 )
                 return None
         elif recv_req.type == ParaSConfigureReqType.CONFIGURE_EP:
             rejected = self.paras_configure_ep()
             if rejected:
                 self.ep_send_to_tokenizer.send_output(
-                    ParaSConfigureReqOutput(), recv_req
+                    ParaSConfigureReqOutput(success=False), recv_req
                 )
                 return None
         else:

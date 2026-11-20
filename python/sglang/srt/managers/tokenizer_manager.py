@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import pickle
+import random
 import signal
 import sys
 import threading
@@ -1126,6 +1127,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             tokenized_objs = await asyncio.gather(
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
+
+            # Keep each warmup and its samples on the same EP worker.
+            if (
+                self.server_args.enable_paras_moe
+                and not self.server_args.disable_radix_cache
+            ):
+                for tokenized_obj in tokenized_objs:
+                    if tokenized_obj.data_parallel_rank is None:
+                        tokenized_obj.data_parallel_rank = random.randrange(
+                            self.server_args.dp_size
+                        )
 
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):

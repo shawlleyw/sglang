@@ -263,6 +263,7 @@ class TokenizerCommunicatorMixin:
         # mutation. paras_configure_communicator is exempt because it is the
         # communicator that legitimately fires during a switch.
         self._paras_switch_counter: List[int] = [0]
+        self._paras_configured_tp = False
         self._control_rpc_in_flight_counter: List[int] = [0]
         for comm in self.communicators:
             if comm is self.paras_configure_communicator:
@@ -427,25 +428,22 @@ class TokenizerCommunicatorMixin:
         await self.expert_distribution_communicator(req)
     
     async def paras_configure_tp(self: TokenizerManager):
-        self.auto_create_handle_loop()
-        if self._control_rpc_in_flight_counter[0] != 0:
-            raise RuntimeError(
-                f"ParaS switch attempted while "
-                f"{self._control_rpc_in_flight_counter[0]} control RPC(s) in "
-                f"flight; serialize control RPCs around paras switches."
-            )
-        self._paras_switch_counter[0] += 1
-        try:
-            paras_dp_size = self.server_args.tp_size // self.server_args.paras_tp_size
-            for comm in self.communicators:
-                comm._fan_out = paras_dp_size
-            req = ParaSConfigureReqInput(type=ParaSConfigureReqType.CONFIGURE_TP)
-            await self.paras_configure_communicator(req)
-        finally:
-            self._paras_switch_counter[0] -= 1
+        return await asyncio.shield(
+            self._paras_configure(ParaSConfigureReqType.CONFIGURE_TP)
+        )
 
     async def paras_configure_ep(self: TokenizerManager):
+        return await asyncio.shield(
+            self._paras_configure(ParaSConfigureReqType.CONFIGURE_EP)
+        )
+
+    async def _paras_configure(self: TokenizerManager, target: ParaSConfigureReqType):
         self.auto_create_handle_loop()
+        if not self.server_args.enable_paras_moe or self._paras_switch_counter[0]:
+            return False
+        target_tp = target == ParaSConfigureReqType.CONFIGURE_TP
+        if target_tp == self._paras_configured_tp:
+            return True
         if self._control_rpc_in_flight_counter[0] != 0:
             raise RuntimeError(
                 f"ParaS switch attempted while "
@@ -454,10 +452,20 @@ class TokenizerCommunicatorMixin:
             )
         self._paras_switch_counter[0] += 1
         try:
-            for comm in self.communicators:
-                comm._fan_out = self.server_args.dp_size
-            req = ParaSConfigureReqInput(type=ParaSConfigureReqType.CONFIGURE_EP)
-            await self.paras_configure_communicator(req)
+            fan_out = self.server_args.dp_size
+            if target_tp:
+                fan_out = self.server_args.tp_size // self.server_args.paras_tp_size
+            switch = self.paras_configure_communicator
+            switch._fan_out = fan_out
+            results = await switch(ParaSConfigureReqInput(type=target))
+            success = all(result.success for result in results)
+            if self.server_args.dp_size > 1:
+                self.send_to_scheduler.send_pyobj(ParaSConfigureReqOutput(success=success))
+            if success:
+                self._paras_configured_tp = target_tp
+                for comm in self.communicators:
+                    comm._fan_out = fan_out
+            return success
         finally:
             self._paras_switch_counter[0] -= 1
 

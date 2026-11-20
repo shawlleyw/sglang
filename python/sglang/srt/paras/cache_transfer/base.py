@@ -12,7 +12,7 @@ Backends live in sibling modules (``mha.py``, ``swa.py``), shared
 stateless kernel wrappers live in ``utils.py``.
 """
 
-from typing import List, Literal, Optional, Protocol, runtime_checkable
+from typing import List, Literal, Optional, Protocol, Sequence, runtime_checkable
 
 import torch
 import torch.distributed as dist
@@ -85,7 +85,7 @@ class CacheTransferBase:
         peer_addresses: Optional[List[int]] = None,
         # -- scatter state --
         ep_head_num: int = 0,
-        token_partition: Optional[List[List[int]]] = None,
+        token_partition: Optional[Sequence[Sequence[int]]] = None,
         ep_dst_positions: Optional[torch.Tensor] = None,
         paras_tp_rank: int = 0,
         paras_tp_size: int = 1,

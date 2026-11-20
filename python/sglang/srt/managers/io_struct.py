@@ -1570,7 +1570,7 @@ class ParaSConfigureReqInput(BaseReq):
 
 @dataclass
 class ParaSConfigureReqOutput(BaseReq):
-    pass
+    success: bool = True
 
 
 @dataclass

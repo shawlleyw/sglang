@@ -152,13 +152,16 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.paras.scheduler_paras_mixin import SchedulerParasMixin
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.paras.prefix_cache import ParaSPrefixCache
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -707,7 +710,36 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
-        if (
+        if server_args.enable_paras_moe and not server_args.disable_radix_cache:
+            if (
+                self.page_size != 1
+                or not isinstance(
+                    self.token_to_kv_pool_allocator, TokenToKVPoolAllocator
+                )
+                or not isinstance(
+                    self.token_to_kv_pool_allocator.get_kvcache(), MHATokenToKVPool
+                )
+                or self.is_hybrid
+                or self.is_hybrid_gdn
+                or not self.spec_algorithm.is_none()
+                or self.enable_hierarchical_cache
+                or self.enable_kv_cache_events
+                or server_args.enable_lmcache
+                or server_args.disaggregation_mode != "null"
+                or os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1"
+            ):
+                raise ValueError(
+                    "ParaS prefix migration requires page size 1 and the in-process "
+                    "Python radix cache with full MHA, without speculative decoding "
+                    "or KV cache events. Pass --disable-radix-cache for other configurations."
+                )
+            self.tree_cache = ParaSPrefixCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
+                eviction_policy=server_args.radix_eviction_policy,
+            )
+        elif (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):

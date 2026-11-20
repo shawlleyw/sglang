@@ -303,11 +303,11 @@ an up-to-date test inventory. Current layout tests are linked from the
 
 ## Unsupported Features (hard constraints)
 
-ParaS migration interacts with several scheduler subsystems in ways that are not currently safe. The following features must be **disabled** when `--enable-paras-moe` is set; the relevant assertions live in [`server_args._check_paras_config`](../../python/sglang/srt/server_args.py) and [`scheduler_paras_mixin`](../../python/sglang/srt/paras/scheduler_paras_mixin.py).
+ParaS migration has the following configuration constraints when `--enable-paras-moe` is set. See [server arguments](../../python/sglang/srt/server_args.py) and [scheduler initialization](../../python/sglang/srt/managers/scheduler.py).
 
 | Feature | Required flag | Why |
 |---|---|---|
-| Radix cache | `--disable-radix-cache` | ParaS uses `ChunkCache` / `SWAChunkCache`. The radix cache's tree state (lock_refs, tombstones, LRU lists) would not survive `tree.reset()` at switch boundaries, and prefix sharing is not a project priority for ParaS. |
+| Radix cache | `--disable-radix-cache` for unsupported configurations | Live prefix transfer supports the in-process Python radix cache with full MHA, page size 1, a single TP group, and speculative decoding disabled. Set `DISABLE_RADIX_CACHE=0` with the ParaS launch scripts to enable it. |
 | Chunked prefill | `--chunked-prefill-size -1` | ParaS migration cannot preserve mid-chunked-prefill state: `chunked_req` is not part of the gather/scatter request set, and per-token `kv_indices` in `req.prefix_indices` reference the pre-resize slot layout that paras_resize_and_clear destroys. |
 
 The overlap scheduler is supported on this branch. Both switch entry points
@@ -333,4 +333,4 @@ The DP/EP launch scripts under [`scripts/paras/eval/`](../../scripts/paras/eval/
 
 3. **Quantized weights**: The unified runtime requires unquantized BF16 weights. FP8 KV storage is a separate planner setting; hybrid SWA with FP8 KV is unsupported.
 
-4. **Cross-request prefix sharing**: not available for ParaS (we run with `--disable-radix-cache`). Re-enabling would require porting tombstone-aware insert from PR #17220 to the ParaS path. Not on the roadmap.
+4. **Prefix cache across switches**. A successful switch transfers only the KV used by active requests, with one copy of each shared slot per destination rank. The destination keeps transferred prefixes locked while their requests are active. Queued and new requests build up the destination mode's prefix cache. A capacity rejection preserves the source cache and routing.
