@@ -39,6 +39,11 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
             src=self.frequency_penalties,
         )
 
+    def restore_output_history(self, positions: torch.Tensor, rows: torch.Tensor):
+        self.cumulated_frequency_penalties.view(-1).index_add_(
+            0, positions, self.frequency_penalties[:, 0][rows]
+        )
+
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         logits.sub_(self.cumulated_frequency_penalties)
 

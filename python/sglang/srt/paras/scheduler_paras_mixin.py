@@ -27,6 +27,10 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.paras.utils import paras_func, paras_profile_func
 from sglang.srt.paras.prefix_cache import ParaSPrefixCache
 from sglang.srt.paras.gather_manager import ParaSReqGatherManager, recover_request
+from sglang.srt.paras.sampling_history import (
+    prepare_penalty_history,
+    restore_penalty_history,
+)
 from sglang.srt.paras.scatter_manager import ParaSReqScatterManager
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import MoeA2ABackend
@@ -647,6 +651,8 @@ class SchedulerParasMixin:
             self._paras_restore_ep_state_after_aborted_tp_switch()
             return True
 
+        penalty_history = prepare_penalty_history(paras_gather_manager.global_reqs)
+
         # EP ranks adapt their admission ratios independently after retractions.
         # In TP every rank must choose the same prefill or decode batch.
         admission_ratio = torch.tensor(self.new_token_ratio, dtype=torch.float64)
@@ -681,6 +687,7 @@ class SchedulerParasMixin:
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor
         )
+        restore_penalty_history(self.running_batch, penalty_history)
         self.waiting_queue = paras_gather_manager.get_new_waiting_queue()
         if preserve_prefixes:
             for req in self.waiting_queue:
@@ -814,6 +821,8 @@ class SchedulerParasMixin:
                 self._paras_restore_tp_state_after_aborted_ep_switch()
                 return True
 
+            penalty_history = prepare_penalty_history(paras_scatter_manager.local_reqs)
+
             with TimeReporter("reorchestrate_cache"):
                 paras_scatter_manager.reorchestrate_cache()
 
@@ -830,6 +839,7 @@ class SchedulerParasMixin:
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
         )
+        restore_penalty_history(self.running_batch, penalty_history)
         self.waiting_queue = paras_scatter_manager.get_new_waiting_queue()
         if preserve_prefixes:
             for req in self.waiting_queue:

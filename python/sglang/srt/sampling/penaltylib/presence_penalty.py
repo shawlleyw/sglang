@@ -39,6 +39,12 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
             src=self.presence_penalties,
         )
 
+    def restore_output_history(self, positions: torch.Tensor, rows: torch.Tensor):
+        # Every repeated position belongs to the same row and writes the same value.
+        self.cumulated_presence_penalties.view(-1).scatter_(
+            0, positions, self.presence_penalties[:, 0][rows]
+        )
+
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         logits.sub_(self.cumulated_presence_penalties)
 
