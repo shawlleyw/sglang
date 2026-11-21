@@ -336,6 +336,8 @@ def test_ep_return_restores_independent_sampling_group(monkeypatch, rank):
         paras_func=lambda f: f,
         ParaSPrefixCache=type("ParaSPrefixCache", (), {}),
         ParaSReqScatterManager=lambda **kwargs: scatter,
+        prepare_penalty_history=noop,
+        restore_penalty_history=noop,
         TimeReporter=lambda *args: nullcontext(),
         time=time,
         logger=logging.getLogger(__name__),
