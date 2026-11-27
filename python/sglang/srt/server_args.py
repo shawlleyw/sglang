@@ -1601,12 +1601,11 @@ class ServerArgs:
             assert self.enable_dp_attention, "enable_dp_attention must be set when enable_paras_moe is set"
             assert self.paras_tp_size <= 8 and self.paras_tp_size > 0, "paras_tp_size must be positive when enable_paras_moe is set"
             assert self.tp_size == self.dp_size, "paras moe requires tp_size == dp_size, which means attn tp size is 1"
-            assert self.disable_radix_cache, (
-                "ParaS requires --disable-radix-cache (uses ChunkCache / SWAChunkCache). "
-                "Prefix sharing is not used by ParaS, and the radix cache's tree state "
-                "would not survive EP<->TP switches anyway. Pass --disable-radix-cache "
-                "when --enable-paras-moe is set."
-            )
+            if not self.disable_radix_cache and self.paras_tp_size != self.tp_size:
+                raise ValueError(
+                    "ParaS prefix migration requires a single TP group "
+                    "(--paras-tp-size must match --tp-size)."
+                )
             assert self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0, (
                 "ParaS migration cannot preserve mid-chunked-prefill state "
                 "(chunked_req is not part of the gather/scatter set, and per-token "

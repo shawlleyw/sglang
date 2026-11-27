@@ -7,7 +7,7 @@ Contains:
 - ParaSReqScatterManager
 """
 
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 import os
 import torch
 import torch.distributed as dist
@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator, SWATokenToKVP
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.paras.layers.utils import LayerCacheSpec
 from sglang.srt.paras.cache_transfer.mha import MHACacheTransfer
+from sglang.srt.paras.cache_transfer.prefix import LiveKVRows
 from sglang.srt.paras.cache_transfer.swa import SWACacheTransfer
 from sglang.srt.paras.paras_memory_manager import get_global_paras_memory_manager
 from sglang.srt.paras.gather_manager import paras_tp_group_all_gather_reqs
@@ -124,6 +125,7 @@ class ParaSReqScatterManager:
         paras_tp_size: int = 1,
         layer_specs: Optional[list] = None,
         local_waiting_reqs: Optional[List[Req]] = None,
+        preserve_prefixes: bool = False,
     ):
         self.global_reqs = global_reqs
         self.scatter_group = scatter_group
@@ -135,6 +137,8 @@ class ParaSReqScatterManager:
         self.paras_tp_size = paras_tp_size
         self.method = os.environ.get("PARAS_KV_TRANSFER_METHOD", "nccl")
         self.layer_specs = layer_specs
+        self.preserve_prefixes = preserve_prefixes
+        self.live_rows: Optional[LiveKVRows] = None
 
         # Only rank 0 receives requests in TP mode, so only rank 0 has a
         # populated waiting_queue. Broadcast to all ranks via all-gather
@@ -142,7 +146,7 @@ class ParaSReqScatterManager:
         # same partition algorithm.
         local_waiting_reqs = local_waiting_reqs or []
         gathered_waiting, _ = paras_tp_group_all_gather_reqs(
-            local_waiting_reqs, scatter_group
+            local_waiting_reqs, scatter_group, preserve_source=preserve_prefixes
         )
         self.global_waiting_reqs: List[Req] = gathered_waiting or []
         self.local_waiting_reqs_after_partition: List[Req] = []
@@ -150,7 +154,7 @@ class ParaSReqScatterManager:
         self.local_reqs: List[Req] = []
         self.local_seqlens_list: List[int] = []
         self.num_local_tokens: int = 0
-        self.token_partition: Optional[List[List[int]]] = None
+        self.token_partition: Optional[List[Sequence[int]]] = None
         self.ep_dst_positions: Optional[torch.Tensor] = None
         self.new_cache_size: Optional[int] = None
         self.source_full_to_swa_mapping: Optional[torch.Tensor] = None
@@ -161,7 +165,7 @@ class ParaSReqScatterManager:
         self.num_global_tokens = sum(s - 1 for s in self.global_seqlens_list)
 
         # Flatten TP pool positions for all global requests (identical on every rank).
-        if self.num_global_tokens > 0:
+        if self.num_global_tokens > 0 and not self.preserve_prefixes:
             parts: List[torch.Tensor] = []
             for req in global_reqs:
                 indices = self.req_to_token_pool.req_to_token[
@@ -199,6 +203,10 @@ class ParaSReqScatterManager:
         )
         self.local_waiting_reqs_after_partition = waiting_partitions[self.paras_tp_rank]
 
+        if self.preserve_prefixes and self.num_global_tokens:
+            self._compact_prefix_transfer(partitions)
+            return
+
         # Map each request to its global-token-index range.
         req_to_offset: dict = {}
         offset = 0
@@ -215,6 +223,32 @@ class ParaSReqScatterManager:
                 start, end = req_to_offset[req.rid]
                 rank_indices.extend(range(start, end))
             self.token_partition.append(rank_indices)
+
+    def _compact_prefix_transfer(self, partitions: List[List[Req]]):
+        # A slot shared between requests on different EP workers goes to each
+        # worker once. Sharing within an EP worker uses one destination slot.
+        source = self.req_to_token_pool.req_to_token
+        compact = []
+        offset = 0
+        self.token_partition = []
+        for rank, reqs in enumerate(partitions):
+            if reqs:
+                flat = torch.cat(
+                    [source[req.req_pool_idx, : req.seqlen - 1] for req in reqs]
+                )
+                if rank == self.paras_tp_rank:
+                    unique, self.live_rows = LiveKVRows.compact(reqs, flat)
+                    self.num_local_tokens = unique.numel()
+                else:
+                    unique = torch.unique(flat)
+                count = unique.numel()
+                compact.append(unique)
+            else:
+                count = 0
+            self.token_partition.append(range(offset, offset + count))
+            offset += count
+        self.global_token_indices = torch.cat(compact)
+        self.num_global_tokens = offset
 
     # ------------------------------------------------------------------
     # Step 2: shrink pools to EP capacity
@@ -282,7 +316,7 @@ class ParaSReqScatterManager:
             (len(p) for p in self._all_partitions), default=0
         )
         max_tokens_per_rank = max(
-            (sum(req.seqlen - 1 for req in p) for p in self._all_partitions),
+            (len(partition) for partition in self.token_partition),
             default=0,
         )
 
@@ -365,15 +399,23 @@ class ParaSReqScatterManager:
                 ep_token_indices: torch.Tensor = (
                     self.token_to_kv_pool_allocator.alloc(self.num_local_tokens)
                 )
-                start_index = 0
-                for req, rpi in zip(self.local_reqs, req_pool_indices):
-                    end_index = start_index + req.seqlen - 1
-                    req.req_pool_idx = rpi
-                    self.req_to_token_pool.write(
-                        (rpi, slice(0, req.seqlen - 1)),
-                        ep_token_indices[start_index:end_index],
+                if self.live_rows is not None:
+                    self.live_rows.install(
+                        self.local_reqs,
+                        req_pool_indices,
+                        ep_token_indices,
+                        self.req_to_token_pool,
                     )
-                    start_index = end_index
+                else:
+                    start_index = 0
+                    for req, rpi in zip(self.local_reqs, req_pool_indices):
+                        end_index = start_index + req.seqlen - 1
+                        req.req_pool_idx = rpi
+                        self.req_to_token_pool.write(
+                            (rpi, slice(0, req.seqlen - 1)),
+                            ep_token_indices[start_index:end_index],
+                        )
+                        start_index = end_index
 
                 self.ep_dst_positions = ep_token_indices
 
@@ -434,6 +476,10 @@ class ParaSReqScatterManager:
 
         for req in self.local_reqs:
             recover_request(req, tree_cache, tokenizer)
+        if self.live_rows is not None:
+            self.live_rows.restore_prefixes(
+                self.local_reqs, self.req_to_token_pool, tree_cache
+            )
 
         batch = ScheduleBatch.init_new(
             self.local_reqs,

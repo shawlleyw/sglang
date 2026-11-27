@@ -658,7 +658,8 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 @app.api_route("/paras_configure_tp", methods=["GET", "POST"])
 async def paras_configure_tp():
     """Configure the ParaS TP parallelism."""
-    await _global_state.tokenizer_manager.paras_configure_tp()
+    if not await _global_state.tokenizer_manager.paras_configure_tp():
+        return Response("ParaS TP switch was rejected.\n", status_code=409)
     return Response(
         content="ParaS TP parallelism configured.\n",
         status_code=200,
@@ -667,7 +668,8 @@ async def paras_configure_tp():
 @app.api_route("/paras_configure_ep", methods=["GET", "POST"])
 async def paras_configure_ep():
     """Configure the ParaS EP parallelism."""
-    await _global_state.tokenizer_manager.paras_configure_ep()
+    if not await _global_state.tokenizer_manager.paras_configure_ep():
+        return Response("ParaS EP switch was rejected.\n", status_code=409)
     return Response(
         content="ParaS EP parallelism configured.\n",
         status_code=200,

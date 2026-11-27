@@ -32,8 +32,9 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
-    ParaSConfigureReqType,
     ParaSConfigureReqInput,
+    ParaSConfigureReqOutput,
+    ParaSConfigureReqType,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
@@ -220,9 +221,12 @@ class DataParallelController:
         self.paras_tp_workers = self.workers[:: self.server_args.paras_tp_size]
         self.paras_ep_ctrl_msg_step = self.control_message_step
         self.paras_tp_ctrl_msg_step = 1
+        self.paras_pending_switch = None
+        self.paras_pending_requests = deque()
 
     def paras_configure_helper(self):
         self.round_robin_counter = self.round_robin_counter % len(self.workers)
+        self.dp_budget = DPBudget()
 
     @paras_func
     def paras_tp_configure(self):
@@ -485,8 +489,11 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.data_parallel_rank is not None:
-            logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
-            self.workers[req.data_parallel_rank].send_pyobj(req)
+            rank = req.data_parallel_rank
+            if self.workers is self.paras_tp_workers:
+                rank //= self.server_args.paras_tp_size
+            logger.debug(f"Direct routing to DP rank {rank}")
+            self.workers[rank].send_pyobj(req)
             return True
         return False
 
@@ -524,6 +531,27 @@ class DataParallelController:
         )
         self.round_robin_scheduler(req)
 
+    def dispatch_request(self, req):
+        if isinstance(req, ParaSConfigureReqOutput):
+            target = self.paras_pending_switch
+            assert target is not None
+            if req.success:
+                if target == ParaSConfigureReqType.CONFIGURE_TP:
+                    self.paras_tp_configure()
+                else:
+                    self.paras_ep_configure()
+            self.paras_pending_switch = None
+            while self.paras_pending_requests:
+                self._request_dispatcher(self.paras_pending_requests.popleft())
+        elif self.paras_pending_switch is not None:
+            self.paras_pending_requests.append(req)
+        else:
+            if isinstance(req, ParaSConfigureReqInput):
+                # Generation can arrive during migration. Wait for the schedulers'
+                # result before dispatching it to the committed topology.
+                self.paras_pending_switch = req.type
+            self._request_dispatcher(req)
+
     def event_loop(self):
         while True:
             while True:
@@ -531,15 +559,7 @@ class DataParallelController:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
-                self._request_dispatcher(recv_req)
-
-                if isinstance(recv_req, ParaSConfigureReqInput):
-                    if recv_req.type == ParaSConfigureReqType.CONFIGURE_TP:
-                        self.paras_tp_configure()
-                    elif recv_req.type == ParaSConfigureReqType.CONFIGURE_EP:
-                        self.paras_ep_configure()
-                    else:
-                        raise ValueError(f"Unknown ParaSConfigureReqType: {recv_req.type}")
+                self.dispatch_request(recv_req)
 
 
 def run_data_parallel_controller_process(

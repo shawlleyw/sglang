@@ -23,7 +23,7 @@ import heapq
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Hashable, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
 class RadixKey:
 
-    def __init__(self, token_ids: List[int], extra_key: Optional[str] = None):
+    def __init__(self, token_ids: List[int], extra_key: Optional[Hashable] = None):
         # token ids sequence
         self.token_ids = token_ids
         # extra key (e.g. lora_id, cache_salt)

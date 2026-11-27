@@ -4,7 +4,7 @@ All functions are module-level, stateless, and barrier-free.  Barriers are
 the caller's (manager or backend class) responsibility.
 """
 
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
 import torch
 import torch.distributed as dist
@@ -292,7 +292,7 @@ def do_scatter_one_layer_nccl(
     kv_cache,
     ep_head_num: int,
     layer_id: int,
-    token_partition: List[List[int]],
+    token_partition: Sequence[Sequence[int]],
     group_size: int,
     intra_rank: int,
     replication_factor: int,
